@@ -1,6 +1,6 @@
 # 训练计算量的核算
 
-用于第 2、3、10、12 章。资料核对日期：2026-09-05。下列数值是依据公开报告和配置所做的算子计数，不是训练平台实测。B、T 分别表示十亿和万亿；一次乘加按 2 FLOPs 计算。
+用于第 2、3、11、13 章。资料核对日期：2026-09-05。下列数值是依据公开报告和配置所做的算子计数，不是训练平台实测。B、T 分别表示十亿和万亿；一次乘加按 2 FLOPs 计算。
 
 本地依据：[DeepSeek-V4 报告](../references/files/papers/deepseek-v4.pdf)、[Qwen3.5 配置](../references/files/models/qwen35-config.json)、[Kimi K3 报告](../references/files/papers/kimi-k3.pdf)。版本、获取日期和 SHA-256 见[资料清单](../references/manifest.json)；以下网络链接用于核对出处，复算采用已归档文件。
 

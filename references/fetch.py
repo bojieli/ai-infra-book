@@ -15,7 +15,7 @@ from urllib.parse import quote
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parent
-CHAPTERS = ["认识 AI 基础设施", "模型架构", "训练与推理负载", "加速器", "超节点",
+CHAPTERS = ["认识 AI 基础设施", "模型架构", "训练与推理负载", "加速器架构", "算子与运行时", "超节点",
             "数据中心网络", "端边云协同", "单实例推理", "分布式推理", "训练系统",
             "任务调度与运行", "架构协同设计"]
 
@@ -127,10 +127,12 @@ def index(items):
     ok = [r for r in items if r["status"] in ("downloaded", "local_snapshot", "user_provided")]
     pdfs = [r for r in ok if r.get("file", "").endswith(".pdf")]
     lines = ["# 本地参考资料库", "",
-             "对应当前三部分、十二章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。",
+             "对应当前三部分、十三章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。",
              "", f"当前清单 {len(items)} 项：已保存正文 {len(ok)} 项，其中 PDF {len(pdfs)} 份。其余项目的获取状态见文末。",
              "", "[浏览本地索引](index.html) · [来源清单](sources.tsv) · [下载与校验记录](manifest.json) · [证据缺口](GAPS.md)",
+             "", "[芯片与系统资料覆盖](HARDWARE-COVERAGE.md)按架构列出论文、编程文档和产品规格，并说明尚缺的证据；关键网页配图另见[配图索引](figures/README.md)。",
              "", "作者补充的 UB 正式规范、操作系统参考设计和昇腾 950 白皮书，见 [三份文档的核对笔记](UB-ASCEND-NOTES.md)。",
+             "", "昇腾与 NVIDIA 的数据通路、动态 shape、编程责任和代际证据，见 [架构与执行比较](../case-studies/accelerator-architecture.md)。第 4 章分析硬件供给，第 5 章用实现与执行轨迹验证。",
              "", "PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时保存原始 HTML 与离线文本，外部图片、脚本和站内链接不保证离线可用。不得把网页入口记作规范全文。",
              "", "`manifest.json` 记录实际获取时间、下载与来源地址、内容校验值、字节数、PDF 页数及能从正文识别出的 arXiv 版本。网页和可变分支按本地文件的 SHA-256 固定快照；下载完成不代表已经逐页审阅。",
              "", "`local_snapshot` 表示从作者本地仓库的指定提交归档，记录仓库路径与提交号，不计作网络下载。`landing_only` 是索引入口，`incomplete_text` 表示未取得完整正文，`access_required` 表示来源要求额外的访问条件。",
