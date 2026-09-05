@@ -1,0 +1,911 @@
+    CheckFreq: Frequent, Fine-Grained DNN
+                Checkpointing
+  Jayashree Mohan, UT Austin; Amar Phanishayee, Microsoft Research;
+          Vijay Chidambaram, UT Austin and VMware research
+        https://www.usenix.org/conference/fast21/presentation/mohan
+
+
+
+
+     This paper is included in the Proceedings of the
+19th USENIX Conference on File and Storage Technologies.
+                         February 23–25, 2021
+                             978-1-939133-20-5
+
+
+
+
+                                       Open access to the Proceedings
+                                      of the 19th USENIX Conference on
+                                        File and Storage Technologies
+                                           is sponsored by USENIX.
+                CheckFreq: Frequent, Fine-Grained DNN Checkpointing
+              Jayashree Mohan *             Amar Phanishayee                     Vijay Chidambaram
+                 UT Austin                  Microsoft Research              UT Austin and VMware research
+
+
+
+                             Abstract                               occasionally written to persistent storage, for fault tolerance;
+Training Deep Neural Networks (DNNs) is a resource-hungry           else, an interruption to the job due to process failure, or node
+and time-consuming task. During training, the model per-            crash can wipe out all the job state, resulting in loss of several
+forms computation at the GPU to learn weights, repeatedly,          hours of GPU work. This is termed checkpointing. Tradition-
+over several epochs. The learned weights reside in GPU mem-         ally, models are checkpointed at epoch boundaries [30].
+ory, and are occasionally checkpointed (written to persistent          Interruptions to DNN training jobs are common. Be it ded-
+storage) for fault-tolerance. Traditionally, model parameters       icated enterprise clusters or cloud instances, failures due to
+are checkpointed at epoch boundaries; for modern deep net-          software and hardware errors are inevitable. Prior work has
+works, an epoch runs for several hours. An interruption to          shown that infrastructure and process failures are common
+the training job due to preemption, node failure, or process        in large-scale big data clusters, with a mean time between
+failure, therefore results in the loss of several hours worth of    failure (MTBF) of 4 – 22 hours [19, 27]. Similarly, for GPU
+GPU work on recovery.                                               clusters, recent study of large-scale DNN training clusters at
+   We present CheckFreq, an automatic, fine-grained check-          Microsoft [22] highlight that DNN training jobs encounter
+pointing framework that (1) algorithmically determines the          interruptions due to infrastructure failure, node crashes, soft-
+checkpointing frequency at the granularity of iterations using      ware bugs, and user errors. Over the span of the analysis
+systematic online profiling, (2) dynamically tunes checkpoint-      period (2 months), the mean time between job failures was 45
+ing frequency at runtime to bound the checkpointing overhead        minutes on average (excluding early failures) in the Microsoft
+using adaptive rate tuning, (3) maintains the training data in-     cluster.
+variant of using each item in the dataset exactly once per             Furthermore, a recent trend with cloud providers is the
+epoch by checkpointing data loader state using a light-weight       emergence of cost-effective preemptible VMs which are
+resumable iterator, and (4) carefully pipelines checkpointing       priced 6-8× cheaper than dedicated VMs [9, 16, 29]; such
+with computation to reduce the checkpoint cost by introduc-         VMs may be preempted at any time. Recent work shows that
+ing two-phase checkpointing. Our experiments on a variety           GPU VMs may be preempted as frequent as every 15 minutes
+of models, storage backends, and GPU generations show that          and atleast every 24 hours on the Google Cloud [31].
+CheckFreq can reduce the recovery time from hours to sec-              When interruptions occur, the long running, stateful, DNN
+onds while bounding the runtime overhead within 3.5%.               job terminates abruptly, wiping out the model parameters in-
+                                                                    memory. For instance, training ResNext101 to accuracy on
+1    Introduction                                                   ImageNet-1K dataset using a V100 GPU takes 270 hours
+Deep Neural Networks (DNNs) are widely used in many                 (~3.9 hours per epoch) [35]; if checkpointing is performed
+AI applications including image classification [20, 23, 41],        at epoch boundaries, about two hours of GPU computation
+language translation [46], and speech recognition [17]. While       is wasted on average for every interruption. More generally,
+DNNs have facilitated state-of-the-art accuracy in these tasks,     there is a trend of growing size of datasets [3,7,24], and larger,
+they come at the cost of high computational complexity, taking      complex model architectures [8,10,35], consequently increas-
+up to several days to train [8, 35].                                ing DNN epoch time and overall training time. Therefore, it
+   Training starts with a randomly chosen set of learnable          is critical to frequently checkpoint training progress, at a finer
+parameters (such as weights and biases) and proceeds in itera-      granularity than epochs i.e., at iteration level. In this work,
+tions consisting forward and backward pass over a minibatch         we explore how to perform fine-grained checkpointing auto-
+of data. At the end of each backward pass, the learnable pa-        matically in a model- and hardware-agnostic manner, without
+rameters are recomputed using the gradients obtained, and           intrusive changes to the training workload.
+updated in GPU memory. Training is performed for several               We present CheckFreq, a fine-grained checkpointing frame-
+epochs, where one epoch is a complete pass over the dataset.        work for DNN training. CheckFreq strikes a balance between
+At the end of training, the learned parameters are saved to         ensuring a low runtime overhead and providing a high check-
+persistent storage for inference.                                   pointing frequency, so that there is minimal loss of GPU
+   Due to the large runtime of DNN training, the model              time in the event of job interruptions or failures by perform-
+weights and optimizer state (collectively, model state) are         ing iteration-level checkpointing. CheckFreq has two major
+    * Work done as part of MSR internship                           components; a checkpointing policy that automatically deter-
+
+
+
+USENIX Association                                             19th USENIX Conference on File and Storage Technologies           203
+mines when to checkpoint, and a checkpointing mechanism            begins. Therefore, in the event of an unexpected interruption,
+that performs correct, low-cost checkpointing. To this end, we     the job state will rollback at most one checkpoint.
+build upon a set of techniques from the High Performance           3. Data invariant. For a large class of models that perform
+Computing (HPC) and storage community, alongside novel             random data pre-processing operations in every epoch of
+DNN-specific optimizations such as pipelined in-memory             training (eg CNNs), it is crucial to ensure the following data
+snapshots, utilizing spare GPU capabilities for fast snapshot,     invariant holds: every epoch must process all the items in
+and a DNN-aware systematic profiling for dynamic tuning            the dataset exactly once, in a random order, with random
+of checkpointing frequency. Using CheckFreq, we show that          pre-processing like crop, resize etc. Existing data iterators in
+the recovery time reduces from hours to seconds during job         frameworks like PyTorch, and MxNet do not support resuma-
+interruptions.                                                     bility. When the job is interrupted, these iterators can either
+   Fine-grained checkpointing for DNNs at iteration gran-          miss out, or repeat data items in an epoch, resulting in loss in
+ularity poses several unique challenges which CheckFreq            model accuracy when resuming at iteration granularity.
+addresses as described below.
+                                                                      To address this challenge, CheckFreq introduces a resum-
+1. Checkpointing frequency. There is no single checkpoint-         able data iterator that respects the data invariant even in the
+ing frequency that works across models, hardware, and train-       presence of interruptions. The iterator uses epoch seeded
+ing environments. The frequency of checkpointing depends           psuedo-random transformations, that can reconstruct the iter-
+on several factors; e.g., model size, storage bandwidth, and       ator state as it was prior to interruption. CheckFreq’s iterator
+training iteration time. Moreover, a job could face interference   thus makes correct, iteration-level checkpointing feasible.
+while writing checkpoints due to reading the dataset from the
+same storage device, or due to concurrently running jobs that         We implement CheckFreq as a pluggable module for Py-
+share the storage bandwidth to write checkpoints. Statically       Torch, with minimal (< 10 LOC) changes to the original job’s
+determining a checkpointing frequency is sub-optimal for           script. Our evaluation across a variety of models, GPUs, and
+runtime if a job faces interference in its training environment.   storage types confirms that CheckFreq reduces the wasted
+                                                                   GPU time from order of hours to just under a minute, while
+   Therefore, CheckFreq algorithmically determines an initial
+                                                                   incurring less than 3.5% runtime overhead, as compared
+checkpointing frequency by profiling the job characteristics
+                                                                   to the existing epoch-based checkpointing schemes. Check-
+during runtime. CheckFreq uses systematic online profiling
+                                                                   Freq reduces the end-to-end training time by 2× when train-
+to determine the best-case checkpointing frequency for the
+                                                                   ing a ResNet50 job on a 1080Ti GPU, and by 1.6× for a
+model in the given training environment. However, in practice,
+                                                                   ResNext101 job on a V100 GPU, when the job is interrupted
+the job might incur additional overheads due to intereference
+                                                                   every 5 hours in both cases. We further demonstrate the
+which slows down the checkpointing process. To tackle this,
+                                                                   importance of CheckFreq’s recoverable iterator by training
+CheckFreq introduces adaptive rate tuning to dynamically
+                                                                   ResNet18 to accuracy using ImageNet dataset with frequent
+monitor the job runtime between checkpoint intervals, and
+                                                                   interruptions (once every 2 epochs) and iteration-level check-
+appropriately scale up or scale down the checkpointing fre-
+                                                                   pointing; Existing state-of-the-art data loaders like DALI [4]
+quency, so that the end-to-end runtime overhead is within a
+                                                                   result in up to 13% drop in accuracy while CheckFreq is able
+user-given bound.
+                                                                   to train the model to target accuracy.
+2. Checkpoint stalls. The model state to be checkpointed              In summary, this paper makes the following contributions.
+is updated every iteration. Therefore, training has to briefly      • Analyzes the state of DNN checkpointing today and high-
+pause to accurately checkpoint the current state; the GPU             lights the need for fine-grained checkpointing and the chal-
+(or any accelerator) remains idle until checkpoint completes,         lenges involved in achieveing it (§3)
+introducing checkpoint stalls in training. Naively increasing       • The design and implementation of CheckFreq, an auto-
+the frequency of checkpointing (e.g., every iteration) results        matic, fine-grained checkpointing framework for DNN
+in high runtime overhead due to checkpoint stalls.                    training that exploits the DNN computational model to
+   CheckFreq reduces checkpoint stalls using a DNN-aware              provide low-cost, pipelined checkpointing (§4)
+two-phase checkpointing strategy. The checkpointing oper-           • Experimental results demonstrating the efficacy of Check-
+ation is split into a snapshot() and a persist() phase. In            Freq in reducing the recovery time from hours to seconds,
+the snapshot() phase, CheckFreq performs a consistent in-             across a range of models and hardware configurations (§5)
+memory copy of all the learnable model state. This operation       2   Background
+is pipelined with compute until the weight update of the sub-
+sequent iteration which is the latest point when the model         This section provides a brief overview of the DNN computa-
+parameters are updated. In the persist() phase, the snap-          tional model and the role of checkpointing in DNN training.
+shot is asynchronously written to the storage device. Check-       DNN computational model. Training a Deep Neural Net-
+Freq guarantees that a checkpoint is reliably persisted on disk    work (DNN) is the process of determining the set of weights
+(using fsync()) before the subsequent checkpoint operation         and bias in the network, collectively called the learnable pa-
+
+
+
+204   19th USENIX Conference on File and Storage Technologies                                               USENIX Association
+rameters. Once trained, the DNN computes the output using           Epoch i                                      Epoch i+1
+                                                                                                  Interruption
+the weights learned during the training phase.                                                                               GPU time
+   DNN Training starts with a randomly chosen set of learn-
+able parameters and proceeds iteratively in steps called iter-                         Recovery Time
+ations. Every iteration processes a small disjoint subset of       Figure 1: Recovery time. The amount of GPU work lost and
+the dataset called a minibatch. When the entire dataset is pro-    has to be redone on recovery is termed the recovery time.
+cessed exactly once, an epoch is said to be complete. Each
+iteration of training performs the following steps in order.       released by NVIDIA, TensorFlow and PyTorch. We find that
+                                                                   checkpointing in open source ML training frameworks is
+• Data augmentation. Fetches a minibatch of data from stor-
+                                                                   incorrect and inefficient.
+  age and applies random pre-processing operations. For e.g.,
+  in popular image classification models like the ResNets,         • Correctness. The checkpointing mechanism used in the
+  pre-processing includes randomly cropping the input im-            training scripts could result in loss or corruption of check-
+  age, resizing, rotating, and flipping it.                          point files in the event of job failure or interruption.
+• Forward pass. The model function is applied on the mini-         • Efficiency. Checkpointing is inefficient. The frequency of
+  batch of data to obtain the prediction.                            checkpointing is determined in an ad-hoc fashion, typically
+                                                                     at epoch-boundaries which results in loss of several hours
+• Backward pass. A loss function is used to determine how
+                                                                     of GPU time for recovery. Furthermore, there is lack of
+  much the prediction deviates from the correct answer; each
+                                                                     support for checkpointing at fine granularity; existing data
+  layer in the DNN computes a gradient of the loss.
+                                                                     iterators do not support resuming training state at iteration
+• Weight update. Using the gradients computed in the back-           boundaries and results in high checkpoint stalls.
+  ward pass, the learnable model parameters are updated.
+   At the end of training (typically after a fixed number of       3.1        Checkpointing is Incorrect
+epochs), the final learned parameters are saved to persistent      Corruption due to overwrites. Some of the official training
+storage. To perform inference on the model, the DNN is initial-    workloads maintained by PyTorch [38], overwrite the same
+ized with the learned parameters and the output is predicted.      checkpoint file at the end of each epoch to reduce storage
+Checkpointing. Training a DNN is a highly time-consuming           utilization. However, this exposes the risk of corrupting the
+task. For instance, BERT-large, the state-of-the-art language      checkpoint file in the event of a crash during the checkpoint
+modeling network, takes 2.5 days to train [8], when trained        operation. Prior work [37] has shown that different filesystems
+in parallel across 16 V100 GPUs. Since the learnable param-        treat overwrites differently; a crash could result in non-atomic
+eters are maintained in GPU memory during training, any            data update in the writeback mode of ext3 resulting in data
+interruption to the training job due to a process crash, server    corruption, while it could truncate the file on ext4, resulting in
+crash, job or VM preemption, or job migration, results in the      data loss. In either case, the checkpoint file becomes unusable;
+loss of model state learned so far. This state is typically a      training has to restart from the first epoch.
+few hundred MBs to a few hundred GBs in size [36] (§5.4).          The checkpoint file may not persist. Analyzing the primi-
+Consequently, several hours of GPU time spent on training          tives used by training frameworks for checkpointing, such as
+will be lost. To overcome this, the model state is typically       torch.save reveal that they do not fsync() the checkpoint
+checkpointed at epoch boundaries; i.e., written out to persis-     file. We verified that this can lead to data loss. Moreover,
+tent storage for fault-tolerance. This checkpoint can then be      naively performing frequent synchronous fsync() affects
+loaded when the training job resumes to ensure that progress       training performance significantly ( §5.3.1).
+is not entirely lost.
+                                                                   3.2        Checkpointing is Inefficient
+Recovery Time. When a DNN training job is interrupted, it
+                                                                   Checkpointing is performed sparingly in an ad-hoc fash-
+rolls back to the last completed epoch that was checkpointed
+                                                                   ion. There is no systematic checkpointing policy in the train-
+as shown in Figure 1. Note that, all the GPU work performed
+                                                                   ing jobs; checkpointing interval is chosen in an ad-hoc fash-
+between the last checkpoint and the point of interruption is
+                                                                   ion. For example, some jobs do not checkpoint during train-
+lost and has to be redone when training resumes. The amount
+                                                                   ing, while some others start checkpointing only after a large
+of GPU time lost due to an interruption is termed the recovery
+                                                                   number of epochs (60% of training) have elapsed. In gen-
+time. In other words, this is the time spent to bring the model
+                                                                   eral, we observe that checkpointing is typically performed
+to the same state as it was prior to the interruption.
+                                                                   at epoch boundaries, providing only modest fault-tolerance;
+3   The Current State of Checkpointing                             in the event of a job interruption, the training will resume
+We analyze the current state of checkpointing in popular open      from the last completed epoch, which potentially loses sev-
+source ML training frameworks like PyTorch [5], Tensor-            eral hours of GPU training time that has to be redone. For
+Flow [6], and MxNet [11]. We analyze training workloads            instance, when ResNext101 is trained using ImageNet on a
+from MLPerf submissions v0.7, and the official workloads           V100 GPU, two hours of GPU time is lost on average if the
+
+
+
+USENIX Association                                            19th USENIX Conference on File and Storage Technologies            205
+job is interrupted (§5.5).                                           Technique               Benefits
+A naive frequent checkpointing schedule results in check-            Checkpointing mechanism (How to checkpoint?)
+point stalls. Providing higher fault-tolerance requires check-       2-phase checkpointing   Splits checkpointing into two phases
+pointing to be performed more frequently than at epoch bound-                                and pipelines them carefully with
+aries; i.e., at iteration boundaries. However, naively increas-                              compute to make checkpoints cheap
+ing the frequency of checkpointing introduces a large check-         Recoverable data iterator   Maintains data invariant, allows re-
+point stall in training. Since model weights are constantly                                      suming training at iteration bound-
+updated between iterations, checkpointing requires the train-                                    aries without affecting accuracy
+ing to briefly pause to capture the model weights accurately.        Checkpointing policy (When to checkpoint?)
+We term this overhead (i.e, the time GPU is idle, waiting for        Systematic online profiling Automatically determines check-
+the checkpoint to complete) as the checkpoint stall. Therefore,                                  pointing frequency, cognizant of
+it is crucial to find the correct checkpointing frequency given                                  model characteristics
+a DNN (because the size of checkpoint varies from 100MBs             Adaptive rate tuning        Dynamically tunes checkpointing fre-
+to 100GBs across DNNs), and the storage bandwidth, to min-                                       quency to reduce overhead due to in-
+imize checkpoint stalls.                                                                         terference
+
+Violating the data invariant during training can affect               Table 1: Overview of techniques used by CheckFreq.
+model accuracy. Each epoch performs a full pass over the
+                                                                    4.1    Goals
+dataset, in a random order and holds the invariant that each
+data item is seen exactly once per epoch. One of the ben-           Correctness. CheckFreq aims to provide frequent, iteration-
+efits of checkpointing at epoch boundaries is that, the data        level checkpointing that is consistent, and persistent.
+iterator state need not be persisted, as it is reset at the end     No impact on model accuracy. CheckFreq aims to not im-
+of epoch. Checkpointing at a finer granularity (i.e. at itera-      pact the statistical efficiency of the model by ensuring that the
+tions), requires infrastructure support to resume the state of      data invariant holds when training resumes after interruption.
+data iterator as well. We note that the support to persist iter-    Automatic frequency selection. CheckFreq aims to deter-
+ator state exists in some custom dataloaders of NLP models          mine and tune the frequency of checkpointing automatically
+which do not perform random pre-processing operations for           based on the model being trained, and the training environ-
+every batch. However, for image and video models that apply         ment (GPU gen, storage type, iteration time). Checkpointing
+random transformations on the input data every batch, the           frequency influences the recovery time, i.e., time to bring
+existing dataloaders in PyTorch, MxNet, and state-of-the-art        model state to what it was prior to the interruption.
+data pipelines like NVIDIA’s DALI are not resumable at iter-
+                                                                    Low checkpoint stalls. CheckFreq aims to reduce check-
+ation boundaries. As a result, they violate the data invariant in
+                                                                    point stalls during training, so that there is low runtime over-
+the presence of interruptions, resulting in upto the 13% drop
+                                                                    head to frequent checkpointing (e.g., < 5%).
+in accuracy for popular models ResNet18 (Fig 6).
+                                                                    Minimal code changes. CheckFreq aims to require minimal
+3.3    Summary                                                      changes to the training code to automate checkpoint manage-
+In summary, we observe that the checkpointing mechanism             ment and restoration.
+today is incorrect; resulting in potential checkpoint data loss
+or corruption. Additionally, the checkpointing policy is ad-        4.2    CheckFreq Recovery Guarantees
+hoc; there is no systematic way of determining how frequently       An interrupted job resumes training from the latest available
+one must checkpoint, to both minimize recovery time and             checkpoint on disk. In the traditional epoch-based check-
+incur low checkpoint stalls.                                        pointing, irrespective of when the job is interrupted, training
+   The solution to minimize recovery time is to perform fre-        resumes from the previous epoch boundary as shown in Fig 1.
+quent, iteration-level checkpointing. However, performing           If a job performs n iterations per epoch and takes time ti per
+correct and efficient fine-grained checkpointing is challeng-       iteration, then the average recovery time Ravg for this job is :
+ing. We need (1) low-cost checkpointing mechanisms, (2)                                              n
+                                                                                             Ravg = ∗ ti
+light-weight, resumable data iterators that preserve the model                                       2
+accuracy, and (3) a way to systematically determine the fre-           This is because, when interrupted in the middle of an epoch,
+quency of checkpointing.                                            work done so far in the epoch must be redone when resumed,
+4     CheckFreq: Design and Implementation                          as the state is reset to the end of previous epoch. Thus, recov-
+                                                                    ery time R for epoch-based checkpointing is bounded by:
+We present the goals of CheckFreq and the recovery guaran-                                     0 ≤ R ≤ n ∗ ti
+tees it provides. We then present an overview of the overall
+architecture of CheckFreq, and discuss the techniques used             Note that n ∗ ti is the duration of an epoch; it can be as
+by CheckFreq to achieve the enlisted goals.                         large as a few hours. CheckFreq aims to provide a tight bound
+
+
+
+206    19th USENIX Conference on File and Storage Technologies                                                 USENIX Association
+                                Interruption
+Epoch i                                        Epoch i+1
+                                                                                                      DNN training job
+                                                           GPU time
+                                                                                             next_batch()
+                                  Recovery Time                                                                             CHECKFREQ
+Figure 2: Bounding recovery time. CheckFreq guarantees                                   1
+                                                                                                      must_checkpoint() ?
+that training rolls back at most one checkpoint.                                        Iterator                             Policy
+                                                                                                              2
+                                                                                         3                                  7    Feedback
+on recovery time and takes a more fine-grained approach to
+checkpointing at iteration boundaries. CheckFreq guarantees                            Snapshot()                           Persist()
+                                                                                                      4                5
+that there is at most one ongoing checkpoint operation in the
+system at any point in time. When interrupted, it rolls back at                                                              6
+                                                                                                    Storage
+most one checkpoint - either the last initiated checkpoint (if it
+completes), or the one prior as shown in Fig 2. If the frequency           Figure 3: Training with CheckFreq. CheckFreq’s policy
+automatically determined by CheckFreq is k iterations, then                determines the checkpointing frequency. The checkpointing
+CheckFreq guarantees that the recovery time R is bounded by                mechanism then snapshots and persists the model and iterator
+                          0 ≤ R ≤ 2 ∗ k ∗ ti                               state at the identified frequency in a pipelined manner. If a
+                                                                           failure occurs, CheckFreq rolls back the model and iterator
+                  Ravg = k ∗ ti (k << n)
+                                                                           state to the latest available checkpoint and resumes training.
+   The chosen checkpointing frequency k is 100 – 300× less
+than n, as we show later in evaluation (§5.4), thereby resulting           can significantly slow down the end-to-end training time. To
+in orders of magnitude reduction in recovery time compared                 mask such high checkpoint costs within an overhead p, check-
+to epoch based checkpointing.                                              pointing needs to be performed infrequently, which in turn
+4.3       Design                                                           results in high recovery cost.
+We now present an overview of the architecture of CheckFreq                Two-phase checkpointing. CheckFreq aims to reduce the re-
+and how it uses various techniques to provide frequent check-              covery cost in the event of an interruption by reducing check-
+pointing at a bounded cost described in §4.2. Table 1 lists                point stalls. To achieve low checkpoint cost, CheckFreq in-
+the different techniques used by CheckFreq and the benefit of              troduces a DNN-aware two-phase checkpointing mechanism.
+each technique.                                                            CheckFreq splits checkpointing into two phases; snapshot()
+                                                                           and persist() and pipelines each phase with computation.
+Overview. The architecture of CheckFreq is shown in Fig-                   The main insight behind CheckFreq’s two-phase checkpoint-
+ure 3. CheckFreq has three major components; a recoverable                 ing is that it exploits the DNN computational model (§2) to
+data iterator that returns a minibatch of data to the training             pipeline checkpointing operations on modern accelerators
+job, a feedback-driven checkpointing policy that determines                such as the GPUs.
+when to trigger a checkpoint, and a low-cost checkpointing
+mechanism that is split into a snapshot() and a persist()                  1. Phase 1 : snapshot(). The first is a snapshot() phase,
+phase. CheckFreq monitors the runtime overhead incurred                       performed after the weight update step of the iteration.
+in each checkpoint interval; this is used as feedback to dy-                  Here, a copy of the model state is captured in memory,
+namically tune the checkpointing frequency to ensure that                     so that it can be written out to storage asynchronously.
+the runtime overhead does not exceed a user-given limit p                     Since the model state resides in GPU memory, snapshot()
+(e.g., 5%). When interrupted, CheckFreq restores the latest                   involves copying the model parameters from GPU to CPU
+available checkpoint and resumes training. We describe each                   memory. Performing this operation synchronously in the
+component in detail below.                                                    critical path results in non-trivial snapshot() overhead
+                                                                              as shown in Figure 4b. Therefore, CheckFreq carefully
+4.3.1     Checkpointing Mechanism                                             pipelines snapshot() with compute.
+DNN checkpointing today is performed synchronously; train-                        Pipelining snapshot() with compute has to be per-
+ing is paused until the checkpoint operation is complete. How-                formed cautiously to ensure consistency of model param-
+ever, synchronous checkpointing introduces large checkpoint                   eters and preserve correctness of Stochastic Gradient De-
+stalls, which results in large runtime overhead if performed                  scent (SGD), which is a popular optimization technique
+frequently. In other words, the cost of a checkpoint (Tc ) is                 used by learning algorithms. Naively pipelining them can
+high for synchronous checkpointing. For example, consider a                   result in an inconsistent snapshot that contains part of the
+policy that checkpoints every three iterations. The model state               weight updates from one iteration and the rest from the
+is written to disk after the weight update phase which updates                other. CheckFreq exploits the DNN learning structure to
+weights based on the gradients computed in the backward                       achieve correct, pipelined snapshots.
+pass. As shown in Figure 4a, the checkpoint cost is incurred                      We observe that the learnable model parameters are
+in the critical path, resulting in high checkpoint stalls, which              updated in GPU memory after the backward pass of an
+
+
+
+USENIX Association                                                    19th USENIX Conference on File and Storage Technologies               207
+                (a) Baseline :     Compute      1 1 1                    2 2 2 3 3 3 4 4 4                           5 5 5 6 6 6 7 7 7
+                Synchronous
+               checkpointing       Checkpoint           1        1                                4         4
+                                                                                                                             Forward pass
+
+                                   Compute      1 1 1       2 2 2 3 3 3 4 4 4           5 5 5 6 6 6 7 7 7                    Backward pass
+              (b) Only persist()
+                  pipelining                                                                                                 Weight update
+                                   Checkpoint           1        1               4           4
+                                                                                                                             Snapshot
+               (c) Snapshot()      Compute      1 1 1 2 2   2 3 3 3 4 4 4 5 5    5 6 6 6 7 7 7                               Persist
+                and persist()
+                 pipelining        Checkpoint           1         1         4            4                                   Checkpoint stall
+
+
+Figure 4: Pipelining checkpoint with compute. This figure contrasts three checkpointing mechanisms, when checkpointing is
+performed every 3 iterations. (a) performs checkpointing synchronously and incurs a high checkpoint stall. (b) takes a snapshot
+of the model state synchronously but pipelines disk IO (persist()) with compute, allowing it to proceed in the background.
+CheckFreq takes a more nuanced approach by carefully pipelining snapshot() with the subsequent iteration’s forward and
+backward pass and incurs lower checkpointing stalls as shown in (c)
+
+   iteration; in a step called the weight update. Therefore,                         process; and monitors its progress. When a subsequent
+   we can pipeline snapshot() of iteration i with compute,                           checkpoint is triggered as determined by the policy, the
+   until the weight update of iteration i + 1. If snapshot()                         progress of the ongoing persist() operation is checked.
+   does not complete by then, then iteration i + 1 waits until                       If the persist() has not completed, then the compute
+   the ongoing snapshot() successfully completes as shown                            process waits until the ongoing checkpoint operation is
+   in Figure 4c. This tight coupling is required to ensure a                         complete. This ensures that there is at most one ongoing
+   consistent snapshot; else we might capture a state that is                        checkpoint operation at any point in time, and if the job is
+   partially updated by the subsequent iteration that in turn                        interrupted, it rolls back to at most one prior checkpoint.
+   affects the correctness of the learning algorithm [28].                               While it may be tempting to abandon an ongoing check-
+   GPU-based snapshot(). Although snapshot() is                                      point if the next one is triggered, it is a tricky and risky
+   pipelined with compute of the following iteration, it may                         operation. Suppose we abandon the current checkpoint and
+   result in checkpointing stalls in cases where it is not possi-                    begin writing the next one, a failure at this point may end
+   ble to completely hide the cost of copying model state from                       up losing both the checkpoints. This could be a chain reac-
+   GPU to CPU. Therefore, CheckFreq further optimizes this                           tion; a failure could result in rolling back to a significantly
+   operation using a GPU-based snapshot() when feasible.                             old checkpoint if all the recent ones were abandoned, re-
+   We observe that the cost of performing a snapshot() in                            sulting in a high recovery time. Since CheckFreq aims to
+   GPU memory is an order of magnitude cheaper than per-                             guarantee that we roll back to at most one prior checkpoint,
+   forming it to CPU memory, as the latter involves a GPU to                         it does not abandon any running checkpoints.
+   CPU copy in the critical path. Therefore CheckFreq takes
+   the following approach.                                                      Resumable light-weight data iterator. The DNN training
+                                                                                workload interacts with CheckFreq using a thin API provided
+      (a) When spare GPU memory is available in the train-                      by a data iterator. The function of a data iterator in DNN
+          ing environment to hold a copy of the snapshot,                       training is to return a pre-processed batch of data items to the
+          we snapshot() in the GPU on GPU memory. The                           GPU, such that the data invariant holds - each epoch processes
+          persist() phase then asynchronously copies the                        all the data items exactly once, in a random order. While the
+          snapshot to CPU memory and then to disk.                              native iterator in PyTorch and those provided by state-of-the-
+      (b) If not, CheckFreq snapshots directly into CPU mem-                    art data pipelines like DALI [4] support this in the common
+          ory. This can introduce stalls in critical path.                      case, they lack resumability if the training is interrupted.
+      (c) CheckFreq adjusts the frequency of checkpointing ap-                     For example, consider a dataset with eight data items from 1
+          propriately to minimize the overhead of snapshot(),                   – 8. In an epoch, the order of data items processed could be as
+          which can be especially large in (b), and stalls in                   shown in Fig 5a. Assume that we checkpoint the model state
+          persist().                                                            at the end of every iteration which processes one data item.
+                                                                                If training is interrupted in the middle of this epoch, the data
+2. Phase 2 : persist(). The second phase in checkpoint-                         iterator loses state, and resumes with a random shuffled order
+   ing is the persist() phase which asynchronously writes                       of the dataset as shown in Fig 5b, resulting in data items being
+   the snapshot to persistent storage similar to well explored                  repeated and missed in a epoch, violating the data invariant.
+   asynchronous checkpointing techniques [33, 34, 40, 45].                         CheckFreq’s data iterator uses the following techniques to
+   However, to provide bounded rollback guarantees discussed                    support resumption:
+   in §4.2, persist() is tightly coupled with compute. Check-                    • It shuffles data items every epoch using a seed that is a
+   Freq performs the persist() operation as a background                           function of the epoch number. Therefore, to recreate the
+
+
+
+208     19th USENIX Conference on File and Storage Technologies                                                              USENIX Association
+                        1 5 8 2 6 4 7 3                              Algorithm 1 : Checkpointing frequency determination
+              (a) Order of data items processed in an epoch          Input: Ti, Tw, T c, T g, T s, m, M, Mmax , p
+                                                                       Toc ← max(0, Tc − (Ti − Tw )
+         1 5 8 2 6 4 7 3             4 2 1 5 33 87 78 6
+                                                                       Tog ← Tg
+                (b) Resuming with current data iterator                if Mmax − M > m and Tog ≤ Toc then
+         1 5 8 2 6 4 7 3             1 5 8 2 6 4 7 3                      To ← Tog
+               (c) Resuming with CheckFreq data iterator
+                                                                          mode ← GPU
+                                                                       else
+Figure 5: Resuming iterator state. When iterator state is
+                                                                          To ← Toc
+not resumable, an epoch might miss data items when job
+                                                                          mode ← CPU
+is interrupted (items 3,6,7 are missed in b). CheckFreq (c)
+                                                                       end if
+ensures that training resumes from exactly where it left off.
+                                                                       k ← Tc +TTsi −To
+                                                                               l         m
+  same shuffle order, it is sufficient to persist the current                       To
+                                                                       kmin ← p∗T      i
+  epoch ID, and the number of data items processed so far              k ← max(k, kmin )
+  (which makes iterator checkpointing lightweight).                  Output: k, mode
+• When training resumes, the iterator reconstructs the shuffle
+  order, and deterministically restarts from where it left off       to create an in-memory CPU copy (Tc ), time to write to stor-
+  at the last checkpoint as shown in Fig 5c.                         age (Ts ), size of checkpoint (m), peak GPU memory utilization
+                                                                     (M), and total GPU memory (Mmax ). Based on CheckFreq’s 2-
+Summary. Two-phase checkpointing mechanism along with
+                                                                     phase checkpointing mechanism, the frequency determination
+the resumable data iterator provides correct, low-cost check-
+                                                                     algorithm is as shown in Algorithm 1.
+pointing. The next important question to answer is, how fre-
+                                                                        The algorithm provides two outputs; 1) the checkpointing
+quently should we checkpoint the model?
+                                                                     frequency k which is the number of iterations elapsed be-
+4.3.2   Checkpointing Policy                                         tween every checkpoint, and 2) the snapshot() mode (CPU
+                                                                     or GPU-based). The algorithm first determines the snapshot
+To perform automatic, iteration-level checkpointing, we must         mode based on available free GPU memory; if there is enough
+determine the frequency at which checkpointing is performed.         space to snapshot the model state in GPU memory, then the
+On one hand, we can checkpoint after every iteration, provid-        mode is set to GPU, else the preferred mode is set to CPU-
+ing low recovery cost but possibly high runtime overhead. On         based snapshotting. Based on the chosen mode, the algo-
+the other hand, we can perform coarse grained checkpointing          rithm estimates the overhead in the critical path incurred after
+at epoch boundaries, resulting in high recovery cost but low         pipelining checkpointing and compute in a tightly coupled
+runtime overhead. An effective checkpointing policy must             manner as described earlier (§4.3.1). It then determines the
+find the right balance between recovery cost and runtime over-       number of iterations required to amortize this overhead such
+head, minimizing both. The main idea behind CheckFreq’s              that the total runtime overhead incurred is below the threshold
+checkpointing policy is to initiate checkpoints every k iter-        p. For example, consider the cost of a checkpoint operation
+ations (called the checkpointing frequency), such that the           and the duration of an iteration are both 1 time unit. If the
+overhead of one checkpointing operation can be amortized             threshold on runtime overhead is set to 5%, then CheckFreq
+over k iterations. While prior work in HPC have explored             chooses to checkpoint every 20 iterations.
+ways of identifying the checkpointing frequency based on
+failure distribution in the cluster [12, 14, 15], CheckFreq finds    Adaptive rate tuning. A static, profile-based frequency de-
+the shortest interval that masks the overhead of checkpointing       termination works well when the training environment of the
+based on the DNN and hardware characteristics.                       model remains unchanged throughout the runtime of the job.
+                                                                     However, in practice, the checkpoint cost estimated by the
+Systematic online profiling. CheckFreq takes a systematic            online profiler can deviate, resulting in higher than estimated
+profile-based approach to determine the checkpointing fre-           runtime overheads. For instance, a job could face write in-
+quency. It should be chosen such that the runtime overhead           terference by concurrently running jobs sharing storage for
+introduced due to checkpointing is within a percentage p of          read/write, which affects the time to write a checkpoint.
+the actual compute time, where p is the permissible overhead            Therefore, CheckFreq uses an adaptive rate tuning tech-
+decided by the user (say 5%).                                        nique to perform feedback-driven frequency changes. Check-
+   CheckFreq determines the initial checkpointing frequency          Freq’s iterator monitors the runtime of the job and the actual
+as follows. When a training job starts, CheckFreq’s data itera-      cost of checkpointing during runtime (after the initial fre-
+tor (§4.3.1) automatically profiles several iteration-level and      quency determination). If the observed runtime exceeds the
+checkpoint-specific metrics which influences the checkpoint-         desired overhead, then these values are used to recalculate
+ing frequency - the iteration time (Ti ), time to perform weight     the checkpointing frequency. The idea is to ensure that the
+update (Tw ), time to create an in-memory GPU copy (Tg ), time
+
+
+
+USENIX Association                                              19th USENIX Conference on File and Storage Technologies         209
+overall runtime overhead does not exceed the threshold p.                                 GPU     GPU     CPU    Storage
+                                                                                          Type   Mem(GB) Mem(GB) Media
+4.4    Implementation
+We implement CheckFreq as a pluggable module for PyTorch.                  Conf-Pascal 1080Ti        11         500      HDD
+The data iterator of CheckFreq is implemented on top of the                Conf-Volta V100           32         500      SSD
+state-of-the-art data pipeline DALI for PyTorch. CheckFreq
+can be used as a drop-in replacement to the existing data            Table 2: Server configurations. We use two ML server
+loader in PyTorch.                                                   SKUs; each with 24 CPU cores, 500GB DRAM, and 8 GPUs
+   CheckFreq determines the initial checkpointing frequency          a Volta V100 GPU with a 1.8TB SSD for persistent storage,
+by profiling the first 1% of the iterations in the first epoch, or   and a Pascal 1080Ti GPU with a 1.8TB HDD for persistent
+the first 50 iterations, whichever is the minimum. Therefore,        storage as shown in Table 2. Both these servers have 8 GPUs,
+no checkpointing is performed during this initial phase, which       24 CPU cores and 500GB of DRAM. Both servers run 64-bit
+is a very small fraction of the total runtime. Additionally,         Ubuntu 16.04 with CUDA toolkit 10.0 and PyTorch 1.1.0.
+we cache the profiled metrics and the determined policy on           Models. We use 7 DNNs in our evaluation. ResNet18 [20],
+persistent storage so that profiling can be skipped when the         ResNet50 [20], ResNext101 [48], DenseNet121 [21],
+job resumes after a crash.                                           VGG16 [41], InceptionV3 [42] all on Imagenet-1k
+   CheckFreq internally uses torch.save(), followed by a             dataset [39], and Bert-Large pretraining [13] on Wikipedia &
+fsync() to perform persist(), and thus guarantees persis-            BookCorpus dataset [49]. For each model, we use the default
+tence. To eliminate chances of data corruption, CheckFreq al-        minibatch size reported in the literature for these models.
+ways writes checkpoints to a new file. However, to keep space
+                                                                     Baseline. We use the epoch-boundary checkpointing as the
+utilization bounded, CheckFreq only maintains two check-
+                                                                     baseline for all the models except BERT. BERT trains in units
+points on disk at any given time; one completed checkpoint
+                                                                     of iterations; therefore we use the default checkpointing inter-
+and the other in-flight. Additionally, checkpoints performed at
+                                                                     val of 200 iterations as the baseline [8]. To perform persistent
+epoch boundary are preserved (can be turned off by the user).
+                                                                     and correct checkpoints, we explicitly flush the checkpoint
+CheckFreq wraps the weight update step in the optimizer with
+                                                                     file after the checkpoint operation returns.
+a semaphore that waits on the ongoing snapshot() to ensure
+that a copy of the model state is completed before it is updated     5.2    Accuracy implications
+by the next iteration.
+                                                                     We first show the need for resumable data iterator to make fine
+5     Evaluation                                                     grained iteration-level checkpointing feasible. Using the ex-
+                                                                     isting state-of-the-art data iterators to perform iteration-level
+In this section we use a number of microbenchmarks and
+                                                                     checkpointing results in violation of the DNN data invariant
+end-to-end training to accuracy with interruptions to evaluate
+                                                                     as described in (§4.3.1). To demonstrate this, we perform the
+the efficacy of CheckFreq with respect to the current epoch-
+                                                                     following experiment. We train a ResNet18 job for 70 epochs
+based checkpointing scheme across a variety of DNNs. Our
+                                                                     or to a target accuracy of 69.5% (whichever is earliest) in
+evaluation seeks to answer the following questions.
+                                                                     three different scenarios;
+ • Can CheckFreq’s iterator make iteration-level checkpoint-
+   ing feasible without affecting the accuracy? (§5.2)               • No interrupt. This is the normal training scenario where
+ • Does CheckFreq’s 2-phase checkpoint mechanism reduce                the job is not interrupted until its completion. There is no
+   checkpoint stalls compared to the existing synchronous              checkpointing performed here.
+   strategy? (§5.3)                                                  • Baseline-interrupt. This scenario uses the existing DALI
+ • Can CheckFreq checkpoint more frequently than epoch-                iterator (same with the native PyTorch iterator) to perform
+   based checkpointing, while incurring low runtime over-              checkpoints at the iteration right before the job is inter-
+   head? (§5.4)                                                        rupted. We interrupt the job once very 7 minutes ( approx
+ • Does CheckFreq reduce the recovery cost when DNN train-             every two epochs). This corresponds to commonly used
+   ing is interrupted? (§5.5)                                          round durations in preemptive schedulers [18, 26, 32, 47].
+ • What is the end-to-end benefit of training to accuracy with        • CheckFreq-interrupt. This setting uses the CheckFreq
+   CheckFreq in the presence of job interruptions in a real             data iterator that is capable of performing a light-weight
+   preemptive training environment? (§5.6)                              checkpoint of iterator state and correctly resuming it. We
+5.1    Experimental setup                                               checkpoint, interrupt, and resume the job exactly as de-
+                                                                        scribed in the prior setting.
+We evaluate the efficacy of CheckFreq against the state-of-             We plot the Top-1 validation accuracy against cumulative
+the-art epoch-based checkpointing in PyTorch using the state-        training time. Figure 6 shows that it is not possible to perform
+of-the-art data pipeline DALI [4].                                   iteration-level checkpointing using existing iterator, without
+Servers. We evaluate CheckFreq on two generations of GPU;            affecting the model accuracy. This is because, the model state
+
+
+
+210    19th USENIX Conference on File and Storage Technologies                                                 USENIX Association
+                                                                                             Checkpoint stall (seconds)
+                                                                                      Synchronous IO pipelining CheckFreq
+                                                                     Conf-Volta            3.6             1.5           0.3
+                                                                    Conf-Pascal           10.7             1.3          0.07
+
+                                                                   Table 3: Breakdown of benefits. This table shows the split
+                                                                   of checkpoint stall incurred in critical path for VGG16 on two
+                                                                   different hardwares
+
+                                                                         Model    Res18   Res50   ResNext    VGG16      BERT
+Figure 6: Impact of resumable data iterator on accuracy.
+Performing iteration-level checkpointing with baseline non-             Freq       147     125       238          83    100
+resumable data iterator violates the data invariant, results in       Size(MB)      90     195       482         1055   5000
+significant loss of accuracy if job is interrupted. However,       Table 4: Checkpoint frequency. This table shows the num-
+CheckFreq’s iterator does not affect the final accuracy.           ber of checkpoints per epoch and the size of each checkpoint
+                                                                   5.3.2   Breakdown of benefits
+                                                                   To understand how much each phase of the checkpointing
+                                                                   mechanism contributes to the reduction of checkpoint stalls,
+                                                                   we train VGG16 on the two servers using identical batch
+                                                                   size of 64 that is the maximum that can fit on Conf-Pascal.
+                                                                   Checkpointing is performed at a frequency chosen indepen-
+                                                                   dently for the two servers. We evaluate three settings in Ta-
+                                                                   ble 3; 1) The baseline synchronous mode, 2) CheckFreq with
+Figure 7: Runtime overhead for various models. At a fre-           only persist() pipelining (indicated by IO pipelining) and
+quency chosen by CheckFreq, synchronous checkpointing              snapshot() performed synchronously, 3) CheckFreq with
+incurs upto 70% overhead while CheckFreq’s pipelined check-        both persist() and snapshot() pipelining.
+pointing reduces runtime overhead to under 3.5%                       On both hardware, CheckFreq is able to significantly re-
+is checkpointed at iteration boundaries, but the data loader       duce the checkpoint cost by 5 – 18× by pipelining both
+state is lost. However, with CheckFreq’s iterator, the model       phases of checkpointing with compute as compared to only
+reaches the target accuracy in the almost the same time as the     pipelining persist(). On Conf-Pascal, the benefit due
+setting where the job ran without any interruption.                to pipelining persist() is prominent due to the slower
+                                                                   storage device. On Conf-Volta with fast storage, the CPU
+Storage overhead. Checkpointing data iterator state does not       cost of snapshot() and the storage cost of persist() con-
+have a significant space overhead; it requires persisting two      tribute equally to the checkpointing cost. Therefore, pipelin-
+integers - epoch and iteration number, that take up a few bytes    ing snapshot() with compute provides significant speedup.
+on disk. CheckFreq thus provides light-weight, resumable
+data iterators that do not affect the accuracy of DNNs.            5.4     Checkpointing policy
+5.3     Performance of checkpointing mechanism                     We compare the checkpointing frequency determined by
+                                                                   CheckFreq for a threshold overhead p of 3.5%. Table 4 shows
+We now evaluate the performance of the two-phase check-
+                                                                   the number of checkpoints performed per epoch for vari-
+pointing strategy of CheckFreq, and compare it against the
+                                                                   ous models along with per-checkpoint size when perform-
+synchronous strategy. We further provide a split of benefits
+                                                                   ing distributed data parallel training across across 8 GPUs
+due to pipelining persist() and snapshot() operations.
+                                                                   on Conf-Pascal. There are two main takeaways here. First,
+5.3.1   Checkpoint stalls                                          the checkpointing frequency varies with model; therefore fre-
+Figure 7 shows the runtime overhead incurred due to check-         quency selection must take into account the model character-
+point stalls with CheckFreq and the baseline checkpointing         istics. Second, CheckFreq is able to perform 83 – 278× more
+mechanism while checkpointing at a frequency chosen for            frequent checkpointing when compared to that performed
+that model by CheckFreq on Conf-Pascal. The frequency              at epoch boundaries, while incurring ≤ 3.5% overhead. On
+varies across models, but is kept constant for CheckFreq and       Conf-Volta, CheckFreq resulted in 25 – 100× more frequent
+baseline for a given model. While CheckFreq is able to bound       checkpointing than the epoch-based policy. More frequent
+the runtime overheads to about 3.5%, the baseline incurs 17        checkpoints directly translate to faster recovery times which
+– 73% runtime overhead due to frequent checkpointing. The          we evaluate in Section 5.5.
+reduction in runtime overhead is due to the two-phase check-       Adaptive tuning of frequency. To demonstrate the impor-
+pointing and pipelining it with computation.                       tance of adaptive frequency tuning, we perform the follow-
+
+
+
+USENIX Association                                            19th USENIX Conference on File and Storage Technologies          211
+              Setting            Isolated   Static   Adaptive
+            Overhead                  5%     35%       5%
+      Frequency (# iterations)        14      14       19
+Table 5: Adpative frequency tuning. Adaptive frequency
+tuning is able to dynamically adjust checkpointing frequency
+to maintain the same overhead as if the job is run in isolation.
+
+      Model       Recovery (seconds)        Recovery (seconds)
+                  Baseline     CF           Baseline     CF
+  ResNet18       840              5            180        3         Figure 8: End-to-end training. We train Resnet50 using a
+  ResNet50      2100             24            540        8         Conf-Pascal GPU with interruptions every 5 hours. Check-
+   VGG16        5700             25           1320       31         Freq trains to state-of-the-art accuracy (76.1%) 2× faster than
+ ResNext101     7080             32           1680       14
+ DenseNet121    2340              7            600        4         epoch-based checkpointing by reducing recovery time.
+ Inceptionv3    3000             27            780       42
+    BERT        4920             85           4500       43
+                                                                    from several minutes (and hours) to just a few seconds, all
+                                                                    while incurring less than 3.5% runtime overhead. For in-
+   (a) 1 GPU (V100)                         (b) 8 GPU (1080Ti)
+                                                                    stance, when training ResNext101 on a V100 GPU, on aver-
+    Table 6: Average recovery time (CF - CheckFreq).                age, CheckFreq reduces the recovery time from 2 hours to 32
+                                                                    seconds on average.
+ing experiment. We run a VGG16 training job on a single
+GPU (Job-A), allowing it to checkpoint at an initial frequency      5.6    End-to-end training
+chosen by CheckFreq (with an overhead of 5%). After 100
+iterations have elapsed, we trigger another VGG16 job on            We evaluate the end-to-end benefit of training with CheckFreq
+a different GPU on the same machine (Job-B), so that the            by simulating a preemptive cluster scenario. We consider a
+two jobs contend for storage bandwidth to write checkpoints.        cluster with a premeptive scheduler similar to the one in large
+We measure the runtime for 500 iterations of Job-A with and         production clusters like Philly [2,22]. We consider an average
+without adaptive frequency tuning. The results are as shown         preemption interval of 5 hours. Figure 8 plots the total training
+in Table 5. When Job-A runs in isolation, it incurs an over-        duration against top-1 validation accuracy for the epoch-based
+head of 5% while checkpointing every 14 iterations. However,        baseline checkpointing strategy and CheckFreq for training
+when Job-B is introduced after 100 iterations of Job-A, if          ResNet50 using a GPU on Conf-Pascal to state-of-the-art
+there is no adaptation across the two jobs, the checkpointing       accuracy. CheckFreq results in 2× faster training by reducing
+frequency is statically fixed to 14 iterations and the runtime      recovery time from 1.9 hours to under a minute for every
+overhead for Job-A increases to 35% (indicated as static in         interruption. A similar experiment on Conf-Volta resulted
+Table 5). This is because, the jobs compete for storage band-       in 1.6× faster training time to accuracy for ResNext101.
+width, increasing checkpoint cost. In contrast, CheckFreq’s         6     Discussion
+adaptive rate tuning dynamically adjusts the checkpointing
+frequency and keeps the overhead bounded at 5%.                     Applicability to distributed cluster training. CheckFreq
+                                                                    currently works with the distributed data parallel (DDP) mode,
+5.5     Recovery time                                               where only one GPU per node (rank 0) is responsible for
+To understand the benefits of using CheckFreq in the pres-          checkpointing. While we show results for single- and multi-
+ence of job interruptions, we evaluate the recovery time with       GPU training, extending it to multi-node settings is straight-
+the epoch-based checkpointing and CheckFreq. With epoch-            forward; checkpointing in multi-GPU and multi-node settings
+based checkpointing, irrespective of when during the epoch          is the same for DDP in frameworks such as PyTorch. Model
+the job is interrupted, the job rolls back to the previously com-   weights are synchronized across different workers (same node
+pleted epoch. Therefore, in the best case, if a failure occurs      or in the distributed cluster) typically every iteration, or ac-
+immediately after the finish of an epoch, then the recovery         cumulated over a few tens of iterations before synchronizing;
+time is the same as CheckFreq. However, on average, half            therefore each node sees the same version of weights at these
+an epoch’s worth of work can be lost if the job is interrupted      synchronization points. Hence, one instance of CheckFreq
+in the middle of an epoch. And in the worst case, the entire        runs on each node, and persists an identical checkpoint for lo-
+epoch must be redone if the job fails just before the comple-       cal recovery at synchronization boundaries. Since each node
+tion of an epoch. For the seven different models, we compare        persists checkpoints independently, and in parallel, there is
+the average case recovery time in two distinct scenarios; 1) a      no additional synchronization overhead for checkpointing.
+single-GPU training job on Conf-Volta in Table 6a and 2) a          Generality. CheckFreq focuses on optimizing checkpointing,
+8 GPU data-parallel job on Conf-Pascal in Table 6b.                 which is by far the predominant way in which DNN training
+   As can be seen, CheckFreq is able to reduce recovery time        jobs recover from failures. While our paper focuses on data
+
+
+
+212    19th USENIX Conference on File and Storage Technologies                                                USENIX Association
+parallel training, prior work in model or pipeline parallelism,     ploiting the deterministic, repetitive structure of DNN training
+also rely on checkpointing. Using CheckFreq, checkpointing          to systematically profile resource utilization at runtime.
+at minibatch boundaries (every n iterations), each pipeline         Adaptive checkpointing. The idea of using adaptation for
+stage only persists a subset of parameters and optimizer state      fault management has been used in HPC applications [25] to
+hosted by that worker. CheckFreq also enables checkpointing         decide when to checkpoint, based on a failure prediction mod-
+within minibatch boundaries during pipeline parallel training       ule. CheckFreq introduces adaptivity in DNN checkpointing
+(every m microbatches), as CheckFreq’s iterator controls the        frequency. It identifies and dynamically adapts the checkpoint-
+introduction of each microbatch into the pipeline. Checkpoint-      ing frequency, based on the characteristics of the model being
+ing at the microbatch granularity requires storing additional       trained, system hardware, and interference due to other jobs.
+model state – specifically accumulated weight gradients at
+every stage in addition to parameter and optimizer state. We        TensorFlow Checkpoint Manager. TF checkpoint man-
+leave it to future work to integrate CheckFreq’s implementa-        ager [43] allows checkpointing at a user-given time interval,
+tion into frameworks supporting pipeline parallelism.               and supports persisting iterator state. However, it has three
+    While we implement CheckFreq in PyTorch, we can extend          shortcomings. First, the checkpointing frequency is decided in
+it to other frameworks like TF and MxNet by wrapping the            an ad-hoc fashion by the user; this introduces large checkpoint
+framework-specific APIs into those exposed by CheckFreq.            stalls if not chosen carefully. Second, it cannot checkpoint
+                                                                    the iterator state if random data transformation is involved;
+                                                                    this is common for most image based models [44]. Finally,
+7   Related Work                                                    even in cases where it can persist iterator state, TF writes
+Asynchronous DNN checkpointing. While recent work like              the entire operator graph to storage along with prefetched
+DeepFreeze [33] that perform asynchronous DNN checkpoint-           items resulting in large checkpoint size. CheckFreq addresses
+ing employ techniques similar to CheckFreq for IO pipelining,       these challenges by automatically adapting the checkpointing
+it only considers CPU clusters. It does not consider the cost of    frequency and using a light-weight, resumable data iterator.
+snapshotting the model state in memory when trained using           Framework-transparent checkpointing. Transparent
+state-of-the-art GPUs. Our work shows that on modern ML             checkpointing techniques such as CRIU [1] can backup entire
+optimized servers, the cost of snapshotting the model state         VM state for fault-tolerance; however they do not checkpoint
+(copying from GPU to CPU) is significant, demonstrating             GPU or accelerator state. Even if they were to capture entire
+how to pipeline this transfer with compute, and use spare           device state, device state alone is an order of magnitude larger
+GPU capabilities to enable fast snapshotting.                       than the model state captured at iteration boundaries, making
+   Furthermore, DeepFreeze requires manual intervention to          frequent CRIU checkpoints impractical. Thus, in this work,
+tune the checkpointing frequency for a given model, hard-           we focus on the dominant approach to DNN fault-tolerance -
+ware and training environment while CheckFreq masks these           framework-assisted checkpointing of model state.
+complexities from the user and analytically identifies the best
+parameters for checkpointing. Unlike DeepFreeze that uses           8   Conclusion
+a static checkpointing frequency, CheckFreq is also benefi-         This paper presents CheckFreq, an automatic, fine-grained
+cial in shared cluster settings, as it adapts the checkpointing     checkpointing framework for DNN training. CheckFreq
+frequency based on memory and storage interference due to           achieves consistent, low-cost checkpoints at iteration level
+other jobs to minimize checkpoint stalls.                           using a resumable data iterator, a pipelined two-phase check-
+Asynchronous checkpointing in HPC. Prior work in                    pointing mechanism, and automatic determination and tun-
+HPC [34, 40, 45] uses asynchronous checkpointing to mask            ing of checkpointing frequency. When the job is interrupted,
+the IO latency. A key challenge that differentiates DNN check-      CheckFreq reduces recovery time for popular DNNs from
+pointing from traditional HPC ones is that, performing a syn-       hours to seconds, while incurring low runtime overhead.
+chronous in-memory copy of the model state from GPU to
+CPU is expensive due to the increasingly fast compute ca-           Acknowledgements
+pabilities of the GPU. CheckFreq exploits the DNN learn-            This work was done during an internship at Microsoft Re-
+ing structure to carefully pipeline even the in-memory snap-        search as part of Project Fiddle. We thank our shepherd Mehul
+shot with computation to perform correct, consistent check-         Shah, the anonymous FAST reviewers, members of the UT
+pointing. Moreover, CheckFreq further reduces the latency of        SaSLab, fellow Project Fiddle interns Youjie Li, Kshiteej
+checkpointing by utilizing spare GPU memory and compute             Mahajan, Andrew Or, and many of our MSR colleagues for
+capabilities when possible to perform fast snapshots.               their invaluable feedback that made this work better. We sin-
+Checkpoint interval estimation in HPC. Prior work [12,              cerely thank MSR Labs for their generous support in procur-
+14, 15] determine checkpointing interval for large scale HPC        ing the many resources required for this work. This work was
+applications based on failure distributions observed in the         supported by NSF CAREER #1751277 and donations from
+system. CheckFreq does this in a DNN-aware fashion by ex-           VMware, Google, and Facebook.
+
+
+
+USENIX Association                                             19th USENIX Conference on File and Storage Technologies         213
+References                                                          and Zheng Zhang. Mxnet: A flexible and efficient ma-
+ [1] CRIU checkpointing. https://criu.org/Main_Page.                chine learning library for heterogeneous distributed sys-
+                                                                    tems. CoRR, abs/1512.01274, 2015.
+ [2] Microsoft Philly Traces. https://github.com/msr-
+                                                               [12] John T. Daly. A higher order estimate of the optimum
+     fiddle/philly-traces.
+                                                                    checkpoint interval for restart dumps. Future Gener.
+ [3] Training a Champion: Building Deep Neural Nets for             Comput. Syst., 22(3):303–312, 2006.
+     Big Data Analytics. https://www.kdnuggets.com/            [13] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+     training-a-champion-building-deep-neural-                      Kristina Toutanova. BERT: pre-training of deep bidi-
+     nets-for-big-data-analytics.html/.                             rectional transformers for language understanding. In
+ [4] NVIDIA DALI. https://github.com/NVIDIA/DALI,                   Proceedings of the 2019 Conference of the North Amer-
+     2018.                                                          ican Chapter of the Association for Computational Lin-
+                                                                    guistics: Human Language Technologies, NAACL-HLT
+ [5] PyTorch.   https://github.com/pytorch/pytorch,                 2019, Minneapolis, MN, USA, June 2-7, 2019, Volume 1
+     2019.                                                          (Long and Short Papers), pages 4171–4186. Association
+                                                                    for Computational Linguistics, 2019.
+ [6] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng
+     Chen, Andy Davis, Jeffrey Dean, Matthieu Devin, San-      [14] Sheng Di, Mohamed-Slim Bouguerra, Leonardo Arturo
+     jay Ghemawat, Geoffrey Irving, Michael Isard, Man-             Bautista-Gomez, and Franck Cappello. Optimization of
+     junath Kudlur, Josh Levenberg, Rajat Monga, Sherry             multi-level checkpoint model for large scale HPC appli-
+     Moore, Derek G. Murray, Benoit Steiner, Paul Tucker,           cations. In 2014 IEEE 28th International Parallel and
+     Vijay Vasudevan, Pete Warden, Martin Wicke, Yuan Yu,           Distributed Processing Symposium, Phoenix, AZ, USA,
+     and Xiaoqiang Zheng. Tensorflow: A system for large-           May 19-23, 2014, pages 1181–1190. IEEE Computer
+     scale machine learning. In 12th USENIX Symposium on            Society, 2014.
+     Operating Systems Design and Implementation (OSDI         [15] Sheng Di, Mohamed-Slim Bouguerra, Leonardo Arturo
+     16), pages 265–283, GA, 2016.                                  Bautista-Gomez, and Franck Cappello. Optimization of
+ [7] Sami Abu-El-Haija, Nisarg Kothari, Joonseok Lee, Paul          multi-level checkpoint model for large scale HPC appli-
+     Natsev, George Toderici, Balakrishnan Varadarajan, and         cations. In 2014 IEEE 28th International Parallel and
+     Sudheendra Vijayanarasimhan. Youtube-8m: A large-              Distributed Processing Symposium, Phoenix, AZ, USA,
+     scale video classification benchmark. arXiv preprint           May 19-23, 2014, pages 1181–1190. IEEE Computer
+     arXiv:1609.08675, 2016.                                        Society, 2014.
+                                                               [16] Google.    Preemptible VM instances.   https:
+ [8] NVIDIA AI.     BERT Meets GPUs.      hhttps:
+                                                                    //cloud.google.com/compute/docs/instances/
+     //medium.com/future-vision/bert-meets-gpus-
+                                                                    preemptible#preemptible_with_gpu.
+     403d3fbed848.
+                                                               [17] Alex Graves, Abdel-rahman Mohamed, and Geoffrey
+ [9] Amazon. Amazon EC2 spot instances. https:                      Hinton. Speech recognition with deep recurrent neural
+     //aws.amazon.com/ec2/spot/?cards.sort-by=                      networks. In 2013 IEEE international conference on
+     item.additionalFields.startDateTime&cards.sort-                acoustics, speech and signal processing, pages 6645–
+     order=asc.                                                     6649. IEEE, 2013.
+[10] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie          [18] Juncheng Gu, Mosharaf Chowdhury, Kang G.
+     Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind               Shin, Yibo Zhu, Myeongjae Jeon, Junjie Qian,
+     Neelakantan, Pranav Shyam, Girish Sastry, Amanda               Hongqiang Harry Liu, and Chuanxiong Guo. Tiresias:
+     Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen         A GPU cluster manager for distributed deep learning. In
+     Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,             16th USENIX Symposium on Networked Systems Design
+     Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christo-        and Implementation, NSDI 2019, Boston, MA, February
+     pher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin,            26-28, 2019, pages 485–500. USENIX Association,
+     Scott Gray, Benjamin Chess, Jack Clark, Christopher            2019.
+     Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+     and Dario Amodei. Language models are few-shot learn-     [19] Saurabh Gupta, Tirthak Patel, Christian Engelmann, and
+     ers. CoRR, abs/2005.14165, 2020.                               Devesh Tiwari. Failures in large scale systems: long-
+                                                                    term measurement, analysis, and implications. In Pro-
+[11] Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang,           ceedings of the International Conference for High Per-
+     Minjie Wang, Tianjun Xiao, Bing Xu, Chiyuan Zhang,             formance Computing, Networking, Storage and Analysis,
+
+
+
+214   19th USENIX Conference on File and Storage Technologies                                          USENIX Association
+     SC 2017, Denver, CO, USA, November 12 - 17, 2017,              [28] Qi Meng, Wei Chen, Yue Wang, Zhi-Ming Ma, and Tie-
+     pages 44:1–44:12. ACM, 2017.                                        Yan Liu. Convergence analysis of distributed stochas-
+                                                                         tic gradient descent with shuffling. Neurocomputing,
+[20] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian                   337:46–57, 2019.
+     Sun. Deep residual learning for image recognition. In
+     Proceedings of the IEEE conference on computer vision          [29] Microsoft.   Use low priority VMs.    https:
+     and pattern recognition, pages 770–778, 2016.                       //docs.microsoft.com/en-us/azure/batch/
+                                                                         batch-low-pri-vms.
+[21] Gao Huang, Zhuang Liu, Laurens van der Maaten, and
+                                                                    [30] MLPerf. MLPerf Training Results v0.7. https://
+     Kilian Q. Weinberger. Densely connected convolutional
+                                                                         github.com/mlperf/training_results_v0.7.
+     networks. In 2017 IEEE Conference on Computer Vi-
+     sion and Pattern Recognition, CVPR 2017, Honolulu, HI,         [31] Deepak Narayanan, Keshav Santhanam, Fiodar
+     USA, July 21-26, 2017, pages 2261–2269. IEEE Com-                   Kazhamiaka, Amar Phanishayee, and Matei Zaharia.
+     puter Society, 2017.                                                Analysis and exploitation of dynamic pricing in the
+                                                                         public cloud for ml training. DISPA, 2020.
+[22] Myeongjae Jeon, Shivaram Venkataraman, Amar Phan-
+     ishayee, Junjie Qian, Wencong Xiao, and Fan Yang.              [32] Deepak Narayanan, Keshav Santhanam, Fiodar
+     Analysis of large-scale multi-tenant GPU clusters for               Kazhamiaka, Amar Phanishayee, and Matei Za-
+     DNN training workloads. In 2019 USENIX Annual                       haria.      Heterogeneity-aware cluster scheduling
+     Technical Conference (USENIX ATC 19), pages 947–                    policies for deep learning workloads. arXiv preprint
+     960, 2019.                                                          arXiv:2008.09213, 2020.
+
+[23] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hin-           [33] Bogdan Nicolae, Jiali Li, Justin M. Wozniak, George
+     ton. Imagenet classification with deep convolutional                Bosilca, Matthieu Dorier, and Franck Cappello. Deep-
+     neural networks. In Advances in Neural Information                  freeze: Towards scalable asynchronous checkpointing of
+     Processing Systems, pages 1097–1105, 2012.                          deep learning models. In 20th IEEE/ACM International
+                                                                         Symposium on Cluster, Cloud and Internet Computing,
+[24] Alina Kuznetsova, Hassan Rom, Neil Alldrin, Jasper                  CCGRID 2020, Melbourne, Australia, May 11-14, 2020,
+     Uijlings, Ivan Krasin, Jordi Pont-Tuset, Shahab Kamali,             pages 172–181. IEEE, 2020.
+     Stefan Popov, Matteo Malloci, Tom Duerig, et al. The
+     open images dataset v4: Unified image classification, ob-      [34] Bogdan Nicolae, Adam Moody, Elsa Gonsiorowski,
+     ject detection, and visual relationship detection at scale.         Kathryn Mohror, and Franck Cappello. Veloc: Towards
+     arXiv preprint arXiv:1811.00982, 2018.                              high performance adaptive asynchronous checkpointing
+                                                                         at large scale. In 2019 IEEE International Parallel and
+[25] Zhiling Lan and Yawei Li. Adaptive fault management                 Distributed Processing Symposium, IPDPS 2019, Rio de
+     of parallel applications for high-performance computing.            Janeiro, Brazil, May 20-24, 2019, pages 911–920. IEEE,
+     IEEE Trans. Computers, 57(12):1647–1660, 2008.                      2019.
+
+                                                                    [35] NVIDIA.       ResNext101 Training.    https:
+[26] Kshiteej Mahajan, Arjun Balasubramanian, Arjun                      //github.com/NVIDIA/DeepLearningExamples/
+     Singhvi, Shivaram Venkataraman, Aditya Akella, Amar                 tree/master/PyTorch/Classification/
+     Phanishayee, and Shuchi Chawla. Themis: Fair and                    ConvNets/resnext101-32x4d.
+     efficient GPU cluster scheduling. In 17th USENIX Sym-
+     posium on Networked Systems Design and Implementa-             [36] OpenAI. GPT-3 Checkpoint. https://github.com/
+     tion, NSDI 2020, Santa Clara, CA, USA, February 25-27,              openai/gpt-3/issues/1.
+     2020, pages 289–304. USENIX Association, 2020.
+                                                                    [37] Thanumalayan Sankaranarayana Pillai, Vijay Chi-
+[27] Catello Di Martino, Zbigniew T. Kalbarczyk, Ravis-                  dambaram, Ramnatthan Alagappan, Samer Al-Kiswany,
+     hankar K. Iyer, Fabio Baccanico, Joseph Fullop, and                 Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-
+     William Kramer. Lessons learned from the analysis of                Dusseau. All file systems are not created equal: On
+     system failures at petascale: The case of blue waters.              the complexity of crafting crash-consistent applications.
+     In 44th Annual IEEE/IFIP International Conference on                In 11th USENIX Symposium on Operating Systems De-
+     Dependable Systems and Networks, DSN 2014, Atlanta,                 sign and Implementation, OSDI ’14, Broomfield, CO,
+     GA, USA, June 23-26, 2014, pages 610–621. IEEE Com-                 USA, October 6-8, 2014, pages 433–448. USENIX As-
+     puter Society, 2014.                                                sociation, 2014.
+
+
+
+USENIX Association                                             19th USENIX Conference on File and Storage Technologies       215
+[38] PyTorch.   PyTorch Training Examples. https:              [45] Devesh Tiwari, Saurabh Gupta, and Sudharshan S.
+     //github.com/pytorch/examples/tree/master/                     Vazhkudai. Lazy checkpointing: Exploiting temporal
+     imagenet.                                                      locality in failures to mitigate checkpointing overheads
+                                                                    on extreme-scale systems. In 44th Annual IEEE/IFIP
+[39] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause,           International Conference on Dependable Systems and
+     Sanjeev Satheesh, Sean Ma, Zhiheng Huang, Andrej               Networks, DSN 2014, Atlanta, GA, USA, June 23-26,
+     Karpathy, Aditya Khosla, Michael Bernstein, et al. Im-         2014, pages 25–36. IEEE Computer Society, 2014.
+     agenet large scale visual recognition challenge. Inter-
+     national journal of computer vision, 115(3):211–252,      [46] Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V
+     2015.                                                          Le, Mohammad Norouzi, Wolfgang Macherey, Maxim
+                                                                    Krikun, Yuan Cao, Qin Gao, Klaus Macherey, et al.
+[40] Faisal Shahzad, Markus Wittmann, Thomas Zeiser,                Google’s neural machine translation system: Bridging
+     Georg Hager, and Gerhard Wellein. An evaluation                the gap between human and machine translation. arXiv
+     of different I/O techniques for checkpoint/restart. In         preprint arXiv:1609.08144, 2016.
+     2013 IEEE International Symposium on Parallel & Dis-
+     tributed Processing, Workshops and Phd Forum, Cam-        [47] Wencong Xiao, Romil Bhardwaj, Ramachandran Ram-
+     bridge, MA, USA, May 20-24, 2013, pages 1708–1716.             jee, Muthian Sivathanu, Nipun Kwatra, Zhenhua Han,
+     IEEE, 2013.                                                    Pratyush Patel, Xuan Peng, Hanyu Zhao, Quanlu Zhang,
+                                                                    Fan Yang, and Lidong Zhou. Gandiva: Introspective
+[41] Karen Simonyan and Andrew Zisserman. Very deep con-
+                                                                    cluster scheduling for deep learning. In 13th USENIX
+     volutional networks for large-scale image recognition.
+                                                                    Symposium on Operating Systems Design and Imple-
+     arXiv preprint arXiv:1409.1556, 2014.
+                                                                    mentation, OSDI 2018, Carlsbad, CA, USA, October 8-
+[42] Christian Szegedy, Vincent Vanhoucke, Sergey Ioffe,            10, 2018, pages 595–610. USENIX Association, 2018.
+     Jonathon Shlens, and Zbigniew Wojna. Rethinking
+                                                               [48] Saining Xie, Ross B. Girshick, Piotr Dollár, Zhuowen
+     the inception architecture for computer vision. In
+                                                                    Tu, and Kaiming He. Aggregated residual transforma-
+     2016 IEEE Conference on Computer Vision and Pattern
+                                                                    tions for deep neural networks. In 2017 IEEE Con-
+     Recognition, CVPR 2016, Las Vegas, NV, USA, June 27-
+                                                                    ference on Computer Vision and Pattern Recognition,
+     30, 2016, pages 2818–2826. IEEE Computer Society,
+                                                                    CVPR 2017, Honolulu, HI, USA, July 21-26, 2017, pages
+     2016.
+                                                                    5987–5995. IEEE Computer Society, 2017.
+[43] TensorFlow.     Tensorflow checkpoint manager.
+     https://www.tensorflow.org/api_docs/python/               [49] Yukun Zhu, Ryan Kiros, Rich Zemel, Ruslan Salakhutdi-
+     tf/train/CheckpointManager.                                    nov, Raquel Urtasun, Antonio Torralba, and Sanja Fidler.
+                                                                    Aligning books and movies: Towards story-like visual
+[44] TensorFlow.      Tensorflow iterator checkpoint-               explanations by watching movies and reading books. In
+     ing.        https://www.tensorflow.org/guide/                  Proceedings of the IEEE international conference on
+     data#iterator_checkpointing.                                   computer vision, pages 19–27, 2015.
+
+
+
+
+216   19th USENIX Conference on File and Storage Technologies                                         USENIX Association
+

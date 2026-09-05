@@ -1,0 +1,1119 @@
+     Pollux: Co-adaptive Cluster Scheduling
+     for Goodput-Optimized Deep Learning
+ Aurick Qiao, Petuum, Inc. and Carnegie Mellon University; Sang Keun Choe and
+  Suhas Jayaram Subramanya, Carnegie Mellon University; Willie Neiswanger,
+Petuum, Inc. and Carnegie Mellon University; Qirong Ho, Petuum, Inc.; Hao Zhang,
+  Petuum, Inc. and UC Berkeley; Gregory R. Ganger, Carnegie Mellon University;
+        Eric P. Xing, MBZUAI, Petuum, Inc., and Carnegie Mellon University
+
+              https://www.usenix.org/conference/osdi21/presentation/qiao
+
+
+
+         This paper is included in the Proceedings of the
+         15th USENIX Symposium on Operating Systems
+                  Design and Implementation.
+                                  July 14–16, 2021
+                                  978-1-939133-22-9
+
+
+                                         Open access to the Proceedings of the
+                                         15th USENIX Symposium on Operating
+                                          Systems Design and Implementation
+                                               is sponsored by USENIX.
+    Pollux: Co-adaptive Cluster Scheduling for Goodput-Optimized Deep Learning
+
+    Aurick Qiao1,2    Sang Keun Choe2     Suhas Jayaram Subramanya2       Willie Neiswanger1,2
+              Qirong Ho1    Hao Zhang 1,3    Gregory R. Ganger2     Eric P. Xing4,1,2
+
+               1 Petuum, Inc.          2 Carnegie Mellon University              3 UC Berkeley            4 MBZUAI
+
+
+
+
+                          Abstract                                      Existing schedulers require users to manually configure
+Pollux improves scheduling performance in deep learning              their jobs, which if done improperly, can greatly degrade
+(DL) clusters by adaptively co-optimizing inter-dependent            training performance and resource efficiency. For example,
+factors both at the per-job level and at the cluster-wide level.     allocating too many GPUs may result in long queuing times
+Most existing schedulers expect users to specify the number of       and inefficient resource usage, while allocating too few GPUs
+resources for each job, often leading to inefficient resource use.   may result in long runtimes and unused resources. Such
+Some recent schedulers choose job resources for users, but do        decisions are especially difficult to make in a shared-cluster
+so without awareness of how DL training can be re-optimized          setting, since optimal choices are dynamic and depend on the
+to better utilize the provided resources.                            cluster load while a job is running.
+   Pollux simultaneously considers both aspects. By moni-               Even though recent elastic schedulers can automatically
+toring the status of each job during training, Pollux models         select an appropriate amount of resources for each job, they do
+how their goodput (a metric we introduce to combine system           so blindly to inter-dependent training-related configurations
+throughput with statistical efficiency) would change by adding       that are just as important. For example, the batch size and
+or removing resources. Pollux dynamically (re-)assigns               learning rate of a DL job influence the amount of computation
+resources to improve cluster-wide goodput, while respecting          needed to train its model. Their optimal choices vary between
+fairness and continually optimizing each DL job to better            different DL tasks and model architectures, and they have
+utilize those resources.                                             strong dependence on the job’s allocation of resources.
+   In experiments with real DL jobs and with trace-driven               The amount of resources, batch size, and learning rate are
+simulations, Pollux reduces average job completion times             difficult to configure appropriately without expert knowledge
+by 37–50% relative to state-of-the-art DL schedulers, even           about both the cluster hardware performance and DL model
+when they are provided with ideal resource and training              architecture. Due to the inter-dependence between their
+configurations for every job. Pollux promotes fairness among         optimal values, they should be configured jointly with each
+DL jobs competing for resources, based on a more meaningful          other. Due to the dynamic nature of shared clusters, their
+measure of useful job progress, and reveals a new opportunity        optimal values may change over time. This creates a complex
+for reducing DL cost in cloud environments. Pollux is                web of considerations a user must make in order to configure
+implemented and publicly available as part of an open-source         their job for efficient execution and resource utilization.
+project at https://github.com/petuum/adaptdl.                           How can a cluster scheduler help to automatically con-
+                                                                     figure user-submitted DL jobs? Fundamentally, a properly-
+1   Introduction                                                     configured DL job strikes a balance between two often oppos-
+                                                                     ing desires: (1) system throughput, the number of training exam-
+Deep learning (DL) training has rapidly become a dominant            ples processed per wall-clock time, and (2) statistical efficiency,
+workload in many shared resource environments such as                the amount of progress made per training example processed.
+datacenters and the cloud. DL jobs are resource-intensive and           System throughput can be increased by increasing the
+long-running, often demanding distributed execution using            batch size, as illustrated in Fig. 1a. A larger batch size enables
+expensive hardware devices (eg. GPUs or TPUs) in order to            higher utilization of more compute resources (e.g., more
+complete within reasonable amounts of time. To meet this             GPUs). But, even with an optimally-retuned learning rate,
+resource demand, dedicated clusters are often provisioned for        increasing the batch size often results in a decreased statistical
+deep learning [31, 67], with a scheduler that mediates resource      efficiency [46, 57]. For every distinct allocation of GPUs, there
+sharing between many competing DL jobs.                              is potentially a different batch size that best balances increasing
+
+
+
+USENIX Association                               15th USENIX Symposium on Operating Systems Design and Implementation                 1
+                                                                     2     Background: Distributed DL Training
+                                                                     Training a deep learning model typically involves minimizing
+                                                                     a loss function of the form
+                                                                                                       1
+                                                                                                      |X| x∑
+                                                                                            L (w) =             ℓ(w,xi ),            (1)
+                                                                                                           i ∈X
+
+
+                                                                     where w ∈ Rd are the model parameters to be optimized, X
+(a) Job scalability (and thus (b) The most efficient batch           is the training dataset, xi is an individual sample in X, and ℓ
+resource utilization) depends on size depends on the allocated       is the loss evaluated at a single sample.
+the batch size.                  resources and stage of training.
+                                                                        The loss function can be minimized using stochastic
+                                                                     gradient descent (SGD) or its variants like AdaGrad [15] and
+Figure 1: Trade-offs between the batch size, resource
+                                                                     Adam [36]. For the purpose of explaining system throughput
+scalability, and stage of training (ResNet18 on CIFAR-10).
+                                                                     and statistical efficiency, we will use SGD as the running
+The learning rate is separately tuned for each batch size.
+                                                                     example. SGD repeatedly applies the following update until
+                                                                     the loss converges to a stable value: w(t+1) = w(t) − ηĝ(t) . η
+system throughput with decreasing statistical efficiency, as         is known as the learning rate, which is a scalar that controls
+illustrated in Fig. 1b. Furthermore, how quickly the statistical     the magnitude of each update, and ĝ(t) is a stochastic gradient
+efficiency decreases with respect to the batch size depends on       estimate of the loss function L , evaluated using a random
+the current training progress. A job in a later stage of training    mini-batch M (t) ⊂ X of the training data:
+can potentially tolerate 10x or larger batch sizes without de-
+grading statistical efficiency, than earlier during training [46].                              1
+                                                                                      ĝ(t) =          ∑ ∇ℓ(w(t) ,xi ).              (2)
+   Guided by these insights, this paper presents Pollux, a hybrid                               M
+                                                                                                    xi ∈M (t)
+resource scheduler that co-adaptively allocates resources and
+tunes the batch size and learning rate for all DL jobs in a shared   The learning rate η and batch size M = |M (t) | are training
+cluster. Pollux achieves this by jointly managing several            parameters which are typically chosen by the user.
+system-level and training-related parameters, including the
+number of GPUs, co-location of workers, per-GPU batch size,
+                                                                     2.1    System Throughput
+gradient accumulation, and learning rate scaling. In particular:
+⋆ We propose a formulation of goodput for DL jobs, which             The system throughput of DL training can be defined as the
+is a holistic measure of training performance that takes into        number of training samples processed per unit of wall-clock
+account both system throughput and statistical efficiency.           time. When a DL job is distributed across several nodes, its
+⋆ We show that a model of a DL job’s goodput can be                  system throughput is determined by several factors, including
+learned by observing its throughput and statistical behavior         (1) the allocation and placement of resources (e.g. GPUs)
+during training, and used for predicting the performance given       assigned to the job, (2) the method of distributed execution
+different resource allocations and batch sizes.                      and synchronization, and (3) the batch size.
+⋆ We design and implement a scheduling architecture that uses        Data-parallel execution. Synchronous data-parallelism is a
+such models to configure the right combination of resource al-       popular method of distributed execution for DL training. The
+location and training parameters for each pending and running        model parameters w(t) are replicated across a set of distributed
+DL job. This includes locally tuning system-level and training-      GPUs 1, ... , K, and each mini-batch M (t) is divided into
+related parameters for each DL job, and globally optimizing                                                (t)     (t)
+                                                                     equal-sized partitions per node, M1 ,..., MK . Each GPU k
+cluster-wide resource allocations. The local and global com-                                              (t)
+                                                                     computes a local gradient estimate ĝk using its own partition:
+ponents actively communicate and cooperate with each other,
+operating based on the common goal of goodput maximization.                             (t)     1
+⋆ We evaluate Pollux on a cluster testbed using a workload                            ĝk =
+                                                                                                m     ∑ ∇ℓ(w(t) ,xi ),               (3)
+                                                                                                          (t)
+derived from a Microsoft cluster trace. Compared with recent                                        xi ∈Mk
+DL schedulers, Tiresias [22] and Optimus [52], Pollux reduces                         (t)
+the average job completion time by up to 73%. Even when              where m = |Mk | is the per-GPU batch size. These local
+all jobs are manually tuned beforehand, Pollux reduces the           gradient estimates are then averaged across all GPUs to obtain
+average job completion time by 37%–50%. At the same time,            the desired ĝ(t) . Finally, each node applies the same update
+Pollux improves finish-time fairness [43] by 1.5×–5.4×.              using ĝ(t) to obtain the new model parameters w(t+1) .
+⋆ We show that, in cloud environments, using goodput-driven            The run-time of each training iteration is determined
+auto-scaling based on Pollux can potentially reduce the cost         by two main components. First, the time spent computing
+                                                                            (t)
+of training large models by 25%.                                     each ĝk , which we denote by Tgrad . Second, the time spent
+
+
+
+2   15th USENIX Symposium on Operating Systems Design and Implementation                                              USENIX Association
+             (t)
+averaging ĝk (e.g. using collective all-reduce [51, 56]) and/or        varies between different models and training algorithms (e.g.
+synchronizing w(t) (e.g. using parameter servers [8, 11, 26, 53])       SGD, Adam [36], AdamW [42]), and several well-established
+across all GPUs, which we denote by Tsync . Tsync is influenced         scaling rules may be used. For example, the linear scaling
+by the size of the gradients, performance of the network, and           rule [21], which prescribes that η be scaled proportionally with
+is typically shorter when the GPUs are co-located within the            M, or the square-root scaling rule [40, 69] (commonly used
+same physical node or rack.                                             with Adam),
+                                                                              √       which prescribes that η be scaled proportionally
+Limitations due to the batch size. When the number of GPUs              with M. More recent scaling rules such as AdaScale [32]
+is increased, Tgrad decreases due to a smaller per-GPU batch            may scale the learning rate adaptively during training.
+size. On the other hand, Tsync , which is typically independent            In addition to decreasing statistical efficiency, using large
+of the batch size, remains unchanged. By Amdahl’s Law,                  batch sizes may also degrade the final model quality in terms
+no matter how many GPUs are used, the run-time of each                  of validation performance [19, 35, 60], although the reasons
+training iteration is lower bounded by Tsync . To overcome this         behind this effect are not completely understood at the time of
+scalability limitation, a common strategy is to increase the            this paper. However, for each of the learning rate scaling rules
+batch size. Doing so causes the local gradient estimates to be          mentioned above, there is usually a problem-dependent range
+computed over more training examples and thereby increasing             of batch sizes that achieve similar validation performances.
+the ratio of Tgrad to Tsync . As a result, using a larger batch size    Within these ranges, the batch size may be chosen more freely
+enables higher system throughput when scaling to more GPUs              without significantly degrading the final model quality.
+in the synchronous data-parallel setting.
+                                                                        2.3     Existing DL Schedulers
+2.2    Statistical Efficiency                                           We broadly group existing DL schedulers into two categories,
+The statistical efficiency of DL training can be defined as the         to put Pollux in context. First, non-scale-adaptive schedulers
+amount of training progress made per unit of training data pro-         are agnostic to the performance scalability of DL jobs with
+cessed, influenced by parameters such as batch size or learning         respect to the amount of allocated resources. For example, Tire-
+rate; for example, a larger batch size normally decreases the sta-      sias [22] requires users to specify the number of GPUs at the
+tistical efficiency. The ability to predict statistical efficiency is   time of job submission, which will be fixed for the lifetime of
+key to improving said statistical efficiency, because we can use        the job. Gandiva [66] also requires users to specify number of
+the predictions to better adapt the batch sizes and learning rates.     GPUs, but enhances resource utilization through fine-grained
+Gradient noise scale. Previous work [32, 46] relate the                 time sharing and job packing. Although Gandiva may dynam-
+statistical efficiency of DL training to the gradient noise             ically change the number of GPUs used by a job, it does so op-
+scale (GNS), which measures the noise-to-signal ratio of                portunistically and not based on knowledge of job scalability.
+the stochastic gradient. A larger GNS means that training                  Second, scale-adaptive schedulers automatically decide
+parameters such as the batch size and learning rate can be              the amount of resources allocated to each job based on how
+increased to higher values with relatively less reduction of            well they can be utilized to speed up the job. For example,
+the statistical efficiency. The GNS can vary greatly between            Optimus [52] learns a predictive model for the system
+different DL models [19]. It is also non-constant and tends to          throughput of each job given various amounts of resources,
+gradually increase during training, by up to 10× or more [46].          and optimizes cluster-wide resource allocations to minimize
+Thus, it is possible to attain significantly better statistical         the average job completion time. SLAQ [71], which was
+efficiency for large batch sizes later on during training.              not evaluated on DL, uses a similar technique to minimize
+   The gradient noise scale mathematically captures an                  the average loss values for training general ML models.
+intuitive explanation of how the batch size affects statistical         Gavel [48] goes further by scheduling based on a throughput
+efficiency. When the stochastic gradient has low noise,                 metric that is comparable across different accelerator types.1
+adding more training examples to each mini-batch does not               AntMan [67] uses dynamic scaling and fine-grained GPU
+significantly improve each gradient estimate, which lowers              sharing to improve cluster utilization, resource fairness, and
+statistical efficiency. When the stochastic gradient has high           job completion times. Themis [43] introduces the notion of
+noise, adding more training examples to each mini-batch                 finish-time fairness, and promotes fairness between multiple
+reduces the noise of each gradient estimate, which maintains            DL applications with a two-level scheduling architecture.
+high statistical efficiency. Near convergence, the stochastic              Crucially, existing schedulers are agnostic to the statistical
+gradients have relatively lower signal than noise, and so larger        efficiency of DL training and the inter-dependence of resource
+batch sizes can be more useful later in training.                       decisions and training parameters. Pollux explicitly co-adapts
+Learning rate scaling. When training with an increased total            these inter-dependent values to improve goodput for DL jobs.
+batch size M, the learning rate η should also be increased,                1 Pollux’s current throughput model does not consider accelerator
+otherwise the final trained model quality/accuracy can be               heterogeneity. We believe that extending with Gavel’s metric would allow
+significantly worse [57]. How to increase the learning rate             Pollux to co-adapt for goodput in heterogeneous DL clusters.
+
+
+
+
+USENIX Association                                  15th USENIX Symposium on Operating Systems Design and Implementation                      3
+3     The Goodput of DL Training and Pollux                                     to support a wide variety of LR scaling rules, including state-of-
+                                                                                the-art rules such as AdaScale [32], Pollux provides a plug-in
+In this section, we define the goodput2 of DL jobs, which is                    interface that can be implemented using a function signature
+a measure of training performance that takes into account both
+system throughput and statistical efficiency. We then describe                                       SCALE_LR(M0 ,M) −→ λ.
+how the goodput can be measured during training and used
+as a predictive model, which is leveraged by Pollux to jointly                  SCALE_LR is called before every model update step, and λ is
+optimize cluster-wide resource allocations and batch sizes.                     used by Pollux to scale the learning rate. The implementation
+                                                                                of SCALE_LR can utilize metrics collected during training,
+Definition 3.1. (Goodput) The goodput of a DL training job                      such as the gradient noise scale. Using this interface, one can
+at iteration t is the product between its system throughput and                 implement rules including AdaScale, square-root scaling [40],
+its statistical efficiency at iteration t,                                      linear scaling [21] and LEGW [69].
+     GOODPUTt (⋆) = THROUGHPUT(⋆)×EFFICIENCYt (M(⋆)),                    (4)
+                                                                                3.1     Modeling Statistical Efficiency
+where ⋆ represents any configuration parameters that jointly
+influence the throughput and batch size during training, and M                  We model EFFICIENCYt (M) as the amount of progress made
+is the total batch size summed across all allocated GPUs.                       per training example using M, relative to using M0 . For
+                                                                                SGD-based training, this quantity can be expressed in terms
+   While the above definition is general across many training                   of the gradient noise scale (GNS) [46]. To support popular
+systems, we focus on three configuration parameters of par-                     adaptive variants of SGD like Adam [36] and AdaGrad [64],
+ticular impact in the context of efficient resource scheduling,                 we use the pre-conditioned gradient noise scale (PGNS),
+i.e. ⋆ = (a,m,s), where:                                                        derived by closely following the original derivation of the GNS
+                                                                                (“simple” noise scale in [46]) starting from pre-conditioned
+    • a ∈ ZN : the allocation vector, where an is the number of                 SGD3 rather than vanilla SGD. The PGNS, which we denote
+      GPUs allocated from node n.                                               by ϕt , is expressed as
+    • m ∈ Z: the per-GPU batch size.                                                                              tr(PΣPT )
+                                                                                                           ϕt =             ,                        (5)
+    • s ∈ Z: number of gradient accumulation steps (§3.2).                                                           |Pg|2
+                                                                                where g is the true gradient, P is the pre-conditioning matrix
+The total batch size is then defined as
+                                                                                of the adaptive SGD algorithm, and Σ is the covariance
+                  M(a,m,s) = SUM(a)×m×(s+1).                                    matrix of per-example stochastic gradients. The PGNS is a
+                                                                                generalization of the GNS and is mathematically equivalent
+Pollux’s approach. An initial batch size M0 and learning rate                   to the GNS for the special case of vanilla SGD.
+(LR) η0 are selected by the user when submitting their job.                        Similar to the GNS (Appendix D of [46]), it takes 1+ϕt /M
+Pollux will start each job using a single GPU, m = M = M0 ,                     training iterations to make a similar amount of training progress
+s = 0, and η = η0 . As the job runs, Pollux profiles its execution              across different batch sizes M. Therefore, we can use the PGNS
+to learn and refine predictive models for both THROUGHPUT                       ϕt to define a concrete expression for EFFICIENCYt (M) as
+(§3.2) and EFFICIENCY (§3.1). Using these predictive models,
+                                                                                                                           ϕt +M0
+Pollux periodically re-tunes (a,m,s) for each job, according                                      EFFICIENCYt (M) =               .                  (6)
+to cluster-wide resource availability and performance (§4.2).                                                              ϕt +M
+   EFFICIENCYt is measured relative to the initial batch size                      Intuitively, Eqn. 6 measures the contribution from each train-
+M0 and learning rate η0 , and Pollux only considers batch                       ing example to the overall progress. If EFFICIENCYt (M) = E,
+sizes that are at least the initial batch size, ie. M ≥ M0 . In                 then (1) 0 < E ≤ 1, and (2) training using batch size M will
+this scenario, EFFICIENCYt (M) is a fraction (between 0 and                     need to process 1/E times as many training examples to make
+1) relative to EFFICIENCYt (M0 ). Therefore, goodput can be                     the same progress as using batch size M0 .
+interpreted as the portion of the throughput that is useful for                    During training, Pollux estimates the value of ϕt , then uses
+training progress, being equal to the throughput if and only                    Eqn 6 to predict the EFFICIENCYt at different batch sizes. The
+if perfect statistical efficiency is achieved.                                  measured value of ϕt varies according to the training progress
+Plug-in Learning Rate Scaling. Recall from §2.2 that                            at iteration t, thus EFFICIENCYt (M) reflects the lifetime-
+different training jobs may require different learning rate                     dependent trends exhibited by the true statistical efficiency.
+scaling rules to adjust η in response to changes in M. In order
+                                                                                   3 Pre-conditioned SGD optimizes L (Pw) instead of L (w), where P is
+    2 Our notion of goodput for DL is analogous to the traditional definition   known as a pre-conditioning matrix. Adaptive variants of SGD such as Adam
+of goodput in computer networks, ie. the useful portion of throughput as        and AdaGrad may be viewed as vanilla SGD (with momentum) applied
+benchmarked by training progress per unit of wall-clock time.                   together with a particular pre-conditioning matrix P.
+
+
+
+
+4    15th USENIX Symposium on Operating Systems Design and Implementation                                                       USENIX Association
+         (a) ImageNet                     (b) YoloV3             (c) DeepSpeech2    (d) BERT (fine-tune)    (e) CIFAR10       (f) Recommendation
+
+Figure 2: Statistical efficiency for all models described in Table 1. TOP: validation metric vs training progress for three different
+batch sizes: M0 , an intermediate batch size, and the max batch size limit we set for each DL task. Metrics are as defined in
+Table 1 except for YoloV3 for which validation loss is shown. MIDDLE: measured statistical efficiency vs. training progress
+for two different batch sizes. Training progress (x-axis) in the top two rows is shown in terms of “statistical epochs”, defined
+    M
+as |X| ∑t EFFICIENCYt (M) where |X| is the size of the training dataset. BOTTOM: measured EFFICIENCYt vs. predicted
+EFFICIENCYt for a range of batch sizes (log-scaled), using ϕt measured using the median batch size from each range, during
+an early-training epoch (roughly 1/8th of the way through training).
+
+
+   Fig. 2 (TOP) shows the validation metrics on a held-out                         later on in training. The exceptions being BERT, which
+dataset for a variety of DL training tasks (details in Table                       is a fine-tuning task starting from an already pre-trained
+1) versus their training progress. “Statistical epochs”4 is the                    model, and recommendation, which uses a much smaller
+number of training iterations normalized by EFFICIENCYt so                         and shallower model architecture than the others. How
+that each statistical epoch makes theoretically, as projected                      EFFICIENCYt changes during training varies from task to
+by our model, the same training progress across different                          task, and depends on specific properties like the learning rate
+batch sizes. Thus, the degree of similarity between validation                     schedule. For example, EFFICIENCYt for ImageNet, which
+curves at different batch sizes is an indicator for the accuracy                   uses step-based learning rate annealing, experiences sharp
+of EFFICIENCYt as a predictor of actual training progress.                         increases whenever the learning rate is annealed.
+   Although there are differences in the validation curves for                        Finally, we note that the EFFICIENCYt function (which is
+several DL tasks (especially in earlier epochs), they achieve                      supplied with estimates of ϕt by Pollux) is able to accurately
+similar best values across the different batch sizes we evaluated                  model observed values at a range of different batch sizes. This
+(±1% relative difference for all tasks except DeepSpeech2                          means that ϕt measured using batch size M can be used by
+at ±4%). We note that these margins are within the plateau of                      Pollux to predict the value of EFFICIENCYt at a different batch
+high-quality models expected from large-batch training [45].                       size M ′ without needing to train using M ′ ahead of time.
+   Fig. 2 (MIDDLE and BOTTOM) show the measured                                    Upper batch size limit. In some cases, as the batch size in-
+and predicted EFFICIENCYt during training and for a range                          creases, the chosen LR scaling rule may break down before the
+of different batch sizes. In general, larger batch sizes have                      statistical efficiency decreases, which degrades the final model
+lower EFFICIENCYt early in training, but close the gap                             quality. To address these cases, the application may define
+                                                                                   a maximum batch size limit that will be respected by Pollux.
+   4 Similar to the notion of “scale-invariant iterations” defined in [32].        Nevertheless, we find that a batch size up to 32× larger works
+
+
+
+USENIX Association                                           15th USENIX Symposium on Operating Systems Design and Implementation                5
+well in most cases. Furthermore, limits for common models          same node. αnode            node
+                                                                                    sync and βsync are the analogous parameters
+are well-studied for popular LR scaling rules [21, 32, 57, 69].    for when at least two process are located on different nodes.
+As better LR scaling rules are developed, they may be              Note that our model for Tsync can be extended to account for
+incorporated into Pollux using its plug-in interface (§3).         rack-level locality by adding a third pair of parameters.
+Estimating ϕt . The PGNS ϕt can be estimated in a similar          Combining Tgrad and Tsync . Modern DL frameworks can
+fashion as the GNS by following Appendix A.1 of [46],              partially overlap Tgrad and Tsync by overlapping gradient
+except using the pre-conditioned gradient Pg instead of            computation with network communication [70]. The degree
+the gradient g. This can be done efficiently when there are        of this overlap depends on structures in the specific DL model
+multiple data-parallel processes by using the different values     being trained, like the ordering and sizes of its layers.
+     (t)                                                              Assuming no overlap, then Titer = Tgrad +Tsync . Assuming
+of ĝk already available on each GPU k. However, this method
+doesn’t work when there is only a single GPU (and gradient         perfect overlap, then Titer = max(Tgrad ,Tsync ). A realistic value
+accumulation is off, i.e. s = 0). In this particular situation,    of Titer is somewhere in between these two extremes. To
+Pollux switches to a differenced variance estimator [63] which     capture the overlap between Tgrad and Tsync , we model Titer as
+uses consecutive gradient estimates ĝ(t−1) and ĝ(t) .                                                                1/γ
+                                                                             Titer (a,m,0) = Tgrad (a,m)γ +Tsync (a)γ       ,     (10)
+
+3.2     Modeling System Throughput                                 where γ ≥ 1 is a learnable parameter. Eqn. 10 has the property
+                                                                   that Titer = Tgrad +Tsync when γ = 1, and smoothly transitions
+To model and predict the system throughput for data-parallel       towards Titer = max(Tgrad ,Tsync ) as γ → ∞.
+DL, we aim to predict the time spent per training iteration,       Gradient Accumulation. In data-parallelism, GPU memory
+Titer , and then calculate the throughput as                       limits the per-GPU batch size, and many DL models hit this
+                                                                   limit before the batch size is large enough for Tgrad to over-
+         THROUGHPUT(a,m,s) = M(a,m,s)/Titer (a,m,s).        (7)
+                                                                   come Tsync (or experience diminishing statistical efficiency),
+We start by separately modeling Tgrad , the time in each           resulting in suboptimal scalability. Several techniques exist for
+iteration spent computing local gradient estimates, and Tsync ,    overcoming the GPU memory limit [9, 10, 27, 30]; we focus on
+the time in each iteration spent averaging gradient estimates      gradient accumulation, which is easily implemented using pop-
+and synchronizing model parameters across all GPUs. We             ular DL frameworks. Per-GPU gradients are aggregated locally
+also start by assuming no gradient accumulation, i.e. s = 0.       over s forward-backward passes before being synchronized
+Modeling Tgrad . The local gradient estimates are computed         across all GPUs during the (s+1)th pass, achieving a larger to-
+using back-propagation, whose run-time scales linearly with        tal batch size. Thus, one iteration of SGD spans s accumulation
+the per-GPU batch size m. Thus, we model Tgrad as                  steps followed by one synchronization step, modeled as
+                                                                                                                              1/γ
+                                                                    Titer (a,m,s) = s×Tgrad (a,m)+ Tgrad (a,m)γ +Tsync (a)γ          . (11)
+                 Tgrad (m) = αgrad +βgrad ·m,               (8)
+                                                                   Throughput model validation. Fig. 3 shows an example of
+where αgrad ,βgrad are fittable parameters.                        our THROUGHPUT function fit to measured throughput values
+Modeling Tsync . When allocated a single GPU, no synchro-          for a range of resource allocations and batch sizes. Each DL
+nization is needed and Tsync = 0. Otherwise, we model Tsync as a   task was implemented using PyTorch [51], which overlaps the
+linear function of the number of GPUs since in data-parallelism,   backward pass’ computation and communication. Gradients
+the amount of data sent and received from each replica is          are synchronized with NCCL 2.7.8, which uses either ring all-
+typically only dependent on the size of the gradients and/or pa-   reduce or tree all-reduce depending on the detected GPUs and
+rameters. We include a linear factor to account for performance    their placements and its own internal performance estimates.
+retrogressions associated with using three or more GPUs, such      Overall, we find that our model can represent the observed
+as increasing likelihood of stragglers or network delays.          data closely, while varying both the amount of resources as
+   Co-location of GPUs on the same node reduces network            well as the batch size. In particular, all models we measured
+communication, which can improve Tsync . Thus, we use              except ImageNet exhibited high sensitivity to inter-node
+different parameters depending on GPU placement. Letting           synchronization, indicating that they benefit from co-location
+K = SUM(a) be the number of allocated GPUs,                        of GPUs. Furthermore, YOLOv3 and BERT benefit from
+                                                                  using gradient accumulation to increase their total batch sizes.
+                0
+                                           if K = 1               These detailed characteristics are well-represented by our
+  Tsync (a,m) = αlocal      local
+                     sync +βsync ·(K −2) if N = 1, K ≥ 2 (9)       THROUGHPUT function, and can be optimized for by Pollux.
+                                                                      In addition to the configurations in Fig. 3, we fitted the
+                 node node
+                
+                   αsync +βsync ·(K −2) otherwise,
+                                                                   THROUGHPUT function on a diverse set of GPU placements
+where N is the number of physical nodes occupied by at least       and batch sizes in a 64-GPU cluster. Across all DL tasks, the
+one replica. αlocal     local
+              sync and βsync are the constant and retrogression    average error of the fitted model was at most 10%, indicating
+parameters for when all processes are co-located onto the          that it represents the observed throughput measurements well.
+
+
+
+6     15th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+      (a) ImageNet             (b) YoloV3         (c) DeepSpeech2    (d) BERT (fine-tune)    (e) CIFAR10      (f) Recommendation
+
+Figure 3: System throughput for all models described in Table 1, as measured using g4dn.12xlarge instances in AWS each with
+4 NVIDIA T4 GPUs and created within the same placement group. Eqn. 11 was fitted using the observed data that appeared in each
+plot. TOP: time per training iteration vs. the number of allocated GPUs (log-scaled), with the per-GPU batch size held constant.
+The GPUs are placed in as few 4-GPU nodes as possible, which causes a sharp increase beyond 4 GPUs (when inter-node network
+synchronization becomes required). BOTTOM: system throughput (examples per second) vs. total batch size (log-scaled), with
+the number of GPUs held constant. To the left of the vertical dashed line, the entire mini-batch fits within GPU memory. To the
+right, the total batch size is achieved using gradient accumulation.
+
+
+Limits of the throughput model. Pollux models data-parallel
+training throughput only in the dimensions it cares about,
+i.e. number and co-locality of GPUs, batch size, and gradient
+accumulation steps. The simple linear assumptions made in
+Eqn. 11, although sufficiently accurate for the settings we
+tested, may diverge from reality for specialized hardware [33],
+sophisticated synchronization algorithms [7, 65, 72], different
+parallelization strategies [28,47,58,59], at larger scales [6,68],
+or hidden resource contention not related to network used for
+gradient synchronization. Rather than attempting to cover
+all scenarios with a single throughput model, we designed
+GOODPUTt (Eqn. 4) to be modular so that different equations
+for THROUGHPUT may be easily plugged in without interfering             Figure 4: Co-adaptive scheduling architecture of Pollux.
+with the core functionalities provided by Pollux.
+
+                                                                     of its current allocated resources. PolluxAgent periodically
+4   Pollux Design and Architecture                                   reports the goodput function of its job to the PolluxSched.
+Pollux adapts DL job execution at two distinct granularities.           Second, the PolluxSched periodically optimizes the
+First, at a job-level granularity, Pollux dynamically tunes the      resource allocations for all jobs in the cluster, taking into
+batch size and learning rate for best utilization of the allocated   account the current goodput function for each job and
+resources. Second, at the cluster-wide granularity, Pollux           cluster-wide resource contention. Scheduling decisions made
+dynamically (re-)allocates resources, driven by the goodput of       by PolluxSched also account for the overhead associated
+all jobs sharing the cluster combined with cluster-level goals       with resource re-allocations, slowdowns due to network
+including fairness and job-completion time. To achieve this          interference between multiple jobs, and resource fairness.
+co-adaptivity in a scalable way, Pollux’s design consists of            PolluxAgent and PolluxSched co-adapt to each other.
+two primary components, as illustrated in Fig. 4.                    While PolluxAgent adapts each training job to make efficient
+   First, a PolluxAgent runs together with each job. It fits the     use of its allocated resources, PolluxSched dynamically
+EFFICIENCYt and THROUGHPUT functions for that job, and               re-allocates each job’s resources, taking into account the
+tunes its batch size and learning rate for efficient utilization     PolluxAgent’s ability to tune its job.
+
+
+
+USENIX Association                               15th USENIX Symposium on Operating Systems Design and Implementation              7
+4.1     PolluxAgent: Job-level Optimization                             simple prior-driven strategy is sufficient in our experiments.
+                                                                        Sec. 5.3.2 shows that prior-driven exploration performs close
+An instance of PolluxAgent is started with each training job.           (within 2-5%) to an idealized scenario in which the model is
+During training, it continually measures the job’s gradient             fitted offline for each job before being submitted to the cluster.
+noise scale and system throughput, and it reports them to               Training job tuning. With θsys , ϕt , and M0 , which fully
+PolluxSched at a fixed interval. It also uses this information          specify the DL job’s GOODPUT function at its current training
+to determine the most efficient batch size for its job given its        progress, PolluxAgent determines the most efficient per-GPU
+current resource allocations, and adapts its job’s learning rate        batch size and gradient accumulation steps,
+to this batch size using the appropriate plug-in LR scaling rule
+(e.g. AdaScale for SGD or square-root scaling for Adam).                                (m∗ , s∗ ) = argmax GOODPUT(a,m,s),                       (13)
+Online model fitting. In §3.2, we defined the system                                                       m,s
+
+throughput parameters of a training job as the 7-tuple                  where a is the job’s current resource allocation.
+                                                                         Once a new configuration is found, the job will use it for
+     θsys = αgrad ,βgrad ,αlocal   local node node
+                            sync ,βsync ,αsync ,βsync ,γ , (12)         its subsequent training iterations, using the plug-in LR scaling
+                                                                        rule to adapt its learning rate appropriately. As the job’s
+which are required to construct the THROUGHPUT function. To-            EFFICIENCYt function changes over time, PolluxAgent will
+gether with the PGNS ϕt (for predicting EFFICIENCYt ) and ini-          periodically re-evaluate the most efficient configuration.
+tial batch size M0 , the triple (θsys ,ϕt ,M0 ) specifies the GOODPUT
+function. While M0 is a constant configuration provided by
+the user, and ϕt can be computed according to §3.1, θsys is             4.2     PolluxSched: Cluster-wide Optimization
+estimated by fitting the THROUGHPUT function to observed                The PolluxSched periodically allocates (and re-allocates)
+throughput values collected about the job during training.              resources for every job in the cluster. To determine a set of
+   PolluxAgent measures the time taken per iteration, Titer , and       efficient cluster-wide resource allocations, it maximizes a
+records the tuple (a,m,s,Titer ) for all combinations of resource       fitness function that is defined as a generalized (power) mean
+allocations a, per-GPU batch size m, and gradient accumu-               across speedups for each job:
+lation steps s encountered during its lifetime. Periodically,
+                                                                                                                                   !1/p
+PolluxAgent fits the parameters θsys to all of the throughput
+                                                                                                        1 J
+data collected so far. Specifically, we minimize the root                      FITNESS p (A) =            ∑ SPEEDUP j (A j ) p
+                                                                                                        J j=1
+                                                                                                                                          .       (14)
+mean squared logarithmic error (RMSLE) between Eqn. 11
+and the collected data triples, using L-BFGS-B [73]. We set
+                                                                        A is an allocation matrix with each row A j being the allocation
+constraints for each α and β parameter to be non-negative,
+                                                                        vector for a job j, thus A jn is the number of GPUs on node
+and γ to be in the range [1,10]. PolluxAgent then reports the
+                                                                        n allocated to job j, and J is the total number of running and
+updated values of θsys and ϕt to PolluxSched.
+                                                                        pending jobs sharing the cluster. We define the speedup of
+Prior-driven exploration. At the beginning of each job,
+                                                                        each job as the factor of goodput improvement using a given
+throughput values have not yet been collected. To ensure that
+                                                                        resource allocation over using a fair-resource allocation, ie.
+Pollux finds efficient resource allocations through systematic
+exploration, we impose several priors which bias θsys towards                                         maxm,s GOODPUT j (A j ,m,s)
+the belief that throughput scales perfectly with more resources,               SPEEDUP j (A j ) =                                 ,               (15)
+                                                                                                      maxm,s GOODPUT j (a f ,m,s)
+until such resource configurations are explored.
+   In particular, we set αlocal
+                              sync = 0 while the job had not used       where GOODPUT j is the goodput of job j at its current training
+more than one GPU, αlocal            local
+                            sync = βsync = 0 while the job had not      iteration, and a f is a fair resource allocation for the job, defined
+used more than one node, and βlocal             node
+                                       sync = βsync = 0 while the job
+                                                                        to be an exclusive 1/J share of the cluster.5
+had not used more than two GPUs. This creates the following                In §3, we described how the GOODPUT function can be fitted
+behavior: each job starts with a single GPU and is initially            to observed metrics during training and then be evaluated as a
+assumed to scale perfectly to more GPUs. PolluxSched is then            predictive model. PolluxSched leverages this ability to predict
+encouraged to allocate more GPUs and/or nodes to the job,               GOODPUT to maximize FITNESS via a search procedure, and
+naturally as part of its resource optimization (§4.2), until the        then it applies the outputted allocations to the cluster.
+PolluxAgent can estimate θsys more accurately. Finally, to              Fairness and the effect of p. When p = 1, FITNESS p is
+prevent a job from being immediately scaled out to arbitrarily          the average of SPEEDUP values across all jobs. This causes
+many GPUs, we restrict the maximum number of GPUs that                  PolluxSched to allocate more GPUs to jobs that achieve a high
+can be allocated to at most twice the maximum number of                 SPEEDUP when provided with many GPUs (i.e., jobs that scale
+GPUs the job has been allocated in its lifetime.                            5 We note that SPEEDUP has similarities with finish-time fairness [43]. But,
+   Although other principled approaches to exploration can              SPEEDUP is related to training performance at a moment in time, whereas
+be applied (e.g., Bayesian optimization), we find that this             finish-time fairness is related to end-to-end job completion time.
+
+
+
+
+8     15th USENIX Symposium on Operating Systems Design and Implementation                                                  USENIX Association
+well). However, as p → −∞, FITNESS p smoothly approaches             as well as calculating the gradient noise scale. At a fixed
+the minimum of SPEEDUP values, in which case maximizing              time interval, PolluxAgent fits the system throughput model
+FITNESS p promotes equal SPEEDUP between training jobs,              (Eqn. 10) to the profiled metrics collected so far, and reports the
+but ignores the overall cluster goodput and resource efficiency.     fitted system throughput parameters, along with the latest gra-
+   Thus, p can be considered a “fairness knob”, with larger          dient statistics, to PolluxSched. After reporting to PolluxSched,
+negative values being more fair. A cluster operator may select       PolluxAgent updates the job’s per-GPU batch size and gradient
+a suitable value, based on organizational priorities. In our         accumulation steps, by optimizing its now up-to-date goodput
+experience and results in §5, we find that p = −1 achieves           function (Eqn. 4) with its currently allocated resources.
+most goodput improvements and reasonable fairness.                       PolluxSched is implemented as a service in Kubernetes [2].
+Re-allocation penalty. Each time a job is re-allocated to a          At a fixed time interval, PolluxSched runs its search algorithm,
+different set of GPUs, it incurs some delay to re-configure          and then applies the resultant allocation matrix by creating and
+the training process. Using the the popular checkpoint-restart       terminating Kubernetes Pods that run the job workers. To find
+method, we measured between 15 and 120 seconds of delay              a good allocation matrix, PolluxSched uses a population-based
+depending on the size of the model being trained and other           search algorithm that perturbs and combines candidate alloca-
+initialization tasks in the training code. To prevent an excessive   tion matrices to produce higher-value allocation matrices, and
+number of re-allocations, when PolluxSched evaluates the             finally modifies them to satisfy node resource constraints and
+fitness function for a given allocation matrix, it applies a         interference avoidance. The allocation matrix with the highest
+penalty for every job that needs to be re-allocated,                 fitness score is applied to the jobs running in the cluster.
+                                                                         Both PolluxAgent and PolluxSched require a sub-procedure
+SPEEDUP j (A j ) ←− SPEEDUP j (A j )×REALLOC_FACTOR j (δ).           that optimizes GOODPUTt (a, m, s) given a fixed a (Eqn. 13).
+                                                                     We implemented this procedure by first sampling a range
+   We define REALLOC_FACTOR j (δ) = (T j − R j δ)/(T j + δ),
+                                                                     of candidate values for the total batch size M, then finding
+where T j is the age of the training job, R j is the number of
+                                                                     the smallest s such that m = ⌈M/s⌉ fits into GPU memory
+re-allocations incurred by the job so far, and δ is an estimate
+                                                                     according to a user-defined upper-bound, and finally taking
+of the re-allocation delay. Intuitively, REALLOC_FACTOR j (δ)
+                                                                     the configuration which results in the highest GOODPUT value.
+scales SPEEDUP j (A j ) according to the assumption that the
+historical average rate of re-allocations for job j will continue
+indefinitely into the future. Thus, a job that has historically      5     Evaluation
+experienced a higher rate of re-allocations will be penalized
+more for future re-allocations.                                      We compare Pollux with two state-of-the-art DL sched-
+Interference avoidance. When multiple distributed DL jobs            ulers using a testbed cluster with 64 GPUs. Although one
+share a single node, their network usage while synchronizing         primary advantage of Pollux is automatically selecting
+gradients and model parameters may interfere with each other,        the configurations for each job, we find that Pollux still
+causing both jobs to slow down [31]; Xiao et al. [66] report         reduces average job completion times by 37–50% even when
+up to 50% slowdown for DL jobs which compete with each               the baseline schedulers are supplied with well-tuned job
+other for network resources. PolluxSched mitigates this issue        configurations (a scenario that strongly favors the baseline
+by disallowing different distributed jobs (each using GPUs           schedulers). Pollux is able to dynamically adapt each job
+across multiple nodes) from sharing the same node.                   by trading-off between high-throughput/low-efficiency and
+   Interference avoidance is implemented as a constraint             low-throughput/high-efficiency modes of training, depending
+in Pollux’s search algorithm, by ensuring at most one                on the current cluster state and training progress.
+distributed job is allocated to each node. We study the effects         Using a cluster simulator, we evaluate the impact of specific
+of interference avoidance in §5.3.2.                                 settings on Pollux, including the total workload intensity, prior-
+Supporting non-adaptive jobs. In certain cases, a user may           driven exploration, scheduling interval, and interference avoid-
+want to run a job with a fixed batch size, i.e. M = M0 . These       ance. With its fairness knob, Pollux can improve finish-time
+jobs are well-supported by PolluxSched, which simply fixes           fairness [43] by 1.5–5.4× compared to baseline DL schedulers.
+EFFICIENCYt for that job to 1 and can continue to adapt its          We also reveal a new opportunity for auto-scaling in the cloud
+resource allocations based solely on its system throughput.          by showing that a Pollux-based auto-scaler can potentially re-
+                                                                     duce the cost of training large models (e.g. ImageNet) by 25%.
+4.3    Implementation
+                                                                     5.1    Experimental Setup
+PolluxAgent is implemented as a Python library that is im-
+ported into DL training code. We integrated PolluxAgent with         Testbed. We conduct experiments using a cluster consisting
+PyTorch [51], which uses all-reduce as its gradient synchro-         of 16 nodes and 64 GPUs. Each node is an AWS EC2
+nization algorithm. PolluxAgent inserts performance profiling        g4dn.12xlarge instance with 4 NVIDIA T4 GPUs, 48
+code that measures the time taken for each iteration of training,    vCPUs, 192GB memory, and a 900GB SSD. All instances
+
+
+
+USENIX Association                               15th USENIX Symposium on Operating Systems Design and Implementation                 9
+are launched within the same placement group. We deployed            Whenever possible, we placed jobs onto as few different nodes
+Kubernetes 1.18.2 on this cluster, along with CephFS 14.2.8          as possible to promote worker locality.
+to store checkpoints for checkpoint-restart elasticity.                 Optimus+Oracle. Optimus leverages a throughput predic-
+Synthetic Workload Construction. We randomly sampled                 tion model that is specific to jobs using the parameter server
+160 jobs from the busiest 8-hour range (hours 3–10) in the           architecture. To account for differences due to the perfor-
+deep learning cluster traces published by Microsoft [31]. Each       mance model, our implementation of Optimus uses our own
+job in the orginal trace has information on its submission time,     throughput model as described in §3.2. Furthermore, Optimus
+number of GPUs, and duration. However, no information is             predicts the number of training iterations until convergence
+provided on the model architectures being trained or dataset         by fitting a simple function to the model’s convergence curve.
+characteristics. Instead, our synthetic workload consists of         Since this method does not work consistently for all models
+the models and datasets described in Table 1.                        in our synthetic workload, we run each job ahead of time and
+   We categorized each job in the trace and in Table 1 based         provide Optimus with the exact number of iterations until
+on their total GPU-time: Small (0–1 GPU-hours), Medium               completion. We call this version of Optimus Optimus+Oracle.
+(1–10 GPU-hours), Large (10–100 GPU-hours), and XLarge                  For each job, Tiresias uses the number of GPUs and batch
+(100–1000 GPU-hours). For each job in the trace, we picked           size specified in our synthetic workload. Optimus+Oracle uses
+a training job from Table 1 that is in the same category.            the batch size specified, but determines the number of GPUs
+Manually-tuned jobs for baseline DL schedulers. We                   dynamically. Each job uses gradient accumulation if they are
+manually tuned the number of GPUs and batch sizes for each           allocated too few GPUs to support the specified batch size.
+job in our synthetic workload, as follows. We measured the
+time per training iteration for each model in Table 1 using a
+                                                                     5.2    Testbed Macrobenchmark Experiments
+range of GPU allocations and batch sizes, and fully trained
+each model using a range of different batch sizes (see §5.3 for      Table 2 summarizes the results of our testbed experiments for
+details). We considered a number of GPUs valid if using the          seven configurations: Pollux compared with, first, baseline
+optimal batch size for that number of GPUs achieves 50% –            schedulers using well-tuned job configurations; second,
+80% of the ideal (i.e., perfectly linear) scalability versus using   baseline schedulers using more realistic job configurations;
+the optimal batch size on a single GPU. For each job submitted       third, Pollux using two alternate values for its fairness knob.
+from our synthetic workload, we selected its number of GPUs          Comparisons using well-tuned job configurations. Even
+and batch size randomly from its set of valid configurations.        when Optimus+Oracle and Tiresias are given well-tuned
+   Our job configurations assume that the users are highly           job configurations as described in §5.1, they are still signif-
+rational and knowledgeable about the scalability of the models       icantly behind Pollux. In this setting, Pollux (with p = −1)
+they are training. Less than 50% of the ideal scalability would      achieved 50% and 37% shorter average JCT, 27% and 27%
+lead to under-utilization of resources, and more than 80% of         shorter tail (99th percentile) JCT, and 20% and 33% shorter
+the ideal scalability means the job can still utilize more GPUs      makespan, in comparison to Optimus+Oracle+TunedJobs and
+efficiently. We emphasize that this assumption of uniformly          Tiresias+TunedJobs, respectively. As we previously noted,
+sophisticated users is unrealistically biased in favor of the        this setting highly favors the baseline schedulers, essentially
+baseline schedulers and only serves for comparing Pollux with        mimicking users who possess expert knowledge about system
+the ideal performance of baseline systems.                           throughput, statistical efficiency, and how their values change
+Comparison of DL schedulers. We compare Pollux to two re-            with respect to resource allocations and batch sizes.
+cent deep learning schedulers, Tiresias [22] and Optimus [52],          One key source of improvement for Pollux is its ability
+as described in §2.3. Whereas Pollux dynamically co-adapts           to trade-off between high-throughput/low-efficiency and
+the number of GPUs and batch sizes of DL training jobs,              low-throughput/high-efficiency modes during training. Fig. 5
+Optimus only adapts the number of GPUs, and Tiresias adapts          shows the total number of allocated GPUs and average
+neither. To establish a fair baseline for comparison, for all        EFFICIENCYt during the execution of our synthetic workload.
+three schedulers, we scale the learning rate using AdaScale for      During periods of low cluster contention, Pollux can allocate
+SGD, and the square-root scaling rule for Adam and AdamW.            more GPUs (indicated by (A)) and use larger batch sizes to
+   Pollux. We configured PolluxSched to use a 60s scheduling         boost training throughput, even at the cost of lower statistical
+interval, and compute REALLOC_FACTOR(δ) using δ = 30s.               efficiency, because doing so results in an overall higher
+PolluxAgent reports its most up-to-date system throughput            goodput. On the other hand, during periods of high cluster
+parameters and gradient statistics every 30s. Unless otherwise       contention, Pollux may instead use smaller batch sizes to
+specified, the default fairness knob value of p = −1 is used.        increase statistical efficiency (indicated by (B)).
+   Tiresias. We configured Tiresias as described in the testbed      Comparisons using realistic job configurations. Without
+experiments of Gu et al. [22], with two priority queues              assistance from a system like Pollux, users are likely to try
+and the PromoteKnob disabled. We manually tuned the                  various numbers of GPUs and batch sizes, before finding a
+queue threshold to perform well for our synthetic workload.          configuration that is efficient. Other users may not invest time
+
+
+
+10   15th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+        Task                 Dataset             Model            Optimizer     LR Scaler         M0         Validation       Size    Frac. Jobs
+ Image Classification     ImageNet [12]      ResNet-50 [24]         SGD         AdaScale       200 imgs     75% top1 acc.     XL         2%
+  Object Detection      PASCAL-VOC [16]      YOLOv3 [55]            SGD         AdaScale        8 imgs        84% mAP          L         6%
+ Speech Recognition     CMU-ARCTIC [38]     DeepSpeech2 [3]         SGD         AdaScale        20 seqs     25% word err.      M        10%
+ Question Answering        SQuAD [54]      BERT (finetune) [14]    AdamW       Square-Root      12 seqs     88% F1 score       M        10%
+ Image Classification      Cifar10 [39]      ResNet18 [24]          SGD         AdaScale       128 imgs     94% top1 acc.      S        36%
+  Recommendation         MovieLens [23]       NeuMF [25]            Adam       Square-Root     256 pairs     69% hit rate      S        36%
+
+Table 1: Models and datasets used in our evaluation workload. Each training task achieves the provided validation metrics. The
+fraction of jobs from each category are chosen according to the public Microsoft cluster traces.
+
+
+                             Job Completion Time                           Using this workload, we find that Pollux has 72% and 73%
+           Policy                                    Makespan
+                             Average    99%tile                         shorter average JCT, 50% and 56% shorter tail JCT, and 43%
+      Pollux (p = −1)         0.76h       11h           16h             and 48% shorter makespan, in comparison to Optimus+Oracle
+ Optimus+Oracle+TunedJobs      1.5h       15h           20h             and Tiresias, respectively. Even though Optimus+Oracle can
+    Tiresias+TunedJobs         1.2h       15h           24h             dynamically increase the GPU allocation of each job, it still
+     Optimus+Oracle            2.7h       22h           28h             only slightly outperforms Tiresias because it does not also
+          Tiresias             2.8h       25h           31h             increase the batch size to better utilize those additional GPUs.
+      Pollux (p = +1)         0.83h       10h           16h             A closer look at co-adapted job configurations. Fig. 6
+     Pollux (p = −10)         0.84h       12h           18h             (LEFT) shows the configurations chosen by Pollux for one Im-
+                                                                        ageNet training job as the synthetic workload progresses. (A)
+          Table 2: Summary of testbed experiments.                      during the initial period of low cluster contention, more GPUs
+                                                                        are allocated to ImageNet, causing a larger batch size to be used
+                                                                        and lowering statistical efficiency. (B) during the subsequent
+                                                                        period of high cluster contention, fewer GPUs are allocated to
+                                                                        ImageNet, causing a smaller batch size to be used and raising
+                                                                        statistical efficiency. (C) when the cluster contention comes
+                                                                        back down, ImageNet continues to be allocated more GPUs
+                                                                        and uses a larger batch size. However, we note that the batch
+                                                                        size per GPU is much higher than in the first low-contention pe-
+                                                                        riod, since the job is now in its final, high-statistical-efficiency
+                                                                        phase of training. We see similar trade-offs being made over
+                                                                        time for two YOLOv3 jobs (RIGHT).
+                                                                        Effect of the fairness knob. We ran Pollux using three values
+                                                                        of the fairness knob, p = 1, −1, −10. Compared with no
+                                                                        fairness (p = 1), introducing a moderate degree of fairness
+                                                                        (p = −1) improved the average job completion time (JCT)
+                                                                        but degraded the tail JCT. This is because6 , in our synthetic
+Figure 5: Comparison between Pollux (p = −1), Optimus, and              workload, the tail JCT comprises of long but scalable jobs (i.e.
+Tiresias while executing our synthetic workload (with tuned             ImageNet), which take a large number of GPUs away from
+jobs). TOP: average cluster-wide allocated GPUs over time.              other jobs in the absence of fairness (p = 1). However, further
+BOTTOM: average cluster-wide statistical efficiency over                increasing fairness (p = −10) degraded performance in aver-
+time. Tiresias+TunedJobs dips between hours 16 and 20 due               age JCT, tail JCT, and makespan. In §5.3.1, we present a more
+to a 24-GPU job blocking a 48-GPU job from running.                     detailed analysis of the impact of p on scheduling fairness.
+                                                                        System overheads. During each 60s scheduling interval, Pol-
+                                                                        luxSched spent an average of 1 second on 1 vCPU computing
+into configuring their jobs well in the first place.
+                                                                        the cluster allocations by optimizing the FITNESS p function.
+   To set a more realistically configured baseline, we ran              On average, each job was re-allocated resources once every
+Optimus+Oracle and Tiresias on a version of our synthetic               7 minutes, resulting in an average 8% run-time overhead due
+workload with the number of GPUs exactly as specified in the            to checkpoint-restarts. Each PolluxAgent fits its throughput
+Microsoft cluster trace. The batch size was chosen to be the            model parameters on its latest observed metrics every 30 sec-
+baseline batch size M0 times the number of GPUs, which is               onds, taking an average of 0.2 seconds each time. Finding the
+how we expect most users to initially configure their distributed
+training jobs. We find that these jobs typically use fewer GPUs            6 We note that p = −1 (harmonic mean over speedups) may be more
+
+and smaller batch sizes than their well-configured counterparts.        suitable than p = 1 (arithmetic mean) when optimizing for the average JCT.
+
+
+
+
+USENIX Association                              15th USENIX Symposium on Operating Systems Design and Implementation                            11
+                                                                              Figure 7: CDF of Finish Time Fairness (ρ).
+
+
+                                                                     injecting a 30-second delay for each job that has its resources
+                                                                     re-allocated. Unless stated otherwise, we do not simulate any
+                                                                     network interference between different jobs. We study the
+                                                                     effects of interference in more detail in §5.3.2.
+Figure 6: Co-adaptation over time of one ImageNet job (LEFT)
+                                                                        Compared with our testbed experiments in §5.2, we find
+and two YOLOv3 jobs (RIGHT) using Pollux (p = −1). ROW
+                                                                     that our simulator obtains similar factors of improvement,
+1: number of jobs actively sharing the cluster. ROW 2: number
+                                                                     showing that Pollux reduces the average JCT by 48% and 32%
+of GPUs allocated to the job. ROW 3: batch size (images) used.
+                                                                     over Optimus+Oracle+TunedJobs and Tiresias+TunedJobs.
+ROW 4: statistical efficiency (%).
+
+                                                                     5.3.1   Scheduling Fairness
+optimal per-GPU batch size and gradient accumulation steps
+by optimizing GOODPUTt takes an average of 0.4 milliseconds.         We evaluate the scheduling fairness of Pollux using finish-time
+                                                                     fairness [43] (denoted by ρ), which is defined to be the ratio
+                                                                     of a job’s JCT running on shared resources to that of the job
+5.3    Simulator Experiments                                         running in an isolated and equally-partitioned cluster. Under
+We built a discrete-time cluster simulator in order to evaluate      this metric, jobs with ρ < 1 have been treated better-than-fair
+a broader set of workloads and settings. Our simulator is con-       by the cluster scheduler, while jobs with ρ > 1 have been
+structed by measuring the performance and gradient statistics        treated worse-than-fair.
+of each model in Table 1, under many different resource and             In Fig. 7, we compare the finish-time fairness of Pollux
+batch size configurations, and re-playing them for each sim-         with Optimus+Oracle+TunedJobs and Tiresias+TunedJobs.
+ulated job. This way, we are able to simulate both the system        Pollux with p = 1 results in poor fairness, similar to Tire-
+throughput and statistical efficiency of the jobs in our workload.   sias+TunedJobs, which is apparent as a long tail of jobs with
+   Unless stated otherwise, each experiment in this section is       ρ > 4. Optimus+Oracle+TunedJobs obtains better fairness due
+repeated on 8 different workload traces generated using the          to its allocation algorithm which attempts to equalize the JCT
+same duration, number of jobs, and job size distributions as         improvement for each job. Pollux with p = −1 provides the best
+in §5.2, and we report the average results across all 8 traces.      fairness, with 99% of jobs achieving ρ < 2, and does so while
+Simulator construction. For each job in Table 1, we mea-             still providing significant performance increases (Table 2). For
+sured the time per training iteration for 146 different GPU          p = −10, we observe slightly worse fairness overall, caused by
+allocations+placements in our testbed cluster of 16 nodes            PolluxSched incurring a larger number of re-allocations due to
+and 64 total GPUs. For each allocation, we measured a range          ignoring the cost in favor of equalizing speedups at all times.
+of batch sizes up to the GPU memory limit. To simulate the              To provide context, we note that the curves for Tiresias
+throughput for a job, we queried a multi-dimensional linear          and Optimus are consistent with those reported (for different
+interpolation on the configurations we measured. For each            workloads) by Mahajan et al. [43]. Although their Themis
+model, we also measured the (pre-conditioned) gradient noise         system is not available for direct comparison, the ρ range for
+scale during training using a range of batch sizes, and across       Pollux with p = −1 is similar to the range reported for Themis.
+every epoch. To simulate the statistical efficiency for a job        The max-ρ improvements (1.5× and 5.4×) over Tiresias and
+using a certain batch size, we linearly interpolated its value of    Optimus are also similar.
+the PGNS between the two nearest batch sizes we measured.
+Simulator fidelity. The data we collected about each job             5.3.2   Other Effects on Scheduling
+enables our simulator to reproduce several system effects, in-
+cluding the performance impact of different GPU placements.          Sensitivity to job load. We compare the performance of
+We also simulate the overhead of checkpoint-restarts by              Pollux, Optimus+Oracle+TunedJobs, and Tiresias+TunedJobs
+
+
+
+12    15th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+                                                                     50%. On the other hand, in the ideal scenario when there is zero
+                                                                     slowdown due to interference, PolluxSched performs similarly
+                                                                     whether or not interference avoidance is enabled. This indicates
+                                                                     that PolluxSched is still able to find efficient cluster allocations
+                                                                     while obeying the interference avoidance constraint.
+
+
+                (a) Varying the workload intensity.
+                                                                     5.4     More Applications of Pollux
+                                                                     5.4.1   Cloud Auto-scaling
+                                                                     In cloud environments, computing resources can be obtained
+                                                                     and released as required, and users pay for the duration they
+                                                                     hold onto those resources. Goodput-driven scheduling presents
+                                                                     a unique opportunity: when a DL model’s statistical efficiency
+                                                                     increases during training, it may be more cost-effective to
+                                                                     provision more cloud resources and use larger batch sizes
+                                                                     during the later epochs of a large training job, rather than
+ (b) Varying scheduling interval.    (c) Varying job interference.
+                                                                     earlier on. We present some preliminary evidence using our
+Figure 8: Effects of various parameters on Pollux, error bars        cluster simulator, and note that a full design of an auto-scaling
+and bands represent 95% confidence intervals.                        system based on goodput may be the subject of future work.
+                                                                     Auto-scaling ImageNet training. We implemented a simple
+                                                                     auto-scaling policy using Pollux’s goodput function. During
+                                                                     training, we scaled up the number of nodes whenever
+for increasing workload intensity in terms of rate of job
+                                                                     maxm,s GOODPUTt (a,m,s)/SUM(a) >U ·maxm,s GOODPUTt (1,m,s), i.e.
+submissions. Fig. 8a shows the results. As expected, all three
+                                                                     the goodput exceeds some fraction U of the predicted ideal
+scheduling policies suffer longer average JCT and makespan
+                                                                     goodput assuming perfect scalability. We set U = 2/3, and
+as the load is increased. Across all job loads, Pollux maintains
+                                                                     increased to a number of nodes such that the predicted goodput
+similar relative improvements over the baseline schedulers.
+                                                                     is approximately L = 1/2 of the predicted ideal goodput.
+Impact of prior-driven exploration. Pollux explores GPU
+                                                                        Fig. 9 compares our Pollux-based auto-scaler with the auto-
+allocations for each DL job from scratch during training
+                                                                     scaler proposed by Or et al. [50], which allows the batch size
+(Sec. 4.1). We evaluated the potential improvement from more
+                                                                     to be increased during training, but models job performance
+efficient exploration by seeding each job’s throughput models
+                                                                     using the system throughput rather than the goodput. Since
+using historical data collected offline. We observed minor
+                                                                     the system throughput does not change with training progress,
+(2–5%) reduction in JCT for short jobs like CIFAR10, but
+                                                                     throughput-based autoscaling (Or et al.) quickly scales out
+no significant change for longer running jobs, indicating low
+                                                                     to more nodes and a larger batch size (Fig. 9a), which remains
+overhead from Pollux’s prior-driven exploration.
+                                                                     constant thereafter. On the other hand, Pollux starts with a
+Impact of scheduling interval. We ran Pollux using a range           small number of nodes, and gradually increases the number of
+of values for its scheduling interval, as shown in Fig. 8b. We       nodes as the effectiveness of larger batch sizes improves over
+find that Pollux performs similarly well in terms of average         time. Fig. 9b shows that Pollux maintains a high statistical
+JCT for intervals up to 2 minutes, while longer intervals            efficiency throughout training. Overall, compared to Or et al.’s
+result in performance degradation. Since newly-submitted             throughput-based auto-scaling, Pollux trains ImageNet with
+jobs can only start during the next scheduling interval, we          25% cheaper cost, with only a 6% longer completion time.
+would expect an increase in the average queuing time due to
+longer scheduling intervals. However, we find that queuing
+                                                                     5.4.2   Hyper-parameter Optimization (HPO)
+contributed to roughly half of the performance degradation
+observed, indicating that Pollux still benefits from a relatively    Hyper-parameter optimization (HPO) is an important DL
+frequent adjustment of resource allocations.                         workload. In HPO, the user defines a search space over
+Impact of interference avoidance. To evaluate the impact             relevant model hyper-parameters. A HPO algorithm (aka a
+of PolluxSched’s interference avoidance constraint, we artifi-       trial scheduler) submits many training jobs (trials) to evaluate
+cially inject various degrees of slowdown for distributed jobs       the effectiveness of particular hyper-parameters, in terms of
+sharing the same node. Fig. 8c shows the results. With interfer-     objectives such as model accuracy or energy efficiency.
+ence avoidance enabled, the average JCT is unaffected by even           Different HPO algorithm types manage trials differently.
+severe slowdowns, because network contention is completely           For example, Bayesian optimization algorithms [37, 62] may
+mitigated. However, without interference avoidance, the av-          submit a few training jobs at a time, and determine future
+erage JCT is 1.4× longer when the interference slowdown is           trials based on the fully-trained results of previous trials.
+
+
+
+USENIX Association                               15th USENIX Symposium on Operating Systems Design and Implementation                 13
+                                                                        increases the batch size at pre-determined iterations during
+                                                                        training, while linearly scaling the learning rate. Smith et
+                                                                        al. [61] suggest that instead of decaying the learning rate
+                                                                        during training, the batch size should be increased instead.
+                                                                        CABS [4] adaptively tunes the batch size and learning rate
+                                                                        during training using similar gradient statistics as Pollux.
+                                                                           These works have a common assumption that extra com-
+                                                                        puting resources are available to parallelize larger batch sizes
+ (a) Number of nodes over time. (b) Statistical efficiency over time.   whenever desired, which is rarely true inside shared-resource
+                                                                        environments. Pollux complements existing adaptive batch
+Figure 9: Goodput-based auto-scaling (Pollux) vs throughput-            size strategies by adapting the batch size and learning rate in
+based auto-scaling (Or et al.) for ImageNet training.                   conjunction with the amount of resources currently available.
+                                                                        Alternatively, anytime minibatch [17] adapts the batch size
+     Policy     Accuracy (Top 5 trials)   Avg JCT      Makespan         to mitigate stragglers in distributed training.
+     Pollux           95.4±0.2             25min         10h               KungFu [44] supports adaptive training algorithms, includ-
+    Baseline          95.5±0.3             34min         14h            ing adaptive batch sizes, by allowing applications to define
+                                                                        custom adaptation policies and enabling efficient adaptation
+               Table 3: Summary of HPO experiments.                     and monitoring during training. Although KungFu is directed
+                                                                        at single-job training and Pollux at cluster scheduling, we
+                                                                        believe KungFu offers useful tools which can be used to
+Bandit-based algorithms [41] may launch a large number of               implement the adaptive policies used by the PolluxAgent.
+trials at once and early-stop ones that appear unpromising.             Hyper-parameter tuning. A large body of work focuses on
+   A full evaluation on how Pollux affects different HPO algo-          tuning the hyper-parameters for ML and DL models [5, 18,
+rithm types is future work. Table 3 shows results from tuning a         29, 34, 49], which typically involves many training jobs [1, 20]
+ResNet18 model trained on the CIFAR10 dataset, using a popu-            as discussed earlier. Although batch size and learning rate are
+lar Bayesian optimization-based HPO algorithm known as the              within the space of hyper-parameters often optimized by these
+Tree-structured Parzen Estimator (TPE) [5]. The search space            systems, Pollux’s goal is fundamentally different. Whereas
+covers the learning rate and annealing, momentum, weight de-            HPO algorithms search for the highest model quality, Pollux
+cay, and network width hyper-parameters. We configured TPE              adapts the batch size and learning rate for the most efficient
+so that 4 trials run concurrently with each other, and 100 trials       execution for each job, while not degrading model quality.
+are run in total. The testbed consists of two NVIDIA DGX
+A100 nodes, each with 8 A100 GPUs. The baseline scheduler
+assigns a static allocation of 4 GPUs (all on the same node)            7   Conclusion
+to each trial and uses a fixed per-GPU batch size for every trial.
+As expected, similar accuracy values are achieved, but Pollux           Pollux is a DL cluster scheduler that co-adaptively allocates
+completes HPO 30% faster due to adaptive (re-)allocation of             resources, while at the same time tuning each training job
+resources as trials progress and adaptive batch sizes.                  to best utilize those resources. We present a formulation of
+                                                                        goodput that combines system throughput and statistical
+                                                                        efficiency for distributed DL training. Based on the principle of
+5.5      Artifact                                                       goodput maximization, Pollux automatically and jointly tunes
+We provide an artifact containing the full implementation of            the resource allocations, batch sizes, and learning rates for DL
+Pollux, benchmark model implementations (Table 1), testbed              jobs, which can be particularly difficult for users to configure
+experiment scripts (Sec. 5.2), cluster simulator implemen-              manually. Pollux outperforms and is more fair than recent DL
+tation and results (Sec. 5.3), available at https://github.             schedulers, even if users can configure their jobs well, and pro-
+com/petuum/adaptdl/tree/osdi21-artifact. The raw                        vides even bigger benefits with more realistic user knowledge.
+testbed experiment (Sec. 5.2) logs and analysis scripts are pro-
+vided at https://github.com/petuum/pollux-results.
+                                                                        8   Acknowledgements
+
+6     Additional Related Work                                           We thank our shepherd, Michael Isard, and the anonymous
+                                                                        OSDI reviewers for their insightful comments and suggestions
+Prior DL schedulers are discussed in §2.3.                              that improved our work. We also thank our colleagues from
+Adaptive batch size training. Recent work on DL training                Petuum — Omkar Pangarkar, Richard Fan, Peng Wu, Jayesh
+algorithms have explored dynamically adapting batch sizes               Gada, and Vishnu Vardhan — for their invaluable contributions
+for better efficiency and parallelization. AdaBatch [13]                toward the open source implementation of Pollux.
+
+
+
+14     15th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+References                                                       [7] J. Canny and Huasha Zhao. Butterfly mixing: Accelerat-
+                                                                     ing incremental-update algorithms on clusters. In SDM,
+ [1] Introduction to katib.    https://www.kubeflow.                 2013.
+     org/docs/components/hyperparameter-tuning/
+     overview/. Accessed: 2020-05-18.                            [8] Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang,
+                                                                     Minjie Wang, Tianjun Xiao, Bing Xu, Chiyuan Zhang,
+ [2] Production-grade container orchestration - kubernetes.          and Zheng Zhang. Mxnet: A flexible and efficient
+     https://kubernetes.io/. Accessed: 2020-05-18.                   machine learning library for heterogeneous distributed
+                                                                     systems. CoRR, abs/1512.01274, 2015.
+ [3] Dario Amodei, Sundaram Ananthanarayanan, Rishita
+     Anubhai, Jingliang Bai, Eric Battenberg, Carl Case,         [9] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos
+     Jared Casper, Bryan Catanzaro, Qiang Cheng, Guoliang            Guestrin. Training deep nets with sublinear memory
+     Chen, Jie Chen, Jingdong Chen, Zhijie Chen, Mike                cost. CoRR, abs/1604.06174, 2016.
+     Chrzanowski, Adam Coates, Greg Diamos, Ke Ding,
+     Niandong Du, Erich Elsen, Jesse Engel, Weiwei Fang,        [10] Henggang Cui, Hao Zhang, Gregory R. Ganger, Phillip B.
+     Linxi Fan, Christopher Fougner, Liang Gao, Caixia               Gibbons, and Eric P. Xing. Geeps: Scalable deep learning
+     Gong, Awni Hannun, Tony Han, Lappi Vaino Johannes,              on distributed gpus with a gpu-specialized parameter
+     Bing Jiang, Cai Ju, Billy Jun, Patrick LeGresley, Libby         server. In Proceedings of the Eleventh European Con-
+     Lin, Junjie Liu, Yang Liu, Weigao Li, Xiangang Li,              ference on Computer Systems, EuroSys ’16, New York,
+     Dongpeng Ma, Sharan Narang, Andrew Ng, Sherjil Ozair,           NY, USA, 2016. Association for Computing Machinery.
+     Yiping Peng, Ryan Prenger, Sheng Qian, Zongfeng Quan,      [11] Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen,
+     Jonathan Raiman, Vinay Rao, Sanjeev Satheesh, David             Matthieu Devin, Mark Mao, Marc'aurelio Ranzato,
+     Seetapun, Shubho Sengupta, Kavya Srinet, Anuroop                Andrew Senior, Paul Tucker, Ke Yang, Quoc V. Le, and
+     Sriram, Haiyuan Tang, Liliang Tang, Chong Wang,                 Andrew Y. Ng. Large scale distributed deep networks.
+     Jidong Wang, Kaifu Wang, Yi Wang, Zhijian Wang,                 In F. Pereira, C. J. C. Burges, L. Bottou, and K. Q.
+     Zhiqian Wang, Shuang Wu, Likai Wei, Bo Xiao, Wen                Weinberger, editors, Advances in Neural Information
+     Xie, Yan Xie, Dani Yogatama, Bin Yuan, Jun Zhan,                Processing Systems 25, pages 1223–1231. Curran
+     and Zhenyao Zhu. Deep speech 2: End-to-end speech               Associates, Inc., 2012.
+     recognition in english and mandarin. In Proceedings
+     of the 33rd International Conference on International      [12] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li,
+     Conference on Machine Learning - Volume 48, ICML’16,            and Li Fei-Fei. Imagenet: A large-scale hierarchical
+     page 173–182. JMLR.org, 2016.                                   image database. In 2009 IEEE conference on computer vi-
+                                                                     sion and pattern recognition, pages 248–255. Ieee, 2009.
+ [4] Lukas Balles, Javier Romero, and Philipp Hennig.
+     Coupling adaptive batch sizes with learning rates. CoRR,   [13] Aditya Devarakonda, Maxim Naumov, and Michael
+     abs/1612.05086, 2016.                                           Garland. Adabatch: Adaptive batch sizes for training
+                                                                     deep neural networks. CoRR, abs/1712.02029, 2017.
+ [5] James S Bergstra, Rémi Bardenet, Yoshua Bengio,
+     and Balázs Kégl. Algorithms for hyper-parameter            [14] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+     optimization. In Advances in neural information                 Kristina Toutanova. Bert: Pre-training of deep bidirec-
+     processing systems, pages 2546–2554, 2011.                      tional transformers for language understanding, 2019.
+
+ [6] Tom Brown, Benjamin Mann, Nick Ryder, Melanie              [15] John Duchi, Elad Hazan, and Yoram Singer. Adaptive
+     Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind              subgradient methods for online learning and stochastic
+     Neelakantan, Pranav Shyam, Girish Sastry, Amanda                optimization. Journal of Machine Learning Research,
+     Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen          12(61):2121–2159, 2011.
+     Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,         [16] M. Everingham, L. Van Gool, C. K. I. Williams, J. Winn,
+     Daniel Ziegler, Jeffrey Wu, Clemens Winter, Chris               and A. Zisserman. The pascal visual object classes (voc)
+     Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott            challenge. International Journal of Computer Vision,
+     Gray, Benjamin Chess, Jack Clark, Christopher Berner,           88(2):303–338, June 2010.
+     Sam McCandlish, Alec Radford, Ilya Sutskever, and
+     Dario Amodei. Language models are few-shot learners.       [17] Nuwan Ferdinand, Haider Al-Lawati, Stark Draper,
+     In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan,         and Matthew Nokleby. ANYTIME MINIBATCH:
+     and H. Lin, editors, Advances in Neural Information             EXPLOITING STRAGGLERS IN ONLINE DIS-
+     Processing Systems, volume 33, pages 1877–1901.                 TRIBUTED OPTIMIZATION.             In International
+     Curran Associates, Inc., 2020.                                  Conference on Learning Representations, 2019.
+
+
+
+USENIX Association                          15th USENIX Symposium on Operating Systems Design and Implementation          15
+[18] Matthias Feurer, Aaron Klein, Katharina Eggensperger,       [27] Chien-Chin Huang, Gu Jin, and Jinyang Li. Swapadvisor:
+     Jost Springenberg, Manuel Blum, and Frank Hutter.                Pushing deep learning beyond the gpu memory limit
+     Efficient and robust automated machine learning. In              via smart swapping. In Proceedings of the Twenty-Fifth
+     Advances in neural information processing systems,               International Conference on Architectural Support
+     pages 2962–2970, 2015.                                           for Programming Languages and Operating Systems,
+                                                                      ASPLOS ’20, page 1341–1355, New York, NY, USA,
+[19] Noah Golmant, Nikita Vemuri, Zhewei Yao, Vladimir
+                                                                      2020. Association for Computing Machinery.
+     Feinberg, Amir Gholami, Kai Rothauge, Michael W.
+     Mahoney, and Joseph Gonzalez. On the computational          [28] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan
+     inefficiency of large batch sizes for stochastic gradient        Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan
+     descent. CoRR, abs/1811.12941, 2018.                             Ngiam, Quoc V Le, Yonghui Wu, and zhifeng Chen.
+[20] Daniel Golovin, Benjamin Solnik, Subhodeep Moitra,               Gpipe: Efficient training of giant neural networks using
+     Greg Kochanski, John Karro, and D. Sculley. Google               pipeline parallelism. In H. Wallach, H. Larochelle,
+     vizier: A service for black-box optimization.   In               A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett,
+     Proceedings of the 23rd ACM SIGKDD International                 editors, Advances in Neural Information Processing
+     Conference on Knowledge Discovery and Data Mining,               Systems, volume 32. Curran Associates, Inc., 2019.
+     KDD ’17, page 1487–1495, New York, NY, USA, 2017.           [29] Frank Hutter, Holger H Hoos, and Kevin Leyton-Brown.
+     Association for Computing Machinery.                             Sequential model-based optimization for general
+[21] Priya Goyal, Piotr Dollár, Ross B. Girshick, Pieter              algorithm configuration. In International conference on
+     Noordhuis, Lukasz Wesolowski, Aapo Kyrola, Andrew                learning and intelligent optimization, pages 507–523.
+     Tulloch, Yangqing Jia, and Kaiming He. Accurate, large           Springer, 2011.
+     minibatch SGD: training imagenet in 1 hour. CoRR,
+                                                                 [30] Paras Jain, Ajay Jain, Aniruddha Nrusimha, Amir Gho-
+     abs/1706.02677, 2017.
+                                                                      lami, Pieter Abbeel, Joseph Gonzalez, Kurt Keutzer, and
+[22] Juncheng Gu, Mosharaf Chowdhury, Kang G. Shin, Yibo              Ion Stoica. Checkmate: Breaking the memory wall with
+     Zhu, Myeongjae Jeon, Junjie Qian, Hongqiang Liu, and             optimal tensor rematerialization. In I. Dhillon, D. Papail-
+     Chuanxiong Guo. Tiresias: A GPU cluster manager for              iopoulos, and V. Sze, editors, Proceedings of Machine
+     distributed deep learning. In 16th USENIX Symposium              Learning and Systems, volume 2, pages 497–511, 2020.
+     on Networked Systems Design and Implementation
+     (NSDI 19), pages 485–500, Boston, MA, February 2019.        [31] Myeongjae Jeon, Shivaram Venkataraman, Amar
+     USENIX Association.                                              Phanishayee, Junjie Qian, Wencong Xiao, and Fan Yang.
+                                                                      Analysis of large-scale multi-tenant GPU clusters for
+[23] F. Maxwell Harper and Joseph A. Konstan. The                     DNN training workloads. In 2019 USENIX Annual
+     movielens datasets: History and context. ACM Trans.              Technical Conference (USENIX ATC 19), pages 947–960,
+     Interact. Intell. Syst., 5(4), December 2015.                    Renton, WA, July 2019. USENIX Association.
+[24] K. He, X. Zhang, S. Ren, and J. Sun. Deep residual learn-   [32] Tyler B. Johnson, Pulkit Agrawal, Haijie Gu, and Carlos
+     ing for image recognition. In 2016 IEEE Conference               Guestrin. Adascale {sgd}: A scale-invariant algorithm
+     on Computer Vision and Pattern Recognition (CVPR),               for distributed training, 2020.
+     pages 770–778, 2016.
+                                                                 [33] N. Jouppi, C. Young, Nishant Patil, David A. Patterson,
+[25] Xiangnan He, Lizi Liao, Hanwang Zhang, Liqiang Nie,
+                                                                      Gaurav Agrawal, R. Bajwa, Sarah Bates, Suresh Bhatia,
+     Xia Hu, and Tat-Seng Chua. Neural collaborative filter-
+                                                                      N. Boden, Al Borchers, Rick Boyle, Pierre luc Cantin,
+     ing. In Proceedings of the 26th International Conference
+                                                                      Clifford Chao, Chris Clark, Jeremy Coriell, Mike
+     on World Wide Web, WWW ’17, page 173–182, Republic
+                                                                      Daley, M. Dau, J. Dean, Ben Gelb, T. Ghaemmaghami,
+     and Canton of Geneva, CHE, 2017. International World
+                                                                      R. Gottipati, William Gulland, R. Hagmann, C. Ho,
+     Wide Web Conferences Steering Committee.
+                                                                      Doug Hogberg, J. Hu, R. Hundt, D. Hurt, J. Ibarz,
+[26] Qirong Ho, James Cipar, Henggang Cui, Seunghak Lee,              A. Jaffey, Alek Jaworski, Alexander Kaplan, Harshit
+     Jin Kyu Kim, Phillip B. Gibbons, Garth A Gibson, Greg            Khaitan, Daniel Killebrew, Andy Koch, N. Kumar, Steve
+     Ganger, and Eric P Xing. More effective distributed ml           Lacy, J. Laudon, James Law, Diemthu Le, Chris Leary,
+     via a stale synchronous parallel parameter server. In            Z. Liu, Kyle A. Lucke, Alan Lundin, G. MacKean,
+     C. J. C. Burges, L. Bottou, M. Welling, Z. Ghahramani,           A. Maggiore, M. Mahony, K. Miller, R. Nagarajan,
+     and K. Q. Weinberger, editors, Advances in Neural                Ravi Narayanaswami, Ray Ni, K. Nix, Thomas Norrie,
+     Information Processing Systems 26, pages 1223–1231.              Mark Omernick, Narayana Penukonda, A. Phelps,
+     Curran Associates, Inc., 2013.                                   J. Ross, Matt Ross, Amir Salek, E. Samadiani, C. Severn,
+
+
+
+16   15th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+     G. Sizikov, Matthew Snelham, J. Souter, D. Steinberg,            Systems Design and Implementation (OSDI 20), pages
+     Andy Swing, Mercedes Tan, G. Thorson, Bo Tian,                   937–954. USENIX Association, November 2020.
+     H. Toma, Erick Tuttle, Vijay Vasudevan, Richard Walter,
+     W. Wang, Eric Wilcox, and D. Yoon. In-datacenter            [45] Dominic Masters and Carlo Luschi. Revisiting small
+     performance analysis of a tensor processing unit. 2017           batch training for deep neural networks, 2018.
+     ACM/IEEE 44th Annual International Symposium on             [46] Sam McCandlish, Jared Kaplan, Dario Amodei, and
+     Computer Architecture (ISCA), pages 1–12, 2017.                  OpenAI Dota Team. An empirical model of large-batch
+[34] Kirthevasan Kandasamy, Karun Raju Vysyaraju, Willie              training. CoRR, abs/1812.06162, 2018.
+     Neiswanger, Biswajit Paria, Christopher R Collins, Jeff
+                                                                 [47] Deepak Narayanan, Aaron Harlap, Amar Phanishayee,
+     Schneider, Barnabas Poczos, and Eric P Xing. Tuning
+                                                                      Vivek Seshadri, Nikhil R. Devanur, Gregory R. Ganger,
+     hyperparameters without grad students: Scalable and
+                                                                      Phillip B. Gibbons, and Matei Zaharia. Pipedream:
+     robust bayesian optimisation with dragonfly. arXiv
+                                                                      Generalized pipeline parallelism for dnn training. In
+     preprint arXiv:1903.06694, 2019.
+                                                                      Proceedings of the 27th ACM Symposium on Operating
+[35] Nitish Shirish Keskar, Dheevatsa Mudigere, Jorge                 Systems Principles, SOSP ’19, page 1–15, New York,
+     Nocedal, Mikhail Smelyanskiy, and Ping Tak Peter Tang.           NY, USA, 2019. Association for Computing Machinery.
+     On large-batch training for deep learning: Generalization
+                                                                 [48] Deepak Narayanan, Keshav Santhanam, Fiodar
+     gap and sharp minima. CoRR, abs/1609.04836, 2016.
+                                                                      Kazhamiaka, Amar Phanishayee, and Matei Zaharia.
+[36] Diederik P. Kingma and Jimmy Ba. Adam: A method                  Heterogeneity-aware cluster scheduling policies for deep
+     for stochastic optimization, 2017.                               learning workloads. In 14th USENIX Symposium on Op-
+                                                                      erating Systems Design and Implementation (OSDI 20),
+[37] Aaron Klein, Stefan Falkner, Simon Bartels, Philipp              pages 481–498. USENIX Association, November 2020.
+     Hennig, and Frank Hutter. Fast bayesian optimization
+     of machine learning hyperparameters on large datasets.      [49] Willie Neiswanger, Kirthevasan Kandasamy, Barnabas
+     In Artificial Intelligence and Statistics, pages 528–536.        Poczos, Jeff Schneider, and Eric Xing. Probo: a frame-
+     PMLR, 2017.                                                      work for using probabilistic programming in bayesian
+                                                                      optimization. arXiv preprint arXiv:1901.11515, 2019.
+[38] John Kominek and Alan Black. The cmu arctic speech
+     databases. SSW5-2004, 01 2004.                              [50] Andrew Or, Haoyu Zhang, and Michael Freedman.
+                                                                      Resource elasticity in distributed deep learning. In
+[39] Alex Krizhevsky. Learning multiple layers of features            Proceedings of Machine Learning and Systems 2020,
+     from tiny images. University of Toronto, 05 2012.                pages 400–411. 2020.
+[40] Alex Krizhevsky. One weird trick for parallelizing con-     [51] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer,
+     volutional neural networks. CoRR, abs/1404.5997, 2014.           James Bradbury, Gregory Chanan, Trevor Killeen, Zem-
+[41] Lisha Li, Kevin Jamieson, Giulia DeSalvo, Afshin                 ing Lin, Natalia Gimelshein, Luca Antiga, Alban Des-
+     Rostamizadeh, and Ameet Talwalkar. Hyperband:                    maison, Andreas Kopf, Edward Yang, Zachary DeVito,
+     A novel bandit-based approach to hyperparameter                  Martin Raison, Alykhan Tejani, Sasank Chilamkurthy,
+     optimization.    The Journal of Machine Learning                 Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chin-
+     Research, 18(1):6765–6816, 2017.                                 tala. Pytorch: An imperative style, high-performance
+                                                                      deep learning library. In H. Wallach, H. Larochelle,
+[42] Ilya Loshchilov and Frank Hutter. Decoupled weight               A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett,
+     decay regularization, 2019.                                      editors, Advances in Neural Information Processing Sys-
+                                                                      tems 32, pages 8026–8037. Curran Associates, Inc., 2019.
+[43] Kshiteej Mahajan, Arjun Balasubramanian, Arjun
+     Singhvi, Shivaram Venkataraman, Aditya Akella,              [52] Yanghua Peng, Yixin Bao, Yangrui Chen, Chuan Wu,
+     Amar Phanishayee, and Shuchi Chawla.         Themis:             and Chuanxiong Guo. Optimus: An efficient dynamic
+     Fair and efficient {GPU} cluster scheduling. In 17th             resource scheduler for deep learning clusters. In
+     {USENIX} Symposium on Networked Systems Design                   Proceedings of the Thirteenth EuroSys Conference,
+     and Implementation ({NSDI} 20), pages 289–304, 2020.             EuroSys ’18, New York, NY, USA, 2018. Association
+                                                                      for Computing Machinery.
+[44] Luo Mai, Guo Li, Marcel Wagenländer, Konstantinos
+     Fertakis, Andrei-Octavian Brabete, and Peter Pietzuch.      [53] Aurick Qiao, Abutalib Aghayev, Weiren Yu, Haoyang
+     Kungfu: Making training in distributed machine learning          Chen, Qirong Ho, Garth A. Gibson, and Eric P. Xing.
+     adaptive. In 14th USENIX Symposium on Operating                  Litz: Elastic framework for high-performance distributed
+
+
+
+USENIX Association                           15th USENIX Symposium on Operating Systems Design and Implementation          17
+     machine learning. In 2018 USENIX Annual Technical             [65] Jinliang Wei, Wei Dai, Aurick Qiao, Qirong Ho, Heng-
+     Conference (USENIX ATC 18), pages 631–644, Boston,                 gang Cui, Gregory R Ganger, Phillip B Gibbons, Garth A
+     MA, July 2018. USENIX Association.                                 Gibson, and Eric P Xing. Managed communication and
+                                                                        consistency for fast data-parallel iterative analytics. In
+[54] Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and              Proceedings of the Sixth ACM Symposium on Cloud
+     Percy Liang. Squad: 100,000+ questions for machine                 Computing, pages 381–394, 2015.
+     comprehension of text, 2016.
+                                                                   [66] Wencong Xiao, Romil Bhardwaj, Ramachandran
+[55] Joseph Redmon and Ali Farhadi. Yolov3: An incremental              Ramjee, Muthian Sivathanu, Nipun Kwatra, Zhenhua
+     improvement. CoRR, abs/1804.02767, 2018.                           Han, Pratyush Patel, Xuan Peng, Hanyu Zhao, Quanlu
+[56] Alexander Sergeev and Mike Del Balso. Horovod: fast                Zhang, Fan Yang, and Lidong Zhou. Gandiva: Intro-
+     and easy distributed deep learning in tensorflow. CoRR,            spective cluster scheduling for deep learning. In 13th
+     abs/1802.05799, 2018.                                              USENIX Symposium on Operating Systems Design and
+                                                                        Implementation (OSDI 18), pages 595–610, Carlsbad,
+[57] Christopher J. Shallue, Jaehoon Lee, Joseph M.                     CA, October 2018. USENIX Association.
+     Antognini, Jascha Sohl-Dickstein, Roy Frostig, and
+     George E. Dahl. Measuring the effects of data parallelism     [67] Wencong Xiao, Shiru Ren, Yong Li, Yang Zhang,
+     on neural network training. CoRR, abs/1811.03600,                  Pengyang Hou, Zhi Li, Yihui Feng, Wei Lin, and
+     2018.                                                              Yangqing Jia. Antman: Dynamic scaling on GPU clusters
+                                                                        for deep learning. In 14th USENIX Symposium on Op-
+[58] Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin                   erating Systems Design and Implementation (OSDI 20),
+     Tran, Ashish Vaswani, Penporn Koanantakool, Peter                  pages 533–548. USENIX Association, November 2020.
+     Hawkins, HyoukJoong Lee, Mingsheng Hong, Cliff
+     Young, Ryan Sepassi, and Blake Hechtman. Mesh-                [68] Masafumi Yamazaki, Akihiko Kasagi, Akihiro Tabuchi,
+     tensorflow: Deep learning for supercomputers. In                   Takumi Honda, Masahiro Miwa, Naoto Fukumoto,
+     S. Bengio, H. Wallach, H. Larochelle, K. Grauman,                  Tsuguchika Tabaru, Atsushi Ike, and Kohta Nakashima.
+     N. Cesa-Bianchi, and R. Garnett, editors, Advances in              Yet another accelerated sgd: Resnet-50 training on
+     Neural Information Processing Systems, volume 31.                  imagenet in 74.7 seconds, 2019.
+     Curran Associates, Inc., 2018.                                [69] Yang You, Jonathan Hseu, Chris Ying, James Demmel,
+[59] M. Shoeybi, M. Patwary, R. Puri, P. LeGresley,                     Kurt Keutzer, and Cho-Jui Hsieh. Large-batch training
+     J. Casper, and Bryan Catanzaro. Megatron-lm: Training              for LSTM and beyond. CoRR, abs/1901.08256, 2019.
+     multi-billion parameter language models using model           [70] Hao Zhang, Zeyu Zheng, Shizhen Xu, Wei Dai, Qirong
+     parallelism. ArXiv, abs/1909.08053, 2019.                          Ho, Xiaodan Liang, Zhiting Hu, Jinliang Wei, Pengtao
+[60] S. L. Smith and Quoc V. Le. A bayesian perspective on              Xie, and Eric P. Xing. Poseidon: An efficient communi-
+     generalization and stochastic gradient descent. ArXiv,             cation architecture for distributed deep learning on GPU
+     abs/1710.06451, 2018.                                              clusters. In 2017 USENIX Annual Technical Conference
+                                                                        (USENIX ATC 17), pages 181–193, Santa Clara, CA,
+[61] Samuel L. Smith, Pieter-Jan Kindermans, and Quoc V.                July 2017. USENIX Association.
+     Le. Don’t decay the learning rate, increase the batch size.
+     CoRR, abs/1711.00489, 2017.                                   [71] Haoyu Zhang, Logan Stafman, Andrew Or, and
+                                                                        Michael J. Freedman. Slaq: Quality-driven scheduling
+[62] Jasper Snoek, Hugo Larochelle, and Ryan P Adams.                   for distributed machine learning. In Proceedings of the
+     Practical bayesian optimization of machine learning                2017 Symposium on Cloud Computing, SoCC ’17, page
+     algorithms. Advances in neural information processing              390–404, New York, NY, USA, 2017. Association for
+     systems, 25:2951–2959, 2012.                                       Computing Machinery.
+
+[63] WenWu Wang and Ping Yu. Asymptotically optimal                [72] Huasha Zhao and J. Canny. Kylix: A sparse allreduce for
+     differenced estimators of error variance in nonparametric          commodity clusters. 2014 43rd International Conference
+     regression. Computational Statistics & Data Analysis,              on Parallel Processing, pages 273–282, 2014.
+     105:125 – 143, 2017.
+                                                                   [73] Ciyou Zhu, Richard H. Byrd, Peihuang Lu, and Jorge
+[64] Rachel Ward, Xiaoxia Wu, and Leon Bottou. Ada-                     Nocedal. Algorithm 778: L-bfgs-b: Fortran subroutines
+     grad stepsizes: Sharp convergence over nonconvex                   for large-scale bound-constrained optimization. ACM
+     landscapes. In International Conference on Machine                 Trans. Math. Softw., 23(4):550–560, December 1997.
+     Learning, pages 6677–6686. PMLR, 2019.
+
+
+
+18   15th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+
