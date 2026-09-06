@@ -92,7 +92,7 @@ def fetch(row):
                 info = subprocess.run(["pdfinfo", str(dest)], check=True, capture_output=True, text=True).stdout
                 pages = re.search(r"^Pages:\s+(\d+)", info, re.M)
                 item["pages"] = int(pages.group(1)) if pages else None
-                version = re.search(r"arXiv:\s*([0-9.]+v\d+)", body[:12000])
+                version = re.search(r"(?:arXiv|ChinaXiv):\s*([0-9.]+v\d+)", body[:12000])
                 item["version_in_text"] = version.group(1) if version else None
                 item["first_page_excerpt"] = body.split("\f")[0][:1800]
             else:
@@ -135,9 +135,11 @@ def index(items):
              "", "作者补充的 UB 正式规范、操作系统参考设计和昇腾 950 白皮书，见 [三份文档的核对笔记](UB-ASCEND-NOTES.md)。",
              "", "昇腾与 NVIDIA 的数据通路、动态 shape、编程责任和代际证据，见 [架构与执行比较](../case-studies/accelerator-architecture.md)。第 4 章分析硬件供给，第 5 章用实现与执行轨迹验证。",
              "", "PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时保存原始 HTML 与离线文本，外部图片、脚本和站内链接不保证离线可用。不得把网页入口记作规范全文。",
-             "", "`manifest.json` 记录实际获取时间、下载与来源地址、内容校验值、字节数、PDF 页数及能从正文识别出的 arXiv 版本。网页和可变分支按本地文件的 SHA-256 固定快照；下载完成不代表已经逐页审阅。",
+             "", "`manifest.json` 记录实际获取时间、下载与来源地址、内容校验值、字节数、PDF 页数及能从正文识别出的 arXiv／ChinaXiv 版本。网页和可变分支按本地文件的 SHA-256 固定快照；下载完成不代表已经逐页审阅。",
              "", "`local_snapshot` 表示从作者本地仓库的指定提交归档，记录仓库路径与提交号，不计作网络下载。`landing_only` 是索引入口，`incomplete_text` 表示未取得完整正文，`access_required` 表示来源要求额外的访问条件。",
              "", "`user_provided` 表示作者提供的原件，保留原文件名并记录校验值。清单中的 `local:` 地址只用于读取本资料库内的文件，不发起网络请求；其中的登记时间不是原始下载时间。",
+             "", "本书使用的 PDF 均须归档到仓库并登记 sources.tsv 与 manifest.json，生成可搜索文本和章节索引；案例使用仓库内相对链接，不能仅引用 Downloads 等个人目录。",
+             "", "片上数据移动与能耗的写作落点见 [LogicFolding 笔记](../case-studies/logicfolding-energy.md)；网络处理与 PCIe 并发预算见 [可编程网卡案例](../case-studies/programmable-nic.md)。两篇作者提供的 PDF 均已归档。",
              "", "写作时先查本地资料，引用具体页码、节号、版本及适用条件。规格、实现和测量分别取证；新证据改变参数时新增或明确更新快照，保留变更原因。", ""]
     for number, title in enumerate(CHAPTERS, 1):
         lines += [f"## 第 {number} 章 {title}", "", "| 资料 | 本地文件 | 用途 |", "| --- | --- | --- |"]

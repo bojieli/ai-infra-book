@@ -6,6 +6,7 @@
 - **蓝图源文件**：[`skeleton.html`](skeleton.html)（当前草案 16）
 - **审阅**：[`reviews/draft15-review.md`](reviews/draft15-review.md)、[`reviews/draft16-review.md`](reviews/draft16-review.md)
 - **OpenTallas 案例与习题**：[`case-studies/opentallas.md`](case-studies/opentallas.md)（四条原则、六个案例及手算解答，分布到现有章节）
+- **片上数据移动与能耗**：[`case-studies/logicfolding-energy.md`](case-studies/logicfolding-energy.md)（何庭波 LogicFolding 预印本；第 1、4、13 章写作落点、降压与功率密度手算题、引用边界）
 - **可编程网卡案例**：[`case-studies/programmable-nic.md`](case-studies/programmable-nic.md)（从网络虚拟化的 CPU 核数预算，到 KV-Direct 的 PCIe 并发预算；先解释工作与单位，再建立量级概念）
 - **训练计算量复算**：[`case-studies/training-compute.md`](case-studies/training-compute.md)（近期模型报告、算子计数与未知量）
 - **本地参考资料库**：[`references/README.md`](references/README.md)（按章节整理的论文、芯片规格、协议与官方文档）

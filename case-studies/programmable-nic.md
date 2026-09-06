@@ -95,6 +95,6 @@ SocksDirect 作为协议栈、同步和数据拷贝的延伸阅读，暂不增�
 ## 来源与引用范围
 
 - 李博杰，[芯片架构换血！如何评价微软在数据中心使用 FPGA？](https://01.me/2017/01/microsoft-fpga/)，2017-01-10。用于部署背景、数据路径与编程模型的叙述。
-- 李博杰，[基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf)，中国科学技术大学博士论文，2019-05-26。第 2.3.4 节讨论 FPGA 的特点与限制；第 4.2.1 节、正文第 56 页提供软件转发基线；第 5.2.4 节、正文第 102–104 页提供 PCIe 并发预算与测量。作者提供的本地原件为 `/Users/boj/ring0.me/public/files/pubs/bojieli-phd-thesis.pdf`。
+- 李博杰，[基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf)，中国科学技术大学博士论文，2019-05-26。第 2.3.4 节讨论 FPGA 的特点与限制；第 4.2.1 节、正文第 56 页提供软件转发基线；第 5.2.4 节、正文第 102–104 页提供 PCIe 并发预算与测量。作者提供的原件已归档：[PDF](../references/files/papers/bojieli-phd-thesis.pdf) · [可搜索文本](../references/text/bojieli-phd-thesis.txt)；校验值与页数见 [资料清单](../references/manifest.json)中的 `bojieli-phd-thesis`。
 
 微软 Catapult／Azure 的部署历史与作者及合作者的研究贡献分别叙述。GPU 延迟和 FPGA 优势按具体年代、负载与实现限定；论文第 35 页脚注已指出 GPU 流式编程模型可以降低相应延迟。KV-Direct 的十亿级单机吞吐来自多网卡配置，不能写成单卡成绩。正式写作涉及这些性能比较时，应连同实验配置引用原始论文。

@@ -2,7 +2,7 @@
 
 对应当前三部分、十三章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。
 
-当前清单 228 项：已保存正文 224 项，其中 PDF 134 份。其余项目的获取状态见文末。
+当前清单 230 项：已保存正文 226 项，其中 PDF 136 份。其余项目的获取状态见文末。
 
 [浏览本地索引](index.html) · [来源清单](sources.tsv) · [下载与校验记录](manifest.json) · [证据缺口](GAPS.md)
 
@@ -16,11 +16,15 @@
 
 PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时保存原始 HTML 与离线文本，外部图片、脚本和站内链接不保证离线可用。不得把网页入口记作规范全文。
 
-`manifest.json` 记录实际获取时间、下载与来源地址、内容校验值、字节数、PDF 页数及能从正文识别出的 arXiv 版本。网页和可变分支按本地文件的 SHA-256 固定快照；下载完成不代表已经逐页审阅。
+`manifest.json` 记录实际获取时间、下载与来源地址、内容校验值、字节数、PDF 页数及能从正文识别出的 arXiv／ChinaXiv 版本。网页和可变分支按本地文件的 SHA-256 固定快照；下载完成不代表已经逐页审阅。
 
 `local_snapshot` 表示从作者本地仓库的指定提交归档，记录仓库路径与提交号，不计作网络下载。`landing_only` 是索引入口，`incomplete_text` 表示未取得完整正文，`access_required` 表示来源要求额外的访问条件。
 
 `user_provided` 表示作者提供的原件，保留原文件名并记录校验值。清单中的 `local:` 地址只用于读取本资料库内的文件，不发起网络请求；其中的登记时间不是原始下载时间。
+
+本书使用的 PDF 均须归档到仓库并登记 sources.tsv 与 manifest.json，生成可搜索文本和章节索引；案例使用仓库内相对链接，不能仅引用 Downloads 等个人目录。
+
+片上数据移动与能耗的写作落点见 [LogicFolding 笔记](../case-studies/logicfolding-energy.md)；网络处理与 PCIe 并发预算见 [可编程网卡案例](../case-studies/programmable-nic.md)。两篇作者提供的 PDF 均已归档。
 
 写作时先查本地资料，引用具体页码、节号、版本及适用条件。规格、实现和测量分别取证；新证据改变参数时新增或明确更新快照，保留变更原因。
 
@@ -32,6 +36,8 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [The Hardware Lottery](https://arxiv.org/abs/2009.06489) | [原件](files/papers/hardware-lottery.pdf) · [文本](text/hardware-lottery.txt) | 硬件、软件与研究选择 |
 | [In-Datacenter Performance Analysis of a Tensor Processing Unit](https://arxiv.org/abs/1704.04760) | [原件](files/papers/tpu-v1.pdf) · [文本](text/tpu-v1.txt) | TPU 起源与设计比较 |
 | [计算机网络的新黄金时代（一）](https://01.me/2023/05/new-golden-age-for-network-1/) | [原件](files/documents/network-golden-1.html) · [文本](text/network-golden-1.txt) | 作者素材；数据中心 |
+| [基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf) | [原件](files/papers/bojieli-phd-thesis.pdf) · [文本](text/bojieli-phd-thesis.txt)（user_provided） | 李博杰博士论文，2019-05-26；ClickNP 核数预算、KV-Direct PCIe 并发与数据通路；论文测量按原配置引用 |
+| [Huawei’s τ Chip Was Supposed to Melt?](files/papers/202609.00031v1.pdf) | [原件](files/papers/202609.00031v1.pdf) · [文本](text/logicfolding-energy.txt)（user_provided） | 何庭波，ChinaXiv:202609.00031v1，2026-09-04；片上连线、降压与功率密度；作者报告，AI 集群 80% 能耗说法待独立取证 |
 
 ## 第 2 章 模型架构
 
@@ -186,6 +192,8 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Bullet: Boosting GPU Utilization for LLM Serving via Dynamic Spatial-Temporal Orchestration](https://xianweiz.github.io/doc/papers/26asplos_bullet.pdf) | [原件](files/papers/bullet.pdf) · [文本](text/bullet.txt) | ASPLOS 2026 作者原件；A100/H20 内存与 SM 微基准；作为同卡 P/D 协作对照，不是 A100＋H20 PD 部署实测 |
 | [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
 | [Efficiently Scaling Transformer Inference](https://arxiv.org/abs/2211.05102v1) | [原件](files/papers/scaling-inference.pdf) · [文本](text/scaling-inference.txt) | Google；推理计算／通信模型、TPU 分片与延迟—吞吐取舍；历史配置不直接套用 GPU |
+| [基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf) | [原件](files/papers/bojieli-phd-thesis.pdf) · [文本](text/bojieli-phd-thesis.txt)（user_provided） | 李博杰博士论文，2019-05-26；ClickNP 核数预算、KV-Direct PCIe 并发与数据通路；论文测量按原配置引用 |
+| [Huawei’s τ Chip Was Supposed to Melt?](files/papers/202609.00031v1.pdf) | [原件](files/papers/202609.00031v1.pdf) · [文本](text/logicfolding-energy.txt)（user_provided） | 何庭波，ChinaXiv:202609.00031v1，2026-09-04；片上连线、降压与功率密度；作者报告，AI 集群 80% 能耗说法待独立取证 |
 
 ## 第 5 章 算子与运行时
 
@@ -240,6 +248,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache](https://arxiv.org/abs/2402.02750v2) | [原件](files/papers/kivi.pdf) · [文本](text/kivi.txt) | KV 的 K/V 非对称量化；计入 scale、zero point、残余缓存与反量化成本 |
 | [LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale](https://arxiv.org/abs/2208.07339v2) | [原件](files/papers/llm-int8.pdf) · [文本](text/llm-int8.txt) | 大模型激活异常值与混合精度分解；低比特存储不等于端到端加速 |
 | [TensorRT LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html) | [原件](files/documents/tensorrt-llm-architecture.html) · [文本](text/tensorrt-llm-architecture.txt) | 官方架构文档快照；作为开源项目实现资料，不标为学术论文 |
+| [基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf) | [原件](files/papers/bojieli-phd-thesis.pdf) · [文本](text/bojieli-phd-thesis.txt)（user_provided） | 李博杰博士论文，2019-05-26；ClickNP 核数预算、KV-Direct PCIe 并发与数据通路；论文测量按原配置引用 |
 
 ## 第 6 章 超节点
 
@@ -348,6 +357,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Intel Gaudi 3 AI Accelerator White Paper](https://www.intel.com/content/www/us/en/content-details/817486/intel-gaudi-3-ai-accelerator-white-paper.html) | [原件](files/specs/intel-gaudi3.pdf) · [文本](text/intel-gaudi3.txt) | July 2025 V1 Rev.3；矩阵、可编程核、HBM 与以太互联 |
 | [Hot Chips 2026: SN50 RDU Dataflow at Scale](https://sambanova.ai/blog/hot-chips-2026-dataflow-at-scale) | [原件](files/documents/sambanova-sn50.html) · [文本](text/sambanova-sn50.txt) | 2026-09-02 厂商技术说明；模型推演与测量结果分别标注 |
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
+| [基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf) | [原件](files/papers/bojieli-phd-thesis.pdf) · [文本](text/bojieli-phd-thesis.txt)（user_provided） | 李博杰博士论文，2019-05-26；ClickNP 核数预算、KV-Direct PCIe 并发与数据通路；论文测量按原配置引用 |
 
 ## 第 8 章 端边云协同
 
@@ -598,6 +608,8 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters](https://arxiv.org/abs/2408.03314v1) | [原件](files/papers/test-time-compute.pdf) · [文本](text/test-time-compute.txt) | DeepMind／Berkeley；按难度分配推理预算；计算量、质量与墙钟时间分开 |
 | [Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures](https://arxiv.org/abs/2505.09343v2) | [原件](files/papers/deepseek-infra.pdf) · [文本](text/deepseek-infra.txt) | DeepSeek ISCA 2025 报告；MLA／MoE、跨节点通信及硬件协同设计建议 |
 | [Day 6: DeepSeek-V3/R1 Inference System Overview](https://github.com/deepseek-ai/open-infra-index/blob/56d86855fcf6e08fdfd45ce6280bd24322c93351/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md) | [原件](files/documents/deepseek-serving-report.md) · [文本](text/deepseek-serving-report.txt) | 2025 公司工程报告；固定提交；PD、EP、通信与费用口径 |
+| [基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf) | [原件](files/papers/bojieli-phd-thesis.pdf) · [文本](text/bojieli-phd-thesis.txt)（user_provided） | 李博杰博士论文，2019-05-26；ClickNP 核数预算、KV-Direct PCIe 并发与数据通路；论文测量按原配置引用 |
+| [Huawei’s τ Chip Was Supposed to Melt?](files/papers/202609.00031v1.pdf) | [原件](files/papers/202609.00031v1.pdf) · [文本](text/logicfolding-energy.txt)（user_provided） | 何庭波，ChinaXiv:202609.00031v1，2026-09-04；片上连线、降压与功率密度；作者报告，AI 集群 80% 能耗说法待独立取证 |
 
 ## 获取记录
 
