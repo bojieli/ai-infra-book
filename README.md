@@ -11,6 +11,8 @@
 - **芯片与系统资料覆盖**：[`references/HARDWARE-COVERAGE.md`](references/HARDWARE-COVERAGE.md)（各家架构的本地原件、可支持的论述及剩余缺口）
 - **UB 与昇腾 950 核对笔记**：[`references/UB-ASCEND-NOTES.md`](references/UB-ASCEND-NOTES.md)（作者提供的三份正式资料、页码与章节对应）
 - **加速器架构与执行比较**：[`case-studies/accelerator-architecture.md`](case-studies/accelerator-architecture.md)（昇腾与 NVIDIA 的演进、数据通路、动态 shape 和编程成本；贯穿第 4、5 章）
+- **MacBook／RTX 配对案例**：[`case-studies/macbook-rtx-pro6000.md`](case-studies/macbook-rtx-pro6000.md)（M2 Max 38 核 GPU／96 GB 与 RTX PRO 6000 Blackwell Workstation Edition 600 W；架构、Ollama 后端和实验条件）
+- **异构 PD／AF 案例**：[`case-studies/pd-af-heterogeneous.md`](case-studies/pd-af-heterogeneous.md)（A100 prefill＋H20 decode；KTransformers 4090＋双路 Xeon Gold 6454S，分析 AMX／AVX-512、逐层交接与 NUMA）
 
 ---
 
@@ -60,11 +62,17 @@
 
 第 10 章讨论同一推理服务内部的请求路由、PD 池化与 KV 局部性；第 12 章讨论多个训练作业、模型服务和租户之间的资源分配、跨模型路由与计量计费，并承接沙箱、容器、虚拟机和环境镜像。第 13 章属于系统部分，综合检验模型与系统的联合选择。
 
+加速器架构以 **Apple、NVIDIA、昇腾** 为三条主要比较线。Apple 采用 M2 Max，NVIDIA 采用 RTX PRO 6000 Blackwell 并联系数据中心 GPU；昇腾保留从 910A、910B／910C 到 950 的演进分析。三者用相同算子、形状、数据通路和性能模型比较，其他架构作为专题或历史参照。当前没有昇腾实机，其结构与实现依据公开材料，论文测量按原条件引用；本书实测主要在 Apple／NVIDIA 平台完成，证据类型分别标注。
+
+本地实验以当前 M2 Max MacBook Pro 和 RTX PRO 6000 Blackwell Workstation Edition 为主，M2 Pro 保留为规格参照。第 4 章比较统一内存与独立显存、执行单元和带宽，第 5 章追踪 Ollama 的实际 runner／Metal 或 CUDA 路径，第 9 章按模型、量化、输入长度和并发测量，结果再用于第 8 章的执行位置选择。
+
+第 10.2、10.3 节分别展开 PD 与 AF，全书章内细目共 91 节。PD 以 A100 做 prefill、H20 做 decode 核算资源匹配与 KV 交接；AF 采用公开文档中的 KTransformers 4090＋双路 Xeon Gold 6454S，以 AMX／AVX-512 专家内核解释逐层激活、NUMA 与同步，再分析跨机扩展。公开示例、论文实验和本书实测按各自配置引用。
+
 ## 定位
 
 本书连接负载需求、算子执行、存储与通信代价、服务目标和架构选择，并用可检查的案例说明估算如何得到验证或修正。
 
-现有作品各自站在栈的某一层上：**How to Scale Your Model**（DeepMind）方法同构，TPU 为主，算子达成效率与集合通信的实测分布不是它的重点；**Ultra-Scale Playbook**（HuggingFace）只有训练、只有 GPU；**MLSysBook**（Harvard / MIT Press）广度极大，前沿 LLM 基础设施的推导深度与一手案例不是它的重点；**Efficient Processing of DNNs**（Sze / Emer）止于芯片层且成书于 LLM 之前。本书写的是相邻六层之间的传导，从「制程与功耗作为输入约束」到「Agent 负载」，并用同一套代价模型横向比较 GPU、昇腾、TPU 等多种架构。
+现有作品各自站在栈的某一层上：**How to Scale Your Model**（DeepMind）方法同构，TPU 为主，算子达成效率与集合通信的实测分布不是它的重点；**Ultra-Scale Playbook**（HuggingFace）只有训练、只有 GPU；**MLSysBook**（Harvard / MIT Press）广度极大，前沿 LLM 基础设施的推导深度与一手案例不是它的重点；**Efficient Processing of DNNs**（Sze / Emer）止于芯片层且成书于 LLM 之前。本书以第一章的六层全景组织跨层分析，将应用负载与模型、执行、硬件和互联联系起来，并把制程、功耗与费用作为共同约束，并用同一套代价模型横向比较 GPU、昇腾、TPU 等多种架构。
 
 主要材料包括作者的《Unified Bus 背后的思考》、UB 协议规范和 OpenURMA（第 6、7 章），AKG 的 PLDI 2021 论文与 TVM、isl、Triton（第 5 章），[Queqiao 的语音与广域案例](case-studies/queqiao.md)（第 3、8 章），以及 OpenTallas、Pine 和 Agent 书的相关记录。综述用于解释设计取舍，规范用于定义行为，开源实现用于验证具体机制；分析、模拟、综合和硬件实测分别标注。
 

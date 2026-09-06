@@ -2,7 +2,7 @@
 
 对应当前三部分、十三章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。
 
-当前清单 184 项：已保存正文 180 项，其中 PDF 106 份。其余项目的获取状态见文末。
+当前清单 203 项：已保存正文 199 项，其中 PDF 112 份。其余项目的获取状态见文末。
 
 [浏览本地索引](index.html) · [来源清单](sources.tsv) · [下载与校验记录](manifest.json) · [证据缺口](GAPS.md)
 
@@ -94,7 +94,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [NVIDIA H100 Product Specifications](https://www.nvidia.com/en-us/data-center/h100/) | [原件](files/specs/nvidia-h100-spec.html) · [文本](text/nvidia-h100-spec.txt) | 产品形态与规格表快照 |
 | [NVIDIA Blackwell Tuning Guide](https://docs.nvidia.com/cuda/blackwell-tuning-guide/) | [原件](files/specs/nvidia-blackwell-guide.html) · [文本](text/nvidia-blackwell-guide.txt) | 官方微架构与编程依据 |
 | [NVIDIA DGX B200 Specifications](https://www.nvidia.com/en-us/data-center/dgx-b200/) | [原件](files/specs/nvidia-dgx-b200.html) · [文本](text/nvidia-dgx-b200.txt) | 系统规格不能替代单芯片规格 |
-| [NVIDIA GeForce RTX 4090 Specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/) | [原件](files/specs/nvidia-rtx4090.html) · [文本](text/nvidia-rtx4090.txt) | 历史硬件比较 |
+| [NVIDIA GeForce RTX 4090 Specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/) | [原件](files/specs/nvidia-rtx4090.html) · [文本](text/nvidia-rtx4090.txt) | 历史硬件比较；KTransformers RTX 4090＋Xeon AF 案例 |
 | [Communications of HUAWEI RESEARCH：昇腾架构论文所在期](https://www-file.huawei.com/admin/asset/v1/pro/view/6ca306adab0a4852bacffce25f5573ec.pdf) | [原件](files/specs/ascend-davinci.pdf) · [文本](text/ascend-davinci.txt) | 官方整期刊物；含 A Scalable and Unified AI Architecture；部分提取文字编码不完整，应查 PDF 原件 |
 | [CANN 8.1.RC1.alpha002 Ascend C 算子开发指南](https://www.hiascend.com/) | [原件](files/specs/ascend-c-guide.pdf) · [文本](text/ascend-c-guide.txt) | 公开编程与硬件架构文档 |
 | [CANN 9.0.0 Ascend C 硬件架构](https://www.hiascend.com/) | [原件](files/specs/ascend-c-architecture.html) · [文本](text/ascend-c-architecture.txt)（incomplete_text） | 若为动态页面，仅在获取到正文时记为全文 |
@@ -165,6 +165,16 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html) | [原件](files/documents/nvidia-hopper-tuning.html) · [文本](text/nvidia-hopper-tuning.txt) | SM、Tensor Core、TMA 与 shared memory；固定网页快照 |
 | [CUDA Programming Guide 13.2.1: Asynchronous Data Copies](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/04-special-topics/async-copies.html) | [原件](files/documents/nvidia-async-copies.html) · [文本](text/nvidia-async-copies.txt) | 显式异步搬运、tensor map、stride、对齐与同步；与 NDDMA 比较 |
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
+| [Apple M2 Pro and M2 Max launch specifications](https://www.apple.com/newsroom/2023/01/apple-unveils-m2-pro-and-m2-max-next-generation-chips-for-next-level-workflows/) | [原件](files/specs/apple-m2-pro-max.html) · [文本](text/apple-m2-pro-max.txt) | 2023-01-17；M2 Pro 200 GB/s，M2 Max 400 GB/s；本书实机为 M2 Max 38 核 GPU、96 GB |
+| [Choosing a resource storage mode for Apple GPUs — DocC JSON](https://developer.apple.com/tutorials/data/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus.json) | [原件](files/documents/apple-metal-memory.json) · [文本](text/apple-metal-memory.txt) | 官方文档数据原件；shared／private、访问和同步；非芯片完整微架构 |
+| [Explore the architecture of Apple GPUs — WWDC20](https://developer.apple.com/videos/play/wwdc2020/10602/) | [原件](files/documents/apple-gpu-architecture.html) · [文本](text/apple-gpu-architecture.txt) | Apple GPU 执行与存储模型；2020 年架构说明不证明 M2 未公开单元参数 |
+| [RTX PRO 6000 Blackwell Workstation Edition Datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/data-center/rtx-pro-6000-blackwell-workstation-edition/workstation-blackwell-rtx-pro-6000-workstation-edition-nvidia-us-3519208-web.pdf) | [原件](files/specs/nvidia-rtx-pro6000-spec.pdf) · [文本](text/nvidia-rtx-pro6000-spec.txt) | 用户确认 Workstation Edition；96 GB GDDR7、1792 GB/s、600 W；不能套用 Max-Q／Server 参数 |
+| [NVIDIA RTX Blackwell PRO GPU Architecture v1.0](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/NVIDIA-RTX-Blackwell-PRO-GPU-Architecture-v1.0.pdf) | [原件](files/specs/nvidia-rtx-blackwell-pro.pdf) · [文本](text/nvidia-rtx-blackwell-pro.txt) | RTX Blackwell 的 SM、Tensor Core 与 GDDR7；与 B200 数据中心 Blackwell 分开分析 |
+| [KTransformers 0.3 AMX design notes](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/doc/en/AMX.md) | [原件](files/documents/kt-amx.md) · [文本](text/kt-amx.txt) | 2025 年 v0.3 历史设计；Intel AMX、AVX-512、权重重排与调度；性能按原配置引用 |
+| [NVIDIA A100 80GB datasheet — December 2020](https://www.nvidia.cn/content/dam/en-zz/zh_cn/Solutions/Data-Center/a100/pdf/a100-80gb-datasheet-update-a4-nvidia-1485612-r13-web_zhCN.pdf) | [原件](files/specs/nvidia-a100-80-spec.pdf) · [文本](text/nvidia-a100-80-spec.txt) | A100 80 GB；SXM 与 PCIe、稠密与稀疏峰值分别引用 |
+| [NVIDIA AI Enterprise 6.2 supported H20 SXM5 configurations](https://docs.nvidia.com/ai-enterprise/release-6/6.2/appendix/vgpu.html) | [原件](files/specs/nvidia-h20-vgpu.html) · [文本](text/nvidia-h20-vgpu.txt) | 官方确认 H20 SXM5 96GB 型号；不是完整 H20 带宽／算力数据表 |
+| [Bullet: Boosting GPU Utilization for LLM Serving via Dynamic Spatial-Temporal Orchestration](https://xianweiz.github.io/doc/papers/26asplos_bullet.pdf) | [原件](files/papers/bullet.pdf) · [文本](text/bullet.txt) | ASPLOS 2026 作者原件；A100/H20 内存与 SM 微基准；作为同卡 P/D 协作对照，不是 A100＋H20 PD 部署实测 |
+| [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
 
 ## 第 5 章 算子与运行时
 
@@ -197,6 +207,19 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Triton Programming Guide: Introduction](https://triton-lang.org/main/programming-guide/chapter-1/introduction.html) | [原件](files/documents/triton-introduction.html) · [文本](text/triton-introduction.txt) | 块级编程与编译器管理布局、共享存储和异步搬运；软件与硬件分层 |
 | [Triton Tutorial: Matrix Multiplication](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html) | [原件](files/documents/triton-matmul.html) · [文本](text/triton-matmul.txt) | 运行时尺寸、stride、边界 mask、分块与调优；动态 shape 案例 |
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
+| [Choosing a resource storage mode for Apple GPUs — DocC JSON](https://developer.apple.com/tutorials/data/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus.json) | [原件](files/documents/apple-metal-memory.json) · [文本](text/apple-metal-memory.txt) | 官方文档数据原件；shared／private、访问和同步；非芯片完整微架构 |
+| [Explore the architecture of Apple GPUs — WWDC20](https://developer.apple.com/videos/play/wwdc2020/10602/) | [原件](files/documents/apple-gpu-architecture.html) · [文本](text/apple-gpu-architecture.txt) | Apple GPU 执行与存储模型；2020 年架构说明不证明 M2 未公开单元参数 |
+| [NVIDIA RTX Blackwell PRO GPU Architecture v1.0](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/NVIDIA-RTX-Blackwell-PRO-GPU-Architecture-v1.0.pdf) | [原件](files/specs/nvidia-rtx-blackwell-pro.pdf) · [文本](text/nvidia-rtx-blackwell-pro.txt) | RTX Blackwell 的 SM、Tensor Core 与 GDDR7；与 B200 数据中心 Blackwell 分开分析 |
+| [Ollama Hardware support](https://docs.ollama.com/gpu) | [原件](files/documents/ollama-hardware.html) · [文本](text/ollama-hardware.txt) | Apple GPU 经 Metal；RTX PRO 6000 Blackwell compute capability 12.0；网页按获取日固定 |
+| [Ollama Generate API](https://docs.ollama.com/api/generate.md) | [原件](files/documents/ollama-api-generate.md) · [文本](text/ollama-api-generate.txt) | API 耗时为纳秒；prefill／decode 统计不能直接替代客户端流式 TTFT／ITL |
+| [Ollama v0.20.7 Apple device and working-set discovery](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/discover/gpu_info_darwin.m) | [原件](files/documents/ollama-metal-device.txt) · [文本](text/ollama-metal-device.txt) | 固定提交 8d0dcf4b6daf8d7833c8b55108e5b45063795e57；仅为设备识别，内核来源另计 |
+| [KT-Kernel inference README — fixed revision](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/README.md) | [原件](files/documents/kt-kernel-guide.md) · [文本](text/kt-kernel-guide.txt) | 固定提交 31985f40bcc40da08107efdb1f81bf88cb38c6b2；AF 主案例采用 RTX 4090＋双路 Xeon Gold 6454S 示例 |
+| [KTransformers 0.3 AMX design notes](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/doc/en/AMX.md) | [原件](files/documents/kt-amx.md) · [文本](text/kt-amx.txt) | 2025 年 v0.3 历史设计；Intel AMX、AVX-512、权重重排与调度；性能按原配置引用 |
+| [KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models](https://madsys.cs.tsinghua.edu.cn/publication/ktransformers-unleashing-the-full-potential-of-cpu/gpu-hybrid-inference-for-moe-models/SOSP25-chen.pdf) | [原件](files/papers/ktransformers-paper.pdf) · [文本](text/ktransformers-paper.txt) | SOSP 2025 作者原件；双 Xeon Platinum 8452Y＋A100 40GB／RTX 4080 16GB；与主案例配置分别引用 |
+| [Ollama v0.20.7 bundled ggml Metal device and buffers](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal-device.m) | [原件](files/documents/ollama-ggml-metal-memory.txt) · [文本](text/ollama-ggml-metal-memory.txt) | 固定提交；hasUnifiedMemory、shared／bytesNoCopy、工作集；保留 upstream 署名 |
+| [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
+| [KT-Kernel CMake ARM KML build path](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/CMakeLists.txt) | [原件](files/documents/kt-kml-build.txt) · [文本](text/kt-kml-build.txt) | 固定提交；KML 构建分支的背景归档，不作为当前 Xeon AF 案例的实现依据 |
+| [KT-Kernel KML MoE correctness example](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/examples/test_moe_kml.py) | [原件](files/documents/kt-kml-example.txt) · [文本](text/kt-kml-example.txt) | 固定提交；KML MoE 样例的背景归档，不作为当前 Xeon AF 案例的实现依据 |
 
 ## 第 6 章 超节点
 
@@ -323,6 +346,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [计算机网络的新黄金时代（三）](https://01.me/2023/06/new-golden-age-for-network-3/) | [原件](files/documents/network-golden-3.html) · [文本](text/network-golden-3.txt) | 作者素材；无线与端侧 |
 | [Snapdragon X Elite Product Brief](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/images/company/news-media/media-center/press-kits/snapdragon-summit-2023/documents/SnapdragonXEliteProductBrief.pdf) | [原件](files/specs/qualcomm-xelite.pdf) · [文本](text/qualcomm-xelite.txt) | 端侧 CPU、GPU、Hexagon 与共享内存；2023 年产品代际 |
 | [MacBook Pro (14-inch, M5) Technical Specifications](https://support.apple.com/en-mide/125405) | [原件](files/specs/apple-m5-macbook.html) · [文本](text/apple-m5-macbook.txt) | 2025 年具体端侧产品；CPU、GPU、Neural Engine 与统一内存，非完整微架构手册 |
+| [Apple M2 Pro and M2 Max launch specifications](https://www.apple.com/newsroom/2023/01/apple-unveils-m2-pro-and-m2-max-next-generation-chips-for-next-level-workflows/) | [原件](files/specs/apple-m2-pro-max.html) · [文本](text/apple-m2-pro-max.txt) | 2023-01-17；M2 Pro 200 GB/s，M2 Max 400 GB/s；本书实机为 M2 Max 38 核 GPU、96 GB |
 
 ## 第 9 章 单实例推理
 
@@ -351,6 +375,16 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Serving Large Language Models on Huawei CloudMatrix384, v3](https://arxiv.org/abs/2506.12708v3) | [原件](files/papers/cloudmatrix384-v3.pdf) · [文本](text/cloudmatrix384-v3.txt) | 2025-06-19 修订；核对型号称谓与 v2 差异 |
 | [CUDA Graph Best Practice for PyTorch: CUDA Graph](https://docs.nvidia.com/dl-cuda-graph/cuda-graph-basics/cuda-graph.html) | [原件](files/documents/cuda-graphs.html) · [文本](text/cuda-graphs.txt) | 定义、实例化与执行；区分主机提交和设备启动成本 |
 | [vLLM CUDA Graphs Design](https://docs.vllm.ai/en/latest/design/cuda_graphs/) | [原件](files/documents/vllm-cuda-graphs.html) · [文本](text/vllm-cuda-graphs.txt) | 整图与分段图、批次调度、捕获时间与内存成本；固定网页快照 |
+| [Apple M2 Pro and M2 Max launch specifications](https://www.apple.com/newsroom/2023/01/apple-unveils-m2-pro-and-m2-max-next-generation-chips-for-next-level-workflows/) | [原件](files/specs/apple-m2-pro-max.html) · [文本](text/apple-m2-pro-max.txt) | 2023-01-17；M2 Pro 200 GB/s，M2 Max 400 GB/s；本书实机为 M2 Max 38 核 GPU、96 GB |
+| [RTX PRO 6000 Blackwell Workstation Edition Datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/data-center/rtx-pro-6000-blackwell-workstation-edition/workstation-blackwell-rtx-pro-6000-workstation-edition-nvidia-us-3519208-web.pdf) | [原件](files/specs/nvidia-rtx-pro6000-spec.pdf) · [文本](text/nvidia-rtx-pro6000-spec.txt) | 用户确认 Workstation Edition；96 GB GDDR7、1792 GB/s、600 W；不能套用 Max-Q／Server 参数 |
+| [Ollama Hardware support](https://docs.ollama.com/gpu) | [原件](files/documents/ollama-hardware.html) · [文本](text/ollama-hardware.txt) | Apple GPU 经 Metal；RTX PRO 6000 Blackwell compute capability 12.0；网页按获取日固定 |
+| [Ollama Generate API](https://docs.ollama.com/api/generate.md) | [原件](files/documents/ollama-api-generate.md) · [文本](text/ollama-api-generate.txt) | API 耗时为纳秒；prefill／decode 统计不能直接替代客户端流式 TTFT／ITL |
+| [Ollama v0.20.7 Apple device and working-set discovery](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/discover/gpu_info_darwin.m) | [原件](files/documents/ollama-metal-device.txt) · [文本](text/ollama-metal-device.txt) | 固定提交 8d0dcf4b6daf8d7833c8b55108e5b45063795e57；仅为设备识别，内核来源另计 |
+| [KT-Kernel inference README — fixed revision](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/README.md) | [原件](files/documents/kt-kernel-guide.md) · [文本](text/kt-kernel-guide.txt) | 固定提交 31985f40bcc40da08107efdb1f81bf88cb38c6b2；AF 主案例采用 RTX 4090＋双路 Xeon Gold 6454S 示例 |
+| [KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models](https://madsys.cs.tsinghua.edu.cn/publication/ktransformers-unleashing-the-full-potential-of-cpu/gpu-hybrid-inference-for-moe-models/SOSP25-chen.pdf) | [原件](files/papers/ktransformers-paper.pdf) · [文本](text/ktransformers-paper.txt) | SOSP 2025 作者原件；双 Xeon Platinum 8452Y＋A100 40GB／RTX 4080 16GB；与主案例配置分别引用 |
+| [Bullet: Boosting GPU Utilization for LLM Serving via Dynamic Spatial-Temporal Orchestration](https://xianweiz.github.io/doc/papers/26asplos_bullet.pdf) | [原件](files/papers/bullet.pdf) · [文本](text/bullet.txt) | ASPLOS 2026 作者原件；A100/H20 内存与 SM 微基准；作为同卡 P/D 协作对照，不是 A100＋H20 PD 部署实测 |
+| [Ollama v0.20.7 bundled ggml Metal device and buffers](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal-device.m) | [原件](files/documents/ollama-ggml-metal-memory.txt) · [文本](text/ollama-ggml-metal-memory.txt) | 固定提交；hasUnifiedMemory、shared／bytesNoCopy、工作集；保留 upstream 署名 |
+| [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
 
 ## 第 10 章 分布式推理
 
@@ -361,6 +395,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence](https://arxiv.org/abs/2606.19348) | [原件](files/papers/deepseek-v4.pdf) · [文本](text/deepseek-v4.txt) | 混合压缩注意力与分阶段训练 |
 | [Kimi K3: Open Frontier Intelligence](https://github.com/MoonshotAI/Kimi-K3) | [原件](files/papers/kimi-k3.pdf) · [文本](text/kimi-k3.txt) | 官方报告；以内容校验值固定版本 |
 | [Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity](https://arxiv.org/abs/2101.03961) | [原件](files/papers/switch-transformer.pdf) · [文本](text/switch-transformer.txt) | 条件计算与路由 |
+| [NVIDIA GeForce RTX 4090 Specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/) | [原件](files/specs/nvidia-rtx4090.html) · [文本](text/nvidia-rtx4090.txt) | 历史硬件比较；KTransformers RTX 4090＋Xeon AF 案例 |
 | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) | [原件](files/papers/vllm.pdf) · [文本](text/vllm.txt) | KV 与分页 |
 | [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104) | [原件](files/papers/sglang.pdf) · [文本](text/sglang.txt) | 前缀缓存与执行 |
 | [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670) | [原件](files/papers/distserve.pdf) · [文本](text/distserve.txt) | PD 分离 |
@@ -371,6 +406,15 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Serving Large Language Models on Huawei CloudMatrix384, v2](https://arxiv.org/abs/2506.12708v2) | [原件](files/papers/cloudmatrix384-v2.pdf) · [文本](text/cloudmatrix384-v2.txt) | 2025-06-18；§3.3.1 的 910C、§4.2.2 MLA 与动态 tiling；与 v3 分开保存 |
 | [Serving Large Language Models on Huawei CloudMatrix384, v3](https://arxiv.org/abs/2506.12708v3) | [原件](files/papers/cloudmatrix384-v3.pdf) · [文本](text/cloudmatrix384-v3.txt) | 2025-06-19 修订；核对型号称谓与 v2 差异 |
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
+| [KT-Kernel inference README — fixed revision](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/README.md) | [原件](files/documents/kt-kernel-guide.md) · [文本](text/kt-kernel-guide.txt) | 固定提交 31985f40bcc40da08107efdb1f81bf88cb38c6b2；AF 主案例采用 RTX 4090＋双路 Xeon Gold 6454S 示例 |
+| [KTransformers 0.3 AMX design notes](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/doc/en/AMX.md) | [原件](files/documents/kt-amx.md) · [文本](text/kt-amx.txt) | 2025 年 v0.3 历史设计；Intel AMX、AVX-512、权重重排与调度；性能按原配置引用 |
+| [KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models](https://madsys.cs.tsinghua.edu.cn/publication/ktransformers-unleashing-the-full-potential-of-cpu/gpu-hybrid-inference-for-moe-models/SOSP25-chen.pdf) | [原件](files/papers/ktransformers-paper.pdf) · [文本](text/ktransformers-paper.txt) | SOSP 2025 作者原件；双 Xeon Platinum 8452Y＋A100 40GB／RTX 4080 16GB；与主案例配置分别引用 |
+| [NVIDIA A100 80GB datasheet — December 2020](https://www.nvidia.cn/content/dam/en-zz/zh_cn/Solutions/Data-Center/a100/pdf/a100-80gb-datasheet-update-a4-nvidia-1485612-r13-web_zhCN.pdf) | [原件](files/specs/nvidia-a100-80-spec.pdf) · [文本](text/nvidia-a100-80-spec.txt) | A100 80 GB；SXM 与 PCIe、稠密与稀疏峰值分别引用 |
+| [NVIDIA AI Enterprise 6.2 supported H20 SXM5 configurations](https://docs.nvidia.com/ai-enterprise/release-6/6.2/appendix/vgpu.html) | [原件](files/specs/nvidia-h20-vgpu.html) · [文本](text/nvidia-h20-vgpu.txt) | 官方确认 H20 SXM5 96GB 型号；不是完整 H20 带宽／算力数据表 |
+| [Bullet: Boosting GPU Utilization for LLM Serving via Dynamic Spatial-Temporal Orchestration](https://xianweiz.github.io/doc/papers/26asplos_bullet.pdf) | [原件](files/papers/bullet.pdf) · [文本](text/bullet.txt) | ASPLOS 2026 作者原件；A100/H20 内存与 SM 微基准；作为同卡 P/D 协作对照，不是 A100＋H20 PD 部署实测 |
+| [Demystifying the Design Space and Best Practices for Heterogeneous LLM Inference and Serving](https://arxiv.org/pdf/2606.29708v1) | [原件](files/papers/heterogeneous-pd.pdf) · [文本](text/heterogeneous-pd.txt) | 固定 v1；放置、KV 表示和生命周期；其生产例为 C600＋Hopper，不能写成 A100＋H20 |
+| [KT-Kernel CMake ARM KML build path](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/CMakeLists.txt) | [原件](files/documents/kt-kml-build.txt) · [文本](text/kt-kml-build.txt) | 固定提交；KML 构建分支的背景归档，不作为当前 Xeon AF 案例的实现依据 |
+| [KT-Kernel KML MoE correctness example](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/examples/test_moe_kml.py) | [原件](files/documents/kt-kml-example.txt) · [文本](text/kt-kml-example.txt) | 固定提交；KML MoE 样例的背景归档，不作为当前 Xeon AF 案例的实现依据 |
 
 ## 第 11 章 训练系统
 
@@ -381,7 +425,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence](https://arxiv.org/abs/2606.19348) | [原件](files/papers/deepseek-v4.pdf) · [文本](text/deepseek-v4.txt) | 混合压缩注意力与分阶段训练 |
 | [Kimi K3: Open Frontier Intelligence](https://github.com/MoonshotAI/Kimi-K3) | [原件](files/papers/kimi-k3.pdf) · [文本](text/kimi-k3.txt) | 官方报告；以内容校验值固定版本 |
 | [Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity](https://arxiv.org/abs/2101.03961) | [原件](files/papers/switch-transformer.pdf) · [文本](text/switch-transformer.txt) | 条件计算与路由 |
-| [NVIDIA GeForce RTX 4090 Specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/) | [原件](files/specs/nvidia-rtx4090.html) · [文本](text/nvidia-rtx4090.txt) | 历史硬件比较 |
+| [NVIDIA GeForce RTX 4090 Specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/) | [原件](files/specs/nvidia-rtx4090.html) · [文本](text/nvidia-rtx4090.txt) | 历史硬件比较；KTransformers RTX 4090＋Xeon AF 案例 |
 | [Unsloth official README](https://github.com/unslothai/unsloth) | [原件](files/documents/unsloth.md) · [文本](text/unsloth.txt) | 本地训练、运行、量化与导出 |
 | [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053) | [原件](files/papers/megatron.pdf) · [文本](text/megatron.txt) | 模型并行 |
 | [Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://arxiv.org/abs/2104.04473) | [原件](files/papers/megatron-scale.pdf) · [文本](text/megatron-scale.txt) | 并行组合 |
