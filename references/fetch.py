@@ -130,6 +130,7 @@ def index(items):
              "对应当前三部分、十三章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。",
              "", f"当前清单 {len(items)} 项：已保存正文 {len(ok)} 项，其中 PDF {len(pdfs)} 份。其余项目的获取状态见文末。",
              "", "[浏览本地索引](index.html) · [来源清单](sources.tsv) · [下载与校验记录](manifest.json) · [证据缺口](GAPS.md)",
+             "", "[LLM 推理论文选读与写作落点](INFERENCE-PAPER-GUIDE.md)按问题整理 49 项核心与专题资料，标注查阅小节、可支撑的论点及引用边界；另有 [章节映射](inference-reading-map.tsv)和[本轮新增论文 BibTeX](inference-additions.bib)。",
              "", "[芯片与系统资料覆盖](HARDWARE-COVERAGE.md)按架构列出论文、编程文档和产品规格，并说明尚缺的证据；关键网页配图另见[配图索引](figures/README.md)。",
              "", "作者补充的 UB 正式规范、操作系统参考设计和昇腾 950 白皮书，见 [三份文档的核对笔记](UB-ASCEND-NOTES.md)。",
              "", "昇腾与 NVIDIA 的数据通路、动态 shape、编程责任和代际证据，见 [架构与执行比较](../case-studies/accelerator-architecture.md)。第 4 章分析硬件供给，第 5 章用实现与执行轨迹验证。",
@@ -160,7 +161,7 @@ def index(items):
     for r in items:
         link = f"<a href='{html.escape(r['file'])}'>原件</a> · <a href='{html.escape(r['text'])}'>离线文本</a>" if r.get("file") else "未获取"
         rows.append(f"<tr><td>{','.join(map(str,r['chapters']))}</td><td>{html.escape(r['category'])}</td><td><a href='{html.escape(r['source_page'])}'>{html.escape(r['title'])}</a></td><td>{link}</td><td>{html.escape(r['status'])}</td></tr>")
-    (ROOT / "index.html").write_text("<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>AI Infra 参考资料</title><style>body{font:16px/1.6 system-ui;margin:2rem;color:#24352f}table{border-collapse:collapse;width:100%}td,th{padding:.6rem;border-bottom:1px solid #ddd;text-align:left}a{color:#14674c}input{font:inherit;padding:.5rem;width:60%}</style><h1>AI Infra 本地参考资料</h1><p>按标题、章号、类型或状态筛选。原件和文本均指向本地文件。</p><input id='q' placeholder='筛选资料'><table><thead><tr><th>章节</th><th>类型</th><th>资料</th><th>本地文件</th><th>状态</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table><script>document.querySelector('#q').oninput=e=>{let q=e.target.value.toLowerCase();document.querySelectorAll('tbody tr').forEach(r=>r.hidden=!r.textContent.toLowerCase().includes(q))}</script></html>")
+    (ROOT / "index.html").write_text("<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>AI Infra 参考资料</title><style>body{font:16px/1.6 system-ui;margin:2rem;color:#24352f}table{border-collapse:collapse;width:100%}td,th{padding:.6rem;border-bottom:1px solid #ddd;text-align:left}a{color:#14674c}input{font:inherit;padding:.5rem;width:60%}</style><h1>AI Infra 本地参考资料</h1><p>按标题、章号、类型或状态筛选。原件和文本均指向本地文件。</p><p><a href='INFERENCE-PAPER-GUIDE.md'>LLM 推理论文选读与写作落点</a></p><input id='q' placeholder='筛选资料'><table><thead><tr><th>章节</th><th>类型</th><th>资料</th><th>本地文件</th><th>状态</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table><script>document.querySelector('#q').oninput=e=>{let q=e.target.value.toLowerCase();document.querySelectorAll('tbody tr').forEach(r=>r.hidden=!r.textContent.toLowerCase().includes(q))}</script></html>")
 
 
 def main():

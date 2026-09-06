@@ -1,0 +1,1150 @@
+                                              S-L O RA: S ERVING T HOUSANDS OF C ONCURRENT L O RA A DAPTERS
+
+
+                                                  Ying Sheng * 1 2 Shiyi Cao * 1 Dacheng Li 1 Coleman Hooper 1 Nicholas Lee 1 Shuo Yang 1 3
+                                            Christopher Chou 1 Banghua Zhu 1 Lianmin Zheng 1 Kurt Keutzer 1 Joseph E. Gonzalez 1 Ion Stoica 1
+
+
+                                                                                                  A BSTRACT
+                                             The “pretrain-then-finetune” paradigm is commonly adopted in the deployment of large language models. Low-
+                                             Rank Adaptation (LoRA), a parameter-efficient fine-tuning method, is often employed to adapt a base model to a
+arXiv:2311.03285v3 [cs.LG] 5 Jun 2024
+
+
+
+
+                                             multitude of tasks, resulting in a substantial collection of LoRA adapters derived from one base model. We observe
+                                             that this paradigm presents significant opportunities for batched inference during serving. To capitalize on these
+                                             opportunities, we present S-LoRA, a system designed for the scalable serving of many LoRA adapters. S-LoRA
+                                             stores all adapters in the main memory and fetches the adapters used by the currently running queries to the
+                                             GPU memory. To efficiently use the GPU memory and reduce fragmentation, S-LoRA proposes Unified Paging.
+                                             Unified Paging uses a unified memory pool to manage dynamic adapter weights with different ranks and KV cache
+                                             tensors with varying sequence lengths. Additionally, S-LoRA employs a novel tensor parallelism strategy and
+                                             highly optimized custom CUDA kernels for heterogeneous batching of LoRA computation. Collectively, these
+                                             features enable S-LoRA to serve thousands of LoRA adapters on a single GPU or across multiple GPUs with a
+                                             small overhead. Compared to state-of-the-art libraries such as HuggingFace PEFT and vLLM (with naive support
+                                             of LoRA serving), S-LoRA can improve the throughput by up to 4 times and increase the number of served
+                                             adapters by several orders of magnitude. As a result, S-LoRA enables scalable serving of many task-specific
+                                             fine-tuned models and offers the potential for large-scale customized fine-tuning services. The code is available at
+                                             https://github.com/S-LoRA/S-LoRA.
+
+                                        1    I NTRODUCTION                                                by updating only low-rank additive matrices. These matri-
+                                                                                                          ces consist of a small number of parameters, referred to as
+                                        Large language models (LLMs) have become ubiquitous in            adapter weights. LoRA has shown that by fine-tuning just
+                                        modern applications, ranging from natural language pro-           these adapter weights, it is possible to achieve performance
+                                        cessing to more general tasks (OpenAI, 2023; Touvron              on par with full-weight fine-tuning. However, despite con-
+                                        et al., 2023b; Alayrac et al., 2022). Within these domains,       siderable research into fine-tuning, the question of how to
+                                        LLMs have consistently demonstrated superior performance,         serve these fine-tuned variants at scale remains unexplored.
+                                        especially when fine-tuned for specific tasks (Kenton &
+                                        Toutanova, 2019; Houlsby et al., 2019; Ouyang et al., 2022).      One of the key innovations in the LoRA paper was the
+                                        This “pretrain-then-finetune” paradigm has led to the pro-        elimination of adapter inference latency by directly merging
+                                        liferation of numerous fine-tuned variants of a single base       the adapter with the model parameters. Additionally, to
+                                        LLM, each tailored to a specific task or domain.                  support multiple models on a single machine, the same
+                                                                                                          paper proposes swapping adapters by adding and subtracting
+                                        When scaling the fine-tuning of a base model for numer-           LoRA weights from the base model. While this approach
+                                        ous tasks, such as personalized assistants, which could in-       enables low-latency inference for a single adapter and serial
+                                        volve thousands or millions of users, the associated train-       execution across adapters, it significantly reduces overall
+                                        ing and serving costs can become substantial. To address          serving throughput and increases total latency when serving
+                                        this, several parameter-efficient fine-tuning methods have        multiple adapters concurrently. Moreover, the paper does
+                                        been developed. A prime exemplar is Low-Rank Adaptation           not consider the opportunity to leverage host memory to
+                                        (LoRA) (Hu et al., 2021), which enables efficient fine-tuning     increase the number of adapters hosted by a single machine.
+                                            *
+                                              Equal contribution. Part of the work was done when Ying     In this paper, we study how to scalably serve thousands
+                                        was visiting UC Berkeley. 1 UC Berkeley 2 Stanford University
+                                        3
+                                          Shanghai Jiao Tong University. Correspondence to: Ying Sheng
+                                                                                                          of LoRA adapters on a single machine. We observe that
+                                        <ying1123@stanford.edu>, Shiyi Cao <shicao@berkeley.edu>.         the shared base model, which underpins numerous LoRA
+                                                                                                          adapters, presents a substantial opportunity for batched in-
+                                        Proceedings of the 5 th MLSys Conference, Santa Clara, CA, USA,   ference. To achieve high-throughput multi-adapter serving,
+                                        2024. Copyright 2024 by the author(s).
+                                   S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+it is advantageous to separate the batchable base model             throughput by up to 4× and increase the number of served
+computation from individual LoRA computations.                      adapters by several orders of magnitude.
+While leveraging batching in the base model is straight-
+forward (as all queries share the base model), extending            2     BACKGROUND
+batching to the adapters is challenging. First, serving many
+                                                                    Low-Rank Adaptation (LoRA) (Hu et al., 2021) is a
+LoRA adapters simultaneously requires efficient memory
+                                                                    parameter-efficient fine-tuning method designed to adapt
+management. Since GPU memory is limited, we must store
+                                                                    pre-trained large language models to new tasks. The mo-
+adapter weights outside the GPU and dynamically fetch
+                                                                    tivation behind LoRA stems from the low intrinsic dimen-
+them when needed. However, dynamically loading and un-
+                                                                    sionality of model updates during adaptation. In the training
+loading adapters of varying sizes, coupled with the dynamic
+                                                                    phase, LoRA freezes the weights of a pre-trained base model
+allocation and deallocation of KV cache tensors for requests
+                                                                    and adds trainable low-rank matrices to each layer. This
+with different sequence lengths, can lead to significant mem-
+                                                                    approach significantly reduces the number of trainable pa-
+ory fragmentation and I/O overhead. Second, apart from
+                                                                    rameters and memory consumption. When compared to full
+the easily batchable base model computation, the separated
+                                                                    parameter fine-tuning, LoRA can often reduce the number of
+computation of many adapters with distinct ranks in non-
+                                                                    trainable parameters by orders of magnitude (e.g., 10000×)
+contiguous memory is challenging to batch and demands the
+                                                                    while retaining comparable accuracy. For the inference
+development of new computation kernels. Third, leveraging
+                                                                    phase, the original paper suggests merging the low-rank
+multiple GPUs on a single machine requires novel paral-
+                                                                    matrices with the weights of the base model. As a result,
+lelism strategies to accommodate the added LoRA weights
+                                                                    there is no added overhead during inference, setting it apart
+and computations. It is essential to carefully design this strat-
+                                                                    from previous adapters like (Houlsby et al., 2019) or prompt
+egy to minimize communication and memory overheads.
+                                                                    tuning methods such as (Lester et al., 2021).
+To this end, we introduce S-LoRA, a scalable LoRA serving
+                                                                    Formally, for a pre-trained weight matrix W ∈ Rh×d , LoRA
+system. S-LoRA exploits batching opportunities, efficiently
+                                                                    introduces the update as W ′ = W + AB, where A ∈ Rh×r ,
+manages both host and GPU memory, and orchestrates par-
+                                                                    B ∈ Rr×d , and the rank r ≪ min(h, d). If the forward pass
+allelism across multiple GPUs. The primary contributions
+                                                                    of a base model is defined by h = xW , then after applying
+of S-LoRA are summarized as follows:
+                                                                    LoRA, the forward pass becomes
+   • Unified Paging: To reduce memory fragmentation and
+                                                                                     h = xW ′ = x(W + AB)                      (1)
+     increase batch size, S-LoRA introduces a unified mem-
+     ory pool. This pool manages dynamic adapter weights                               = xW + xAB.                             (2)
+     and KV cache tensors by a unified paging mechanism.            Typically, this adjustment is only applied to the query, key,
+   • Heterogeneous Batching: To minimize the latency over-          value, and output projection matrices in the self-attention
+     head when batching different adapters of varying ranks,        module, excluding the feed-forward module.
+     S-LoRA employs highly optimized custom CUDA ker-
+     nels. These kernels operate directly on non-contiguous         Because LoRA greatly reduces the training and weight stor-
+     memory and align with the memory pool design, facili-          age costs, it has been widely adopted by the community,
+     tating efficient batched inference for LoRA.                   and people have created hundreds of thousands of LoRA
+   • S-LoRA TP: To ensure effective parallelization across          adapters for pre-trained large language models and diffusion
+     multiple GPUs, S-LoRA introduces a novel tensor par-           models (Mangrulkar et al., 2022).
+     allelism strategy. This approach incurs minimal com-
+     munication cost for the added LoRA computation com-            2.1   Serving Large Language Models
+     pared to that of the base model. This is realized by           Most large language models (LLMs) are based on the trans-
+     scheduling communications on small intermediate ten-           former architecture (Vaswani et al., 2017). The number of
+     sors and fusing the large ones with the communications         parameters in an LLM ranges from several billion to several
+     of the base model.                                             trillion (Brown et al., 2020; Chowdhery et al., 2022; Fedus
+We evaluate S-LoRA by serving Llama-7B/13B/30B/70B.                 et al., 2022), corresponding to disk sizes spanning several gi-
+Results show that S-LoRA can serve thousands of LoRA                gabytes to even terabytes. This scale results in LLM serving
+adapters on a single GPU or across multiple GPUs with               having significant computational and memory demands.
+a small overhead. When compared to the state-of-the-art             Additionally, the inference process for LLMs requires iter-
+parameter-efficient fine-tuning library, Huggingface PEFT,          ative autoregressive decoding. Initially, the model carries
+S-LoRA can enhance throughput by up to 30×. In com-                 out a forward pass to encode the prompt. Following this, it
+parison to the high-throughput serving system vLLM using            decodes the output one token at a time. The sequential pro-
+a naive support of LoRA serving, S-LoRA can improve                 cess makes decoding slow. Since each token attends to the
+                                  S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+hidden states of all its preceding tokens, it becomes essential                          Batched base computation
+to store the hidden states of all previous tokens. This storage                             x1
+is referred to as the “KV cache”. Such a mechanism adds to                                  x2       x         W
+the memory overhead and causes the decoding process to                                      x3
+be more memory-intensive than computation-intensive.
+The challenges become even more pronounced in online                                     Batched LoRA computation
+settings, where requests of varying sequence lengths ar-                   x                                                 add
+                                                                                                     A
+                                                                                            x1   x     x       B1
+rive dynamically. To accommodate such dynamic incoming                                               1
+requests, Orca (Yu et al., 2022) introduces a method of fine-
+grained, iteration-level scheduling. Instead of scheduling at                                        A
+                                                                                            x2   x     x       B2
+the request level, Orca batches at the token level. This ap-                                         2
+proach allows for the continuous addition of new requests to
+the currently running batch, resulting in substantially higher                                       A
+                                                                                            x3   x     x       B3
+throughput. vLLM (Kwon et al., 2023) further optimizes                                               3
+Orca’s memory efficiency using PagedAttention. PagedAt-
+tention adopts concepts from virtual memory and paging in
+                                                                  Figure 1. Separated batched computation for the base model and
+operating systems and manages the storage and access of
+                                                                  LoRA computation. The batched computation of the base model
+dynamic KV cache tensors in a paged fashion. This method          is implemented by GEMM. The batched computation for LoRA
+efficiently reduces fragmentation, facilitating larger batch      adapters is implemented by custom CUDA kernels which support
+sizes and higher throughput.                                      batching various sequence lengths and adapter ranks.
+When serving very large models that exceed the memory
+capacity of a single GPU, or when there are stringent la-                Main Memory                            GPU Memory
+tency requirements, it is necessary to parallelize the model         Adapter 1       Adapter 2       Unified memory pool
+across multiple GPUs. Several model parallelism methods                                              for dynamic tensors
+                                                                     Adapter 3       Adapter 4                                 Base
+have been proposed, such as tensor parallelism (Shoeybi                                                                       Model
+                                                                     Adapter 5       Adapter 6
+et al., 2019), sequence parallelism (Korthikanti et al., 2023),                                            KV cache           Weights
+                                                                                 …
+pipeline parallelism (Huang et al., 2019), and their combi-
+nations (Narayanan et al., 2021; Zheng et al., 2022).                Fetch active                                               Other
+                                                                                                           Adapter 2
+                                                                     adapters for                                            Temporary
+                                                                     the current batch                     Adapter 5           Tensors
+3     OVERVIEW OF S-L O RA
+S-LoRA encompasses three principal components of innova-          Figure 2. Overview of memory allocation in S-LoRA. S-LoRA
+tion. In Section 4, we introduce our batching strategy, which     stores all adapters in the main memory and fetches the active
+decomposes the computation between the base model and             adapters for the current batch to the GPU memory. The GPU
+the LoRA adapters. Additionally, we discuss adapter clus-         memory is used to store the KV cache, adapter weights, base
+tering and admission control when scheduling the requests.        model weights, and other temporary tensors.
+The ability to batch across concurrent adapters, introduces
+new challenges around memory management. In Section 5,
+we generalize PagedAttention (Kwon et al., 2023) to Unfied        For a single adapter, the method recommended by (Hu et al.,
+Paging, which supports dynamically loading LoRA adapters.         2021) is to merge the adapter weights into the base model
+This approach uses a unified memory pool to store the KV          weights, resulting in a new model (see Eq. 1). This has the
+caches and adapter weights in a paged fashion, which can          advantage that there is no additional adapter overhead during
+reduce fragmentation and balance the dynamic changing             inference, since the new model has the same number of
+size of the KV caches and adapter weights. In Section 6, we       parameters as the base model. In fact, this was a prominent
+introduce our new tensor parallelism strategy that enables us     feature of the original LoRA work.
+to efficiently decouple the base model and LoRA adapters.         However, when there are multiple adapters, merging the
+                                                                  weights into the base model leads to multiple weight copies
+4     BATCHING AND S CHEDULING                                    and missed batching opportunities. Directly merging the
+                                                                  models requires maintaining many copies of the full lan-
+4.1   Batching                                                    guage model. In the original LoRA paper, the authors pro-
+Our batching strategy aims to support online and high-            posed adding and subtracting LoRA weights on the fly to
+throughput serving of many LoRA adapters simultaneously.          enable serving multiple models without increasing the mem-
+                                                                  ory overhead. However, this approach doesn’t support con-
+                                 S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+current inference on separate LoRA adapters and therefore        more memory to the KV cache, which in turn can facili-
+limits batching opportunities.                                   tate larger batch sizes. Given the common memory capaci-
+                                                                 ties of GPUs, they are often underutilized while decoding.
+In this paper, we show that merging LoRA adapters into
+                                                                 Consequently, increasing the batch size can lead to higher
+the base model is inefficient for the multi-LoRA high-
+                                                                 throughput. A direct approach to reducing the number of
+throughput serving setting. Instead, we propose computing
+                                                                 adapters in a running batch is to prioritize batching requests
+the LoRA computation xAB on-the-fly as shown in Eq. 2.
+                                                                 that use the same adapter, a strategy we term “adapter clus-
+This avoids weight duplication and enables batching of the
+                                                                 tering”. However, adapter clustering comes with its own set
+more costly xW operation. But this approach also increases
+                                                                 of trade-offs. For example, it can hurt the average latency
+the computation overhead. However, because the cost of
+                                                                 or fairness among adapters. We provide an ablation study in
+xAB is substantially lower than xW and there is a consid-
+                                                                 Appendix A to illustrate how throughput and latency change
+erable savings from batching xW across different adapters,
+                                                                 according to the cluster size.
+we show that the savings far exceed the additional overhead.
+Unfortunately, directly implementing the factored computa-       4.3   Admission Control
+tion of the base model and individual LoRA adapters using
+the batch GEMM kernel from the existing BLAS libraries           In S-LoRA, we also applied an admission control strategy
+would require significant padding and result in poor hard-       to sustain good attainment when the traffic is higher than the
+ware utilization. This is because of the heterogeneity of        serving system capacity. A serving system is typically char-
+sequence lengths and adapter ranks.                              acterized by a service level objective (SLO) which specifies
+                                                                 the desired latency of processing requests. If the serving
+In S-LoRA, we batch the computation of the base model and        system has fixed capacity, it must implement an admission
+then employ custom CUDA kernels to execute the additional        control mechanism, that drops a request, if the system can-
+xAB for all adapters separately. This process is illustrated     not meet its SLO. Otherwise, if no request is dropped, and
+by Figure 1. Instead of naively using padding and using the      the number of incoming requests is larger than the system
+batch GEMM kernel from the BLAS library for the LoRA             capacity for long enough, the serving system is bound to
+computation, we implement custom CUDA kernels for more           violate the SLO. We implemented an abort strategy to mimic
+efficient computation without padding. In Subsection 5.3,        admission control in S-LoRA, called early abort strategy.
+we discuss the implementation details.                           Intuitively, we estimate the set of latest requests that we
+While the number of LoRA adapters can be large if we             can serve in SLO, and then serve them in the order of ar-
+store them in main memory, the number of LoRA adapters           rival time. More implementation details and mathematical
+needed for the currently running batch is manageable, be-        justifications are deferred to Appendix B.
+cause the batch size is bounded by the GPU memory. To
+take advantage of this, we store all LoRA adapters in the        5     M EMORY M ANAGEMENT
+main memory and fetch only the LoRA adapters needed
+for the currently running batch to the GPU RAM when              Compared to serving a single base model, serving multiple
+running the inference for that batch. In this case, the max-     LoRA adapters simultaneously presents new memory man-
+imum number of adapters that can be served is bounded            agement challenges. To support many adapters, S-LoRA
+by the main memory size. This process is illustrated by          stores them in the main memory and dynamically loads the
+Figure 2. To achieve high-throughput serving, we adopt the       adapter weights needed for the currently running batch into
+iteration-level scheduling batching strategy from Orca (Yu       GPU RAM. During this process, there are two noticeable
+et al., 2022). In this approach, requests are scheduled at the   challenges. The first is memory fragmentation, resulting
+token level. We immediately incorporate a new request into       from the dynamic loading and offloading adapter weights of
+the running batch if space is available. The request will exit   various sizes. The second is the latency overhead introduced
+the batch once it reaches the maximum number of gener-           by adapter loading and offloading. To tackle these chal-
+ated tokens or fulfills other stopping criteria. This process    lenges efficiently, we propose Unfied Paging and overlap
+reduces GPU memory usage but introduces new memory               the I/O with computation by prefetching adapter weights.
+management challenges. In Section 5, we will discuss our
+techniques to manage memory efficiently.                         5.1   Unified Paging
+                                                                 Understanding the nature of adapter weights is essential for
+4.2   Adapter Clustering                                         optimizing memory usage. Our primary observation is that
+To enhance batching efficiency, one potential strategy is        these dynamic adapter weights are analogous to dynamic
+reducing the number of active adapters in a running batch.       KV caches in several ways:
+By using fewer adapters, there is an opportunity to allocate         • Variable sizes and operations: Just as the size of
+                                  S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+                    H                                              To proactively address this issue, we introduce a dynamic
+                                                                   prediction mechanism. While running the current decoding
+                                     KV caches                     batch, we predict the adapters required for the next batch
+                                     Adapter weights
+                                                                   based on the current waiting queue. This prediction allows
+                                                                   us to prefetch and store them in available memory. Such a
+                                     Empty                         forward-looking strategy keeps most of the adapters needed
+                                                                   for the next batch already in place before running it, which
+                                                                   reduces I/O time for adapter swapping.
+Figure 3. Unified memory pool. We use a unified memory pool to
+store both KV caches and adapter weights in a non-contiguous way   5.3   Custom Kernels for heterogeneous LoRA batching
+to reduce memory fragmentation. The page size is H elements.             on Non-Contiguous Memory
+                                                                   Due to the design of the unified memory pool, the adapter
+                                                                   weights are stored in non-contiguous memory. To run com-
+     KV cache size fluctuates with the sequence length, the
+                                                                   putations efficiently under this design, we implement cus-
+     ranks of the active adapters can also depend on the
+                                                                   tom CUDA kernels that support batching LoRA computa-
+     choice of adapter associated with each request. KV
+                                                                   tions with varying ranks and sequence lengths in a non-
+     caches are allocated when requests arrive and deal-
+                                                                   contiguous memory layout.
+     located once the requests are completed. Similarly,
+     adapter weights are loaded and cleared with each re-          In the prefill stage, the kernel handles a sequence of tokens
+     quest. If not managed properly, this variability can          and gathers adapter weights with different ranks from the
+     result in fragmentation.                                      memory pool. We call this kernel Multi-size Batched Gather
+   • Dimensionality: A KV cache tensor for a request in            Matrix-Matrix Multiplication (MBGMM). It is implemented
+     a layer has a shape of (S, H), where S denotes the se-        in Triton (Tillet et al., 2019) with tiling.
+     quence length and H represents the hidden dimension.
+                                                                   In the decode stage, the kernel handles a single token and
+     Meanwhile, the shape of a LoRA weight is (R, H),
+                                                                   gathers adapter weights with different ranks from the mem-
+     with R standing for the rank and H the hidden dimen-
+                                                                   ory pool. We call this kernel Multi-size Batched Gather
+     sion. Both share a dimension size of H that can be
+                                                                   Matrix-Vector Multiplication (MBGMV). We implemented
+     leveraged to reduce fragmentation.
+                                                                   two versions of this kernel: one in Triton and another by
+Motivated by these parallels, we extend the idea of Page-          modifying an earlier version of Punica kernels (Chen, 2023)
+dAttention (Kwon et al., 2023) to Unified Paging which             to extend support for non-contiguous memory, multiple
+manages adapter weights in addition to the KV cache. Uni-          ranks in a batch, and more fine-grained memory gathering.
+fied Paging uses a unified memory pool to jointly manage           We found the latter one was faster, so we used it in the
+both KV cache and adapter weights. To implement this, we           experiments.
+first allocate a large buffer statically for the memory pool.
+                                                                   Punica (Chen et al., 2023) is concurrent work on serving
+This buffer uses all available space except for the space oc-
+                                                                   multiple LoRA adapters, which will be discussed in Sec-
+cupied by the base model weights and temporary activation
+                                                                   tion 8. In addition to Triton and Pucina kernels, NVIDIA
+tensors. Both KV caches and adapter weights are stored in
+                                                                   CUTLASS also provides high-performance kernels for
+this memory pool in a paged manner, with each page corre-
+                                                                   grouped GEMM (NVIDIA) that can be used for hetero-
+sponding to a vector of H. Thus, a KV cache tensor with a
+                                                                   geneous batching.
+sequence length of S uses up S pages, while a LoRA weight
+tensor of rank R takes up R pages. Figure 3 illustrates the
+layout of our memory pool, where KV caches and adapter             6     T ENSOR PARALLELISM
+weights are stored interleaved and non-contiguously. This
+                                                                   We design novel tensor parallelism strategies for batched
+approach significantly reduces fragmentation, ensuring that
+                                                                   LoRA inference to support multi-GPU inference of large
+adapters weights of various ranks can coexist with dynamic
+                                                                   transformer models. Tensor parallelism is the most
+KV caches in a structured and systematic manner.
+                                                                   widely used parallelism method because its single-program
+                                                                   multiple-data pattern simplifies its implementation and inte-
+5.2   Prefetching and Overlapping                                  gration with existing systems. Tensor parallelism can reduce
+Although the unified memory pool mitigates fragmentation,          the per-GPU memory usage and latency when serving large
+the I/O overhead from loading and offloading remains a             models. In our setting, the additional LoRA adapters intro-
+concern—especially when dealing with numerous or large             duce new weight matrices and matrix multiplications, which
+adapters. The latency introduced by waiting to load these          calls for new partition strategies for these added items.
+adapters can compromise the efficiency of the system.
+                                                S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+                            Column Partition                  Row Partition                 Partial Sum               Replication
+
+
+
+                                                                 (h, d/N)                                                        (d/N, h)
+                                                 W1                                                              W2
+
+
+                                                                 (B, d/N)                                                        (B, h)
+                                               matmul_1                                                       matmul_2
+
+
+
+       input X                                        (B, d/N)          add_1                                                             add_2           all-reduce
+
+      (B, h)                                                                                                                                  (B, h)        (B, h)
+                                 (h, r/N)        B1                                              (d/N, r)        B2
+                            A1                                                             A2
+                                                   (r, d/N)                                                           (r, h/N)
+
+                                      (B, r)                                                         (B, r)                                       Fuse all-gather
+                                                                                                                                                  and all-reduce
+               (B, r/N)                        matmul_3                         (B, r)                        matmul_4
+
+                          matmul all-gather    (B, d/N)                                  matmul all-reduce     (B, h/N)
+
+
+Figure 4. Tensor parallelism partition strategy for batched LoRA computation. This is a computational graph where nodes represent
+tensors/operators and the edges represent dependency. We use different colors to represent different partition strategies, which include
+column partition, row partition, partial sum, and replication. The per-GPU shape of each tensor is also annotated in gray. Note that B is
+the number of tokens, h is the input dimension, N is the number of devices, d is the hidden size, and r is the adapter rank.
+
+
+6.1      Partition Strategy                                                                  Next, we discuss adapting the strategy from the 2-layer MLP
+                                                                                             to the self-attention layer. Similar to the Megatron-LM strat-
+Since the base model uses the Megatron-LM tensor paral-
+                                                                                             egy, we partition the head dimension of the self-attention
+lelism strategy (Shoeybi et al., 2019), our approach aims
+                                                                                             layer. The query-key-value projection weight matrix can be
+to align the partition strategies of inputs and outputs of the
+                                                                                             seen as W 1 in our example and the output projection weight
+added LoRA computation with those of the base model.
+                                                                                             matrix can be seen as W 2 in our example.
+In this way, we can minimize the communication costs
+by avoiding unnecessary communications and fusing some
+                                                                                             6.2      Communication and Memory Cost Analysis
+communications.
+We use the feed-forward module (2-layer MLP) to illus-                                       Let N be the number of devices, B be the number of to-
+trate our partition strategy. We will explain later how this                                 kens, h be the hidden size, and r be the adapter rank. The
+strategy can easily be adapted to the self-attention layer.                                  communication cost of the base model is one all-reduce, or
+                                                                                             2(N −1)Bh
+As depicted in Figure 4, the upper box illustrates the base                                      N     . The communication cost of the added LoRA
+model’s Megatron-LM partition strategy: the first weight                                     computation is three all-gather for query, key, and value
+matrix (W 1) is column-partitioned, and the second (W 2) is                                  projections, and one all-reduce for the output projection.
+row-partitioned. An all-reduce communication is required                                     Formally, it is 3 (N −1)Br
+                                                                                                                   N    + 2(N −1)Br
+                                                                                                                              N     = 5(N −1)Br
+                                                                                                                                          N     .
+to accumulate the partial sum from distributed devices.                                      Under our strategy, the additional communication cost intro-
+The lower box illustrates the partitioning strategy for the                                  duced by LoRA is negligible when compared to the commu-
+added LoRA computation. The matrices A1 and B1 for                                           nication cost of the base model, because r ≪ h. Intuitively,
+the adapter of the first weight matrix (W 1) are column-                                     this is achieved by carefully scheduling communications on
+partitioned. An all-gather operation is used to collect the in-                              the small intermediate tensors of LoRA computation and
+termediate results. The matrices A2 and B2 for the adapter                                   fusing communications with base models.
+of the second weight (W 2) are row-partitioned and column-                                   In terms of memory usage, our strategy is optimal because
+partitioned, respectively. An all-reduce operation is used                                   we partition all weight matrices among all devices and there
+to sum up the intermediate results. Finally, the result from                                 is no replicated weight matrix.
+the LoRA computation is added to that from the base model
+(add 2). A single all-reduce operation is sufficient to ac-
+cumulate the final results. It is worth noting that we are                                   7       E VALUATION
+essentially fusing an all-gather operation for matmul 4                                      We evaluate the performance of S-LoRA on both synthetic
+with the final all-reduce. To our knowledge, this paralleliza-                               and real production workloads. S-LoRA is built on top of
+tion strategy has not been studied before.                                                   LightLLM (ModelTC, 2023), a single-model LLM serv-
+                                    S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+ing system based on PyTorch (Paszke et al., 2019) and                    request rate for each process.
+Triton (Tillet et al., 2019). We evaluate the scalability of           • “S-LoRA” is S-LoRA with all the optimizations and it
+S-LoRA by serving up to two thousand LoRA adapters si-                   is using the first-come-first-serve scheduling strategy.
+multaneously and compare it with other strong baselines.               • “S-LoRA-no-unify-mem” is S-LoRA without the uni-
+We then perform ablation studies to verify the effectiveness             fied memory management.
+of individual components.                                              • “S-LoRA-bmm” is S-LoRA without unified memory
+                                                                         management and customized kernels. It copies the
+7.1    Setup                                                             adapter weights to continuous memory space and per-
+                                                                         forms batched matrix multiplication with padding.
+Model. We test the Llama model series (Touvron et al.,
+2023a;b), one of the most popular open large language mod-          Metrics. There are several metrics to measure the perfor-
+els. We consider 5 different model and adapter configura-           mance of serving systems, including latency and throughput.
+tions, which are listed in Table 1 1 . Our optimizations can        Following common practice, we report the throughput, av-
+be easily adapted to other transformer-based architectures as       erage request latency, average first token latency, and SLO
+well, such as GPT-3 (Brown et al., 2020) and PaLM (Chowd-           attainment. SLO attainment is defined as the percentage
+hery et al., 2022; Anil et al., 2023).                              of requests that return the first token in 6 seconds. Addi-
+                                                                    tionally, we introduce a new metric termed user satisfaction
+                                                                    (see Appendix B), which offers a more fine-grained analysis
+      Setting    Base model    Hidden size    Adapter ranks
+                                                                    of the first token latency. Intuitively, a shorter first token
+        S1       Llama-7B          4096       {8}                   latency gives a higher satisfaction. The satisfaction becomes
+        S2       Llama-7B          4096       {64, 32, 16, 8}       0 if the first token latency exceeds the SLO.
+        S4       Llama-13B         5120       {64, 32, 16}
+        S5       Llama-30B         7168       {32}                  7.2   End-to-End Results on Synthetic Workloads
+        S6       Llama-70B         8192       {64}
+                                                                    Workload trace. We generate synthetic workload traces
+             Table 1. Model and adapter configurations.             using the Gamma process, which is commonly used in ma-
+                                                                    chine learning serving literature (Crankshaw et al., 2020; Li
+Hardware. We conduct tests on various hardware settings,            et al., 2023). Given n adapters, the requests for adapter i are
+including a single NVIDIA A10G GPU (24GB), a single                 modeled using a Gamma arrival process with a mean rate of
+A100 GPU (40GB), a single A100 GPU (80GB), and mul-                 λi and a coefficient of variance (CV) of cv. The mean rate,
+tiple A100 GPUs (40GB/80GB). The host’s main memory                 λi , adheres to a power-law distribution with an exponent
+varies based on the GPU setup, ranging from 64 GB to                α. The total request rate for all adapters is R requests per
+670 GB. We will show that S-LoRA can efficiently scale              second. For the n adapters, we set their ranks based on the
+the number of adapters, limited only by the available main          list provided in Table 1 with a round-robin method. Our
+memory.                                                             tests cover various combinations of n, α, R, and cv. For
+Baselines. We benchmark several variants of S-LoRA, Hug-            every request, the input and output lengths are sampled from
+gingFace PEFT (Mangrulkar et al., 2022), and vLLM (Kwon             uniform distributions U [Il , Iu ] and U [Ol , Ou ] respectively.
+et al., 2023).                                                      The default duration of a trace is 5 minutes. To conduct
+                                                                    comprehensive experiments, we first pick a set of default
+   • “HuggingFace PEFT” is a library for training and run-          parameters for generating workloads, as shown in Table 2.
+     ning parameter-efficient fine-tuning models. It lacks ad-      We then vary one of the n, α, R, and cv to see how each
+     vanced batching and memory management. We build a              factor affects the performance.
+     server using it that batches single adapter requests and
+     switches adapter weights between batches.
+   • “vLLM m-packed” is a simple multi-model serving                Table 2. Default parameters for generating the synthetic workloads.
+     solution based on vLLM, a high-throughput serving              “7B @ A10G” means running a Llama-7B on a single A10G.
+     system. Because vLLM does not support LoRA, we                         Setting          n     α R cv [Il , Iu ] [Ol , Ou ]
+     merge the LoRA weights into the base model and serve             7B @ A10G (24G)       200    1    2    1    [8, 512]   [8, 512]
+     the multiple versions of the merged weights separately.          7B @ A100 (80G)       200    1   10    1    [8, 512]   [8, 512]
+     To serve m LoRA adapters, we run m vLLM workers                  13B @ A100 (40G)      200    1    2    1    [8, 512]   [8, 512]
+     on a single GPU, where multiple workers are separate             13B @ A100 (80G)      400    1    6    1    [8, 512]   [8, 512]
+     processes managed by NVIDIA MPS. We statistically
+                                                                    Comparison with other systems. We compare S-LoRA
+     allocate the GPU memory proportionally to the average
+                                                                    with both vLLM-packed and HuggingFace PEFT for serv-
+    1
+      For Llama-70B, we used different architecture parameters      ing many LoRA adapters. The results are shown in Table 3.
+than the official model and did not employ group-query attention.   Remarkably, S-LoRA can serve 2,000 adapters simultane-
+                                                              S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+                                                                        S-LoRA         S-LoRA-bmm          S-LoRA-no-unify-mem
+                                  S1 (Llama-7b)                 S2 (Llama-7b)               S4 (Llama-13b)               S2 (Llama-7b)               S4 (Llama-13b)
+                                  A10G (24GB)                   A10G (24GB)                 A100 (40GB)                  A100 (80GB)                 A100 (80GB)
+                                                                                                                8.0
+                                                      1.5                            1.5                                                     4.0
+Throughput (req/s)
+
+
+
+
+                       1.5                                                                                      6.0
+                                                                                     1.0                                                     3.0
+                       1.0                            1.0
+                                                                                                                4.0                          2.0
+                       0.5                            0.5                            0.5                        2.0                          1.0
+                       0.0 0          100         200 0.0 0         100          200 0.0 0       100        200 0.0 0         100        200 0.0 0        200         400
+                      60.0                                                                                     200.0
+                                                 100.0                      150.0
+Average Latency (s)
+
+
+
+
+                                                                                                       150.0                      200.0
+                      40.0                        75.0
+                                                                            100.0                      100.0
+                                                  50.0                                                                            100.0
+                      20.0                                                   50.0                       50.0
+                                                  25.0
+                       0.0 0       100        200 0.0 0       100        200 0.0 0       100        200 0.0 0        100       200 0.0 0        200        400
+                             Number of Adapters         Number of Adapters         Number of Adapters         Number of Adapters         Number of Adapters
+
+    Figure 5. The throughput and average request latency of S-LoRA and its variants under different numbers of adapters. S-LoRA achieves
+    significantly better performance and can scale to a large number of adapters. We run S-LoRA-bmm for a shorter duration since it has a
+    significantly lower throughput. Some S-LoRA-bmm curves are omitted because it is out of the figures’s scope.
+
+                                                                                                  Comparing with own variants. Since no baseline system
+    Table 3. Throughput (req/s) comparison between S-LoRA, vLLM-
+                                                                                                  can efficiently scale to a large number of adapters, we now
+    packed, and PEFT. The hardware is a single A100 (80GB). We run
+    PEFT for a shorter duration when n = 100. We do not evaluate                                  focus on comparing S-LoRA with its own variants. Fig-
+    PEFT for n ≥ 1000, as its throughput is already very low for a                                ure 5 illustrates how they scale with the number of adapters.
+    small n. “OOM” denotes out-of-memory.                                                         S-LoRA achieves noticeably higher throughput and lower
+                      Model Setup           n      S-LoRA       vLLM-packed         PEFT          latency compared to S-LoRA-bmm and S-LoRA-no-unify-
+                                                                                                  mem. This implies that our memory pool and custom ker-
+                                           5         8.05            2.04            0.88         nels are effective. When the number of adapters increases,
+                                         100         7.99            OOM             0.25
+                             S1                                                                   the throughput of S-LoRA initially experiences a slight de-
+                                         1000        7.64            OOM               -
+                                         2000        7.61            OOM               -          cline due to the overhead introduced by LoRA. However,
+                                                                                                  once the number of adapters reaches a certain threshold
+                                           5         7.48            2.04            0.74         (e.g., 100 in most experiments), the throughput of S-LoRA
+                                         100         7.29            OOM             0.24
+                             S2                                                                   no longer decreases. This stability can be attributed to the
+                                         1000        6.69            OOM               -
+                                         2000        6.71            OOM               -
+                                                                                                  fact that as the number of adapters grows, the number of
+                                                                                                  activated adapters for the currently running batch remains
+                                           2         4.49            3.83            0.54         unchanged, maintaining a constant overhead. Consequently,
+                             S4          100         4.28            OOM             0.13
+                                                                                                  S-LoRA can scale to a much larger number of adapters with-
+                                         1000        3.96            OOM               -
+                                                                                                  out incurring additional overhead, constrained only by the
+                                                                                                  available main memory.
+                                                                                                   Figure 6 demonstrates the variation in throughput, first token
+    ously, maintaining minimal overhead for the added LoRA
+                                                                                                   latency, and SLO attainment relative to the total request
+    computation. In contrast, vLLM-packed needs to maintain
+                                                                                                   rate, revealing a pattern consistent with the aforementioned
+    multiple weight copies and can only serve fewer than 5
+                                                                                                   observations and underscoring the efficacy of our design.
+    adapters due to the GPU memory constraint. The through-
+    put of vLLM-packed is also much lower due to the missed
+                                                                                                   7.3   End-to-End Results on Real Workloads
+    batching opportunity. Although PEFT can swap adapters
+    between batches, enabling it to handle a large number of                                      Real workload trace. We construct real-world serving
+    adapters, its lack of advanced batching methods and mem-                                      traces by downsampling from the traces of LMSYS Chatbot
+    ory management results in significantly worse performance.                                    Arena (Zheng et al., 2023b;a), a website that serves multiple
+    Overall, S-LoRA achieves a throughput up to 4x higher than                                    LLMs. The raw log from Arena does not concern LoRA
+    vLLM-packed when serving a small number of adapters,                                          adapters; it focuses on different base models. Nonetheless,
+    and up to 30x higher than PEFT, while supporting a signifi-                                   we treat the distribution of different base models as if they
+    cantly larger number of adapters.
+                                                                             S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+                                        S-LoRA        S-LoRA-bmm        S-LoRA-no-unify-mem                               results, which show a similar pattern to the synthetic work-
+                                  S2 (Llama-7b) A10G (24GB)         S4 (Llama-13b) A100 (80GB)                            loads. This means the strong performance S-LoRA holds
+                          1.5                                   4.0                                                       for real world workloads.
+Throughput (req/s)
+
+
+
+
+                          1.0
+                                                                                 2.0                                      7.4                       Multi-GPU Tensor Parallelism
+                          0.5
+                                                                                                                         We test the scalability of our tensor parallelism strategy by
+                          0.0 1.0       1.5      2.0        2.5 0.0                       2         4       6       8    running 1) Llama-30B on two A100 (40GB) and four A100
+                                                               400.0
+First Token Latency (s)
+
+
+
+
+                                                                                                                         (40GB) GPUs with 10 to 100 adapters; and 2) Llama-70B
+                     200.0
+                                                                                                                         on two A100 (80GB) and four A100 (80GB) GPUs with 10
+                                                                    200.0                                                adapters. We then report the serving throughputs.
+                     100.0
+                                                                                                                          As depicted in Figure 8, the disparity between S-LoRA
+                          0.0 1.0       1.5      2.0        2.5 0.0                       2         4       6       8     with and without LoRA communication is small. This sug-
+                          1.0                                   1.0                                                       gests that the added LoRA communication in our strategy
+SLO Attainment
+
+
+
+
+                                                                                                                          has a very small overhead. The figure further reveals that
+                          0.5                                                    0.5                                      the communication overhead due to LoRA is less than the
+                                                                                                                          computational overhead it introduces. Furthermore, when
+                          0.0 1.0       1.5      2.0        2.5 0.0                       2        4        6       8     transitioning from 2 GPUs to 4 GPUs, the serving through-
+                                         Request Rate                                          Request Rate               put increases by more than 2 times. This significant increase
+                                                                                                                          can be attributed to the fact that the system is predominantly
+     Figure 6. The throughput, first token latency, and SLO attainment                                                    memory-bound in this context. Adding more GPUs alle-
+     of S-LoRA and its variants under different request rates. Note that                                                  viates memory constraints, leading to superlinear scaling.
+     in both settings the first token latency of S-LoRA-bmm is out of                                                     In conclusion, the results verify both the minimal overhead
+     the figure’s scope.                                                                                                  and the scalability of our tensor parallelism strategy.
+
+                                      S-LoRA            S-LoRA-bmm                            S-LoRA-no-unify-mem                                  S-LoRA           S-LoRA (w/o LoRA communication)                     S-LoRA (base only)
+                          3.0                                                     1.0                                                        5                               5                               3.5
+Throughput (req/s)
+
+
+
+
+                                                                SLO Attainment
+
+
+
+
+                                                                                                                                                                                                             3.0
+                                                                                  0.8
+                                                                                                                        Throughput (req/s)
+
+
+
+
+                                                                                                                                             4                               4
+                          2.0                                                                                                                                                                                2.5
+
+                                                                                  0.5                                                        3                               3                               2.0
+                          1.0                                                                                                                                                                                1.5
+                                                                                  0.2                                                        2                               2
+                                                                                                                                                                                                             1.0
+                                                                                                                                             1                               1
+                          0.0 1        2        3           4                     0.0 1           2        3        4                                                                                        0.5
+
+                                      Request Rate                                                Request Rate                               0
+                                                                                                                                                   Llama-30B    Llama-30B
+                                                                                                                                                                             0
+                                                                                                                                                                                   Llama-30B    Llama-30B
+                                                                                                                                                                                                             0.0
+                                                                                                                                                                                                                     Llama-70B    Llama-70B
+                                                                                                                                                 2xA100(40GB) 4xA100(40GB)       2xA100(40GB) 4xA100(40GB)         2xA100(80GB) 4xA100(80GB)
+                                                                                                                                                      n=10         n=10              n=100        n=100                 n=10         n=10
+     Figure 7. The throughput of S-LoRA and its variants on real work-
+     load traces with different request rates. The model and hardware                                                                                    Figure 8. Throughput with tensor parallelism.
+     configuration is S2 on an A10G (24GB).
+
+                                                                                                                          7.5                       Ablation Study
+     were the distribution of different adapters of a single base
+     model. The raw log can be sampled into traces that exhibit                                                          Merging adapter weights versus computing on-the-fly.
+     varying request rates, denoted as R, and durations, repre-                                                          While S-LoRA does not merge adapter weights and com-
+     sented by D. To achieve this, we sample R · D requests                                                              putes LoRA matrices on-the-fly each time, we compare it
+     from the raw log and rescale the time stamps to fit within                                                          with an alternative design that merges an adapter with the
+     the range of [0, D]. The number of models n corresponds                                                             base model, denoted as x(W + AB), as proposed in the
+     to the number of adapters. Furthermore, we set the adapter                                                          LoRA paper. This approach involves: 1) Updating the base
+     ranks based on Table 1 with a round-robin method.                                                                   model with the current adapter weights before each new
+                                                                                                                         batch; and 2) Switching to a new adapter if there are too
+      Since we are using a real workload trace, there are no pa-
+                                                                                                                         many waiting requests.2 This method is efficient for a small
+      rameters such as α, λi , or cv. For consistency, we set the
+                                                                                                                         number of adapters due to the reduced LoRA computation
+      duration to 5 minutes. We adjust the request rate R to study
+                                                                                                                         overhead.
+      its impact on performance metrics. In the sampled trace, the
+      average input length is 85 tokens, the average output length                                                        Results in Figure 9 demonstrate that with just one adapter,
+      is 165 tokens, and the number of adapters is around 26.                                                                 2
+                                                                                                                                This is different from PEFT. For example, it has continuous
+      Results. Figure 7 shows the throughput and attainment                                                               batching and PagedAttention, which are not enabled in PEFT.
+                                                                 S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+the merging approach outperforms the on-the-fly computa-                                                           S-LoRA-FCFS        S-LoRA-LCFS        S-LoRA-Abort
+tion owing to a one-time merging cost. However, its per-                                                                S2 (Llama-7b)               S4 (Llama-13b)
+formance declines with more than 2 adapters, primarily                                                       0.8
+
+
+
+
+                                                                                             SLO Attainment
+because of the time-consuming switch between adapters.                                                                                   0.6
+Such switching results in periods of GPU under-utilization.                                                  0.5                         0.4
+Furthermore, a smaller value of α causes requests to be
+                                                                                                             0.2                         0.2
+distributed unevenly across adapters, which in turn reduces
+batch sizes and overall performance.                                                                         0.0   2     4     6      8 0.0     2    4      6      8
+                                        S-LoRA-merge alpha=0.1      S-LoRA-merge alpha=1                                                 0.6
+
+
+
+
+                                                                                             User Satisfaction
+                                        S-LoRA alpha=0.1            S-LoRA alpha=1                           0.6
+                              1.8                                                                            0.4                         0.4
+                              1.7
+         throughput (req/s)
+
+
+
+
+                              1.6                                                                            0.2                         0.2
+                              1.5                                                                            0.0
+                              1.4                                                                                  2     4      6     8 0.0     2    4      6      8
+                                                                                                                         CV Scale                    CV Scale
+                              1.3
+                              1.2
+                              1.1                                                             Figure 10. Ablation study for early abort scheduling strategy on
+                                    1           2        3         4                  5       A10G-24G (S1) and A100-80G (S4). Other settings follow the
+                                                 number of adapters                           description in Table 2.
+Figure 9. Ablation study comparing adapter merging and on-the-
+fly compute for S2 on A10G (24GB) with different α and number                                  In concurrent work, Punica (Chen et al., 2023) explored the
+of adapters. The settings for the synthetic workloads are R =                                  concept of decomposed computation for the base model and
+2, cv = 1, [It , Iu ] = [8, 512], [Ol , Ou ] = [8, 512].
+                                                                                               adapters. Some of our CUDA kernels were developed based
+                                                                                               on the implementation presented in a previous blog post
+Early abort strategy experiments. We compared S-
+                                                                                               of Punica, with additional support for batching different
+LoRA’s early abort strategy to First Come First Serve
+                                                                                               ranks and non-contiguous memory. Analyzing kernel per-
+(FCFS) and Last Come First Serve (LCFS) for optimiz-
+                                                                                               formance is not the focus of this paper, but it is discussed in
+ing user satisfaction and SLO attainment. As shown in
+                                                                                               Punica. Our work differs from Punica in our novel memory
+Figure 10, S-LoRA-Abort outperforms both, especially as
+                                                                                               management and tensor parallelism techniques, which have
+cv scales. FCFS is least effective, often processing requests
+                                                                                               not been covered in any previous work.
+that have already missed the SLO. LCFS, similar to a greedy
+algorithm that only prioritizes the newest requests, works                                     Optimize LLM serving with algorithm techniques. In
+well for small cv, but its performance drops with larger                                       addition to system-level improvements, inference efficiency
+cv. S-LoRA-Abort excels as it avoids prioritizing only the                                     can be enhanced using algorithm techniques like quanti-
+newest requests, as detailed in Appendix B.                                                    zation (Yao et al., 2022; Dettmers et al., 2022; Frantar
+                                                                                               et al., 2022; Xiao et al., 2023; Lin et al., 2023), sparsifi-
+8    R ELATED WORK                                                                             cation (Frantar & Alistarh, 2023; Zhang et al., 2023b) and
+                                                                                               model architecture improvements (Shazeer, 2019). These
+Optimize LLM serving with system techniques. The sig-                                          approaches can reduce memory consumption and accelerate
+nificance of the transformer architecture has led to the devel-                                the computation, with a minor compromise in model quality.
+opment of many specialized serving systems for it. These                                       They are complementary to the techniques in this paper.
+systems use advanced batching mechanisms (Fang et al.,
+                                                                                               Parameter-efficient fine-tuning. Recent work has devel-
+2021; Yu et al., 2022), memory optimizations (Sheng et al.,
+                                                                                               oped methods for parameter-efficient fine-tuning of large
+2023; Kwon et al., 2023), GPU kernel optimizations (Wang
+                                                                                               pre-trained language models. These methods show fine-
+et al., 2021; Aminabadi et al., 2022; NVIDIA, 2023; Dao,
+                                                                                               tuning is possible with only a small fraction of tuned param-
+2023), model parallelism (Pope et al., 2022; Aminabadi
+                                                                                               eters. The state-of-the-art methods include LoRA (Hu et al.,
+et al., 2022), parameter sharing (Zhou et al., 2022), and
+                                                                                               2021), Prefix-tuning (Li & Liang, 2021), P-Tuning (Liu
+speculative execution (Stern et al., 2018; Miao et al., 2023)
+                                                                                               et al., 2021), Prompt tuning (Liu et al., 2023; Lester et al.,
+for efficient serving. Among them, PetS (Zhou et al., 2022)
+                                                                                               2021), AdaLoRA (Zhang et al., 2022), and (IA)3 (Liu et al.,
+is most relevant to ours. However, PetS only considers
+                                                                                               2022). While our paper focuses on LoRA due to its wide
+the serving for small encoder-only BERT models. It does
+                                                                                               adoption, most techniques can be easily applied to other
+not consider generative inference, a very large number of
+                                                                                               parameter-efficient fine-tuning methods as well.
+adapters or large models go beyond a single GPU, so it does
+not address the problems in our settings.                                                      General purpose model serving systems. Over the years,
+                                S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+the domain of general model serving has seen significant          In Wolf, F., Shende, S., Culhane, C., Alam, S. R., and
+advancements, Notable systems from earlier research in-           Jagode, H. (eds.), SC22: International Conference for
+clude Clipper (Crankshaw et al., 2017), TensorFlow Serv-          High Performance Computing, Networking, Storage and
+ing (Olston et al., 2017), Nexus (Shen et al., 2019), Infer-      Analysis. IEEE, 2022.
+Line (Crankshaw et al., 2020), and Clockwork (Gujarati
+et al., 2020). These systems delve into topics such as batch-   Anil, R., Dai, A. M., Firat, O., Johnson, M., Lepikhin,
+ing, caching, and model placement, catering to both individ-      D., Passos, A., Shakeri, S., Taropa, E., Bailey, P., Chen,
+ual and multiple model deployments. In more recent devel-         Z., et al. Palm 2 technical report. arXiv preprint
+opments, DVABatch (Cui et al., 2022), REEF (Han et al.,           arXiv:2305.10403, 2023.
+2022), Shepherd (Zhang et al., 2023a) and AlpaServe (Li         Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+et al., 2023) have explored the ideas of multi-entry multi-       Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+exit batching, preemption, and statistical multiplexing with      Askell, A., et al. Language models are few-shot learners.
+model parallelism. Although these systems have made sig-          Advances in neural information processing systems, 33:
+nificant contributions, they overlook the auto-regressive         1877–1901, 2020.
+characteristics and parameter-efficient adapters in LLM serv-
+ing, leading to potential optimization gaps.                    Chen, L. Potentials of multitenancy fine-tuned llm serv-
+                                                                  ing. https://le.qun.ch/en/blog/2023/09/
+9   C ONCLUSION                                                   11/multi-lora-potentials/, 2023.
+
+We present S-LoRA, a system capable of serving thou-            Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., and Krishna-
+sands of LoRA adapters from a single machine with much            murthy, A. Punica: Multi-tenant lora serving, 2023.
+higher throughput compared to existing systems. S-LoRA          Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,
+is made possible by our innovative design of the unified          G., Roberts, A., Barham, P., Chung, H. W., Sutton, C.,
+memory pool, tensor parallelism strategy, adapter batch-          Gehrmann, S., et al. Palm: Scaling language modeling
+ing, and CUDA kernels. S-LoRA enables large-scale, cus-           with pathways. arXiv preprint arXiv:2204.02311, 2022.
+tomized fine-tuning services essential for deploying models
+tailored to diverse requirements. Future extensions of S-       Crankshaw, D., Wang, X., Zhou, G., Franklin, M. J., Gon-
+LoRA will encompass support for additional adapter meth-          zalez, J. E., and Stoica, I. Clipper: A low-latency online
+ods, enhanced fused kernels, and the use of multiple CUDA         prediction serving system. In 14th USENIX Symposium
+streams to parallelize base model and LoRA computations.          on Networked Systems Design and Implementation (NSDI
+                                                                  17), pp. 613–627, 2017.
+ACKNOWLEDGMENT                                                  Crankshaw, D., Sela, G.-E., Mo, X., Zumar, C., Stoica, I.,
+This research was supported by gifts from Anyscale, As-           Gonzalez, J., and Tumanov, A. Inferline: latency-aware
+tronomer, Google, IBM, Intel, Lacework, Microsoft, Mo-            provisioning and scaling for prediction serving pipelines.
+hamed Bin Zayed University of Artificial Intelligence, Sam-       In Proceedings of the 11th ACM Symposium on Cloud
+sung SDS, Uber, and VMware. Ying is partly supported by           Computing, pp. 477–491, 2020.
+the Stanford Center for Automated Reasoning. We thank           Cui, W., Zhao, H., Chen, Q., Wei, H., Li, Z., Zeng, D.,
+Clark Barrett for academic advising and funding support.          Li, C., and Guo, M. Dvabatch: Diversity-aware multi-
+We also thank Yonghao Zhuang and Lisa Dunlap for their            entry multi-exit batching for efficient processing of dnn
+helpful discussions and feedback.                                 services on gpus. In 2022 USENIX Annual Technical
+                                                                  Conference (USENIX ATC 22), pp. 183–198, 2022.
+R EFERENCES
+                                                                Dao, T. Flashattention-2: Faster attention with bet-
+Alayrac, J.-B., Donahue, J., Luc, P., Miech, A., Barr, I.,        ter parallelism and work partitioning. arXiv preprint
+  Hasson, Y., Lenc, K., Mensch, A., Millican, K., Reynolds,       arXiv:2307.08691, 2023.
+  M., et al. Flamingo: a visual language model for few-shot
+  learning. Advances in Neural Information Processing           Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.
+  Systems, 35:23716–23736, 2022.                                  Llm.int8(): 8-bit matrix multiplication for transformers at
+                                                                  scale. In Oh, A. H., Agarwal, A., Belgrave, D., and Cho,
+                                                                  K. (eds.), Advances in Neural Information Processing
+Aminabadi, R. Y., Rajbhandari, S., Awan, A. A., Li, C., Li,       Systems, 2022.
+ D., Zheng, E., Ruwase, O., Smith, S., Zhang, M., Rasley,
+ J., and He, Y. Deepspeed- inference: Enabling efficient        Fang, J., Yu, Y., Zhao, C., and Zhou, J. Turbotransformers:
+ inference of transformer models at unprecedented scale.          an efficient gpu serving system for transformer models.
+                                 S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+  In Proceedings of the 26th ACM SIGPLAN Symposium               Korthikanti, V. A., Casper, J., Lym, S., McAfee, L., Ander-
+  on Principles and Practice of Parallel Programming, pp.          sch, M., Shoeybi, M., and Catanzaro, B. Reducing activa-
+  389–402, 2021.                                                   tion recomputation in large transformer models. Proceed-
+                                                                   ings of Machine Learning and Systems, 5, 2023.
+Fedus, W., Zoph, B., and Shazeer, N. Switch transform-
+  ers: Scaling to trillion parameter models with simple          Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  and efficient sparsity. The Journal of Machine Learning         C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  Research, 23(1):5232–5270, 2022.                                memory management for large language model serving
+                                                                  with pagedattention. In Flinn, J., Seltzer, M. I., Druschel,
+Frantar, E. and Alistarh, D. Massive language models
+                                                                  P., Kaufmann, A., and Mace, J. (eds.), Proceedings of the
+  can be accurately pruned in one-shot. arXiv preprint
+                                                                  29th Symposium on Operating Systems Principles, SOSP
+  arXiv:2301.00774, 2023.
+                                                                  2023, pp. 611–626. ACM, 2023.
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. Gptq:
+                                                                 Lester, B., Al-Rfou, R., and Constant, N. The power of scale
+  Accurate post-training quantization for generative pre-
+                                                                   for parameter-efficient prompt tuning. In Proceedings of
+  trained transformers. arXiv preprint arXiv:2210.17323,
+                                                                   the 2021 Conference on Empirical Methods in Natural
+  2022.
+                                                                   Language Processing, pp. 3045–3059, 2021.
+Gujarati, A., Karimi, R., Alzayat, S., Hao, W., Kaufmann,
+ A., Vigfusson, Y., and Mace, J. Serving {DNNs} like             Li, X. L. and Liang, P. Prefix-tuning: Optimizing continu-
+  clockwork: Performance predictability from the bottom            ous prompts for generation. In Proceedings of the 59th
+  up. In 14th USENIX Symposium on Operating Systems                Annual Meeting of the Association for Computational Lin-
+ Design and Implementation (OSDI 20), pp. 443–462,                 guistics and the 11th International Joint Conference on
+  2020.                                                            Natural Language Processing (Volume 1: Long Papers),
+                                                                   pp. 4582–4597, 2021.
+Han, M., Zhang, H., Chen, R., and Chen, H.
+  Microsecond-scale preemption for concurrent {GPU-              Li, Z., Zheng, L., Zhong, Y., Liu, V., Sheng, Y., Jin, X.,
+  accelerated}{DNN} inferences. In 16th USENIX Sympo-              Huang, Y., Chen, Z., Zhang, H., Gonzalez, J. E., et al.
+  sium on Operating Systems Design and Implementation              {AlpaServe}: Statistical multiplexing with model paral-
+ (OSDI 22), pp. 539–558, 2022.                                     lelism for deep learning serving. In 17th USENIX Sympo-
+                                                                   sium on Operating Systems Design and Implementation
+Houlsby, N., Giurgiu, A., Jastrzebski, S., Morrone, B.,            (OSDI 23), pp. 663–679, 2023.
+  De Laroussilhe, Q., Gesmundo, A., Attariyan, M., and
+  Gelly, S. Parameter-efficient transfer learning for nlp.       Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., and
+  In International Conference on Machine Learning, pp.             Han, S. Awq: Activation-aware weight quantization
+  2790–2799. PMLR, 2019.                                           for llm compression and acceleration. arXiv preprint
+                                                                   arXiv:2306.00978, 2023.
+Hu, E. J., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang,
+  L., Chen, W., et al. Lora: Low-rank adaptation of large        Liu, H., Tam, D., Muqeeth, M., Mohta, J., Huang, T., Bansal,
+  language models. In International Conference on Learn-           M., and Raffel, C. A. Few-shot parameter-efficient fine-
+  ing Representations, 2021.                                       tuning is better and cheaper than in-context learning. Ad-
+                                                                   vances in Neural Information Processing Systems, 35:
+Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, D., Chen,        1950–1965, 2022.
+  M., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., et al. Gpipe:
+  Efficient training of giant neural networks using pipeline     Liu, X., Ji, K., Fu, Y., Tam, W. L., Du, Z., Yang, Z., and
+  parallelism. Advances in neural information processing           Tang, J. P-tuning v2: Prompt tuning can be comparable
+  systems, 32, 2019.                                               to fine-tuning universally across scales and tasks. arXiv
+                                                                   preprint arXiv:2110.07602, 2021.
+Jamin, S., Shenker, S., Zhang, L., and Clark, D. D. An ad-
+  mission control algorithm for predictive real-time service.    Liu, X., Zheng, Y., Du, Z., Ding, M., Qian, Y., Yang, Z.,
+  In Network and Operating System Support for Digital              and Tang, J. Gpt understands, too. AI Open, 2023. ISSN
+  Audio and Video: Third International Workshop La Jolla,          2666-6510. doi: https://doi.org/10.1016/j.aiopen.2023.08.
+  California, USA, November 12–13, 1992 Proceedings 3,             012. URL https://www.sciencedirect.com/
+  pp. 347–356. Springer, 1993.                                     science/article/pii/S2666651023000141.
+Kenton, J. D. M.-W. C. and Toutanova, L. K. Bert: Pre-           Mangrulkar, S., Gugger, S., Debut, L., Belkada, Y., Paul,
+  training of deep bidirectional transformers for language        S., and Bossan, B. Peft: State-of-the-art parameter-
+  understanding. In Proceedings of NAACL-HLT, pp. 4171–           efficient fine-tuning methods. https://github.
+  4186, 2019.                                                     com/huggingface/peft, 2022.
+                                 S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z., Wong,      Shen, H., Chen, L., Jin, Y., Zhao, L., Kong, B., Philipose,
+ R. Y. Y., Chen, Z., Arfeen, D., Abhyankar, R., and Jia,           M., Krishnamurthy, A., and Sundaram, R. Nexus: A gpu
+ Z. Specinfer: Accelerating generative llm serving with            cluster engine for accelerating dnn-based video analysis.
+ speculative inference and token tree verification. arXiv          In Proceedings of the 27th ACM Symposium on Operating
+ preprint arXiv:2305.09781, 2023.                                  Systems Principles, pp. 322–337, 2019.
+
+ModelTC. Lightllm: Python-based llm inference and serv-          Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,
+ ing framework. https://github.com/ModelTC/                        B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flex-
+ lightllm, 2023. GitHub repository.                                gen: High-throughput generative inference of large lan-
+                                                                   guage models with a single GPU. In International Confer-
+Naghshineh, M. and Schwartz, M. Distributed call admis-            ence on Machine Learning, ICML 2023, volume 202 of
+  sion control in mobile/wireless networks. IEEE Journal           Proceedings of Machine Learning Research, pp. 31094–
+  on Selected Areas in Communications, 14(4):711–717,              31116. PMLR, 2023.
+ 1996.
+                                                                 Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,
+Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Pat-        J., and Catanzaro, B. Megatron-lm: Training multi-
+  wary, M., Korthikanti, V., Vainbrand, D., Kashinkunti, P.,       billion parameter language models using model paral-
+  Bernauer, J., Catanzaro, B., et al. Efficient large-scale        lelism. arXiv preprint arXiv:1909.08053, 2019.
+  language model training on gpu clusters using megatron-
+  lm. In Proceedings of the International Conference for         Stern, M., Shazeer, N., and Uszkoreit, J. Blockwise parallel
+  High Performance Computing, Networking, Storage and              decoding for deep autoregressive models. Advances in
+ Analysis, pp. 1–15, 2021.                                         Neural Information Processing Systems, 31, 2018.
+NVIDIA.   Cutlass gemm grouped.  https:                          Tillet, P., Kung, H.-T., and Cox, D. Triton: an intermediate
+ //github.com/NVIDIA/cutlass/blob/                                  language and compiler for tiled neural network computa-
+ main/examples/24_gemm_grouped/gemm_                                tions. In Proceedings of the 3rd ACM SIGPLAN Interna-
+ grouped.cu.                                                        tional Workshop on Machine Learning and Programming
+                                                                   Languages, pp. 10–19, 2019.
+NVIDIA. Fastertransformer. https://github.com/
+ NVIDIA/FasterTransformer, 2023.                                 Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+                                                                   M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+Olston, C., Fiedel, N., Gorovoy, K., Harmsen, J., Lao, L., Li,
+                                                                   Azhar, F., et al. Llama: Open and efficient foundation lan-
+  F., Rajashekhar, V., Ramesh, S., and Soyke, J. Tensorflow-
+                                                                   guage models. arXiv preprint arXiv:2302.13971, 2023a.
+  serving: Flexible, high-performance ml serving. arXiv
+  preprint arXiv:1712.06139, 2017.                               Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+OpenAI. Gpt-4 technical report, 2023.                              A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+                                                                   Bhosale, S., et al. Llama 2: Open foundation and fine-
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C.,        tuned chat models. arXiv preprint arXiv:2307.09288,
+  Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A.,         2023b.
+  et al. Training language models to follow instructions
+  with human feedback. Advances in Neural Information            Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+  Processing Systems, 35:27730–27744, 2022.                        L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+                                                                   tention is all you need. Advances in neural information
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J.,         processing systems, 30, 2017.
+  Chanan, G., Killeen, T., Lin, Z., Gimelshein, N., Antiga,
+  L., et al. Pytorch: An imperative style, high-performance      Vin, H., Goyal, P., and Goyal, A. A statistical admission con-
+  deep learning library. Advances in neural information            trol algorithm for multimedia servers. In Proceedings of
+  processing systems, 32, 2019.                                    the second ACM international conference on Multimedia,
+                                                                   pp. 33–40, 1994.
+Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury,
+  J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S., and         Wang, X., Xiong, Y., Wei, Y., Wang, M., and Li, L. Light-
+  Dean, J. Efficiently scaling transformer inference. arXiv       seq: A high performance inference library for transform-
+  preprint arXiv:2211.05102, 2022.                                ers. In Proceedings of the 2021 Conference of the North
+                                                                  American Chapter of the Association for Computational
+Shazeer, N. Fast transformer decoding: One write-head is          Linguistics: Human Language Technologies: Industry
+  all you need. arXiv preprint arXiv:1911.02150, 2019.            Papers, pp. 113–120, 2021.
+                                 S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,      Zhou, Z., Wei, X., Zhang, J., and Sun, G. {PetS}: A
+  S. Smoothquant: Accurate and efficient post-training              unified framework for {Parameter-Efficient} transformers
+  quantization for large language models. In International          serving. In 2022 USENIX Annual Technical Conference
+  Conference on Machine Learning, ICML 2023, volume                 (USENIX ATC 22), pp. 489–504, 2022.
+  202 of Proceedings of Machine Learning Research, pp.
+  38087–38099. PMLR, 2023.
+
+Yao, Z., Aminabadi, R. Y., Zhang, M., Wu, X., Li, C., and
+  He, Y. Zeroquant: Efficient and affordable post-training
+  quantization for large-scale transformers. In Oh, A. H.,
+  Agarwal, A., Belgrave, D., and Cho, K. (eds.), Advances
+  in Neural Information Processing Systems, 2022.
+
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  G. Orca: A distributed serving system for {Transformer-
+  Based} generative models. In 16th USENIX Symposium
+  on Operating Systems Design and Implementation (OSDI
+  22), pp. 521–538, 2022.
+
+Zhang, H., Tang, Y., Khandelwal, A., and Stoica, I. SHEP-
+  HERD: Serving DNNs in the wild. In 20th USENIX
+  Symposium on Networked Systems Design and Imple-
+  mentation (NSDI 23), pp. 787–808, Boston, MA, April
+  2023a. USENIX Association. ISBN 978-1-939133-33-5.
+  URL https://www.usenix.org/conference/
+  nsdi23/presentation/zhang-hong.
+
+Zhang, Q., Chen, M., Bukharin, A., He, P., Cheng, Y.,
+  Chen, W., and Zhao, T. Adaptive budget allocation for
+  parameter-efficient fine-tuning. In The Eleventh Interna-
+  tional Conference on Learning Representations, 2022.
+
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+  R., Song, Z., Tian, Y., Ré, C., Barrett, C., et al. H 2 o:
+  Heavy-hitter oracle for efficient generative inference of
+  large language models. arXiv preprint arXiv:2306.14048,
+  2023b.
+
+Zheng, L., Li, Z., Zhang, H., Zhuang, Y., Chen, Z., Huang,
+  Y., Wang, Y., Xu, Y., Zhuo, D., Xing, E. P., et al. Alpa:
+  Automating inter-and intra-operator parallelism for dis-
+  tributed deep learning. In 16th USENIX Symposium on
+  Operating Systems Design and Implementation (OSDI
+  22), pp. 559–578, 2022.
+
+Zheng, L., Chiang, W.-L., Sheng, Y., Li, T., Zhuang, S., Wu,
+  Z., Zhuang, Y., Li, Z., Lin, Z., Xing, E., et al. Lmsys-chat-
+  1m: A large-scale real-world llm conversation dataset.
+  arXiv preprint arXiv:2309.11998, 2023a.
+
+Zheng, L., Chiang, W.-L., Sheng, Y., Zhuang, S., Wu, Z.,
+  Zhuang, Y., Lin, Z., Li, Z., Li, D., Xing, E., et al. Judg-
+  ing llm-as-a-judge with mt-bench and chatbot arena. In
+  Conference on Neural Information Processing Systems,
+  Datasets and Benchmarks Track, 2023b.
+                                   S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+A      A DDITIONAL E XPERIMENT R ESULTS                                  d can result in better performance. The small fluctuation
+                                                                         for small d’s may be because of the scheduler overhead and
+A.1    Analysis of PEFT                                                  random noise.
+In our evaluation of PEFT, several key observations were
+                                                                                                  alpha = 0.1            alpha = 0.3                        alpha = 0.6            alpha = 1
+discerned. First, the lack of KV cache support makes the
+                                                                                                            S2 (Llama-7b)                                      S4 (Llama-13b)
+maximal batch size of PEFT much smaller compared to
+S-LoRA. For instance, in A10G S1, S-LoRA can accom-                                       1.6                                                 1.2
+
+
+
+
+                                                                     Throughput (req/s)
+modate a maximal batch size of 30, while PEFT can only                                                                                        1.2
+accommodate a maximal batch size of 6. Secondly, the                                      1.4                                                 1.2
+lack of continuous batching support makes shorter requests                                                                                    1.1
+wait for longer requests in a batch. These two factors to-                                1.2
+                                                                                                                                              1.1
+gether result in the low throughput of PEFT even when                                     1.00                                                1.00
+                                                                                                        10          20        30                                10            20      30
+there is only one adapter. When there are more adapters, the
+lack of batching support across different adapters makes the                                                                                  0.5
+                                                                                          0.8
+throughput even lower, resulting in only 0.17 request/sec-                                                                                    0.4
+
+
+
+
+                                                                     SLO Attainment
+ond performance in the largest number of adapters we test.                                0.6                                                 0.3
+As another result, the average latency explodes because the                               0.4                                                 0.2
+request rate is far beyond the maximal capacity of the PEFT
+                                                                                          0.2                                                 0.1
+system. In Table 5, we show that even in the lowest request
+rate we test, PEFT fails to process with a low latency.                                   0.00          10      20         30                 0.00              10       20       30
+                                                                                                         Number of Clusters                                    Number of Clusters
+  num adapters     throughput    avg. latency    avg. attainment
+                                                                        Figure 11. Ablation study for different number of clusters on A100
+         1            0.26         1021.86            0.0               (40GB) with different α. The settings for the synthetic work-
+        20            0.23         1178.52            0.0               load trace are n = 32, α = [0.1, 0.3, 0.6, 1], R = 2, cv =
+        50            0.22         1293.97            0.0               1, [It , Iu ] = [8, 512], [Ol , Ou ] = [8, 512]
+       100            0.20         1421.16            0.0
+       200            0.17         1609.50            0.0
+                                                                                                   cv = 1           cv = 2                cv = 4                     cv = 6          cv = 8
+Table 4. PEFT results on the synthetic workload S1 against number                                                                            1.0
+                                                                                          2.0
+                                                                     Throughput (req/s)
+
+
+
+
+                                                                                                                                   SLO Attainment
+of adapters.                                                                                                                                        0.8
+                                                                                          1.8
+                                                                                          1.5                                                       0.5
+  req rate    throughput      avg. latency      avg. attainment
+                                                                                          1.2                                                       0.2
+       1          0.11          1165.46              0.0                                  1.0 0                                                     0.0 0
+                                                                                                      10        20     30                                         10      20       30
+      1.5         0.13          1398.56              0.0                                            Number of Clusters                                          Number of Clusters
+       2          0.17          1614.37              0.0
+      2.5         0.18          1904.73              0.0                Figure 12. Ablation study for different number of clusters on S2
+                                                                        (Llama-7b) A100 (80GB) with different cv. The settings for the
+Table 5. PEFT results on the synthetic workload S1 against request      synthetic workload trace are n = 32, α = 1, R = 2, cv =
+rate.                                                                   [1, 2, 4, 6, 8], [It , Iu ] = [8, 512], [Ol , Ou ] = [8, 512]
+
+A.2    Experiments for adapter clustering.
+                                                                         B                   A DMISSION C ONTROL IN S-L O RA
+We implement a straightforward adapter clustering algo-
+rithm. Let parameter d be the number of adapters in a batch.            Traditional admission control usually assumes a hard thresh-
+In addition to the FCFS order (or early abort order if turned           old for the delay in the service (Jamin et al., 1993; Vin
+on), if the number of adapters reaches d, we will prioritize            et al., 1994; Naghshineh & Schwartz, 1996), and controls
+the requests that have their adapter already in the batch. But          the total number of violations of delay. Here for LoRA
+if the requests from the d adapters cannot fill all the space           serving, we assume a soft threshold characterized by the
+for a running batch, we allow other requests to be added. We            user’s reward function. For illustration purposes, let the
+run some additional experiments to study how the number                 arrival time of the requests be integers, and assume that
+of clusters impacts throughput and SLO attainment. We                   we process one query in each time period of length 1. Let
+call d as the number of clusters in the figure. As shown in             Q = {q1 , q2 , · · · qn } be the request queue in the ascending
+Figure 11 and Figure 12, the impact is not significant but ob-          order of the arrival time, and l be the desired number of
+servable, especially for larger α and cv. Generally, a small            served requests. We quantify the user’s satisfaction with a
+                                    S-LoRA: Serving Thousands of Concurrent LoRA Adapters
+
+reward function r : R+ 7→ [0, 1] that maps the first token        B.1     Proof of Theorem B.1
+latency of a request to a scalar in between [0, 1], where 0
+                                                                  We first prove that for any admission control strategy that
+represents the user losing patience and giving up the query,
+                                                                  serves l elements, one can always find another admission
+and 1 represents the user is completely satisfied with the
+                                                                  control strategy that serves the most recent l elements with
+latency. Let ti be the latency of serving the request qi in the
+                                                                  a larger cumulative reward.
+queue Q. Then we aim to solve the following constrained
+optimization:                                                     Assume that we serve l elements qs1 , qs2 , · · · , qsl in the l
+                                                                  timesteps. Assume without loss of generality that qs1 is not
+                                                                  among the most recent l elements, and assume that the k-th
+                         n
+                         X                                        element is not served with k ∈ [n − l, n]. By definition
+                   max         r(ti )                      (3)
+                                                                  we know that s1 < k. Now at the time of serving qs1 , we
+                         i=1
+                                                                  serve qk rather than qs1 , and keep the rest of the choices in
+                    s.t. 1(r(ti ) > 0) = l.                       other time steps same. In this case, the number of served
+                                                                  queries remains the same. On the other hand, we know that
+                                                                  the latency satisfies ts1 > tk since the k-th element is more
+We show that when the derivative of reward is non-
+                                                                  recent. This gives that
+increasing, the optimal solution to the above constrained
+optimization problem is to serve the most recent l elements                                 r(ts1 ) < r(tk ).
+qn−l+1 , qn−l+2 , · · · , qn in order.
+                                                                  Since the reward for other elements does not change, the
+Theorem B.1. Assume that r′ (t) ≤ 0 for any t ∈ R+ . The          total reward is increased while the constraint is still satisfied.
+optimal solution to Equation (3) is to serve the most recent      By repeating the operations until all the elements served are
+l elements qn−l+1 , qn−l+2 , · · · , qn in order.                 the most recent l elements, we prove that claim.
+                                                                  Next, we prove that serving the most recent l elements in
+The proof is deferred to Appendix B.1. In practice, for a         order of qn−l+1 , qn−l+2 , · · · , qn is optimal. For any i, j ∈
+given request queue, we can estimate the largest possible         [n − l + 1, n], we assume that i < j and j is first served at
+number of requests to be served in SLO as l. Then we              time t1 while i is served at time t2 with t1 < t2 . Let tai , taj
+take the most recent l elements for serving. Such an l can        be the arrival time of i, j. The reward for serving i, j in this
+be approximated by simulating a First-Come-First-Serve            case becomes
+(FCFS) strategy, which is optimized to serve requests as
+many as possible.                                                                      r(t2 − tai ) + r(t1 − taj ).
+In S-LoRA, the scenario is more complicated because of the
+                                                                  Now we show that by swapping the time of serving i, j, the
+heterogeneity and unpredictability of the sequence length.
+                                                                  reward does not decrease. This is equivalent to showing that
+As an approximation, we implement a heuristic as follows.
+The high-level scheduling is that we will fetch a minibatch             r(t1 − tai ) + r(t2 − taj ) ≥ r(t2 − tai ) + r(t1 − taj ).
+of new requests to be added into the running batch every
+several decode step. From the history, we use the moving          Rearranging the above equation, we know that it is equiva-
+average to estimate a current request rate R1 measured in         lent to
+how many requests will be added to the waiting queue per
+period of fetching new requests. We also use the moving              r(t1 − tai ) − r(t2 − tai )   r(t1 − taj ) − r(t2 − taj )
+                                                                                                 ≤                             .
+average to estimate the number of new requests R2 that can                    t1 − t2                       t1 − t2
+be added to the running batch for a period. Let rti be the
+                                                                  This is true due to the concavity of the reward function, thus
+coming time of request ri , ct be the current time, tlmax be
+                                                                  finishing the proof.
+the maximum allowed first token latency to meet the SLO
+and lpref ill be the maximum prefill latency for a minibatch
+in history. Each time we generate the new minibatch, we
+will first abort the requests R = {rk | ct − rtk + lpref ill >
+tlmax }. Requests in R are highly likely to miss the SLO
+even if they get scheduled immediately due to the high
+prefill latency. Then if R1 > R2 , which means the system
+is temporarily overloaded, we will fetch the newest requests
+into the minibatch. If R1 ≤ R2 , the waiting queue will be
+shortened if the trend continues. In this case, we will choose
+from the earliest.
+

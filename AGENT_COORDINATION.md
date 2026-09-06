@@ -1,5 +1,13 @@
 # Skeleton 编辑分工
 
+### LLM 推理论文选读与归档（2026-09-06，已完成）
+
+按作者要求对照已有资料做定向 survey，新增 22 篇 arXiv 论文 PDF 和 3 份官方工程资料，全部取得正文。新增内容覆盖推理资源模型、FlashInfer、DeepSpeed、KV 压缩、投机采样与 EAGLE、多副本缓存、公司模型／基础设施报告及多模型服务。原有 203 项快照保持原件与校验值；现共 228 项，224 项取得正文，134 份 PDF。
+
+新增 `references/INFERENCE-PAPER-GUIDE.md`，按写作问题组织 49 项选读，逐项标注章内落点、原文入口、可支撑的论点与引用边界；配套 `inference-reading-map.tsv` 和本轮 22 篇论文的 `inference-additions.bib`。定向阅读与原页抽查的范围在指南中列明，不标为逐页精读或复现。正文继续按问题展开，只在蓝图章节细目处加入入口，并同步 README、资料索引生成器、来源章号及缺口说明。
+
+验证：新增 25 项的字节数、SHA-256、正文，22 个 PDF 的页数和固定 arXiv 版本，已有原件的校验值、本地 Markdown 链接、49 项映射完整性、22 条 BibTeX 及 91 节编号均通过；`git diff --check` 通过。此次新增原件约 64.8 MB，论文共 510 页；未把论文测量作为本书实测。
+
 ### 最新补充（本地设备与异构推理案例，2026-09-06）
 
 按作者确认加入 M2 Max（38 核 GPU、96 GB）与 RTX PRO 6000 Blackwell Workstation Edition（600 W）配对案例，M2 Pro 保留为规格参照。第 4、5、8、9 章同步设备、Ollama 实际后端和测量安排。第 10 章将 PD 与 AF 独立为 10.2、10.3 节，细目增至 91 节；PD 重点为 A100 prefill＋H20 decode，AF 按作者最终选择采用公开文档中的 KTransformers RTX 4090＋双路 Xeon Gold 6454S，重点分析 AMX／AVX-512、NUMA 与异步执行。

@@ -8,6 +8,7 @@
 - **OpenTallas 案例与习题**：[`case-studies/opentallas.md`](case-studies/opentallas.md)（四条原则、六个案例及手算解答，分布到现有章节）
 - **训练计算量复算**：[`case-studies/training-compute.md`](case-studies/training-compute.md)（近期模型报告、算子计数与未知量）
 - **本地参考资料库**：[`references/README.md`](references/README.md)（按章节整理的论文、芯片规格、协议与官方文档）
+- **LLM 推理论文与写作落点**：[`references/INFERENCE-PAPER-GUIDE.md`](references/INFERENCE-PAPER-GUIDE.md)（49 项选读；新增 22 篇论文和 3 份官方工程资料，按具体问题标注查阅位置与引用边界）
 - **芯片与系统资料覆盖**：[`references/HARDWARE-COVERAGE.md`](references/HARDWARE-COVERAGE.md)（各家架构的本地原件、可支持的论述及剩余缺口）
 - **UB 与昇腾 950 核对笔记**：[`references/UB-ASCEND-NOTES.md`](references/UB-ASCEND-NOTES.md)（作者提供的三份正式资料、页码与章节对应）
 - **加速器架构与执行比较**：[`case-studies/accelerator-architecture.md`](case-studies/accelerator-architecture.md)（昇腾与 NVIDIA 的演进、数据通路、动态 shape 和编程成本；贯穿第 4、5 章）

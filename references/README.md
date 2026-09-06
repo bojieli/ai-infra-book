@@ -2,9 +2,11 @@
 
 对应当前三部分、十三章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。
 
-当前清单 203 项：已保存正文 199 项，其中 PDF 112 份。其余项目的获取状态见文末。
+当前清单 228 项：已保存正文 224 项，其中 PDF 134 份。其余项目的获取状态见文末。
 
 [浏览本地索引](index.html) · [来源清单](sources.tsv) · [下载与校验记录](manifest.json) · [证据缺口](GAPS.md)
+
+[LLM 推理论文选读与写作落点](INFERENCE-PAPER-GUIDE.md)按问题整理 49 项核心与专题资料，标注查阅小节、可支撑的论点及引用边界；另有 [章节映射](inference-reading-map.tsv)和[本轮新增论文 BibTeX](inference-additions.bib)。
 
 [芯片与系统资料覆盖](HARDWARE-COVERAGE.md)按架构列出论文、编程文档和产品规格，并说明尚缺的证据；关键网页配图另见[配图索引](figures/README.md)。
 
@@ -54,6 +56,9 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [OpenTallas architecture and analysis](https://github.com/bojieli/OpenTallas/tree/39b96158d35b24bd2bcd49061a689aea6893d2ed) | [原件](files/documents/opentallas-readme.md) · [文本](text/opentallas-readme.txt)（local_snapshot） | 与本书已有案例使用相同提交 |
 | [Llama 2: Open Foundation and Fine-Tuned Chat Models](https://arxiv.org/abs/2307.09288) | [原件](files/papers/llama2.pdf) · [文本](text/llama2.txt) | 历史 70B 案例的配置来源 |
 | [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) | [原件](files/papers/llama3.pdf) · [文本](text/llama3.txt) | 架构与训练报告 |
+| [Efficient Streaming Language Models with Attention Sinks](https://arxiv.org/abs/2309.17453v4) | [原件](files/papers/streamingllm.pdf) · [文本](text/streamingllm.txt) | Attention sinks 与滑动窗口；流式稳定性不等于保留完整历史检索能力 |
+| [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388v1) | [原件](files/papers/qwen3.pdf) · [文本](text/qwen3.txt) | Alibaba 公司技术报告；稠密／MoE 配置与 thinking budget，不代填 Qwen3.5 参数 |
+| [Mixtral of Experts](https://arxiv.org/abs/2401.04088v1) | [原件](files/papers/mixtral.pdf) · [文本](text/mixtral.txt) | Mistral 公司模型报告；稀疏激活、专家路由与驻留参数的区别 |
 
 ## 第 3 章 训练与推理负载
 
@@ -70,11 +75,16 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [In-Datacenter Performance Analysis of a Tensor Processing Unit](https://arxiv.org/abs/1704.04760) | [原件](files/papers/tpu-v1.pdf) · [文本](text/tpu-v1.txt) | TPU 起源与设计比较 |
 | [Robust Speech Recognition via Large-Scale Weak Supervision](https://arxiv.org/abs/2212.04356) | [原件](files/papers/whisper.pdf) · [文本](text/whisper.txt) | ASR 计算与数据流 |
 | [Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech](https://arxiv.org/abs/2106.06103) | [原件](files/papers/vits.pdf) · [文本](text/vits.txt) | TTS 结构；不预设为流式系统 |
+| [Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving](https://arxiv.org/abs/2407.00079) | [原件](files/papers/mooncake.pdf) · [文本](text/mooncake.txt) | KV 池化与路由 |
 | [A100/H100 太贵，何不用 4090？](https://01.me/2023/09/h100-vs-4090/) | [原件](files/documents/h100-vs-4090.html) · [文本](text/h100-vs-4090.txt) | 历史价格与计算需按正文案例重新核算 |
 | [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685) | [原件](files/papers/lora.pdf) · [文本](text/lora.txt) | 冻结参数与训练计算量 |
 | [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314) | [原件](files/papers/qlora.pdf) · [文本](text/qlora.txt) | 量化微调 |
 | [Llama 2: Open Foundation and Fine-Tuned Chat Models](https://arxiv.org/abs/2307.09288) | [原件](files/papers/llama2.pdf) · [文本](text/llama2.txt) | 历史 70B 案例的配置来源 |
 | [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) | [原件](files/papers/llama3.pdf) · [文本](text/llama3.txt) | 架构与训练报告 |
+| [Efficiently Scaling Transformer Inference](https://arxiv.org/abs/2211.05102v1) | [原件](files/papers/scaling-inference.pdf) · [文本](text/scaling-inference.txt) | Google；推理计算／通信模型、TPU 分片与延迟—吞吐取舍；历史配置不直接套用 GPU |
+| [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388v1) | [原件](files/papers/qwen3.pdf) · [文本](text/qwen3.txt) | Alibaba 公司技术报告；稠密／MoE 配置与 thinking budget，不代填 Qwen3.5 参数 |
+| [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948v2) | [原件](files/papers/deepseek-r1.pdf) · [文本](text/deepseek-r1.txt) | 公司技术报告；RL 推理模型、长输出与采样负载；不视为 serving 性能报告 |
+| [Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters](https://arxiv.org/abs/2408.03314v1) | [原件](files/papers/test-time-compute.pdf) · [文本](text/test-time-compute.txt) | DeepMind／Berkeley；按难度分配推理预算；计算量、质量与墙钟时间分开 |
 
 ## 第 4 章 加速器架构
 
@@ -175,6 +185,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [NVIDIA AI Enterprise 6.2 supported H20 SXM5 configurations](https://docs.nvidia.com/ai-enterprise/release-6/6.2/appendix/vgpu.html) | [原件](files/specs/nvidia-h20-vgpu.html) · [文本](text/nvidia-h20-vgpu.txt) | 官方确认 H20 SXM5 96GB 型号；不是完整 H20 带宽／算力数据表 |
 | [Bullet: Boosting GPU Utilization for LLM Serving via Dynamic Spatial-Temporal Orchestration](https://xianweiz.github.io/doc/papers/26asplos_bullet.pdf) | [原件](files/papers/bullet.pdf) · [文本](text/bullet.txt) | ASPLOS 2026 作者原件；A100/H20 内存与 SM 微基准；作为同卡 P/D 协作对照，不是 A100＋H20 PD 部署实测 |
 | [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
+| [Efficiently Scaling Transformer Inference](https://arxiv.org/abs/2211.05102v1) | [原件](files/papers/scaling-inference.pdf) · [文本](text/scaling-inference.txt) | Google；推理计算／通信模型、TPU 分片与延迟—吞吐取舍；历史配置不直接套用 GPU |
 
 ## 第 5 章 算子与运行时
 
@@ -197,6 +208,10 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Unsloth official README](https://github.com/unslothai/unsloth) | [原件](files/documents/unsloth.md) · [文本](text/unsloth.txt) | 本地训练、运行、量化与导出 |
 | [Ollama Development and Compute Backends](https://docs.ollama.com/development) | [原件](files/documents/ollama.html) · [文本](text/ollama.txt) | Metal 与当前后端能力 |
 | [OpenTallas architecture and analysis](https://github.com/bojieli/OpenTallas/tree/39b96158d35b24bd2bcd49061a689aea6893d2ed) | [原件](files/documents/opentallas-readme.md) · [文本](text/opentallas-readme.txt)（local_snapshot） | 与本书已有案例使用相同提交 |
+| [GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers](https://arxiv.org/abs/2210.17323) | [原件](files/papers/gptq.pdf) · [文本](text/gptq.txt) | 权重量化 |
+| [AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration](https://arxiv.org/abs/2306.00978) | [原件](files/papers/awq.pdf) · [文本](text/awq.txt) | 量化与设备效率 |
+| [SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models](https://arxiv.org/abs/2211.10438) | [原件](files/papers/smoothquant.pdf) · [文本](text/smoothquant.txt) | 激活量化 |
+| [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) | [原件](files/papers/llama3.pdf) · [文本](text/llama3.txt) | 架构与训练报告 |
 | [昇腾 950 NPU 架构白皮书](files/specs/昇腾950%20NPU架构白皮书.pdf) | [原件](files/specs/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) · [文本](text/ascend-950-whitepaper.txt)（user_provided） | 作者提供，40 页；保留原文件；另存官方 OBS 文件 ascend-950-official，两份文件差异核对见 UB-ASCEND-NOTES.md |
 | [Serving Large Language Models on Huawei CloudMatrix384, v2](https://arxiv.org/abs/2506.12708v2) | [原件](files/papers/cloudmatrix384-v2.pdf) · [文本](text/cloudmatrix384-v2.txt) | 2025-06-18；§3.3.1 的 910C、§4.2.2 MLA 与动态 tiling；与 v3 分开保存 |
 | [Serving Large Language Models on Huawei CloudMatrix384, v3](https://arxiv.org/abs/2506.12708v3) | [原件](files/papers/cloudmatrix384-v3.pdf) · [文本](text/cloudmatrix384-v3.txt) | 2025-06-19 修订；核对型号称谓与 v2 差异 |
@@ -220,6 +235,11 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
 | [KT-Kernel CMake ARM KML build path](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/CMakeLists.txt) | [原件](files/documents/kt-kml-build.txt) · [文本](text/kt-kml-build.txt) | 固定提交；KML 构建分支的背景归档，不作为当前 Xeon AF 案例的实现依据 |
 | [KT-Kernel KML MoE correctness example](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/examples/test_moe_kml.py) | [原件](files/documents/kt-kml-example.txt) · [文本](text/kt-kml-example.txt) | 固定提交；KML MoE 样例的背景归档，不作为当前 Xeon AF 案例的实现依据 |
+| [DeepSpeed Inference: Enabling Efficient Inference of Transformer Models at Unprecedented Scale](https://arxiv.org/abs/2207.00032v1) | [原件](files/papers/deepspeed-inference.pdf) · [文本](text/deepspeed-inference.txt) | Microsoft／DeepSpeed；内核、模型并行及 CPU／NVMe 异构推理的联合设计 |
+| [FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving](https://arxiv.org/abs/2501.01005v2) | [原件](files/papers/flashinfer.pdf) · [文本](text/flashinfer.txt) | 开源注意力引擎；KV 布局、负载均衡调度、JIT 与 CUDA Graph 兼容 |
+| [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache](https://arxiv.org/abs/2402.02750v2) | [原件](files/papers/kivi.pdf) · [文本](text/kivi.txt) | KV 的 K/V 非对称量化；计入 scale、zero point、残余缓存与反量化成本 |
+| [LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale](https://arxiv.org/abs/2208.07339v2) | [原件](files/papers/llm-int8.pdf) · [文本](text/llm-int8.txt) | 大模型激活异常值与混合精度分解；低比特存储不等于端到端加速 |
+| [TensorRT LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html) | [原件](files/documents/tensorrt-llm-architecture.html) · [文本](text/tensorrt-llm-architecture.txt) | 官方架构文档快照；作为开源项目实现资料，不标为学术论文 |
 
 ## 第 6 章 超节点
 
@@ -295,6 +315,8 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Serving Large Language Models on Huawei CloudMatrix384, v2](https://arxiv.org/abs/2506.12708v2) | [原件](files/papers/cloudmatrix384-v2.pdf) · [文本](text/cloudmatrix384-v2.txt) | 2025-06-18；§3.3.1 的 910C、§4.2.2 MLA 与动态 tiling；与 v3 分开保存 |
 | [Serving Large Language Models on Huawei CloudMatrix384, v3](https://arxiv.org/abs/2506.12708v3) | [原件](files/papers/cloudmatrix384-v3.pdf) · [文本](text/cloudmatrix384-v3.txt) | 2025-06-19 修订；核对型号称谓与 v2 差异 |
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
+| [Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures](https://arxiv.org/abs/2505.09343v2) | [原件](files/papers/deepseek-infra.pdf) · [文本](text/deepseek-infra.txt) | DeepSeek ISCA 2025 报告；MLA／MoE、跨节点通信及硬件协同设计建议 |
+| [Day 6: DeepSeek-V3/R1 Inference System Overview](https://github.com/deepseek-ai/open-infra-index/blob/56d86855fcf6e08fdfd45ce6280bd24322c93351/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md) | [原件](files/documents/deepseek-serving-report.md) · [文本](text/deepseek-serving-report.txt) | 2025 公司工程报告；固定提交；PD、EP、通信与费用口径 |
 
 ## 第 7 章 数据中心网络
 
@@ -344,6 +366,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech](https://arxiv.org/abs/2106.06103) | [原件](files/papers/vits.pdf) · [文本](text/vits.txt) | TTS 结构；不预设为流式系统 |
 | [计算机网络的新黄金时代（二）](https://01.me/2023/05/new-golden-age-for-network-2/) | [原件](files/documents/network-golden-2.html) · [文本](text/network-golden-2.txt) | 作者素材；广域 |
 | [计算机网络的新黄金时代（三）](https://01.me/2023/06/new-golden-age-for-network-3/) | [原件](files/documents/network-golden-3.html) · [文本](text/network-golden-3.txt) | 作者素材；无线与端侧 |
+| [FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU](https://arxiv.org/abs/2303.06865) | [原件](files/papers/flexgen.pdf) · [文本](text/flexgen.txt) | 卸载与数据移动 |
 | [Snapdragon X Elite Product Brief](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/images/company/news-media/media-center/press-kits/snapdragon-summit-2023/documents/SnapdragonXEliteProductBrief.pdf) | [原件](files/specs/qualcomm-xelite.pdf) · [文本](text/qualcomm-xelite.txt) | 端侧 CPU、GPU、Hexagon 与共享内存；2023 年产品代际 |
 | [MacBook Pro (14-inch, M5) Technical Specifications](https://support.apple.com/en-mide/125405) | [原件](files/specs/apple-m5-macbook.html) · [文本](text/apple-m5-macbook.txt) | 2025 年具体端侧产品；CPU、GPU、Neural Engine 与统一内存，非完整微架构手册 |
 | [Apple M2 Pro and M2 Max launch specifications](https://www.apple.com/newsroom/2023/01/apple-unveils-m2-pro-and-m2-max-next-generation-chips-for-next-level-workflows/) | [原件](files/specs/apple-m2-pro-max.html) · [文本](text/apple-m2-pro-max.txt) | 2023-01-17；M2 Pro 200 GB/s，M2 Max 400 GB/s；本书实机为 M2 Max 38 核 GPU、96 GB |
@@ -385,6 +408,21 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Bullet: Boosting GPU Utilization for LLM Serving via Dynamic Spatial-Temporal Orchestration](https://xianweiz.github.io/doc/papers/26asplos_bullet.pdf) | [原件](files/papers/bullet.pdf) · [文本](text/bullet.txt) | ASPLOS 2026 作者原件；A100/H20 内存与 SM 微基准；作为同卡 P/D 协作对照，不是 A100＋H20 PD 部署实测 |
 | [Ollama v0.20.7 bundled ggml Metal device and buffers](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal-device.m) | [原件](files/documents/ollama-ggml-metal-memory.txt) · [文本](text/ollama-ggml-metal-memory.txt) | 固定提交；hasUnifiedMemory、shared／bytesNoCopy、工作集；保留 upstream 署名 |
 | [Ollama v0.20.7 bundled ggml Metal kernels](https://raw.githubusercontent.com/ollama/ollama/8d0dcf4b6daf8d7833c8b55108e5b45063795e57/ml/backend/ggml/ggml/src/ggml-metal/ggml-metal.metal) | [原件](files/documents/ollama-ggml-metal-kernels.txt) · [文本](text/ollama-ggml-metal-kernels.txt) | 固定提交；量化解码、矩阵／向量计算、simdgroup；实际分派仍需运行日志确认 |
+| [DeepSpeed Inference: Enabling Efficient Inference of Transformer Models at Unprecedented Scale](https://arxiv.org/abs/2207.00032v1) | [原件](files/papers/deepspeed-inference.pdf) · [文本](text/deepspeed-inference.txt) | Microsoft／DeepSpeed；内核、模型并行及 CPU／NVMe 异构推理的联合设计 |
+| [DeepSpeed-FastGen: High-throughput Text Generation for LLMs via MII and DeepSpeed-Inference](https://arxiv.org/abs/2401.08671v1) | [原件](files/papers/deepspeed-fastgen.pdf) · [文本](text/deepspeed-fastgen.txt) | Microsoft／DeepSpeed-MII；Dynamic SplitFuse 与 token 级尾延迟；与 Sarathi 对照 |
+| [FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving](https://arxiv.org/abs/2501.01005v2) | [原件](files/papers/flashinfer.pdf) · [文本](text/flashinfer.txt) | 开源注意力引擎；KV 布局、负载均衡调度、JIT 与 CUDA Graph 兼容 |
+| [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache](https://arxiv.org/abs/2402.02750v2) | [原件](files/papers/kivi.pdf) · [文本](text/kivi.txt) | KV 的 K/V 非对称量化；计入 scale、zero point、残余缓存与反量化成本 |
+| [H$_2$O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models](https://arxiv.org/abs/2306.14048v3) | [原件](files/papers/h2o.pdf) · [文本](text/h2o.txt) | 基于 heavy hitter 的 KV 淘汰；近似注意力须单独测量质量 |
+| [Efficient Streaming Language Models with Attention Sinks](https://arxiv.org/abs/2309.17453v4) | [原件](files/papers/streamingllm.pdf) · [文本](text/streamingllm.txt) | Attention sinks 与滑动窗口；流式稳定性不等于保留完整历史检索能力 |
+| [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318v1) | [原件](files/papers/speculative-sampling.pdf) · [文本](text/speculative-sampling.txt) | DeepMind；投机采样的拒绝校正与目标分布；和 Leviathan 等独立工作并列 |
+| [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774v3) | [原件](files/papers/medusa.pdf) · [文本](text/medusa.txt) | 多头草稿与树形验证；区分不同训练方式、接受规则及分布保证 |
+| [EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty](https://arxiv.org/abs/2401.15077v3) | [原件](files/papers/eagle.pdf) · [文本](text/eagle.txt) | 特征层草稿与不确定性；额外模型训练、接受率和验证代价 |
+| [EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test](https://arxiv.org/abs/2503.01840v3) | [原件](files/papers/eagle3.pdf) · [文本](text/eagle3.txt) | 2025 投机解码进展；多层特征融合、training-time test 与负载适用范围 |
+| [LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference](https://arxiv.org/abs/2510.09665v2) | [原件](files/papers/lmcache.pdf) · [文本](text/lmcache.txt) | 2025 开源系统报告；KV 分层存储、复用与传输；论文不代替当前接口文档 |
+| [S-LoRA: Serving Thousands of Concurrent LoRA Adapters](https://arxiv.org/abs/2311.03285v3) | [原件](files/papers/s-lora.pdf) · [文本](text/s-lora.txt) | 多适配器服务；Unified Paging、异构批处理与张量并行 |
+| [Fast Distributed Inference Serving for Large Language Models](https://arxiv.org/abs/2305.05920v3) | [原件](files/papers/fastserve.pdf) · [文本](text/fastserve.txt) | FastServe；输出长度未知下的抢占式调度与 KV 交换 |
+| [LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale](https://arxiv.org/abs/2208.07339v2) | [原件](files/papers/llm-int8.pdf) · [文本](text/llm-int8.txt) | 大模型激活异常值与混合精度分解；低比特存储不等于端到端加速 |
+| [TensorRT LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html) | [原件](files/documents/tensorrt-llm-architecture.html) · [文本](text/tensorrt-llm-architecture.txt) | 官方架构文档快照；作为开源项目实现资料，不标为学术论文 |
 
 ## 第 10 章 分布式推理
 
@@ -401,6 +439,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670) | [原件](files/papers/distserve.pdf) · [文本](text/distserve.txt) | PD 分离 |
 | [Splitwise: Efficient Generative LLM Inference Using Phase Splitting](https://arxiv.org/abs/2311.18677) | [原件](files/papers/splitwise.pdf) · [文本](text/splitwise.txt) | 阶段资源池 |
 | [Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving](https://arxiv.org/abs/2407.00079) | [原件](files/papers/mooncake.pdf) · [文本](text/mooncake.txt) | KV 池化与路由 |
+| [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) | [原件](files/papers/llama3.pdf) · [文本](text/llama3.txt) | 架构与训练报告 |
 | [昇腾 950 NPU 架构白皮书](files/specs/昇腾950%20NPU架构白皮书.pdf) | [原件](files/specs/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) · [文本](text/ascend-950-whitepaper.txt)（user_provided） | 作者提供，40 页；保留原文件；另存官方 OBS 文件 ascend-950-official，两份文件差异核对见 UB-ASCEND-NOTES.md |
 | [SambaRack SN50 Official Product Description](https://sambanova.ai/products/sambarack) | [原件](files/specs/sambanova-sn50-system.html) · [文本](text/sambanova-sn50-system.txt) | 系统产品介绍，非完整 ISA 或全部产品参数手册 |
 | [Serving Large Language Models on Huawei CloudMatrix384, v2](https://arxiv.org/abs/2506.12708v2) | [原件](files/papers/cloudmatrix384-v2.pdf) · [文本](text/cloudmatrix384-v2.txt) | 2025-06-18；§3.3.1 的 910C、§4.2.2 MLA 与动态 tiling；与 v3 分开保存 |
@@ -415,6 +454,16 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Demystifying the Design Space and Best Practices for Heterogeneous LLM Inference and Serving](https://arxiv.org/pdf/2606.29708v1) | [原件](files/papers/heterogeneous-pd.pdf) · [文本](text/heterogeneous-pd.txt) | 固定 v1；放置、KV 表示和生命周期；其生产例为 C600＋Hopper，不能写成 A100＋H20 |
 | [KT-Kernel CMake ARM KML build path](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/CMakeLists.txt) | [原件](files/documents/kt-kml-build.txt) · [文本](text/kt-kml-build.txt) | 固定提交；KML 构建分支的背景归档，不作为当前 Xeon AF 案例的实现依据 |
 | [KT-Kernel KML MoE correctness example](https://raw.githubusercontent.com/kvcache-ai/ktransformers/31985f40bcc40da08107efdb1f81bf88cb38c6b2/kt-kernel/examples/test_moe_kml.py) | [原件](files/documents/kt-kml-example.txt) · [文本](text/kt-kml-example.txt) | 固定提交；KML MoE 样例的背景归档，不作为当前 Xeon AF 案例的实现依据 |
+| [Efficiently Scaling Transformer Inference](https://arxiv.org/abs/2211.05102v1) | [原件](files/papers/scaling-inference.pdf) · [文本](text/scaling-inference.txt) | Google；推理计算／通信模型、TPU 分片与延迟—吞吐取舍；历史配置不直接套用 GPU |
+| [DeepSpeed Inference: Enabling Efficient Inference of Transformer Models at Unprecedented Scale](https://arxiv.org/abs/2207.00032v1) | [原件](files/papers/deepspeed-inference.pdf) · [文本](text/deepspeed-inference.txt) | Microsoft／DeepSpeed；内核、模型并行及 CPU／NVMe 异构推理的联合设计 |
+| [Preble: Efficient Distributed Prompt Scheduling for LLM Serving](https://arxiv.org/abs/2407.00023v2) | [原件](files/papers/preble.pdf) · [文本](text/preble.txt) | 分布式前缀感知调度；缓存局部性与队列均衡的联合取舍 |
+| [LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference](https://arxiv.org/abs/2510.09665v2) | [原件](files/papers/lmcache.pdf) · [文本](text/lmcache.txt) | 2025 开源系统报告；KV 分层存储、复用与传输；论文不代替当前接口文档 |
+| [AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving](https://arxiv.org/abs/2302.11665v2) | [原件](files/papers/alpaserve.pdf) · [文本](text/alpaserve.txt) | 多模型服务的统计复用；模型并行、放置与 SLO 联合优化 |
+| [Mixtral of Experts](https://arxiv.org/abs/2401.04088v1) | [原件](files/papers/mixtral.pdf) · [文本](text/mixtral.txt) | Mistral 公司模型报告；稀疏激活、专家路由与驻留参数的区别 |
+| [Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures](https://arxiv.org/abs/2505.09343v2) | [原件](files/papers/deepseek-infra.pdf) · [文本](text/deepseek-infra.txt) | DeepSeek ISCA 2025 报告；MLA／MoE、跨节点通信及硬件协同设计建议 |
+| [Day 6: DeepSeek-V3/R1 Inference System Overview](https://github.com/deepseek-ai/open-infra-index/blob/56d86855fcf6e08fdfd45ce6280bd24322c93351/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md) | [原件](files/documents/deepseek-serving-report.md) · [文本](text/deepseek-serving-report.txt) | 2025 公司工程报告；固定提交；PD、EP、通信与费用口径 |
+| [How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale](https://developer.nvidia.com/blog/?p=113961) | [原件](files/documents/dynamo-production.html) · [文本](text/dynamo-production.txt) | 2026 官方技术文章；编排、KV 路由与恢复；厂商比较须保留原条件 |
+| [TensorRT LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html) | [原件](files/documents/tensorrt-llm-architecture.html) · [文本](text/tensorrt-llm-architecture.txt) | 官方架构文档快照；作为开源项目实现资料，不标为学术论文 |
 
 ## 第 11 章 训练系统
 
@@ -445,6 +494,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Serving Large Language Models on Huawei CloudMatrix384, v2](https://arxiv.org/abs/2506.12708v2) | [原件](files/papers/cloudmatrix384-v2.pdf) · [文本](text/cloudmatrix384-v2.txt) | 2025-06-18；§3.3.1 的 910C、§4.2.2 MLA 与动态 tiling；与 v3 分开保存 |
 | [Serving Large Language Models on Huawei CloudMatrix384, v3](https://arxiv.org/abs/2506.12708v3) | [原件](files/papers/cloudmatrix384-v3.pdf) · [文本](text/cloudmatrix384-v3.txt) | 2025-06-19 修订；核对型号称谓与 v2 差异 |
 | [CUDA Graph Best Practice for PyTorch: CUDA Graph](https://docs.nvidia.com/dl-cuda-graph/cuda-graph-basics/cuda-graph.html) | [原件](files/documents/cuda-graphs.html) · [文本](text/cuda-graphs.txt) | 定义、实例化与执行；区分主机提交和设备启动成本 |
+| [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948v2) | [原件](files/papers/deepseek-r1.pdf) · [文本](text/deepseek-r1.txt) | 公司技术报告；RL 推理模型、长输出与采样负载；不视为 serving 性能报告 |
 
 ## 第 12 章 任务调度与运行
 
@@ -473,6 +523,10 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [灵衢使能操作系统参考设计 2.0（中文版）](https://www.unifiedbus.com/zh/docs/UB-Software-Reference-Design-for-OS-2.0-zh) | [原件](files/specs/UB-Software-Reference-Design-for-OS-2.0-zh.pdf) · [文本](text/ub-os-zh.txt)（user_provided） | 作者提供；2025 年 9 月，57 页；设备、内存、通信、虚拟化与 RAS；引用 Base 2.0 |
 | [Google Cloud TPU Machine Specifications](https://docs.cloud.google.com/compute/docs/tpus/tpu-machines) | [原件](files/specs/google-tpu-machines.html) · [文本](text/google-tpu-machines.txt) | 主机 VM、芯片、ICI 和 DCN 的口径区别 |
 | [SambaNova SN40L: Scaling the AI Memory Wall with Dataflow and Composition of Experts](https://arxiv.org/abs/2405.07518) | [原件](files/papers/sambanova-sn40l-paper.pdf) · [文本](text/sambanova-sn40l-paper.txt) | 厂商原始架构论文；三级存储、融合与多模型切换，非两页宣传材料 |
+| [S-LoRA: Serving Thousands of Concurrent LoRA Adapters](https://arxiv.org/abs/2311.03285v3) | [原件](files/papers/s-lora.pdf) · [文本](text/s-lora.txt) | 多适配器服务；Unified Paging、异构批处理与张量并行 |
+| [AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving](https://arxiv.org/abs/2302.11665v2) | [原件](files/papers/alpaserve.pdf) · [文本](text/alpaserve.txt) | 多模型服务的统计复用；模型并行、放置与 SLO 联合优化 |
+| [Fast Distributed Inference Serving for Large Language Models](https://arxiv.org/abs/2305.05920v3) | [原件](files/papers/fastserve.pdf) · [文本](text/fastserve.txt) | FastServe；输出长度未知下的抢占式调度与 KV 交换 |
+| [How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale](https://developer.nvidia.com/blog/?p=113961) | [原件](files/documents/dynamo-production.html) · [文本](text/dynamo-production.txt) | 2026 官方技术文章；编排、KV 路由与恢复；厂商比较须保留原条件 |
 
 ## 第 13 章 架构协同设计
 
@@ -490,7 +544,9 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [昇腾 950 与 Unified Bus 公开路线图](https://www.huawei.com/cn/news/2025/9/hc-xu-keynote-speech) | [原件](files/specs/ascend-950-roadmap.html) · [文本](text/ascend-950-roadmap.txt) | 按型号区分计划与交付状态 |
 | [Huawei SuperPoD Portfolio at MWC Barcelona 2026](https://www.huawei.com/en/news/2026/3/mwc-superpod-computing) | [原件](files/documents/ascend-950-mwc.html) · [文本](text/ascend-950-mwc.txt) | Atlas 950 至多 8192 NPU 的官方公告 |
 | [Unified Bus 背后的思考](https://01.me/2025/09/a-story-of-unified-bus/) | [原件](files/documents/ub-reflection.html) · [文本](text/ub-reflection.txt) | 作者综述；非协议规范 |
+| [Splitwise: Efficient Generative LLM Inference Using Phase Splitting](https://arxiv.org/abs/2311.18677) | [原件](files/papers/splitwise.pdf) · [文本](text/splitwise.txt) | 阶段资源池 |
 | [OpenTallas architecture and analysis](https://github.com/bojieli/OpenTallas/tree/39b96158d35b24bd2bcd49061a689aea6893d2ed) | [原件](files/documents/opentallas-readme.md) · [文本](text/opentallas-readme.txt)（local_snapshot） | 与本书已有案例使用相同提交 |
+| [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) | [原件](files/papers/llama3.pdf) · [文本](text/llama3.txt) | 架构与训练报告 |
 | [The Cerebras Wafer-Scale Architecture for Deep Learning](https://www.cerebras.ai/chip) | [原件](files/specs/cerebras-wse3.pdf) · [文本](text/cerebras-wse3.txt) | 13 页架构白皮书，正文介绍 WSE-3；官网 Datasheet 链接名称与正文标题不同，以正文为准 |
 | [SambaNova SN40L Reconfigurable Dataflow Unit](https://sambanova.ai/) | [原件](files/specs/sambanova-sn40l.pdf) · [文本](text/sambanova-sn40l.txt) | 两页官方产品技术介绍；非完整微架构论文 |
 | [SambaNova SambaRack SN40L-16 Datasheet](https://sambanova.ai/) | [原件](files/specs/sambanova-sambarack.pdf) · [文本](text/sambanova-sambarack.txt) | 按 PDF 正文核对产品代际，不从下载文件名推断日期 |
@@ -536,6 +592,12 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Serving Large Language Models on Huawei CloudMatrix384, v2](https://arxiv.org/abs/2506.12708v2) | [原件](files/papers/cloudmatrix384-v2.pdf) · [文本](text/cloudmatrix384-v2.txt) | 2025-06-18；§3.3.1 的 910C、§4.2.2 MLA 与动态 tiling；与 v3 分开保存 |
 | [Serving Large Language Models on Huawei CloudMatrix384, v3](https://arxiv.org/abs/2506.12708v3) | [原件](files/papers/cloudmatrix384-v3.pdf) · [文本](text/cloudmatrix384-v3.txt) | 2025-06-19 修订；核对型号称谓与 v2 差异 |
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
+| [Efficiently Scaling Transformer Inference](https://arxiv.org/abs/2211.05102v1) | [原件](files/papers/scaling-inference.pdf) · [文本](text/scaling-inference.txt) | Google；推理计算／通信模型、TPU 分片与延迟—吞吐取舍；历史配置不直接套用 GPU |
+| [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388v1) | [原件](files/papers/qwen3.pdf) · [文本](text/qwen3.txt) | Alibaba 公司技术报告；稠密／MoE 配置与 thinking budget，不代填 Qwen3.5 参数 |
+| [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948v2) | [原件](files/papers/deepseek-r1.pdf) · [文本](text/deepseek-r1.txt) | 公司技术报告；RL 推理模型、长输出与采样负载；不视为 serving 性能报告 |
+| [Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters](https://arxiv.org/abs/2408.03314v1) | [原件](files/papers/test-time-compute.pdf) · [文本](text/test-time-compute.txt) | DeepMind／Berkeley；按难度分配推理预算；计算量、质量与墙钟时间分开 |
+| [Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures](https://arxiv.org/abs/2505.09343v2) | [原件](files/papers/deepseek-infra.pdf) · [文本](text/deepseek-infra.txt) | DeepSeek ISCA 2025 报告；MLA／MoE、跨节点通信及硬件协同设计建议 |
+| [Day 6: DeepSeek-V3/R1 Inference System Overview](https://github.com/deepseek-ai/open-infra-index/blob/56d86855fcf6e08fdfd45ce6280bd24322c93351/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md) | [原件](files/documents/deepseek-serving-report.md) · [文本](text/deepseek-serving-report.txt) | 2025 公司工程报告；固定提交；PD、EP、通信与费用口径 |
 
 ## 获取记录
 
