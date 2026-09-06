@@ -6,6 +6,7 @@
 - **蓝图源文件**：[`skeleton.html`](skeleton.html)（当前草案 16）
 - **审阅**：[`reviews/draft15-review.md`](reviews/draft15-review.md)、[`reviews/draft16-review.md`](reviews/draft16-review.md)
 - **OpenTallas 案例与习题**：[`case-studies/opentallas.md`](case-studies/opentallas.md)（四条原则、六个案例及手算解答，分布到现有章节）
+- **可编程网卡案例**：[`case-studies/programmable-nic.md`](case-studies/programmable-nic.md)（从网络虚拟化的 CPU 核数预算，到 KV-Direct 的 PCIe 并发预算；先解释工作与单位，再建立量级概念）
 - **训练计算量复算**：[`case-studies/training-compute.md`](case-studies/training-compute.md)（近期模型报告、算子计数与未知量）
 - **本地参考资料库**：[`references/README.md`](references/README.md)（按章节整理的论文、芯片规格、协议与官方文档）
 - **LLM 推理论文与写作落点**：[`references/INFERENCE-PAPER-GUIDE.md`](references/INFERENCE-PAPER-GUIDE.md)（49 项选读；新增 22 篇论文和 3 份官方工程资料，按具体问题标注查阅位置与引用边界）
@@ -32,6 +33,8 @@
 排队、丢包恢复和资源竞争需要另行建模，避免重复计算已计入实测延迟或有效带宽的开销。基本记账规则在第 1 章的完整算例中引入：共享资源汇总工作量，串行依赖累加时间，充分重叠的最大值只给出理想下界。
 
 **方法**采用量化估算、执行轨迹和测量校准，参考 Jeff Dean 与 H&P《计算机体系结构：量化研究方法》。分析依次建立需求、列出供给、检查资源与时间约束、比较候选改进，再复核完整系统。
+
+**教学起点**不要求读者预先熟悉数字量级。先说明系统在做什么、为何需要这些工作，再依次解释工作量、单位、处理能力与资源预算；数字首次出现时给出含义和比较基准，每步换算后说明设计含义。案例标题使用自然中文，例如“网络虚拟化需要多少 CPU 核？”，具体链路速率放到正文逐步解释。
 
 **历史视角**关注负载、技术能力及资源条件的共同变化。各章的变迁表记录设计、约束、变化来源和证据，将历史事实与因果解释分别标明。
 
