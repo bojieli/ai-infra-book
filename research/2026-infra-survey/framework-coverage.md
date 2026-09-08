@@ -16,6 +16,7 @@
 | 推理引擎接进 RL，还缺哪些状态与一致性条件？ | vLLM／SGLang 确定性、休眠和权重交接；[概率、路由与 KV 版本](../../case-studies/rl-state-and-reproducibility.md)，以及[阶段峰值与分片权重交接](../../case-studies/weight-handoff.md)；研究系统负责跨角色协调 | 5.1／5.4 执行语义→8.1 服务条件→10.5 RL 闭环→11.2／11.3 环境及调度；实验 10-8、10-9、11-4、11-5 |
 | 历史匹配能否换成有效产出？ | vLLM 2024 prompt lookup、2025 Arctic 插件提议及 2026 suffix 入口，SGLang NGRAM；[确定性草稿、索引成本与 RL 供给](../../case-studies/history-drafts-and-rollout.md) | 8.3.1 每轮收支→10.5.3 阶段配比；实验 8-5、10-8 |
 | 自动优化的分数能否换成部署收益？ | LOOPRAG 的 CPU 反馈方法与固定 FlashInfer-Bench 评估、评分、配置和分派；[参考／基线与调用频数](../../case-studies/optimization-evaluation-and-deployment.md) | 5.3.5 候选验证→5.5.2 实际请求；实验 5-6、5-9。完整引擎集成、硬件匹配与真实替换仍待实验验证 |
+| 少配验证资源，会不会拖住更大的训练组？ | DistRS 条件剩余时间与批次目标，对照 verl v0.4.1／2026 Agent Loop 的评分入口；[执行超时、反馈与释放](../../case-studies/reward-deadlines-and-feedback.md)；PolyRL 文档中的定制 SGLang 路径另列 | 3 长尾分布→5 优化反馈→10 批次依赖→11.3.3 验证资源；实验 11-5。逐条评分接口不等于跨作业阶段调度 |
 
 此前补查的结构化生成连接了冷 schema 准备、CPU 掩码、GPU 前向的重叠条件和推测回滚。当前 8.1.3 先讲请求调度，把语法、视觉、数值一致性作为执行条件留在实验变体和延伸材料；沿用实验 8-2 和图 8-1，不恢复成一个新的主小节。各框架的定位不同，只在同模型、精度、任务与执行条件可以对齐时做性能比较。
 
