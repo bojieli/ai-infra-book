@@ -1,0 +1,1092 @@
+    D IFFUSION P IPE : T RAINING L ARGE D IFFUSION M ODELS WITH E FFICIENT
+                                    P IPELINES
+
+
+                               Ye Tian 1 * Zhen Jia 2 Ziyue Luo 3 Yida Wang 2 Chuan Wu 1
+
+
+                                                            A BSTRACT
+        Diffusion models have emerged as dominant performers for image generation. To support training large diffusion
+        models, this paper studies pipeline parallel training of diffusion models and proposes DiffusionPipe, a synchronous
+        pipeline training system that advocates innovative pipeline bubble filling technique, catering to structural char-
+        acteristics of diffusion models. State-of-the-art diffusion models typically include trainable (the backbone) and
+        non-trainable (e.g., frozen input encoders) parts. We first unify optimal stage partitioning and pipeline scheduling
+        of single and multiple backbones in representative diffusion models with a dynamic programming approach. We
+        then propose to fill the computation of non-trainable model parts into idle periods of the pipeline training of the
+        backbones by an efficient greedy algorithm, thus achieving high training throughput. Extensive experiments show
+        that DiffusionPipe can achieve up to 1.41x speedup over pipeline parallel methods and 1.28x speedup over data
+        parallel training on popular diffusion models.
+
+1       I NTRODUCTION                                               training scale is large (Narayanan et al., 2019).
+Diffusion models have become the dominant choice for con-           Pipeline parallelism (Huang et al., 2019; Narayanan et al.,
+tent generation today, including text-image synthesis (Choi         2019; Luo et al., 2022) has been widely adopted to train
+et al., 2021) and video generation (Ramesh et al., 2022).           large DNN models, which partitions networks across mul-
+Large diffusion models such as Stable Diffusion (Rombach            tiple devices and pipelines micro-batch processing across
+et al., 2022), ControlNet (Zhang & Agrawala, 2023), and             model partitions, substantially alleviating memory consump-
+Imagen (Saharia et al., 2022) achieve state-of-the-art perfor-      tion on a single device and enabling larger training batch
+mance in various scenarios. There is a continuing trend to          sizes. Although pipeline parallelism is potentially useful
+develop larger diffusion models by increasing the backbone          in enabling larger diffusion model training, it has not been
+size (Rombach et al., 2022; Peebles & Xie, 2022a; Bao et al.,       well explored for diffusion models and its application faces
+2023; Podell et al., 2023), cascading multiple backbones            several challenges as follows:
+to enable higher resolution image generation (Nichol et al.,       First, the structural characteristics and special training pro-
+2021; Peebles & Xie, 2022a; Saharia et al., 2022; Ho et al.,       cedures of diffusion models cannot be handled well by tra-
+2022; Podell et al., 2023), and combining different trans-         ditional pipelining methods. A diffusion model typically
+former architectures with diffusion models (Peebles & Xie,         contains a trainable part with one or multiple backbone
+2022a; Zhang & Agrawala, 2023; Wu et al., 2023).                   models (e.g., U-Net) (Rombach et al., 2022), and a non-
+Data parallelism is adopted for distributed diffusion model        trainable part with frozen text and image encoders, and
+training (Falcon & The PyTorch Lightning team, 2019; Bian          they are usually trained with special techniques such as self-
+et al., 2021; von Platen et al., 2022). For large diffusion        conditioning (Chen et al., 2022), which involves an addi-
+models, this method duplicates parameters, which limits            tional forward computation pass on the backbone. Pipeline
+the training batch size (Rombach et al., 2022; Ho et al.,          training involves only the trainable part, while the non-
+2022; Saharia et al., 2022) and device utilization, and causes     trainable part is not readily handled by existing pipeline
+significant synchronization overhead, especially when the          training methods because it does not require pipelining.
+    *
+                                                                   Self-conditioning is beyond the scope of existing pipeline
+   Work done during internship at AWS. 1 The University of         systems, as they assume that there is only one forward pass.
+Hong Kong, Hong Kong 2 Amazon Web Services, USA 3 The
+Ohio State University, USA. Correspondence to: Ye Tian              Second, pipeline bubbles are often significant in syn-
+<yetiansh@connect.hku.hk>.                                          chronous pipeline training (Huang et al., 2019; Fan et al.,
+Proceedings of the 7 th MLSys Conference, Santa Clara, CA, USA,
+                                                                    2021; Luo et al., 2022), which is more widely used in prac-
+2024. Copyright 2024 by the author(s).                              tice due to not altering model performance but involves
+                            DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+periodic pipeline flushing. We identify a unique opportunity           Text input   Conditional encoder
+                                                                                                                Backbone                    Backbone
+to fill the pipeline bubbles using the computation of non-               Image
+                                                                                                          (forward computation)         (back propagation)
+                                                                                    First stage encoder
+trainable model components, to substantially improve de-                  input                                     Self-conditioning
+                                                                                                                        feedback
+vice utilization and expedite training speed. However, there
+are dependencies between the trainable and non-trainable           Figure 1. Training process of Stable Diffusion v2.1 (Rombach
+part that block pipeline bubble filling by overlapping their       et al., 2022) and additional feedback of self-conditioning (Chen
+execution. In addition, how to partition the non-trainable         et al., 2022). Non-trainable components are marked in grey boxes.
+part into sets of layers and insert them into the pipeline
+                                                                   Table 1. Ratio of the forward time of the non-trainable part to the
+bubble is not studied.                                             forward and backward time of the trainable part on A100 GPU
+Third, Non-trainable layers with extra-long execution time               Model / Batch size         8      16      32      64
+are common in frozen encoders (Kingma & Welling, 2013).                 Stable Diffusion v2.1 38% 41% 43% 44%
+Such layers may not fit into any pipeline bubble and block                 ControlNet v1.0        76% 81% 86% 89%
+filling pipeline bubble with all subsequent layers in the non-
+trainable part, which cannot be solved by only partitioning        cess only a portion of a training batch. Partial-batch layer’s
+the non-trainable part into sets of layers. In addition, as non-   execution time can be precisely controlled by its input batch
+trainable layers’ execution time is discrete, it is unlikely to    size, enabling it to be inserted into bubbles. In addition,
+fully utilize idle time in individual pipeline bubble, leading     partial-batch layers help eliminate the remaining idle time
+to performance degradation.                                        in pipeline bubbles after inserting non-trainable layers (pro-
+                                                                   cessing a complete batch).
+In this paper, we propose DiffusionPipe, an efficient pipeline
+training system designed specifically for large diffusion          We implement DiffusionPipe and compare it to state-of-
+models. DiffusionPipe systematically determines optimized          the-art data parallel training systems (Rasley et al., 2020)
+model partitioning, stages, and replication settings while         and ZeRO-3 (Rajbhandari et al., 2021), together with syn-
+applying pipeline bubble filling techniques. These optimiza-       chronous pipeline training paradigms, including SPP (Luo
+tions are tailored for a variety of representative diffusion       et al., 2022) and GPipe (Huang et al., 2019). Experimen-
+models and training methods. To the best of our knowledge,         tal results show that DiffusionPipe achieves up to 1.28x
+we are the first to enable efficient pipeline parallel training    speedup over data parallel training and up to 1.41x speedup
+of diffusion models. Our contributions can be summarized           over existing pipeline parallel methods on representative
+as follows:                                                        diffusion models. We observe that DiffusionPipe achieves
+                                                                   almost complete elimination of pipeline bubbles and ef-
+▷ We propose a unified dynamic programming-based al-               fectively handles multiple training scenarios of diffusion
+gorithm for optimized model partitioning, that can handle          models.
+various training scenarios, e.g., models with different num-
+bers of backbones and models trained with self-conditioning.
+The proposed partitioning algorithm optimizes the model            2      BACKGROUND AND M OTIVATION
+partitioning scheme under various settings of number of            2.1      Diffusion models and training
+stages and number of micro-batches, with performance com-
+parable to state-of-the-art pipeline paradigms under tradi-        Diffusion models (Ho et al., 2020; Song et al., 2020; Chen
+tional pipelining, and effectively handles scenarios beyond        et al., 2022; Rombach et al., 2022; Ho et al., 2022; Sa-
+traditional pipelining and specific to diffusion models.           haria et al., 2022; Podell et al., 2023) are generative mod-
+                                                                   els that learn to reverse the diffusion process that gradu-
+▷ We design a novel pipeline bubble filling strategy that fills    ally turns data into noise. They typically comprise a back-
+the non-trainable part computation into the bubble time of         bone model that performs image generation and multiple
+the pipeline training of the backbone(s), effectively elimi-       frozen encoders that encode image and conditional infor-
+nating pipeline bubbles. It efficiently partitions the non-        mation, e.g., class information (Yu et al., 2015), text de-
+trainable components and the input data for bubble fill-           scription (Deng et al., 2009), canny edge (Canny, 1986) and
+ing, and effectively addresses dependencies between the            human pose (Kreiss et al., 2021), and provide it as input to
+non-trainable part and the trainable part by allowing cross-       the backbone. During diffusion model training, the encoders
+iteration overlapping of backbone training of an iteration         are typically fixed and executed in advance in the forward
+and non-trainable part computation of the next iteration and       computation pass (referred to as the non-trainable part),
+filling pipeline bubbles of the former with the latter.            while the backbone (the trainable part) is trained with both
+▷ We effectively handles extra-long non-trainable layers           forward computation and backward propagation (Fig. 1).
+which do not fit into individual pipeline bubbles, by a partial-   Table 1 compares the execution time of the non-trainable
+batch processing design, for the non-training layer to pro-        part and the training time (forward and backward) of the
+                                                                   trainable part.
+                                             DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+                                                                                                          Table 2. Proportion of synchronization in training iteration time at
+      Device 0       0       1   2   3                    0       1           2               3           local batch size 8 on A100 GPUs
+      Device 1               0   1   2   3         0          1       2               3                      Model / GPU count         8        16         32         64
+      Device 2                   0   1   2   0     3      1       2           3                             Stable Diffusion v2.1 5.2% 19.3% 36.1% 38.1%
+      Device 3                       0   0   1     1      2   2   3   3                                        ControlNet v1.0       6.9% 22.7% 39.1% 40.1%
+
+                     Warm-up                       Stable                 Cool-down                       2.2   Pipeline parallel training, schedule and pipeline
+                                                                                                                bubble
+Figure 2. FIFO-1F1B schedule of a DNN. Gray blocks without
+numbers indicate pipeline bubbles. Potential critical paths are                                           Pipeline parallel training partitions the model into stages,
+marked with a dashed line. Numbers indicate micro-batch index                                             and each stage is deployed on a single device; the input
+in both forward (blue) and backward (pink) steps.                                                         data batch in each training iteration is divided into multi-
+                                                                                                          ple micro-batches, which are processed through the model
+Device 0   0             1   4   2   5   3   6     4      7   5   0   6   1       7       2           3   stages in a pipelined manner. The micro-batch execution
+Device 1         0       4   1   5   2   6   3     7      4   0   5   1   6       2       7       3       pipelines are typically scheduled by a First-In-First-Out
+Device 2         4       0   5   1   6   2   7     3      0   4   1   5   2       6       3       7       (FIFO) heuristic (Chen et al., 2015; Abadi et al., 2016;
+Device 3   4             5   0   6   1   7   2     0      3   1   4   2   5       3       6           7
+                                                                                                          Sergeev & Del Balso, 2018), which executes micro-batches
+                                                                                                          on model stages according to their ready order. The One-
+           Warm-up                               Stable                                   Cool-down
+                                                                                                          Forward-One-Backward (1F1B) schedule is widely adopted
+Figure 3. Bidirectional pipeline schedule of a DNN. Communica-                                            with FIFO, that alternatively executes forward computation
+tion omitted. The same meaning of number and color with Fig. 2.                                           and back propagation of micro-batches on each model stage
+Micro-batch 0 to 3 pipeline from device 0 to 3 (down direction),                                          in the stable phase of the pipeline execution (when multiple
+while micro-batch 4 to 7 pipeline from device 3 to device 0 (up                                           micro-batches are available to run on a model stage at the
+direction).                                                                                               same time). As illustrated in Fig. 2, this schedule allows
+                                                                                                          releasing intermediate activations and reduces peak mem-
+                                                                                                          ory usage by launching the backward computation when
+Some diffusion models, e.g., Cascaded Diffusion Models                                                    forward computation of the micro-batch is complete.
+(CDM) (Ho et al., 2022; Ramesh et al., 2022; Podell et al.,
+2023), involve multiple backbones of different capacities                                                 Chimera (Li & Hoefler, 2021) proposes bidirectional pipelin-
+for high-resolution image generation. Multiple backbones                                                  ing to reduce pipeline bubbles while retaining training syn-
+accept the same encoder outputs, and each backbone also                                                   chronous. Chimera maintains two pipelines of micro-batch
+takes the output of the preceding backbone as input. The                                                  execution in different device rank orders (i.e., pipeline direc-
+training of backbones in a CDM are typically independent,                                                 tions) on the same set of model stages, with the two pipeline
+and each is trained on a different set of devices using the                                               execution schedules being symmetric along the device di-
+same procedure, as shown in Fig. 1.                                                                       mension. An example of bidirectional pipelining is shown
+                                                                                                          in Fig. 3. Each micro-batch’s execution can fit perfectly
+In the current mainstream diffusion models, U-Net (Ho                                                     into pipeline bubbles of its counterpart in the pipeline of the
+et al., 2020; Rombach et al., 2022) is widely used as the                                                 other direction (when the number of stages is even).
+backbone model. Transformer models can also serve as the
+backbone (Peebles & Xie, 2022a; Bao et al., 2023). T5-                                                    In synchronous pipeline training, pipeline bubbles generally
+xxl (Raffel et al., 2020), BERT (Devlin et al., 2018) and                                                 exist in the pipeline schedule (Fig. 2). There is a barrier that
+CLIP (Radford et al., 2021) text encoders are popular text                                                gradient synchronization imposes between pipeline stages
+encoders, while the image encoders are often variational                                                  of the trainable part of diffusion models at different itera-
+auto-encoders (Kingma & Welling, 2013), ViT (Dosovitskiy                                                  tions, disabling pipeline bubbles be filled by the trainable
+et al., 2020) and CLIP image encoders. There are corre-                                                   part at different iterations. Therefore, although pipeline
+sponding encoders (Zhang & Agrawala, 2023) for other                                                      bubbles can be partially reduced by applying a better model
+modalities, such as canny edge and human pose.                                                            partitioning and pipeline schedule, e.g., SPP (Luo et al.,
+                                                                                                          2022) and Chimera (Li & Hoefler, 2021), such approaches
+Self-conditioning (Chen et al., 2022) has become a very                                                   cannot fundamentally eliminate pipeline bubbles, as they
+popular technique for training diffusion models (Rombach                                                  only manipulate the trainable part of the model and do not
+et al., 2022; Saharia et al., 2022; Yuan et al., 2022), which                                             take the non-trainable part into consideration.
+improves the sampling quality by introducing an additional
+forward computation pass of the backbone (Fig. 1). The
+                                                                                                          2.3   Synchronization overhead and memory
+output of this forward pass is fed back to the backbone and
+                                                                                                                consumption of data parallel training
+serves as a conditional input. The fidelity of the image
+is then improved because each step is conditioned on the                                                  Diffusion models are largely trained using data parallelism
+previously generated samples.                                                                             nowadays (Rombach et al., 2022; Ho et al., 2022; Saharia
+                                                           DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+
+                      67.6% 51.0% 41.0% 34.3%                                   61.3% 44.2% 34.5% 28.4%
+
+
+
+
+                                                                                                                    Execution time (ms)
+
+
+
+
+                                                                                                                                                                                             Execution time (ms)
+  Number of stages
+
+
+
+
+                                                             Number of stages
+                      684.3% 342.2% 228.1% 171.1%                               335.4% 167.7% 111.8% 83.9%                                     2                                                                        2
+             4
+
+
+
+
+                                                                        4
+                                                                                                                                          10                                                                       10
+                      58.2% 41.0% 31.7% 25.8%                                   51.4% 34.5% 26.0% 20.9%                                        1                                                                        1
+                      456.2% 228.1% 152.1% 114.1%                               223.6% 111.8% 74.5% 55.9%                                 10                                                                       10
+             3
+
+
+
+
+                                                                        3
+                                                                                                                                               0                                                                        0
+                      41.0% 25.8% 18.8% 14.8%                                   34.5% 20.9% 15.0% 11.7%                                   10                                                                       10
+                      228.1% 114.1% 76.0% 57.0%                                 111.8% 55.9% 37.3% 28.0%
+             2
+
+
+
+
+                                                                        2
+                                                                                                                                               1                                                                        1
+                         1         2       3           4                          1         2       3           4                         10                                                                       10
+                             Number of micro-batches                                  Number of micro-batches                                          0      10       20          30   40                                      0            20         40           60
+                                                                                                                                                           Non-trainable layer index                                                Non-trainable layer index
+                     (a) Stable Diffusion v2.1                                  (b) ControlNet v1.0
+                                                                                                                                           (a) Stable Diffusion v2.1                                                        (b) ControlNet v1.0
+Figure 4. Ratio of pipeline bubble time to iteration time (upper)
+                                                                                                                      Figure 5. Execution time of non-trainable layers at batch size 64.
+and ratio of pipeline bubble time to non-trainable part execution
+time (lower) at batch size 64 using FIFO-1F1B scheduling.
+                                                                                                                                                           Top-1        2 stages                                                     Top-1        2 stages
+
+
+
+
+                                                                                                                    Execution time (ms)
+
+
+
+
+                                                                                                                                                                                             Execution time (ms)
+et al., 2022; Podell et al., 2023), which involves significant                                                                            400              Top-2        3 stages                                   400               Top-2        3 stages
+                                                                                                                                                           Top-3        4 stages                                                     Top-3        4 stages
+parameter synchronization overhead among devices and                                                                                      300                                                                      300
+large memory consumption on each device that restricts the                                                                                200                                                                      200
+maximum feasible local batch size and the device utilization.                                                                             100                                                                      100
+For example, Stable Diffusion is trained at a local batch size                                                                                 0                                                                        0
+of only 8 on each TPU-v3 (32GB) in (Rombach et al., 2022)                                                                                          0           20           40          60                                  0            20          40         60
+                                                                                                                                                                    Batch size                                                                Batch size
+consuming about 24.3 GB memory, which results in limited                                                                                   (a) Stable Diffusion v2.1                                                        (b) ControlNet v1.0
+device utilization and exacerbates the synchronization por-
+tion of the training time. The synchronization overhead in                                                            Figure 6. Execution time of top-3 non-trainable layers with longest
+Table 2 is computed as the ratio of parameter synchroniza-                                                            execution time under different batch sizes, compared to longest
+tion time to the end-to-end time of a training iteration. As                                                          pipeline bubble time when there are 4 micro-batches and different
+the number of devices increases, parameter synchronization                                                            number of stages at batch size 64 using FIFO-1F1B scheduling.
+soon takes up a significant portion of the iteration time. In
+summary, the data parallel style of diffusion model training
+limits the training batch size and imposes high synchroniza-                                                           non-trainable layers with a large proportion of short and
+tion overhead.                                                                                                         moderately long layer execution times provides excellent
+                                                                                                                       opportunities for executing individual layers in pipeline
+                                                                                                                       bubbles ranging from 10 to 100 ms.
+2.4                   Efficient pipeline bubble filling with non-trainable
+                      components                                                                                       There are also some non-trainable layers with extra-long ex-
+                                                                                                                       ecution times (more than 400 ms), as shown in Fig. 5. Such
+We profile the iteration training time of two popular diffu-
+                                                                                                                       layers may not fit into any pipeline bubble. Nevertheless,
+sion models (without self-conditioning) by pipelining their
+                                                                                                                       we observe that the layer execution time can be precisely
+backbones under different model stage and micro-batch
+                                                                                                                       controlled by adjusting the input batch size. Fig. 6 shows
+number settings, and executing the non-trainable part using
+                                                                                                                       the execution times of the layers with the longest execution
+data parallelism before backbone training.
+                                                                                                                       times at different batch sizes. When the batch size is re-
+Fig. 4 shows the pipeline bubble ratios, where the iteration                                                           duced to 16, most of these non-trainable layers can fit into
+time is the sum of pipeline training time of the backbone and                                                          the longest pipeline bubble obtained by the way we identify
+the execution time of the non-trainable part in each training                                                          bubbles in Fig. 2, implying that we can run such layers in
+iteration. Pipeline bubbles can take up to 68% of the overall                                                          pipeline bubbles by partitioning their input.
+training time, which is quite significant, according to the
+                                                                                                                      We seek to design an efficient algorithm to schedule the
+upper line in Fig. 4. In the lower line, a ratio close to 1
+                                                                                                                      execution of non-trainable layers into pipeline bubbles.
+indicates that the pipeline bubble time can be almost com-
+pletely filled by scheduling the non-trainable part in pipeline
+bubbles, under the respective model stage and micro-batch                                                               3                          S YSTEM DESIGN
+numbers. This observation motivates us to advocate pipeline
+                                                                                                                       Fig. 7 presents an overview of DiffusionPipe, which com-
+bubble filling with the non-trainable part, and to study the
+                                                                                                                       prises of two modules: (1) The front-end carries out our
+detailed bubble filling strategies.
+                                                                                                                       workflow of generating an optimized pipeline training sched-
+Fig. 5 shows that many non-trainable layers (indexed 0 to                                                              ule for an input diffusion model, including pipeline training
+21) in both models have short execution times, which belong                                                            configurations of the backbone(s) and bubble-filling strate-
+to the frozen text encoder. Most layers (indexed 22 to 41)                                                             gies of the non-trainable part; (2) The back-end is an execu-
+from the frozen image encoder take a moderate amount of                                                                tion engine that performs pipeline training according to the
+time to compute (less than 30 ms). Such a distribution of                                                              optimized pipeline schedule.
+                                            DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+                             Front-end                                  Back-end                                 Device              Stage 0                              Stage 1            Stage 2
+          Input model
+                                                                                                                 mapping
+
+                                                                  Pipeline instructions                         Data
+                                                                   of current device                                             0           1            2           3           4      5      6       7
+                  Parallel              Pipeline instructions                                                dependency
+          1                                                           Model stages
+                  profile                  of all devices
+                                                                    Execution engine                                                     Machine 0                                     Machine 1
+                                                    Instruction
+       Profile records                       6
+                                                    generation
+                                                                                    Invoke      Figure 8. DiffusionPipe’s data and pipeline parallelism. Devices
+                  Dynamic
+          2                                                                                     in the same color run the same model stage.
+                programming                                         Load micro-batch data
+                                                                                                                             Time elapses
+        Trainable part                    Optimal overall           Trainable stage forward
+      partition schemes                  pipeline schedule         Trainable stage backward
+                                                                                                  Backbone       Device 0                                 0       1                      0          1
+          3      Schedule                    5      Schedule      Non-trainable stage forward                                        N                                                                      F
+                                                                                                 pipeline only   Device 1                                         0       1      0       1
+                                4
+                                                                     Send or receive data
+                                               Overall
+                                                                                                                             0   1               N'                   0          1            Saved time
+                                         partition schemes             Synchronization          Cross-iteration Device 0                                                               N'
+                                                                                                  pipelining    Device 1     N' 0        1            0               1          N'   (F)
+        Trainable part       Greedy                                Pipeline instruction
+      pipeline schedules      filling                               implementations
+                                                                                                                                                                      Synchronization
+                                                                                                 0    Forward stage      0    Backward stage                  F                                 Pipeline bubble
+                                                                                                                                                                      (pipeline flush)
+              Figure 7. The architecture of DiffusionPipe
+                                                                                                      Non-trainable part of
+                                                                                                                            N' Non-trainable
+                                                                                                                                             part of                              Overlapped synchronization and
+                                                                                                 N                                                                        N(F)
+                                                                                                      the current iteration     the next iteration                                 non-trainable part execution
+              Table 3. Pipeline training hyper-parameters
+               Symbol               Description                                                 Figure 9. Cross-iteration pipelining of a diffusion model. Numbers
+                                                                                                indicate the micro-batch index of a pipeline stage.
+                  S          Number of model stages
+                  M          Number of micro-batches
+                  D        Pipeline parallel group size1                                        ing, filling the bubble time of the backbone pipeline training
+                                                                                                in one iteration with the non-trainable part computation of
+                                                                                                the next iteration, as shown in Fig. 9. Non-trainable layers
+3.1   Workflow                                                                                  can be computed in a data parallel manner without pipelin-
+                                                                                                ing, following their inter-layer data dependencies. At the
+DiffusionPipe takes the diffusion model configuration, the
+                                                                                                end of a training iteration, the output of the non-trainable
+training batch size, and the cluster configuration (i.e., num-
+                                                                                                part is collected and divided into micro-batches according
+ber of machines and number of devices per machine) as
+                                                                                                to the pipeline training configurations of the backbone(s). In
+inputs. DiffusionPipe first performs parallel profiling on the
+                                                                                                the next iteration, these intermediate results are loaded onto
+entire cluster to obtain the model layer execution time at
+                                                                                                the correct devices and fed as input to the pipeline training of
+different batch sizes (step 1 in Fig. 7), which is used in steps
+                                                                                                the backbone(s). In addition, we only run the non-trainable
+2 to 5. Based on the input specifications, DiffusionPipe
+                                                                                                part in the first iteration to enable such overlapping. The
+searches for pipeline training hyper-parameters as listed in
+                                                                                                cross-iteration pipeline is mathematically equivalent to data
+Table 3. Note that DiffusionPipe supports mixed pipeline
+                                                                                                parallel and synchronous pipeline training.
+and data parallelism, as shown in Fig. 8. For each feasible
+hyper-parameter combination (S, M , and D), Diffusion-
+Pipe generates a near-optimal partitioning scheme for the                                       4       BACKBONE PARTITIONING
+trainable backbone(s) (§4, step 2), including the number of
+layers in each model stage and the number of devices on                                         In this section, we present a unified dynamic programming
+which each stage replicates. According to the corresponding                                     approach to optimize partitioning and device assignment of
+pipeline schedule generated in step 3, DiffusionPipe further                                    the trainable part in diffusion models.
+partitions the non-trainable part and fills it into pipeline
+bubbles (§5, step 4). Then DiffusionPipe generates the over-                                    4.1      Single backbone
+all pipeline training schedules, and selects the optimal one                                    We first consider a diffusion model with a single backbone.
+with minimum iteration time (step 5). Finally, Diffusion-                                       The high-level idea is to analyze the critical path of FIFO-
+Pipe generates pipeline instructions for the back-end module                                    1F1B pipelining of the backbone and derive an upper bound
+according to the overall pipeline schedule (step 6).                                            on its execution time, to identify the optimal partitioning
+                                                                                                scheme that minimizes the execution time. We use the
+3.2   Cross-iteration pipelining                                                                notations in Table 4.
+For effective pipeline bubble filling that respects data depen-                                 FIFO pipeline execution can be divided into 3 phases, i.e.,
+dencies between the non-trainable part and the backbone(s),                                     warm-up, stable and cool-down, as shown in Fig. 2. It
+DiffusionPipe advocates cross-iteration pipeline bubble fill-                                   launches micro-batch processing one by one in the warm-
+     1                                                                                          up phase and waits for all micro-batches to be completed
+       Pipeline parallel group is a minimum group of devices on
+which a complete set of pipeline communications is performed.                                   in the cool-down phase. When we enlarge the last stage’s
+In DiffusionPipe, pipeline parallel group size (i.e., D) = world size                           execution time to the longest among all stages, enforcing
+(i.e., number of devices in the cluster) / data parallel degree.                                it on the critical path, the warm-up phase contains forward
+                                          DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+                                                                                           time among the micro-batches and add T0S−C , i.e., the max-
+                                    Table 4. Notations
+                                                                                           imum gap between TS (s) and TC (s) to the pipeline training
+    Symbol                                 Definition                                      time of the backbone for all stages s, where TS (s) indicates
+      L                     Number of layers in backbone model                             the synchronization time of stage s and TC (s) is used to
+    B, B, b
+                             Training batch size, micro-batch size                         compensate the overlapping time of parameter synchroniza-
+                          and number of samples in a partial-batch                         tion of stage s and computation of later stages. Fig. 10 gives
+      S, s                   Set of model stages and model stage                           an illustration. Putting the above together, an upper bound
+    Pfl (B),              Forward and backward computation time                            on the FIFO-1F1B pipeline execution time is:
+    Pbl (B)                      of layer l given batch size B
+                         Data size of communication in forward and                                        T max = T0 (M + 2S − 2) + T0S−C                  (1)
+  Cfl,l+1 (B),
+                                backward pass between layers l
+  Cbl+1,l (B)                    and l + 1 given batch size B                              We design a dynamic programming approach to identify the
+                        Bandwidth and latency of communication type                        backbone partition and device assignment by minimizing
+    Rx , Lx
+                         x (e.g., allreduce (ar), point-to-point (p2p))                    T max . We order the D devices in a pipeline parallel group
+    Gl (B)                Gradient size of layer l given batch size B                      into a chain according to their rank. Let W (L, S, r, D)
+    Ol (B)                Output size of layer l given batch size B                        denote T0 when partitioning the first L consecutive layers
+    TS (s)                      Synchronization time of stage s
+                                                                                           of the backbone into S stages, with these stages placed on
+    TC (s)                       Compensation time of stage s
+                            Maximum micro-batch execution time                             devices 1 to D and the last stage s replicated on the last
+       T0                                                                                  r devices (of the 1 to D device chain). Additionally, let
+                         per stage or inter-stage communication time
+                        Maximum gap between synchronization time                           Y (L, S, r, D) denote T0S−C under the same setting. The
+     T0S−C
+                               and compensation time per stage                             optimal partition of the backbone into S stages with the
+       TB                  Length of a pipeline bubble (idle time)                         device placement of each stage can be computed by:
+                                                                                               min {(M + 2S − 2)W (L, S, r, D) + Y (L, S, r, D)}           (2)
+                                                                                              1≤r≤D
+   Stage 0   0      1                 0   1                       0          1     F0
+
+Communication      C0,1 C0,1 Cf       Cf C0,1 C0,1         C1,0        C1,0 Compensation   W (L, S, r, D) can be decomposed into sub-problems that
+                                                                              time (Tc)
+   Stage 1                0     1              0      0     1     1     F1                 further partition the first l model layers into S − 1 stages on
+                                                                                           the remaining D − r devices, with the last stage replicated
+                                     Warm-up           Stable          Cool-down
+                                                                                           on r′ devices2 . Then, W (L, S, r, D) can be computed by
+                Self-conditioning
+                     forward
+                                                     FIFO-1F1B pipelining                  the maximum of W (l, S − 1, r′ , D − r) and the estimation
+Figure 10. FIFO-1F1B scheduling of pipelining a backbone model                             of T0 by the last stage s (i.e., T0 (s)), and Y (L, S, r, D) can
+with 2 stages, 2 micro-batches and self-conditioning. The same                             be computed in the same way, following Eqn. (3) to (8).
+color and number setting with Fig. 9. Ci,j is communication from                           Then we add the range in Eqn. (9) when optimizing Eqn. (2).
+stage i to stage j. Cf feeds back the output of the backbone to
+stage 0. Fi refers to the parameter synchronization of stage i, Tc                                                       X                B    X b B
+is the compensation time of stage 1.                                                                  T0 (s) = max{               Pfi (     )+  Pi ( ),
+                                                                                                                                          r         r
+                                                                                                                         l<i≤L                 l<i≤L
+
+computation on S − 1 model stages (aka forward stages).                                                        Cfl,l+1 ( Br ) + Cbl+1,l ( Br )
+Similarly, the cool-down phase includes backward compu-                                                                                        + 2Lp2p }   (3)
+                                                                                                                            Rp2p
+tation on S − 1 model stages (aka backward stages). The                                                         X            B
+stable phase of the critical path contains M forward stages                                           TS (s) =        Gi ( )/Rar + Lar                     (4)
+                                                                                                                              r
+                                                                                                                 l<i≤L
+and M backward stages, where M is the number of micro-
+batches. Therefore, there are a total of 2(M +S−1) forward
+                                                                                                                 X               B
+                                                                                                      TC (s) =           Pbi (     )                       (5)
+and backward stages on the critical path of the FIFO-1F1B                                                                        r
+                                                                                                                 l<i≤L
+pipeline schedule in total. Considering the intermediate data                                     T0S−C (s) =TS (s) − TC (s)                               (6)
+communication between model stages in pipeline training,
+                                                                                            W (L, S, r, D) = max{W (l, S − 1, r′ , D − r), T0 (s)}         (7)
+we add S − 1 inter-stage communications in the forward                                                                                     ′
+and backward passes, respectively, which then becomes                                        Y (L, S, r, D) = max{Y (l, S − 1, r , D − r), T0S−C (s)}      (8)
+                                                                                                          ′                        ′
+2(M + S − 1) + 2(S − 1) forward and backward stages,                                                  ∀l, r , 1 ≤ l ≤ L − 1, 1 ≤ r ≤ D − r                 (9)
+together with communications on the critical path.                                                                          {f /b} B
+                                                                                           Here B is the micro-batch size, Pi     ( r ) is the forward
+We use T0 to denote the maximum of the time to run the                                     / backward computation time of layer i given local batch
+forward plus backward computation of a micro-batch on                                         2
+a model stage, and the communication time between two                                           Though we support different model stages using different data
+                                                                                           parallel degrees (e.g., r ̸= r′ ), we find that such cases are rare.
+stages, among all model stages. Then we have an upper                                      They can result in strange bubble filling schemes (§5) and require
+bound T0 (M + 2S − 2) on the execution time of the critical                                complex implementations. In evaluation (§6), we force all stages
+path. We further consider the parameter synchronization                                    to have the same data parallel degree.
+                               DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+size Br . Cfl,l+1 ( Br ) and Cbl+1,l ( Br ) are data sizes in forward   In Eqn. (14) and (15) we give the definition of
+and backward pass between layer l and l + 1 given local                 W (Ld , Lu , S, r, D) and Y (Ld , Lu , S, r, D). Eqn. (16)
+batch size Br . Gi ( Br ) is the gradient size of layer i given         presents the additional optimization range. Communica-
+local batch size Br . Rx and Lx are bandwidth and latency               tion in the bidirectional pipelines may compete for re-
+of communication type x, while ar indicates all-reduce                  sources, and we reasonably enlarge the communication time
+used in synchronization and p2p indicates point-to-point                in Eqn. (3) by a factor of 2 (as there are two pipelining
+communication between model stages.                                     directions). Other equations are the same with §4.1.
+                                                                            W (Ld , Lu , S, r, D) = max{W (ld , lu , S − 1, r′ , D − r),
+Note that a sub-problem in Eqn. (8) does not know the parti-
+                                                                                                   T0 (sd ), T0 (su )}                 (14)
+tion scheme of all subsequent layers (with indices greater
+than l) for computing the compensation time TC . Instead,                     Y (Ld , Lu , S, r, D) = max{Y (ld , lu , S − 1, r′ , D − r),
+we use a lower bound of TC in Eqn. (5), i.e., the sum of the                                          T0S−C (sd ), T0S−C (su )}              (15)
+backward computation time of all these layers on r devices.                                      ′
+                                                                                        ∀ ld/u , r , 1 ≤ l{d/u} ≤ L{d/u} − 1,
+                                                                                                      1 ≤ r′ ≤ D − r                         (16)
+4.2    Multiple backbones
+                                                                        For a diffusion model with more than two backbones, we can
+For a cascaded diffusion model with multiple backbones,
+                                                                        divide the backbones into two groups, one to be pipelined in
+we advocate bidirectional pipelining to train the backbones
+                                                                        each direction. We then combine stages of the backbones in
+on the same set of devices (instead of using a separate set
+                                                                        the same pipeline direction to form a larger model stage and
+of devices to train each backbone), in order to utilize the
+                                                                        apply our design for bi-directional pipelining accordingly.
+devices more efficiently. In particular, we leverage bidi-
+rectional pipelining (Li & Hoefler, 2021) to train multiple
+backbones, with each backbone pipelining in different di-               4.3     Backbone(s) with self-conditioning
+rection. Here, we consider pipelining from low-rank device              DiffusionPipe performs self-conditioning on the same de-
+to high-rank device as the down direction and vice versa,               vice to eliminate unnecessary parameter storage and updat-
+and the corresponding pipelines are down and up pipelines.              ing, as shown in Fig. 10. There is an additional forward pass
+Consider 2 backbones in a CDM. As shown in Fig. 3, the du-              at each model stage, and Eqn. (3) is changed to:
+ration of the stable phase of the critical path in bidirectional
+                                                                                                       X              B    X b B
+                                                                                T0,SC (s) = max{2             Pfi (     )+  Pi ( ),
+pipelining differs from unidirectional pipelining while the                                                           r         r
+                                                                                                      l<i≤L                l<i≤L
+duration of the warm-up and cool-down phases are not af-                                     2Cfl,l+1 ( Br ) + Cbl+1,l ( Br )
+fected. We calculate the number of paired forward and back-                                                                     + 3Lp2p      (17)
+                                                                                                         Rp2p
+ward stages between the down and up pipelines (MCDM ),
+and derive an upper bound on bi-directional pipeline execu-             In addition, the communication time for sending the output
+tion time for training two backbones:                                   from the last stage to the first stage (Cf in Fig. 10) should be
+      T0,CDM = max{T0,down , T0,up }                            (10)    considered. We use a point-to-point transmission time as the
+       S−C          S−C       S−C
+                                                                        upper bound of this feedback time: TF = OL (B)/Rp2p +
+      T0,CDM = max{T0,down , T0,up }                            (11)    Lp2p , where OL ( Br ) is the output size of the last layer L
+        max                            S−C
+       TCDM = (MCDM + 2S − 2)T0,CDM + T0,CDM                    (12)    at local batch size Br . The upper bound on the pipeline
+Here T0,{down/up} is the maximum of the time to perform                 execution time with self-conditioning is:
+                                                                                    max
+the forward and backward computation of a micro-batch and                          TSC  = (M + 2S − 2)T0,SC + T0S−C + TF                     (18)
+the communication time between two stages in the down or                The dynamic programming formulation remains the same
+up pipeline among all model stages. The sub-problem in the              as in §4.1. Since self-conditioning is usually randomly acti-
+dynamic programming approach in bi-directional pipelin-                 vated during the training process with a certain probability
+ing should decide partitioning and placement of model                   p (0.5 in (Chen et al., 2022)), the formulation optimizes an
+stages for both backbones. Let W (Ld , Lu , S, r, D) denote                              max
+                                                                        expectation of TSC     and T max .
+T0,CDM when partitioning the last Ld and the first Lu con-
+secutive layers of the down- and up-pipelined backbones,                In case self-conditioning is applied to CDMs, we can readily
+respectively, into S stages, while placing them on D devices            extend the formulation in §4.2 by counting the additional
+and replicating the last stage sd and the first stage su of             number of forward stages in the critical path.
+the two backbones on the last r devices of the 1 to D de-
+vice chain, and we have Y (Ld , Lu , S, r, D) similarly. The            5      P IPELINE BUBBLE FILLING
+optimal partitioning of two backbones can be computed by:
+          min {(MCDM + 2S − 2)W (Ld , Lu , S, r, D)                     In DiffusionPipe, we divide the pipeline idle time along the
+         1≤r≤D
+                                                                        timeline and define a pipeline bubble using a tuple (start
+                 + Y (Ld , Lu , S, r, D)}                       (13)    time, end time, idle devices) so that a bubble contains the
+                                DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+  Pipeline                            Full-batch layer    Bubble filling candidates
+  bubble                             filling candidates   with a partial-batch layer
+                                                                                             Algorithm 1 Filling One Pipeline Bubble
+Non-trainable                                                                            *   Input: Number of ready non-trainable components n, training
+                0       1   2    0       0         1       0     0         1        2'
+component 0
+Non-trainable
+                                                                                                 batch size B, pipeline bubble time TB , number of idle devices
+                0   1       2    0       1     0           0     1     0       1'
+component 1                                                                                      d, indices of starting layers of components u (list, length is n),
+                                                           0     1     0       2'                numbers of layers of components L (list, length is n)
+                                                                                             Output: Optimal bubble filling candidate k∗
+                                                                                              1: K0 , K ← emptyList(), FFC(n, B, TB , d, u, L, 0)
+Figure 11. Full-batch bubble filling candidates and corresponding
+                                                                                              2: for k in K, h in 0, . . . , n − 1 do
+candidates with a partial-batch layer. Numbers indicate the index                             3:    b ← maximum of getValidNumSamples(B, d), s.t., 4
+of the non-trainable layer. 1’ and 2’ denote partial-batch layers. *                                      TB ≥
+                                                                                                                    P                 f         B      f          b
+                                                                                              4:                       i∈[n],j∈[ki ] Pi,ui +j ( d ) + Ph,uh +kh ( d )
+marks the candidate with the longest execution time.                                                // Bubble time should be greater than the sum of execu-
+same number of idle devices in its time span. For example,                                          tion time of candidate k and a partial-batch layer
+                                                                                              5:    K0 .append((k, (h, uh +kh , b)) // Add candidate k enhanced
+in Fig. 2, the first pipeline bubble is in the first time slot with                                 with a partial-batch layer (h, uh + kh , b)
+idle devices 1 to 3. Pipeline bubble filling is always per-                                   6: end for
+formed under the cross-iteration style of pipelining (§3.2),                                  7: return the candidate in K0 with the longest execution time
+regardless of the number of backbones and whether self-
+conditioning is applied. We also define a partial-batch layer
+                                                                                             Algorithm 2 FFC - Full-batch Layer Bubble Filling
+using a tuple (component index, layer index, number of
+                                                                                             Candidates
+samples in partial-batch).
+                                                                                             Input: n, B, TB , d, u, L, current component index i
+Non-trainable components in a diffusion model may have                                       Output: bubble filling candidates K
+inter-dependencies (e.g., ControlNet (Zhang & Agrawala,                                       1: t, k0 , K ← 0, 0, emptyList()
+                                                                                              2: while t + Pfi,ui +k0 ( B      ) ≤ TB and ui + k0 < Li do
+2023)), and layers within each component are linearly de-                                                                    d
+
+pendent. We schedule the execution of non-trainable com-                                      3:     t ← t + Pfi,ui +k0 ( B    d
+                                                                                                                                 ) // Cumulative execution time
+                                                                                              4:     k0 ← k0 + 1
+ponents in pipeline bubbles following a topological order of
+                                                                                              5: end while
+components according to their dependencies. Especially, we                                    6: if i = n − 1 then
+fill in the pipeline bubbles sequentially in their chronologi-                                7:     return [[k0 ]] // Add all k0 layers to the candidate as it is
+cal order3 . To fill a pipeline bubble, we consider all of the                                       the last component
+components that are ready at the time, i.e., their dependen-                                  8: else
+                                                                                              9:     for k in k0 , . . . , 0Pdo
+cies are resolved. Whenever a component becomes ready,
+                                                                                             10:         TB′ ← TB − h∈[k] Pfi,ui +h ( B         ) // Remaining bubble
+we add it to the set of ready components.                                                                                                     d
+                                                                                                         time after adding k layers to the candidate
+An efficient algorithm is designed to fill a pipeline bubble                                 11:         K ′ ← FFC(n, B, TB′ , d, u, L, i + 1)
+with ready components (Alg. 1). Its input mainly includes                                    12:         K.extend([concat([k], k′ ) for k′ in K ′ ])
+                                                                                             13:     end for
+the bubble time TB and the number of idle devices d, a list                                  14:     return K
+u containing the index of the starting layer in each currently                               15: end if
+ready component (layers of a component can be executed
+in multiple bubbles). It first finds candidates K containing
+full-batch layers of ready components to fill the current                                    ner: assuming layers from components with indices smaller
+pipeline bubble (Alg. 2), whose execution completes within                                   than i are already considered, it adds layers from component
+the bubble time. Then it adds at most one layer from a                                       i to the candidate. Alg. 2 first computes how many layers
+component to be executed on a partial batch in the remaining                                 can be added at most from line 2 to 5, where Pfi,ui +k ( B
+                                                                                                                                                      d ) is
+bubble time to each candidate, and finally it produces the                                   the computation time of layer ui + k of component i given
+optimal bubble filling scheme with the longest execution                                     local batch size Bd . Then it adds different numbers of layers
+time (not exceeding the bubble time), as shown in Fig. 11.                                   to the candidate (with total execution time not exceeding
+Note that the component layers assigned to the bubble are                                    TB ), and recursively calls itself to add layers from the next
+executed in a data parallel manner at local batch size B d.                                  component i + 1 from line 9 to 13. Alg. 2 returns a list K
+Input of Alg. 2 includes the input of Alg. 1, and the com-                                   containing bubble filling candidates, where each candidate
+ponent index i that it focuses on. It finds bubble filling                                   is a list containing n elements (n is the number of ready
+candidates containing full-batch layers in a recursive man-                                  components), with each element containing the indices of
+                                                                                             the layers of that component to be executed in the bubble.
+    3
+      For bubble filling efficiency, we only identify pipeline bubbles
+longer than 10 ms, which is empirically greater than the cost of                             Then for each bubble filling candidate k in K, an additional
+setting up inputs and outputs for pipeline bubble filling. Chronolog-                        partial-batch layer is added to it. Especially, we identify a
+ical order of pipeline bubbles is achieved by analyzing the pipeline                         layer that is the subsequent layer following the scheduled
+schedule, which is simulated using the profiled results obtained in
+                                                                                                4
+step 1 of Fig. 7. All proposed algorithms work offline only.                                        Here [n] := {0, 1, . . . , n − 1}, [ki ] := {0, 1, . . . , ki − 1}.
+                                       DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+       Split full-batch inputs               Concatenate partial-batch outputs    Amazon EC2 p4de.24xlarge machines, each containing 8
+                                                                                  NVIDIA A100-80GB GPUs and 96 vCPU cores. The inter-
+      0      1         2'             2''             2'''              3
+                                                                                  node connection (EFA) bandwidth is 400 Gbps and the
+          Pipeline
+                                                                                  intra-node connection (NVSwitch) bandwidth is 600 GBps.
+                       0 Full-batch     2'('') Partial-batch
+                                                                      Split or
+          bubble           layer                   layer            concatenate
+            Partial-batch        Partial-batch
+                                                                                  Models We train these models: Stable-Diffusion (Rom-
+                                                             Full-batch output
+                input               output                                        bach et al., 2022) v2.1, ControlNet (Zhang & Agrawala,
+                                                                                  2023) v1.0, CDM-LSUN and CDM-ImageNet (Ho et al.,
+Figure 12. Input split and output concatenation of partial-batch                  2022). For CDM-LSUN, we train its 2 backbones using bi-
+layer’s processing among pipeline bubbles. The partial-batch layer                directional pipelining. For CDM-ImageNet, we only train
+2 of a non-trainable component is scheduled in 3 consecutive                      its second and third backbones because training all of them
+pipeline bubbles.                                                                 will exceed the GPU memory. The backbones of the same
+full-batch layers in the candidate, as well as a partial batch                    CDM are trained under the same batch size. The input con-
+to process, whose execution can occupy the longest of the                         figurations of all models (Table 5) are the same as in their
+remaining bubble time (line 3 to 4 of Alg. 1). We then                            original papers.
+choose among the enhanced bubble filling candidates with                               Table 5. Diffusion models and training configurations
+a partial-batch layer each, the one achieving the longest                                   Model              Input shape        Self-cond
+execution time to maximally utilize the idle time.                                   Stable Diffusion v2.1
+                                                                                                                 512x512           Enabled
+                                                                                        ControlNet v1.0
+To decide the partial batch for the extra layer to process in
+                                                                                         CDM-LSUN            64x64, 128x128
+a pipeline bubble (function getValidNumSamples in line 3                                                                         Not enabled
+                                                                                        CDM-ImageNet         (2 image inputs)
+of Alg. 1), we follow two principles: (1) The local batch
+size b/d should not be too small, as otherwise the benefit of                     Baselines We run DeepSpeed (Rasley et al., 2020) with
+inserting a partial-batch layer will not compensate for the                       vanilla distributed data parallelism (DDP) and ZeRO-3 (Ra-
+overhead of handling its input and output, as illustrated in                      jbhandari et al., 2021) as baselines for data parallel training.
+Fig. 12; (2) b/d should be a regular value to avoid potential                     We use GPipe (Huang et al., 2019) and SPP (Luo et al., 2022)
+kernel performance degradation at unusual batch sizes. We                         as baselines of pipeline parallelism, which perform the back-
+empirically use 4, 8, 12, 16, 24, 32, 48, 64 and 96 as the local                  bone only pipelining in Fig. 9. For GPipe that partitions a
+batch size candidates. If pipeline bubbles cannot completely                      model into stages with equal number of layers, we evalu-
+accommodate the non-trainable part, the remaining part will                       ate it with 2 pipeline stages and 4 micro-batches. For SPP
+be executed after pipelining completes.                                           that solves a dynamic programming problem to optimize
+Furthermore, after introducing a partial-batch layer (h, uh +                     model partitioning, we perform the same hyper-parameter
+kh , b) in a pipeline bubble (line 5 of Alg. 1), the layer uh +kh                 searching as in DiffusionPipe. When self-conditioning is en-
+of component h is the first ready layer of that component to                      abled, we also run the extra-forward part in the way shown
+be considered when filling the following pipeline bubbles,                        in Fig. 10 for pipeline parallel baselines. Bubble filling is
+and it is treated as a full-batch layer on the remaining batch.                   not performed for pipeline parallel baselines.
+In this way, this layer can be scheduled to process all or                        For cascaded diffusion models, data parallel training is per-
+part of the remaining batch in a subsequent pipeline bubble.                      formed in two ways: (1) Training multiple backbones in
+Fig 12 shows an example of scheduling part of the remaining                       sequential using all devices, i.e., DeepSpeed(-ZeRO-3)-S;
+batch in a subsequent (i.e., the second) pipeline bubble.                         (2) Training multiple backbones in parallel on evenly parti-
+                                                                                  tioned sets of devices, i.e., DeepSpeed(-ZeRO-3)-P, which
+6    E VALUATION                                                                  is the default strategy in many CDM works. Both SPP and
+                                                                                  GPipe do not apply to CDM, because they do not support
+We build DiffusionPipe on PyTorch 2.0.1 and CUDA 11.7                             pipelining of multiple models.
+with 20k LoC in Python, and integrate it with Deep-
+Speed 0.8.3 to support pipeline and data parallel train-                          Metrics We present the training throughput in terms of the
+ing. Communication operations are implemented using                               number of samples processed per second. The through-
+PyTorch’s distributed communication package and NCCL                              put of DeepSpeed(-ZeRO-3)-S and DeepSpeed(-ZeRO-
+2.17.1. Though DiffusionPipe is integrated into DeepSpeed,                        3)-P is computed by sumtotal    batch size of all backbones
+                                                                                                              of iteration time of all backbones
+it is easy to migrate DiffusionPipe to other vendor frame-                                          batch size of all backbones, respectively.
+                                                                                  and sum of iteration
+works. We only need to switch to the new launching method                                                   time
+                                                                                  We also present the pipeline bubble ratio of Diffusion-
+and replace the communication and optimizer implementa-                           PipePand pipelined baselines, which is computed by
+tions with corresponding implementations.                                                b∈pipeline bubbles Tb ×db
+                                                                                  iteration time×total num devices , where Tb and db are the
+Test-bed We conduct our experiments on a cluster of 8                             duration and the number of idle devices of the bubble b.
+                                                        DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+                                                   DiffusionPipe                            SPP           GPipe             DeepSpeed                          DeepSpeed-ZeRO-3                   Out of memory
+                               8 GPUs, vanilla case                                          8 GPUs, self-conditioning                                       16 GPUs, vanilla case                                 16 GPUs, self-conditioning
+                 2e2
+    Throughput
+
+
+
+
+                                                                       Throughput
+
+
+
+
+                                                                                                                                  Throughput
+
+
+
+
+                                                                                                                                                                                             Throughput
+                                                                                    1e2                                                        2e2                                                        2e2
+                 1e2
+
+                     0                                                                  0                                                          0                                                          0
+                         64        128      256        384                                   64     128     256       384                              128        256    512       768                            128      256     512    768
+                                   Batch size                                                      Batch size                                                     Batch size                                             Batch size
+                              32 GPUs, vanilla case                                          32 GPUs, self-conditioning                                      64 GPUs, vanilla case                                 64 GPUs, self-conditioning
+                                                                                    5e2                                                                                                                   1e3
+Throughput
+
+
+
+
+                                                                  Throughput
+
+
+
+
+                                                                                                                                  Throughput
+
+
+
+
+                                                                                                                                                                                             Throughput
+                 5e2                                                                                                                           1e3
+             2.5e2                                                             2.5e2                                                           5e2                                                        5e2
+                     0                                                                  0                                                          0                                                          0
+                         256       512     1024       1536                                  256     512     1024     1536                              512       1024    2048     3072                            512      1024   2048   3072
+                                    Batch size                                                      Batch size                                                    Batch size                                                Batch size
+                                                                                                            (a) Stable Diffusion v2.1
+                                                   DiffusionPipe                            SPP           GPipe             DeepSpeed                          DeepSpeed-ZeRO-3                   Out of memory
+                               8 GPUs, vanilla case                                          8 GPUs, self-conditioning                                       16 GPUs, vanilla case                                 16 GPUs, self-conditioning
+    Throughput
+
+
+
+
+                                                                       Throughput
+
+
+
+
+                                                                                                                                  Throughput
+
+
+
+
+                                                                                                                                                                                             Throughput
+                                                                                    1e2                                                        2e2                                                        2e2
+                 1e2
+
+                     0                                                                  0                                                          0                                                          0
+                          64       128      256       384                                    64     128     256      384                                128       256    512      768                              128     256     512   768
+                                   Batch size                                                      Batch size                                                     Batch size                                             Batch size
+                              32 GPUs, vanilla case                                          32 GPUs, self-conditioning                                      64 GPUs, vanilla case                                 64 GPUs, self-conditioning
+                                                                                    5e2                                                                                                                   1e3
+Throughput
+
+
+
+
+                                                                  Throughput
+
+
+
+
+                                                                                                                                  Throughput
+
+
+
+
+                                                                                                                                                                                             Throughput
+                 5e2                                                                                                                           1e3
+             2.5e2                                                             2.5e2                                                           5e2                                                        5e2
+                     0                                                                  0                                                          0                                                          0
+                         256       512     1024       1536                                   256    512     1024     1536                               512      1024    2048     3072                             512     1024   2048   3072
+                                    Batch size                                                      Batch size                                                    Batch size                                                Batch size
+                                                                                                                  (b) ControlNet v1.0
+                                   DiffusionPipe              DeepSpeed-S                           DeepSpeed-P               DeepSpeed-ZeRO-3-S                              DeepSpeed-ZeRO-3-P                         Out of memory
+                                      8 GPUs                                                         16 GPUs                                                      32 GPUs                                                   64 GPUs
+                 5e2                                                               1e3                                                       2e3                                                       4e3
+Throughput
+
+
+
+
+                                                                      Throughput
+
+
+
+
+                                                                                                                                Throughput
+
+
+
+
+                                                                                                                                                                                          Throughput
+             2.5e2                                                                 5e2                                                       1e3                                                       2e3
+
+                     0                                                                  0                                                       0                                                         0
+                         128        256      384        512                                  256    512      768      1024                             512       1024    1536     2048                            1024    2048    3072   4096
+                                    Batch size                                                       Batch size                                                   Batch size                                               Batch size
+                                                                                                                   (c) CDM-LSUN
+                                 DiffusionPipe               DeepSpeed-S                           DeepSpeed-P               DeepSpeed-ZeRO-3-S                             DeepSpeed-ZeRO-3-P                           Out of memory
+                                    8 GPUs                                                          16 GPUs                                                       32 GPUs                                                  64 GPUs
+                                                                                                                                           1e3                                                        2e3
+Throughput
+
+
+
+
+                                                              Throughput
+
+
+
+
+                                                                                                                              Throughput
+
+
+
+
+                                                                                                                                                                                         Throughput
+
+
+
+
+                                                                               5e2
+             2e2
+                                                                           2.5e2                                                           5e2                                                        1e3
+
+                 0                                                                  0                                                          0                                                          0
+                         64       128      256         384                                  128    256      512       768                              256       512    1024      1536                            512     1024    2048   3072
+                                   Batch size                                                       Batch size                                                   Batch size                                                Batch size
+                                                                                                                 (d) CDM-ImageNet
+                                                                                            Figure 13. Training throughput (samples/second)
+6.1                  Training throughput                                                                                               utilization. At batch size 256, DiffusionPipe achieves 1.44x
+                                                                                                                                       and 1.16x speedups over GPipe and DeepSpeed, respec-
+In Fig. 13 we present the throughput of training the diffusion
+                                                                                                                                       tively, when training Stable Diffusion v2.1.
+models at different cluster scales and batch sizes.
+                                                                                                                                      When training on multiple machines, synchronization over-
+For single backbone models (Fig. 13a and 13b), Diffusion-
+                                                                                                                                      head has a more significant impact on training throughput.
+Pipe outperforms other pipeline systems both with and with-
+                                                                                                                                      DiffusionPipe outperforms data parallel baselines as it can
+out self-conditioning, as it efficiently fills pipeline bubbles
+                                                                                                                                      mitigate the overhead in two ways: (1) Each device hosts
+with non-trainable layer execution. When training on a
+                                                                                                                                      fewer parameters in pipeline training, so less synchroniza-
+machine, device utilization determines performance. Dif-
+                                                                                                                                      tion communication is required; (2) Synchronization can
+fusionPipe can outperform data parallel baselines because
+                                                                                                                                      be overlapped with the non-trainable part, further reducing
+both trainable model stages and the non-trainable part oc-
+                                                                                                                                      its impact on the throughput. At batch size 2048 on 64
+cupy only part of the cluster, and it processes the input batch
+                                                                                                                                      GPUs, DiffusionPipe achieves 1.41x and 1.28x speedups
+with a larger local batch size, thus achieving better device
+                                                                                                                                      over GPipe and DeepSpeed training of ControlNet v1.0.
+                                                              DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+   For the cascaded diffusion models (Fig. 13c and                                                                                 6.4   Pre-processing overhead
+   Fig. 13d), DiffusionPipe’s throughput is comparable to
+                                                                                                                                   Pre-processing, including profiling, running the model par-
+   DeepSpeed-P for two reasons: (1) In both CDM models,
+                                                                                                                                   titioning and the pipeline bubble filling algorithm, is per-
+   there is little non-trainable part to fill bubbles, so we can-
+                                                                                                                                   formed once and completes within a few minutes, which is
+   not get speedup from the non-trainable part; (2) Backbone
+                                                                                                                                   acceptable given training usually takes much longer time.
+   sizes in both CDMs are relatively close to each other, and
+   DeepSpeed-S already achieves balanced training iteration                                                                        Profiling is executed in parallel on all GPUs, and its over-
+   time with respect to backbones. However, DiffusionPipe                                                                          head is decided by the number of GPUs. A typical profiling
+   can still achieve a higher training batch size compared                                                                         time of Stable Diffusion v2.1 on 2 AWS EC2 p4de.24xlarge
+   to DeepSpeed-P because the activation memory of micro-                                                                          machines at batch size 512 is 55 seconds.
+   batches does not persist during the entire backward process.
+                                                                                                                                   Model partitioning algorithm is executed in parallel on all
+                                                                                                                                   CPUs in the host machine, and its overhead is decided by
+   6.2                      Pipeline bubble ratio
+                                                                                                                                   the number of CPUs in the host, the number of trainable
+  In Fig. 14, we observe that DiffusionPipe can reduce the                                                                         components and the number of layers in them. For Stable
+  pipeline bubble ratio to less than 5% for both Stable Diffu-                                                                     Diffusion v2.1 and ControlNet v1.0 at the same setting, the
+  sion v2.1 and ControlNet v1.0, which is dramatically lower                                                                       overhead is about 0.5 second.
+  than other pipeline training baselines. The unfilled pipeline                                                                    Pipeline bubble fulling algorithm is executed on only 1
+  bubble time can be explained by: (1) The difference between                                                                      CPU, and its overhead is decided by the number of pipeline
+  the actual execution time and the profiled execution time                                                                        bubbles and the number of non-trainable components. For
+  (used to drive the bubble-filling algorithm); (2) The non-                                                                       the same models at the same setting, the overhead is less
+  continuous execution times of non-trainable layers, which                                                                        than 1 second.
+  make it unlikely to perfectly fill the bubble.
+                                             DiffusionPipe                               GPipe             SPP
+                                                                                                                                   7     C ONCLUSION
+Pipeline bubble (%)
+
+
+
+
+                                                                   Pipeline bubble (%)
+
+
+
+
+                                Stable Diffusion v2.1                                              ControlNet v1.0
+                                                                                         40
+                      20
+                                                                                                                                   This paper presents DiffusionPipe, a system that automati-
+                                                                                         20                                        cally optimizes pipeline training for large diffusion models.
+                       0                                                                  0                                        Our unified partitioning algorithm for the trainable part op-
+                                 256                384                                           256                  384
+                                     Batch size                       Batch size                                                   timizes partitioning schemes of multiple training scenarios
+                                  Figure 14. Pipeline bubble ratio on 8 GPUs                                                       of diffusion models. We also propose to fill pipeline bub-
+                                                                                                                                   bles with the non-trainable part of diffusion models, which
+   6.3                      Ablation study                                                                                         achieves higher training throughput compared to pipelining
+                                                                                                                                   only the backbone model and training in data parallel. Ex-
+  In Fig. 15, we evaluate the throughput of DiffusionPipe                                                                          perimental results demonstrate that DiffusionPipe achieves
+  when the partial-batch layer design is disabled and when                                                                         speedups of up to 1.41x compared to pipeline baselines
+  the pipeline bubble filling design is completely disabled,                                                                       and 1.28x compared to data parallel baselines. This is ac-
+  respectively. We observe that disabling the partial-batch                                                                        complished by reducing the pipeline bubble to less than
+  layer significantly degrades throughput, and disabling bub-                                                                      5% of the training iteration time. Moreover, DiffusionPipe
+  ble filling degrades it even more (by 10.9% and 17.6% for                                                                        enables the use of larger training batch sizes in comparison
+  ControlNet v1.0 at batch size 256). This demonstrates that                                                                       to data parallel baselines. Our design of filling pipeline
+  pipeline bubble filling and the partial-batch layer design can                                                                   bubbles with non-trainable parts can extend to more appli-
+  effectively improve training efficiency. We also observe that                                                                    cations, e.g., training or fine-tuning diffusion models with
+  at batch size 384, disabling the partial-batch layer achieves                                                                    transformer backbones (Peebles & Xie, 2022b; Ma et al.,
+  almost the same throughput as no bubble filling, indicating                                                                      2024; Chen et al., 2023; 2024), together with multimodal
+  that the extra-long layer in Fig. 5 blocks almost all lay-                                                                       models with frozen encoder components (Li et al., 2023a;b;
+  ers during bubble filling, and validating our partial-batch                                                                      Yu et al., 2023).
+  design.
+                             DiffusionPipe          Partial-batch layer disabled                         Bubble filling disabled
+                                Stable Diffusion v2.1                                               ControlNet v1.0                8     ACKNOWLEDGEMENT
+                      2e2
+Throughput
+
+
+
+
+                                                                       Throughput
+
+
+
+
+                      1e2                                                                1e2                                       We would like to thank the Program Chairs and anonymous
+                                                                                                                                   reviewers for their valuable feedback. This work was sup-
+                        0                                                                     0                                    ported by an Amazon Research Award (ARA) on AWS AI
+                                 256                384                                            256                  384
+                                    Batch size                     Batch size                                                      and grants from Hong Kong RGC under the contracts HKU
+                           Figure 15. Ablation study on 8 GPUs (samples/second)                                                    17208920, 17204423 and C7004-22G (CRF).
+                            DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+R EFERENCES                                                       Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn,
+                                                                    D., Zhai, X., Unterthiner, T., Dehghani, M., Minderer, M.,
+Abadi, M., Barham, P., Chen, J., Chen, Z., Davis, A., Dean,
+                                                                    Heigold, G., Gelly, S., et al. An image is worth 16x16
+  J., Devin, M., Ghemawat, S., Irving, G., Isard, M., et al.
+                                                                   words: Transformers for image recognition at scale. arXiv
+  Tensorflow: a system for large-scale machine learning.
+                                                                    preprint arXiv:2010.11929, 2020.
+  In 12th USENIX symposium on operating systems design
+  and implementation (OSDI 16), pp. 265–283, 2016.                Falcon, W. and The PyTorch Lightning team. PyTorch Light-
+                                                                    ning, March 2019. URL https://github.com/
+Bao, F., Nie, S., Xue, K., Cao, Y., Li, C., Su, H., and Zhu,        Lightning-AI/lightning.
+  J. All are worth words: A vit backbone for diffusion
+  models. In Proceedings of the IEEE/CVF Conference               Fan, S., Rong, Y., Meng, C., Cao, Z., Wang, S., Zheng, Z.,
+  on Computer Vision and Pattern Recognition, pp. 22669–            Wu, C., Long, G., Yang, J., Xia, L., et al. Dapple: A
+  22679, 2023.                                                      pipelined data parallel approach for training large models.
+                                                                    In Proceedings of the 26th ACM SIGPLAN Symposium
+Bian, Z., Liu, H., Wang, B., Huang, H., Li, Y., Wang, C.,           on Principles and Practice of Parallel Programming, pp.
+  Cui, F., and You, Y. Colossal-ai: A unified deep learning         431–445, 2021.
+  system for large-scale parallel training. arXiv preprint
+                                                                  Ho, J., Jain, A., and Abbeel, P. Denoising diffusion proba-
+  arXiv:2110.14883, 2021.
+                                                                    bilistic models. Advances in Neural Information Process-
+                                                                    ing Systems, 33:6840–6851, 2020.
+Canny, J. F. A computational approach to edge detection.
+  IEEE Transactions on Pattern Analysis and Machine In-           Ho, J., Saharia, C., Chan, W., Fleet, D. J., Norouzi, M., and
+  telligence, PAMI-8:679–698, 1986.                                 Salimans, T. Cascaded diffusion models for high fidelity
+                                                                    image generation. J. Mach. Learn. Res., 23(47):1–33,
+Chen, J., Yu, J., Ge, C., Yao, L., Xie, E., Wu, Y., Wang,           2022.
+  Z., Kwok, J. T., Luo, P., Lu, H., and Li, Z. Pixart-α:
+  Fast training of diffusion transformer for photorealistic       Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, D., Chen,
+  text-to-image synthesis. ArXiv, abs/2310.00426, 2023.             M., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., et al. Gpipe:
+                                                                    Efficient training of giant neural networks using pipeline
+Chen, J., Wu, Y., Luo, S., Xie, E., Paul, S., Luo, P.,              parallelism. Advances in neural information processing
+  Zhao, H., and Li, Z. Pixart-δ: Fast and controllable              systems, 32, 2019.
+  image generation with latent consistency models. ArXiv,
+                                                                  Kingma, D. P. and Welling, M. Auto-encoding variational
+  abs/2401.05252, 2024.
+                                                                    bayes. arXiv preprint arXiv:1312.6114, 2013.
+Chen, T., Li, M., Li, Y., Lin, M., Wang, N., Wang, M., Xiao,      Kreiss, S., Bertoni, L., and Alahi, A. Openpifpaf: Com-
+  T., Xu, B., Zhang, C., and Zhang, Z. Mxnet: A flexible            posite fields for semantic keypoint detection and spatio-
+  and efficient machine learning library for heterogeneous          temporal association. IEEE Transactions on Intelligent
+  distributed systems. arXiv preprint arXiv:1512.01274,             Transportation Systems, 23(8):13498–13511, 2021.
+  2015.
+                                                                  Li, J., Pan, K., Ge, Z., Gao, M., Zhang, H., Ji, W., Zhang, W.,
+Chen, T., Zhang, R., and Hinton, G. Analog bits: Gen-                Chua, T.-S., Tang, S., and Zhuang, Y. Fine-tuning multi-
+  erating discrete data using diffusion models with self-            modal llms to follow zero-shot demonstrative instructions.
+  conditioning. arXiv preprint arXiv:2208.04202, 2022.               2023a.
+
+Choi, J., Kim, S., Jeong, Y., Gwon, Y., and Yoon, S. Ilvr:        Li, J. Y., Liu, C., Cheng, S., Arcucci, R., and linda Qiao.
+  Conditioning method for denoising diffusion probabilistic         Frozen language model helps ecg zero-shot learning.
+  models. arXiv preprint arXiv:2108.02938, 2021.                    arXiv preprint arXiv:2303.12311, 2023b.
+                                                                  Li, S. and Hoefler, T. Chimera: efficiently training large-
+Deng, J., Dong, W., Socher, R., Li, L.-J., Li, K., and Fei-Fei,     scale neural networks with bidirectional pipelines. In
+  L. Imagenet: A large-scale hierarchical image database.           Proceedings of the International Conference for High
+  In 2009 IEEE conference on computer vision and pattern            Performance Computing, Networking, Storage and Anal-
+  recognition, pp. 248–255, 2009.                                   ysis, pp. 1–14, 2021.
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. Bert:        Luo, Z., Yi, X., Long, G., Fan, S., Wu, C., Yang, J., and Lin,
+  Pre-training of deep bidirectional transformers for lan-          W. Efficient pipeline planning for expedited distributed
+  guage understanding. arXiv preprint arXiv:1810.04805,             dnn training. In IEEE INFOCOM 2022-IEEE Conference
+  2018.                                                             on Computer Communications, pp. 340–349. IEEE, 2022.
+                           DiffusionPipe: Training Large Diffusion Models with Efficient Pipelines
+
+Ma, N., Goldstein, M., Albergo, M. S., Boffi, N. M., Vanden-     Rombach, R., Blattmann, A., Lorenz, D., Esser, P., and
+ Eijnden, E., and Xie, S. Sit: Exploring flow and diffusion-       Ommer, B. High-resolution image synthesis with latent
+ based generative models with scalable interpolant trans-          diffusion models. In Proceedings of the IEEE/CVF Con-
+ formers. ArXiv, abs/2401.08740, 2024.                             ference on Computer Vision and Pattern Recognition,
+                                                                   2022.
+Narayanan, D., Harlap, A., Phanishayee, A., Seshadri, V.,
+  Devanur, N. R., Ganger, G. R., Gibbons, P. B., and Za-         Saharia, C., Chan, W., Saxena, S., Li, L., Whang, J., Denton,
+  haria, M. Pipedream: Generalized pipeline parallelism for        E., Ghasemipour, S. K. S., Ayan, B. K., Mahdavi, S. S.,
+  dnn training. In Proceedings of the 27th ACM Symposium           Lopes, R. G., et al. Photorealistic text-to-image diffusion
+  on Operating Systems Principles, pp. 1–15, 2019.                 models with deep language understanding. arXiv preprint
+                                                                   arXiv:2205.11487, 2022.
+Nichol, A., Dhariwal, P., Ramesh, A., Shyam, P., Mishkin,
+  P., McGrew, B., Sutskever, I., and Chen, M. Glide:             Sergeev, A. and Del Balso, M. Horovod: fast and easy
+  Towards photorealistic image generation and editing              distributed deep learning in tensorflow. arXiv preprint
+  with text-guided diffusion models. arXiv preprint                arXiv:1802.05799, 2018.
+  arXiv:2112.10741, 2021.
+                                                                 Song, J., Meng, C., and Ermon, S. Denoising diffusion
+Peebles, W. and Xie, S. Scalable diffusion models with             implicit models. arXiv preprint arXiv:2010.02502, 2020.
+  transformers. arXiv preprint arXiv:2212.09748, 2022a.
+                                                                 von Platen, P., Patil, S., Lozhkov, A., Cuenca, P., Lambert,
+Peebles, W. S. and Xie, S. Scalable diffusion models with          N., Rasul, K., Davaadorj, M., and Wolf, T. Diffusers:
+  transformers. 2023 IEEE/CVF International Conference             State-of-the-art diffusion models, 2022. URL https:
+  on Computer Vision (ICCV), pp. 4172–4182, 2022b.                 //github.com/huggingface/diffusers.
+
+Podell, D., English, Z., Lacey, K., Blattmann, A., Dockhorn,     Wu, C., Yin, S., Qi, W., Wang, X., Tang, Z., and Duan, N.
+  T., Müller, J., Penna, J., and Rombach, R. Sdxl: Im-           Visual chatgpt: Talking, drawing and editing with visual
+  proving latent diffusion models for high-resolution image       foundation models. arXiv preprint arXiv:2303.04671,
+  synthesis. arXiv preprint arXiv:2307.01952, 2023.               2023.
+                                                                 Yu, F., Seff, A., Zhang, Y., Song, S., Funkhouser, T., and
+Radford, A., Kim, J. W., Hallacy, C., Ramesh, A., Goh, G.,
+                                                                   Xiao, J. Lsun: Construction of a large-scale image dataset
+  Agarwal, S., Sastry, G., Askell, A., Mishkin, P., Clark, J.,
+                                                                   using deep learning with humans in the loop. arXiv
+  et al. Learning transferable visual models from natural
+                                                                   preprint arXiv:1506.03365, 2015.
+  language supervision. In International conference on
+  machine learning, pp. 8748–8763. PMLR, 2021.                   Yu, L., Cheng, Y., Wang, Z., Kumar, V., Macherey, W.,
+                                                                   Huang, Y., Ross, D. A., Essa, I., Bisk, Y., Yang, M.-H.,
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+                                                                   et al. Spae: Semantic pyramid autoencoder for mul-
+  Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring
+                                                                   timodal generation with frozen llms. arXiv preprint
+  the limits of transfer learning with a unified text-to-text
+                                                                   arXiv:2306.17842, 2023.
+  transformer. The Journal of Machine Learning Research,
+  21(1):5485–5551, 2020.                                         Yuan, H., Yuan, Z., Tan, C., Huang, F., and Huang, S. Seqdif-
+                                                                   fuseq: Text diffusion with encoder-decoder transformers.
+Rajbhandari, S., Ruwase, O., Rasley, J., Smith, S., and
+                                                                   arXiv preprint arXiv:2212.10325, 2022.
+  He, Y. Zero-infinity: Breaking the gpu memory wall for
+  extreme scale deep learning. In Proceedings of the Inter-      Zhang, L. and Agrawala, M. Adding conditional con-
+  national Conference for High Performance Computing,              trol to text-to-image diffusion models. arXiv preprint
+  Networking, Storage and Analysis, pp. 1–14, 2021.                arXiv:2302.05543, 2023.
+Ramesh, A., Dhariwal, P., Nichol, A., Chu, C., and Chen,
+  M. Hierarchical text-conditional image generation with
+  clip latents. arXiv preprint arXiv:2204.06125, 2022.
+
+Rasley, J., Rajbhandari, S., Ruwase, O., and He, Y. Deep-
+  speed: System optimizations enable training deep learn-
+  ing models with over 100 billion parameters. In Proceed-
+  ings of the 26th ACM SIGKDD International Conference
+  on Knowledge Discovery & Data Mining, pp. 3505–3506,
+  2020.
+
