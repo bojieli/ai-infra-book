@@ -20,7 +20,7 @@ def norm(text):
 
 def verify():
     sources = json.loads((D / 'selected-sources.json').read_text())
-    assert len(sources) == len({s['id'] for s in sources}) == 56
+    assert len(sources) == len({s['id'] for s in sources}) == 71
     byid = {s['id']: s for s in sources}
     for s in sources:
         b = (ROOT / s['file']).read_bytes()
@@ -44,7 +44,7 @@ def verify():
     screens = list(csv.DictReader((ROOT / 'research/2026-infra-survey/screening-asplos-2025.tsv').open(), delimiter='\t'))
     orders = [a['program_order'] for a in abstracts]
     assert orders == sorted(set(orders)) == [int(s['number']) for s in screens]
-    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 24
+    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 35
     for a, sc in zip(abstracts, screens):
         p = papers[a['program_order']]; s = byid[a['source_id']]
         assert a['source_file'] == s['file'] and a['source_sha256'] == s['sha256']
@@ -74,7 +74,7 @@ def verify():
         assert p['public_abstract']['sha256'] == a['abstract_sha256']
         assert p['screening'] == {'basis': 'title_and_full_primary_public_abstract', 'decision': sc['decision'], 'reason': sc['reason']}
     pdfs = [s for s in sources if 'pdf_pages' in s]
-    assert len(pdfs) == manifest['public_pdfs_archived'] == 23
+    assert len(pdfs) == manifest['public_pdfs_archived'] == 34
     for s in pdfs:
         p = papers[s['program_order']]; pdf = ROOT / s['file']
         assert pdf.read_bytes().startswith(b'%PDF-') and p['pdf']['sha256'] == s['sha256']
@@ -86,12 +86,12 @@ def verify():
         title = re.search(r'^Title:\s*(.+)', info, re.M)
         assert norm(p['title']) in norm(data.decode()) or (title and norm(p['title']) == norm(title[1]))
     selected = [p for p in papers.values() if p['reading_status'] == 'selected_sections_read']
-    assert len(selected) == manifest['selected_sections_read'] == 2
-    assert {p['program_order'] for p in selected} == {3, 94}
-    for order, filename in [(3, 'iks-reading.json'), (94, 'fsmoe-reading.json')]:
+    assert len(selected) == manifest['selected_sections_read'] == 3
+    assert {p['program_order'] for p in selected} == {3, 27, 94}
+    for order, filename in [(3, 'iks-reading.json'), (27, 'ascend-components-reading.json'), (94, 'fsmoe-reading.json')]:
         proof = json.loads((D / filename).read_text()); reading = proof['reading']
         assert reading == papers[order]['selected_reading']
-        assert reading['physical_pdf_pages'] == list(range(1, 14))
+        assert reading['physical_pdf_pages'] == list(range(2, 15) if order == 27 else range(1, 14))
         assert reading['individual_pdf'] == papers[order]['pdf']['file']
         for page, expected in reading['page_text_sha256'].items():
             data = subprocess.check_output(['pdftotext', '-f', page, '-l', page, str(ROOT / reading['individual_pdf']), '-'])

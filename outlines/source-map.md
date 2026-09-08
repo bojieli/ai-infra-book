@@ -741,3 +741,6 @@
 | `asplos26-wave-body` | [Wave 正文范围](../references/proceedings/ASPLOS/2026/wave-reading.json) | 1、11 | 补充／版本参照 | 2025 出版卷、2026 日程；十三页正文范围与五张实际查看图页 |
 | `smartnic-policy-interfaces` | [Wave 与公开 ghOSt 接口](../references/framework-history/2026-09-09/smartnic-policy/README.md) | 1、5、8、11 | 补充／版本参照 | 固定接口、硬件与主机请求路径分别核对；无引擎集成结论 |
 | `smartnic-policy-agent-budget` | [主机调度与 Agent 平台预算](../case-studies/host-policy-and-dispatch.md) | 1、11 | 扩写 1,11 | 实验 1-6／11-1 的延伸；核数翻转点、环境容量与任务吞吐 |
+| `asplos25-ascend-components-body` | [昇腾单元分析正文范围](../references/proceedings/ASPLOS/2025/ascend-components-reading.json) | 4、5 | 补充／版本参照 | 历史 MindSpore 与芯片条件、十三页正文和五张实际查看图页 |
+| `ascend-components-framework` | [激活分支与性能采集](../references/framework-history/2026-09-09/ascend-components/README.md) | 5、8、9 | 补充／版本参照 | 固定普通／310P 入口、三段发行说明及 PD 采集；不把接口当作论文工件 |
+| `ascend-components-qwen3-case` | [同一 Qwen3 的单元与流水推算](../case-studies/component-utilization-and-overlap.md) | 4、5 | 扩写 5 | 5.2.3／5.3.5、实验 5-6、图 5-5；R×E、缓冲和资源共享 |
