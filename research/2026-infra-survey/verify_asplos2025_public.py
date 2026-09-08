@@ -20,7 +20,7 @@ def norm(text):
 
 def verify():
     sources = json.loads((D / 'selected-sources.json').read_text())
-    assert len(sources) == len({s['id'] for s in sources}) == 71
+    assert len(sources) == len({s['id'] for s in sources}) == 87
     byid = {s['id']: s for s in sources}
     for s in sources:
         b = (ROOT / s['file']).read_bytes()
@@ -44,7 +44,7 @@ def verify():
     screens = list(csv.DictReader((ROOT / 'research/2026-infra-survey/screening-asplos-2025.tsv').open(), delimiter='\t'))
     orders = [a['program_order'] for a in abstracts]
     assert orders == sorted(set(orders)) == [int(s['number']) for s in screens]
-    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 35
+    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 48
     for a, sc in zip(abstracts, screens):
         p = papers[a['program_order']]; s = byid[a['source_id']]
         assert a['source_file'] == s['file'] and a['source_sha256'] == s['sha256']
@@ -74,7 +74,7 @@ def verify():
         assert p['public_abstract']['sha256'] == a['abstract_sha256']
         assert p['screening'] == {'basis': 'title_and_full_primary_public_abstract', 'decision': sc['decision'], 'reason': sc['reason']}
     pdfs = [s for s in sources if 'pdf_pages' in s]
-    assert len(pdfs) == manifest['public_pdfs_archived'] == 34
+    assert len(pdfs) == manifest['public_pdfs_archived'] == 47
     for s in pdfs:
         p = papers[s['program_order']]; pdf = ROOT / s['file']
         assert pdf.read_bytes().startswith(b'%PDF-') and p['pdf']['sha256'] == s['sha256']
@@ -86,10 +86,10 @@ def verify():
         title = re.search(r'^Title:\s*(.+)', info, re.M)
         assert norm(p['title']) in norm(data.decode()) or (title and norm(p['title']) == norm(title[1]))
     selected = [p for p in papers.values() if p['reading_status'] == 'selected_sections_read']
-    assert len(selected) == manifest['selected_sections_read'] == 6
-    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 35, 94}
-    expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 35: range(1, 14), 94: range(1, 14)}
-    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (35, 'darwingame-reading.json'), (94, 'fsmoe-reading.json')]:
+    assert len(selected) == manifest['selected_sections_read'] == 7
+    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 94}
+    expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 28: range(2, 13), 35: range(1, 14), 94: range(1, 14)}
+    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (28, 'picachu-reading.json'), (35, 'darwingame-reading.json'), (94, 'fsmoe-reading.json')]:
         proof = json.loads((D / filename).read_text()); reading = proof['reading']
         assert reading == papers[order]['selected_reading']
         assert reading['physical_pdf_pages'] == list(expected_pages[order])
@@ -99,7 +99,19 @@ def verify():
             assert hashlib.sha256(data).hexdigest() == expected
         for f in proof['figures']:
             assert f['actually_viewed'] and hashlib.sha256((ROOT / f['file']).read_bytes()).hexdigest() == f['sha256']
-    report = dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed', scope='Public sources and declared reading only; not full proceedings completion.', responses=len(sources), failed_responses=sum(s['status_code'] != 200 for s in sources), location_dois=184, public_pdfs=len(pdfs), public_pdf_pages=sum(s['pdf_pages'] for s in pdfs), primary_abstracts_screened=len(abstracts), remaining_abstracts=184-len(abstracts), selected_sections_read=len(selected))
+    middle = json.loads((D / 'middle-screening-notes.json').read_text())
+    assert len(middle['new_source_ids']) == 16
+    assert middle['new_abstract_orders'] == [36, 37, 38, 39, 40, 41, 43, 44, 46, 48, 49, 55, 60]
+    assert set(middle['new_abstract_orders']).issubset(orders)
+    assert sum(byid[i].get('pdf_pages', 0) for i in middle['new_source_ids']) == middle['new_pdf_pages'] == 260
+    assert {v['program_order'] for v in middle['abstract_page_views']} == {38, 40, 43, 55}
+    for view in middle['abstract_page_views']:
+        data = (ROOT / view['file']).read_bytes()
+        assert len(data) == view['bytes'] and hashlib.sha256(data).hexdigest() == view['sha256']
+        source = byid[view['source_id']]
+        assert source['sha256'] == view['source_sha256'] and source['program_order'] == view['program_order']
+        assert view['actually_viewed'] and view['physical_page'] == 1
+    report = dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed', scope='Public sources and declared reading only; not full proceedings completion.', responses=len(sources), failed_responses=sum(s['status_code'] != 200 for s in sources), location_dois=184, public_pdfs=len(pdfs), public_pdf_pages=sum(s['pdf_pages'] for s in pdfs), primary_abstracts_screened=len(abstracts), remaining_abstracts=184-len(abstracts), selected_sections_read=len(selected), middle_abstract_page_views=4)
     (D / 'public-audit.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     return report
 

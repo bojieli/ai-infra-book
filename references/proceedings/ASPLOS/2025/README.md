@@ -1,6 +1,6 @@
 # ASPLOS 2025：出版目录核对
 
-官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 34 份公开 PDF、筛读 35 篇原始摘要，其中六篇有声明范围的正文阅读；其余 149 篇摘要与更多公开正文待补。
+官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 47 份公开 PDF、筛读 48 篇原始摘要，其中七篇有声明范围的正文阅读；其余 136 篇摘要与更多公开正文待补。
 
 | 日程对应的正式卷 | 匹配条目 | 出版元数据中的日期 |
 | --- | ---: | --- |
@@ -18,9 +18,9 @@
 
 ## 公开稿与读取进度
 
-[selected-sources.json](selected-sources.json) 另存 71 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。34 份有效 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。四份非 200 响应，以及一份以 200 返回的实验室首页均未计入 PDF。
+[selected-sources.json](selected-sources.json) 另存 87 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。47 份有效 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。六份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
 
-[35 篇摘要](public-abstracts.json)直接来自作者 arXiv 页面、作者／机构论文 PDF 或作者摘要页，逐项保存来源及提取范围。作者稿可能晚于正式出版，HAL 的封面页与正文页也分开计；不混用卷页码。具体取舍见[阅读记录](../../../../research/2026-infra-survey/reading-asplos-2025.md)，其中 IKS、FSMoE 作者 v1 的物理页 1–13 各已读，相关图已查看；其余 PDF 主要完成身份与摘要核对。页级范围见 [IKS](iks-reading.json) 与 [FSMoE](fsmoe-reading.json)，历史模型和数值疑点留在阅读记录。
+[48 篇摘要](public-abstracts.json)直接来自作者 arXiv 页面、作者／机构论文 PDF 或作者摘要页，逐项保存来源及提取范围。作者稿可能晚于正式出版，HAL 的封面页与正文页也分开计；不混用卷页码。具体取舍见[阅读记录](../../../../research/2026-infra-survey/reading-asplos-2025.md)，其中 IKS、FSMoE 作者 v1 的物理页 1–13 各已读，相关图已查看；其余 PDF 主要完成身份与摘要核对。页级范围见 [IKS](iks-reading.json) 与 [FSMoE](fsmoe-reading.json)，历史模型和数值疑点留在阅读记录。
 
 核验：`python research/2026-infra-survey/verify_asplos2025_public.py`。它核对已有来源、摘要提取、页级阅读和取舍记录，不证明全部论文集已归档或全文已读。
 
@@ -31,3 +31,5 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 2026-09-09 继续按问题选读 [Diffuse](diffuse-reading.json) 物理页 2–13 与 [CXLfork](cxlfork-reading.json) 物理页 2–14，共 25 页和八张实际查看图页。分别补充片内→跨卡融合的依赖，以及 CPU 环境恢复的驻留与共享读取；未新增摘要／PDF，不把其余参考文献计为已读。
 
 2026-09-09 补读 [DarwinGame](darwingame-reading.json) 物理页 1–13 与七张实际查看图页。作者工件的占位入口、评分和决赛差距留在[对照归档](../../../framework-history/2026-09-09/tuning-measurement/README.md)；仅补测量条件，论文原件、摘要和 PDF 数量不变。
+
+2026-09-09 增加[十六份响应](middle-screening-notes.json)，其中十三份有效 PDF／260 页及十三篇完整摘要；另补 [PICACHU](picachu-reading.json) 的十一页正文范围与五张图页。当前总计 47 份 PDF／811 页、48 篇摘要、七篇选读范围。新 PDF 中 DaCapo 作者版的 72 页包含附录，Mint 保留占位 DOI，RTL 去重属于正式 2024 卷；逐篇版本备注不混入最终出版页数。本轮其余新 PDF 只完成身份与完整摘要阅读。
