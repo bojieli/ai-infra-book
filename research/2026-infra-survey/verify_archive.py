@@ -427,6 +427,8 @@ questions=re.findall(r'^\| (I\d+) ',(ROOT/'research/2026-infra-survey/interview-
 assert questions==[f'I{i:02}' for i in range(1,22)]
 from verify_interview_sixth import verify as verify_interview_sixth
 verify_interview_sixth()
+from verify_interview_seventh import verify as verify_interview_seventh
+verify_interview_seventh()
 c=a['kv_compression_teaching'];assert c['baseline_seconds']==c['assumed_ttft_seconds']+c['baseline_tokens']/c['baseline_tokens_per_second'];assert c['compressed_seconds']==c['assumed_ttft_seconds']+c['compressed_tokens']/c['compressed_tokens_per_second']
 c=a['reconfiguration_teaching'];assert math.isclose(c['break_even_remaining_steps'],c['transition_seconds']/(c['old_step_seconds']-c['new_step_seconds']));assert c['old_total_seconds']==c['remaining_steps']*c['old_step_seconds'];assert c['new_total_seconds']==c['transition_seconds']+c['remaining_steps']*c['new_step_seconds']
 c=a['plan_reuse_teaching'];assert c['per_layer_total_microseconds']==c['layers']*c['assumed_plan_microseconds'];assert c['shared_plan_microseconds']==c['assumed_plan_microseconds']
