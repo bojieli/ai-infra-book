@@ -17,6 +17,7 @@
 | 历史匹配能否换成有效产出？ | vLLM 2024 prompt lookup、2025 Arctic 插件提议及 2026 suffix 入口，SGLang NGRAM；[确定性草稿、索引成本与 RL 供给](../../case-studies/history-drafts-and-rollout.md) | 8.3.1 每轮收支→10.5.3 阶段配比；实验 8-5、10-8 |
 | 自动优化的分数能否换成部署收益？ | LOOPRAG 的 CPU 反馈方法与固定 FlashInfer-Bench 评估、评分、配置和分派；[参考／基线与调用频数](../../case-studies/optimization-evaluation-and-deployment.md) | 5.3.5 候选验证→5.5.2 实际请求；实验 5-6、5-9。完整引擎集成、硬件匹配与真实替换仍待实验验证 |
 | 少配验证资源，会不会拖住更大的训练组？ | DistRS 条件剩余时间与批次目标，对照 verl v0.4.1／2026 Agent Loop 的评分入口；[执行超时、反馈与释放](../../case-studies/reward-deadlines-and-feedback.md)；PolyRL 文档中的定制 SGLang 路径另列 | 3 长尾分布→5 优化反馈→10 批次依赖→11.3.3 验证资源；实验 11-5。逐条评分接口不等于跨作业阶段调度 |
+| 新增 rollout 实例，能否在可用窗口内降低训练成本？ | RLBoost 评估与固定 PolyRL／SGLang 0.5.5 补丁；[共享出口、完整权重与实际恢复进度](../../case-studies/preemptible-rollout-and-weight-readiness.md)。配置的 Mooncake 名称与实际 TCP 路径分别核对 | 7 出口预算→8 前缀重建→10 同步阶段→11.3.2 可抢占资源；实验 11-4。模型配置、历史成本与当前实现分别保留 |
 
 此前补查的结构化生成连接了冷 schema 准备、CPU 掩码、GPU 前向的重叠条件和推测回滚。当前 8.1.3 先讲请求调度，把语法、视觉、数值一致性作为执行条件留在实验变体和延伸材料；沿用实验 8-2 和图 8-1，不恢复成一个新的主小节。各框架的定位不同，只在同模型、精度、任务与执行条件可以对齐时做性能比较。
 

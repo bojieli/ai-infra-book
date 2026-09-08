@@ -1,6 +1,6 @@
 # NSDI 2026：摘要筛选与重点阅读
 
-已按官方日程中的正式论文顺序阅读 150／150 篇完整摘要；3 篇登记所列正文范围。下载、首页核对、摘要筛选和正文阅读分别记录。
+已按官方日程中的正式论文顺序阅读 150／150 篇完整摘要；4 篇登记所列正文范围。下载、首页核对、摘要筛选和正文阅读分别记录。
 
 [逐项手工取舍](screening-nsdi-2026.tsv)与[归档清单](../../references/proceedings/NSDI/2026/manifest.json)同步。
 
@@ -159,6 +159,7 @@
 
 ## 重点章节与采用边界
 
+- **RLBoost: Harvesting Preemptible Cloud Resources for Cost-Efficient Reinforcement Learning on LLMs**：2026-09-09 补读物理页 9–13、17–18，实际查看图像 9、12、17、18；实现、评估、讨论与附录 A–E 接到 11.3.2。保留此前设计／方法阅读，不称全文已读。原件与整卷逐页比较；共享出口、完整权重、恢复进度和费用交点见[案例](../../case-studies/preemptible-rollout-and-weight-readiness.md)。Table 4 的 Qwen3-14B 48 层／48 Q 头与官方固定配置 40／40 不同，推算采用官方配置，不反推作者实测模型。固定源码使用 TCP，Mooncake 命名和 roadmap 不构成 RDMA 实现证据。范围见[论文记录](../../references/proceedings/NSDI/2026/rlboost-reading.json)。
 - **DistRS: Disaggregated Reward Service for RLVR with Batch-Level Constraint**：2026-09-09 补读物理页 8–13 的批次下界、历史搜索、条件剩余时间、超时调整、EBF 与评估；实际查看页面图像 8–12，对应整卷页 1547–1552 逐页核对文本。此前 platform-routing 案例已有负载／设计／方法阅读；这里登记具体范围，不把补读说成全文阅读。采用资源时间与批次等待的推算，不将 3.79 倍资源时间之比改写为吞吐提升，不推定未知 GPU 或模型身份。固定 verl／PolyRL 对照和执行超时边界见[案例](../../case-studies/reward-deadlines-and-feedback.md)与[范围证据](../../references/proceedings/NSDI/2026/distrs-reading.json)。
 - **RollPacker: Taming Long-Tail Rollouts for RL Post-Training with Tail Batching**：读物理页 2–15 的摘要与 §1–9：长／短轮次的两维额外采样、取消与 prompt 延后；TP／KV 规划、奖励重叠与超时；流式梯度、迁移、归一化；Qwen2.5/H800 端到端、消融、扩展性及 MoE/Agent 扩展边界。表格、图注和正文已读，曲线未独立数字化，参考文献未全读。教学反例分别核查参数新鲜与回答入选分布，不把验证曲线当任意任务的等价证明；Table 2 的 2.02→2.22 相对变化重新计算，不照抄正文 20%。固定作者源码只读另列片段，未运行。；原整卷物理页 873, 874, 875, 876, 877, 878, 879, 880, 881, 882, 883, 884, 885, 886。
 - **ServeGen: Workload Characterization and Generation of Large Language Model Serving in Production**：读物理页 2–13 的摘要、§1–9：生产负载范围、客户分解、语言／多模态／reasoning 请求、轮间间隔、生成方法、vLLM 实例规划与 SGLang PD 评估及限制；表 1、图注和正文已读，曲线未独立数字化。各模型采样窗口不同；公开参数化／脱敏数据不是完整生产日志，也未覆盖工具依赖与真实前缀缓存行为。论文历史 Qwen2.5／R1 设置不改名为当前模型，正文未定位精确引擎版本。；原整卷物理页 1869, 1870, 1871, 1872, 1873, 1874, 1875, 1876, 1877, 1878, 1879, 1880。
