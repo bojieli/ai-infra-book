@@ -4,6 +4,8 @@
 
 本地依据：[DeepSeek-V4 报告](../references/files/papers/deepseek-v4.pdf)、[Qwen3.5 配置](../references/files/models/qwen35-config.json)、[Kimi K3 报告](../references/files/papers/kimi-k3.pdf)。版本、获取日期和 SHA-256 见[资料清单](../references/manifest.json)；以下网络链接用于核对出处，复算采用已归档文件。
 
+历史训练数据、GPU 小时与 scaling law 的跨代比较另见[训练投入笔记](scaling-history.md)；逐层形状见[Qwen3／V4-Flash 模型与算子笔记](model-operator-examples.md)。本页保留复杂模型的逐项计算。
+
 ## 6ND 的来源与边界
 
 对形状为 `X: [m, k]`、`W: [k, n]` 的可训练线性层，前向 `XW` 约需 `2mkn` 次浮点运算。若反向同时求输入梯度和权重梯度，两次矩阵乘再需约 `4mkn`。因此，这三个矩阵乘合计约为 `6mkn`。

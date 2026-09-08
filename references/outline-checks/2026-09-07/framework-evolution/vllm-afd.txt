@@ -1,0 +1,205 @@
+Announcing vLLM AFD Plugin: Disaggregating Attention and FFN for Flexible MoE Serving | vLLM Blog
+We are excited to introduce
+vLLM AFD Plugin
+, an experimental external plugin that brings
+Attention-FFN Disaggregation (AFD)
+to vLLM.
+vLLM AFD Plugin brings AFD into Mixture-of-Experts (MoE) models by separating Attention and FFN into independently deployed services. The plugin preserves vLLM’s existing request lifecycle and OpenAI-compatible serving interface, while allowing the Attention and FFN paths to scale independently.
+The project currently supports NVIDIA GPUs and Ascend NPUs, synchronous and asynchronous connectors, DeepSeek V2/V3-family model wrappers, and eager, graph, and dual-batch execution paths within clearly validated limits.
+Note
+This project is still experimental and needs more large-scale testing across different hardware backends.
+Why Attention-FFN Disaggregation?
+Mixture-of-Experts (MoE) inference combines two very different kinds of work inside every transformer layer. Attention is stateful and closely coupled to request scheduling and the KV cache, while the FFN or expert path is dominated by routed expert computation and all-to-all communication. When both paths share the same worker topology, the serving system must make one set of scaling and execution choices for workloads with very different requirements.
+Making this separation practical requires addressing several system design challenges:
+Attention and FFN have different scaling requirements.
+Attention capacity follows request state, sequence length, and KV-cache pressure. Expert capacity follows token routing and expert load. The serving system should support independent scaling by allowing both paths to use different rank topologies, instead of requiring one shared layout.
+Attention and FFN have different runtime responsibilities.
+Attention needs scheduling, KV-cache coordination, and sampling. FFN execution only needs activations, routing metadata, and a way to return expert outputs. Splitting the services lets the FFN side run as a lightweight connector-driven daemon.
+Communication is backend-specific.
+CUDA and Ascend expose different collective libraries, graph runtimes, and optimized MoE operators. A common connector contract keeps the model-facing flow stable while allowing each backend to own its data path.
+Communication and computation benefit from overlap.
+Asynchronous dispatch and MoE ubatching can overlap independent stages instead of serializing all expert work behind the Attention path.
+Together, these challenges define the core design goal of AFD: keep vLLM’s request-facing Attention path intact, while moving FFN execution behind a narrow connector interface that can scale, communicate, and execute independently.
+Inside the Architecture
+The plugin integrates through vLLM’s
+vllm.general_plugins
+entry point and the standard
+--additional-config
+channel. It does not require edits to the vLLM source tree.
+The runtime has three main parts:
+Attention service.
+The Attention worker retains vLLM’s scheduler, KV cache, batching, model lifecycle, and sampling path. A plugin-owned model runner installs AFD metadata into the forward context and publishes data-parallel, ubatch, layer, and graph state to the FFN side.
+FFN service.
+The FFN worker has no request traffic, scheduler, or KV cache. A background loop receives metadata and activations, invokes
+compute_ffn_output()
+on the plugin-owned model wrapper, and sends the result back to Attention. Requests are always sent to the Attention API server.
+Connector layer.
+At each split layer, the connector transfers Attention hidden states together with the execution metadata required by the FFN service, then returns the computed FFN outputs. A backend-neutral connector interface defines this exchange while allowing each backend to implement its own communication and runtime optimizations.
+This integration surface is designed to be intentionally small. vLLM continues to own the serving control plane where its existing abstractions fit, while the plugin provides the implementations of AFD workers, model runners, connectors, metadata, model split points, and a small set of version-scoped compatibility patches.
+Connector and backend support
+Connector
+Backend
+Execution
+Recommended stage
+Graph support
+P2pNcclAFDConnector
+GPU
+Synchronous P2P
+Decode
+FULL_DECODE_ONLY
+CUDA graph
+CAMP2pAFDConnector
+NPU
+Synchronous CAMP2P/HCCL
+Decode
+FULL_DECODE_ONLY
+ACL graph
+CAMAsyncAFDConnector
+NPU
+Asynchronous CAM
+Prefill
+Not currently supported
+The same high-level exchange - Attention output to FFN, FFN output back to Attention - is shared across connectors. Backend packages remain separate so CUDA graph behavior, ACL graph behavior, NCCL communication, and Ascend custom operators do not leak into one another.
+Supported features
+Native vLLM serving surface.
+Existing vLLM users still launch with
+vllm serve
+, send requests to an OpenAI-compatible endpoint, and configure the runtime through
+--additional-config
+.
+GPU and NPU implementations.
+GPU workers extend vLLM v1 classes, while NPU workers extend vLLM-Ascend classes directly. Shared behavior lives in configuration, topology, metadata, and connector contracts rather than cross-device inheritance.
+Synchronous AFD for decode throughput.
+P2pNcclAFDConnector
+and
+CAMP2pAFDConnector
+synchronously exchange Attention activations and FFN outputs, allowing the two roles to scale independently in throughput-oriented decode deployments. Their current graph paths use
+FULL_DECODE_ONLY
+semantics on CUDA and ACL, respectively.
+Asynchronous AFD for prefill.
+CAMAsyncAFDConnector
+uses CAM asynchronous dispatch and combine operators to decouple prefill Attention ranks from expert workers. Together with AFD-managed MoE ubatching, it overlaps independent Attention and FFN stages to reduce pipeline stalls. This path currently targets the prefill stage in a prefill/decode-disaggregated deployment and does not yet support graph execution.
+MoE model integration.
+The plugin registers wrappers for DeepSeek V2/V3-family architectures, including DeepSeek V3.2, and GLM MoE DSA. The wrapper exposes separate Attention and FFN computations while reusing upstream layer implementations.
+Graph and ubatching paths.
+The synchronous GPU and NPU connectors support decode-only graph capture. Dual Batch Overlap is supported with exactly two ubatches, and CAM async provides AFD-managed MoE ubatching for its prefill path.
+A Performance Snapshot
+Synchronous AFD Decode Throughput with
+CAMP2pAFDConnector
+The synchronous decode recipe in
+vllm-project/afd-plugin#67
+compares a conventional EP64 deployment with
+CAMP2pAFDConnector
+-based AFD deployments for DeepSeek-V3.2 W8A8 on Ascend 910C. The benchmark measures saturated decode throughput rather than online-serving latency.
+Deployment
+Physical topology
+Total dies
+EP64
+DP64, EP64, TP1
+64
+48A16F
+48 Attention ranks, 16 FFN ranks
+64
+64A16F
+64 Attention ranks, 16 FFN ranks
+80
+Note
+These are controlled performance results, not accuracy or production-serving results. Due to limited machine availability, the physical 48A16F and 64A16F deployments simulate logical 192A64F and 256A64F scales. The experiment replaces natural routed expert IDs with a deterministic forced-balancing cycle, which changes model outputs.
+AFDDecodeBenchConnector
+supplies the decode-only KV state, and DBO is enabled for AFD.
+Throughput is normalized by the total number of deployed dies:
+tokens/s/die = aggregate output token throughput / total deployed dies
+Both workloads use fixed-length inputs and uniformly distributed outputs from 512 to 1,536 tokens.
+16K fixed input
+EP64 achieves
+232.6 tokens/s/die
+, 48A16F achieves
+220.3 tokens/s/die
+, and 64A16F achieves
+258.9 tokens/s/die
+. Relative to EP64, the AFD results are
+-5.3%
+for 48A16F and
++11.3%
+for 64A16F.
+32K fixed input
+EP64 achieves
+168.2 tokens/s/die
+, 48A16F achieves
+151.4 tokens/s/die
+, and 64A16F achieves
+183.3 tokens/s/die
+. Relative to EP64, the AFD results are
+-10.0%
+for 48A16F and
++9.0%
+for 64A16F.
+Across both input lengths, 48A16F is below the EP64 baseline, while 64A16F delivers the highest normalized throughput:
++11.3% at 16K
+and
++9.0% at 32K
+. This result shows that the Attention-to-FFN allocation matters; disaggregation alone does not guarantee a throughput gain.
+Due to limited machine availability, we did not evaluate deployments with higher Attention-to-FFN ratios. The observed trend suggests that, at the ratios tested, the FFN ranks still have compute headroom rather than being compute-bound. Increasing the proportion of Attention ranks may therefore reveal further throughput gains.
+Asynchronous AFD Prefill Performance with
+CAMAsyncAFDConnector
+The repository includes an early CAM async experiment on two Ascend 910C nodes using a DeepSeek V3.2 W8A8 model reduced to 10 layers. The comparison uses forced expert balancing and contrasts a
+DP4PCP8 TP1
+baseline with an AFD layout consisting of Attention
+DP3PCP8 TP1
+plus FFN
+EP8
+.
+Across the measured request rates, the AFD configuration lowers median/P50 time to first token. At 12 requests per second, median TTFT decreases from
+15.1 seconds to 8.0 seconds
+, a reduction of approximately
+47%
+. At both 10 and 12 requests per second, the measured gap is about 7.2 seconds.
+Note
+: These numbers are a focused validation of the CAM async execution path, not a general performance claim for full DeepSeek V3.2 or every AFD topology. The performance gains may also vary across workloads.
+Getting Started
+The current implementation requires Python 3.10–3.13 and targets vLLM
+0.19.1
+.
+Install
+Check out the installation steps in our
+README
+for details.
+Deployment Recipes
+Deployment commands depend on the backend, connector, model, and rank topology. Instead of duplicating configurations here, use the maintained
+AFD Plugin recipes
+:
+GPU synchronous AFD:
+the
+DeepSeek V2 Lite P2P NCCL recipes
+cover decode-oriented colocated and prefill/decode-disaggregated deployments, eager and CUDA graph execution, and multiple DP/TP layouts.
+NPU asynchronous prefill AFD:
+the
+DeepSeek V3.2 CAM async recipe
+documents the required environment, topology, AFD configuration, benchmark setup, and current limitations.
+Refer to the repository README and recipe directory for the latest supported connector matrix, configuration fields, and complete launch commands.
+Current Scope and Roadmap
+The project intentionally exposes its current boundaries: exact vLLM version pinning, model runner v1 only, full weights on both roles, decode-only graph modes, exactly two ubatches for DBO, and hardware-gated end-to-end testing.
+The next phase of development will focus on:
+Broader vLLM compatibility and upstream alignment:
+track newer vLLM releases, evaluate model runner v2, keep compatibility patches minimal, and contribute generally useful abstractions upstream as they mature.
+More flexible execution:
+extend graph modes, ubatch counts, asynchronous stages, and validated rank topologies.
+Production-scale validation:
+publish repeatable accuracy, latency, throughput, stability, and multi-node results on full models and realistic workloads.
+Expanded model and connector coverage:
+add MoE architectures and backend transports through the existing model-wrapper and connector interfaces, together with corresponding deployment recipes for each newly supported model and connector.
+Multimodal and vLLM-Omni integration:
+explore how AFD can integrate with
+vLLM-Omni
+and heterogeneous multimodal pipelines, including its application within autoregressive (AR), Diffusion Transformer (DiT), and other stages that can benefit from independently scaled Attention and FFN execution.
+Heterogeneous hardware and low-latency serving:
+explore deploying Attention and FFN roles across different accelerator types and interconnects, together with connector, scheduling, placement, and computation-communication overlap optimizations that reduce time to first token and inter-token latency.
+Join the Community
+vLLM AFD Plugin is at an early stage, and feedback from model, serving, and hardware communities will shape its direction.
+Code and documentation:
+github.com/vllm-project/afd-plugin
+Runtime design docs:
+GPU Attention/FFN and Ascend Attention/FFN designs
+Issues and feature requests:
+GitHub Issues
+Let’s build a more composable and hardware-aware future for MoE serving together.
