@@ -16,7 +16,9 @@
 
 ## 当前入口
 
-最新补读 Apophenia 十三页声明正文／工件附录范围，并将公开 Legion 工件与固定 vLLM 图封装对照。沿[现有图执行案例](../../case-studies/graph-execution-tradeoffs.md)补任务身份、等待收齐与完成时间，仍用 5.4.4／实验 5-8／图 5-7。累计 **1,358 篇完整摘要／61 篇声明正文范围**；不新增摘要或 PDF，也未重跑本书 GPU 实验。
+最新[第九次面试寻源](../../references/interviews/2026-09-09/ninth-pass/README.md)找回一篇 MiniMax 候选人原帖，核清商业平台的提交年与面试年；仍为 21 道改编题。沿第 6→9→11 章补[共享 GPU 的成组时间线](../../case-studies/resource-sharing-and-placement.md#同时可用的一组-gpu)，区分总资源预算、整组就绪与状态恢复，接现有实验 11-3／图 11-4。累计论文阅读数量不变，没有运行模型或调度器。
+
+此前补读 Apophenia 十三页声明正文／工件附录范围，并将公开 Legion 工件与固定 vLLM 图封装对照。沿[现有图执行案例](../../case-studies/graph-execution-tradeoffs.md)补任务身份、等待收齐与完成时间，仍用 5.4.4／实验 5-8／图 5-7。累计 **1,358 篇完整摘要／61 篇声明正文范围**；不新增摘要或 PDF，也未重跑本书 GPU 实验。
 
 此前补筛 ASPLOS 2025 十三篇完整摘要、归档十三份代表 PDF，并选读 PICACHU 十一页正文范围。资源配比、共享缓冲及 RoPE 系数缓存接入[既有 Qwen3 案例](../../case-studies/component-utilization-and-overlap.md)，不采用旧模型总加速比。累计 **1,358 篇完整摘要／60 篇声明正文范围**；其余会议、框架和全书逐例复核继续。
 

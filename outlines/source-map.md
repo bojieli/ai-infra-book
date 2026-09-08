@@ -760,3 +760,5 @@
 | `asplos25-apophenia-body` | [Apophenia 正文与工件附录](../references/proceedings/ASPLOS/2025/apophenia-reading.json) | 5、8 | 补充／版本参照 | 十三页声明范围与六张实际查看图页；重复身份、匹配等待与稳态条件 |
 | `trace-identification-framework` | [任务匹配与图封装](../references/framework-history/2026-09-09/trace-identification/README.md) | 5、8 | 补充／版本参照 | 公开 Legion 工件与固定 vLLM 源码；缓冲责任和实现范围分别取证 |
 | `trace-identification-case` | [图执行的身份与等待](../case-studies/graph-execution-tradeoffs.md) | 5、8 | 扩写 5 | 同一输入槽位与独立流水推算；既有实验 5-8／图 5-7 |
+| `interview-ninth-provenance` | [第九次面试寻源与日期核对](../references/interviews/2026-09-09/ninth-pass/README.md) | 1、3、10、11 | 补充／版本参照 | 一篇候选人原帖；历史平台、试读和推广线索分别记，不新增题号 |
+| `shared-gpu-group-readiness` | [整组就绪与模型恢复](../case-studies/resource-sharing-and-placement.md#同时可用的一组-gpu) | 6、9、11 | 扩写 11 | 实验 11-3／图 11-4；相同工作量的期限、填空与恢复变体 |
