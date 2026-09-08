@@ -1,0 +1,86 @@
+StreamTensor: Make Tensors Stream in Dataflow Accelerators for LLMs                                                                                                          MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+                       tensor<64x64>                 host                                                                                                                   tensor<64x64>                    host
+                        Kernel 0        linalg.generic                             tensor<64x64>                  host                                                                         tensor.pack
+
+
+
+
+                                                                                                                         Kernel Fusion + Pack & Widen Kernel Interface
+                       tensor<64x64>                                             itensor<16x16…>   dataflow.kernel                                                       tensor<4x4x16x16>
+                        Kernel 1        linalg.generic                            Kernel 0          dataflow.task                                                                       tensor_ext.widen
+                       tensor<64x64>                 (a)                                              scf.for(s)                                                         tensor<4x4x2x2xvector<8x8>>
+                        Linalg Tiling                                                  dataflow.itensor_read(s)                                                           itensor<16x16…>     dataflow.kernel
+                       tensor<64x64>                 host                          tensor<16x16>                                                                           Kernel 0     … …dataflow.task
+                       Kernel 0               scf.for(s)                                        linalg.generic                                                            itensor<16x16…>
+                            tensor.extract_slice(s)                                tensor<16x16>                                                                              dataflow.converter<16x64>
+                       tensor<16x16>                                                  dataflow.itensor_write(s)                                                           itensor<16x16…>
+
+
+
+
+                                                            Linalg to Dataflow
+                                        linalg.generic                                                                                                                     Kernel 1     … …dataflow.task
+                       tensor<16x16>                                             itensor<16x16…>
+                                                                                                                                                                         tensor<4x4x2x2xvector<8x8>>
+                             tensor.insert_slice(s)                                tensor<64x64>
+                                                                                                                                                                                      tensor_ext.unwiden
+                                                                                 itensor<16x16…>   dataflow.kernel
+                       tensor<64x64>                                                                                                                                     tensor<4x4x16x16>
+                                                                                  Kernel 1     … …dataflow.task
+                       Kernel 1     … …       scf.for(s)                                                                                                                                     tensor.unpack
+                       tensor<64x64>                 (b)                           tensor<64x64>                   (c)                                                      tensor<64x64>                    (d)
+
+Figure 6: Linalg tiling, Linalg to dataflow conversion, and dataflow kernel fusion. A solid arrow indicates an operation on the
+left is transformed into the operation on the right, whereas a dashed arrow indicates an operation that remains unchanged.
+
+
+IRs that serve different levels of dataflow optimizations. Eventually,                                 4.2        Dataflow Kernel Fusion
+all dataflow tasks are lowered to MLIR built-in call and func                                          After all tiled Linalg operations are converted to dataflow kernels,
+operations for code generation.                                                                        all these kernels initially communicate via traditional tensors,
+                                                                                                       which are eventually stored in external memory. To reduce this
+4     Compilation Pipeline                                                                             communication overhead, StreamTensor applies stream-based ker-
+Building on the type system and operations, we introduce a com-                                        nel fusion. Figures 6(c)-(d) show this process. To fuse Kernel0 and
+pilation pipeline that compiles Linalg IR into hardware imple-                                         Kernel1, we first compare the output itensor type of Kernel0 with
+mentations and a corresponding runtime. All compilation passes                                         the input itensor type of Kernel1. As described in Section 3.1.2,
+are shown in Figure 4. In this section, we focus on the Linalg-to-                                     if the types match, we can directly fuse the kernels. If not, we in-
+dataflow conversion, dataflow kernel fusion, and dataflow optimiza-                                    sert a stream layout converter as shown in Figure 6(d). The fused
+tions that are unique and essential to understanding the compiler.                                     kernel comprises two tasks and a converter, all communicating
+                                                                                                       via itensors that will be lowered to on-chip stream FIFOs. The
+4.1     Linalg to Dataflow                                                                             itensor typing system enables any dataflow kernels to be fused
+                                                                                                       by design at the cost of potential on-chip memory utilization for
+Figures 6(a)-(c) illustrate the Linalg-to-dataflow conversion pro-
+                                                                                                       converters. In Section 5.2, we will discuss the exploration of kernel
+cess. The original Linalg operations (Figure 6(a)) are first tiled into
+                                                                                                       fusion space given memory constraints.
+Figure 6(b), where scf.fors represent the loop nests for tiling.
+                                                                                                           After fusion, StreamTensor applies additional optimization passes
+In each iteration, extract_slices extract input tensor tiles to
+                                                                                                       to improve the efficiency of external memory access. In particular,
+feed into the tiled Linalg operation. After the operation produces
+                                                                                                       tensor pack and unpack operations are inserted before and after
+output tiles, insert_slices insert them back into the full tensor.
+                                                                                                       the kernel to convert between default and tiled memory layouts for
+Then, each tiled loop nest is converted into a kernel operation in
+                                                                                                       burst memory access. For example, with a tiling size of [16,16] on a
+place as shown in Figure 6(c). The input and output tensors are
+                                                                                                       64x64 tensor, the packed tensor has shape 4x4x16x16. To maximize
+converted into/from itensors at the boundary of kernels. The
+                                                                                                       the usage of external memory bandwidth, StreamTensor widens
+itensor types are inferred from:
+                                                                                                       the tensor with vectors. For instance, with 512-bit DDR or HBM
+(1) The nested scf.for loops — iteration tripcounts and step sizes                                     and uint8 elements, grouping 64 elements into vector<64> fully
+    define the itensor iteration space.                                                                utilizes the bandwidth. In Figure 6, the packed tensor is widened
+(2) The extract_slice and insert_slice operations’ offsets and                                         to shape 4x4x2x2xvector<8x8>. Note that pack and widen opera-
+    sizes — offsets define the iteration mapping, while sizes define                                   tions are eventually lowered to runtime operations on the host CPU,
+    the element shape. For example, offsets [%iv2, %iv0] result                                        which prepares data for the accelerator and causes some latency
+    in the iteration map (d0,d1,d2)->(d2,d0).                                                          and memory overhead. However, for static tensors (e.g., pre-trained
+   After conversion, extract_slice and insert_slice operations                                         parameters), pack and widen can fuse directly into these tensors,
+are replaced with itensor_read and itensor_write operations,                                           eliminating any runtime costs. For dynamic tensors (e.g., activa-
+respectively. The resulting scf.for loop nest is wrapped in a task                                     tions), pack and widen operations can be folded with their unpack
+to form a single-level dataflow hierarchy: a dataflow kernel contain-                                  and unwiden counterparts from the preceding layer via effective
+ing a dataflow task. By converting the Linalg semantics to dataflow,                                   Linalg tiling space exploration. As a result, the pack and widen op-
+we open opportunities for subsequent dataflow-oriented transforms                                      erations, being necessary only for the model’s inputs and outputs,
+and optimizations.                                                                                     contribute negligible memory and latency overhead at runtime.
+
