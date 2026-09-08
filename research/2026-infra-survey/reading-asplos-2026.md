@@ -2,7 +2,15 @@
 
 编写依据是[当前章节清单](../../outlines/chapters.json)和[草案 22 的依赖](../../outlines/structure.md)。第 8–12 章依次为单实例推理、分布式推理、训练系统、资源调度与运行环境、端边云协同；下面按问题定位，不沿用历史章号。
 
-沿日程逐批筛读，当前 **85 篇完整原始摘要已读，35 篇正文候选、31 篇备查、19 篇排除；83 篇摘要待补。** Shift、SuperOffload、AttenIO 与 RedFuser 已完成下述声明范围，其余三十一篇候选正文待读。82 份代表 PDF 共 1,411 页，包含两份复用原件；另有一份四页的旧 STRAW 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+沿日程逐批筛读，当前 **85 篇完整原始摘要已读，35 篇正文候选、31 篇备查、19 篇排除；83 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser 与 RhymeRL 已完成下述声明范围，其余三十篇候选正文待读。82 份代表 PDF 共 1,411 页，包含两份复用原件；另有一份四页的旧 STRAW 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+
+## RhymeRL：历史复用改变哪些供给
+
+选读 2025-08-26 arXiv v1 的物理页 2–11 相关正文及第 12 页参考文献前部分，七张页面图已实际查看。作者出版条目确认正式版题名／DOI 和 17 页身份；出版 PDF 403，未声称获得正式正文。版本、源码行段与已有范围复用见[阅读记录](../../references/proceedings/ASPLOS/2026/rhymerl-reading.json)。
+
+[采用案例](../../case-studies/history-drafts-and-rollout.md)区分离线历史匹配、在线草稿接受与每轮真实产出。固定目标的 40 组穷举给出相同采样分布、不同时间收益，再加入索引准备和新旧缓冲。当前 8.3.1／实验 8-5 用于解释起草收益；10.5.3／实验 10-8 用于按改变后的生成供给重配资源。HistoPipe 的 worker 分配是 DP 粒度，不能写成动态 TP。
+
+固定 vLLM 和 Arctic 源码区分经验分数与目标采样概率，并核对局部／全局历史寿命；SGLang NGRAM 的重叠与 DP 限制随实验保留。基线 verl v0.4.1／AReaL v0.3.0、未披露的 GPU 型号及两组奖励曲线不支持通用性能或质量结论。旧样本、KV 和路由记录的区别复用现有案例，不再展开平行教程。
 
 ## 第 81–105 项：并行调整、历史复用与设计寿命
 

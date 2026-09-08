@@ -690,3 +690,7 @@
 | `redfuser-quant-generated` | [RedFuser FP8 生成示例](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/quant-generated.txt) | 官方实现 | 补充／版本参照 | 实验 5-4 扩写；前缀尺度与 cast 核对，未运行内核 |
 | `redfuser-quant-test` | [RedFuser FP8 参考与误差测试](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/quant-test.txt) | 官方实现 | 补充／版本参照 | 实验 5-4 扩写；完整静态阅读，随机输入容差不代表普遍等价 |
 | `redfuser-onnx-float8` | [ONNX Float8 类型与转换](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/onnx-float8.html) | 官方文档 | 补充／版本参照 | 实验 5-4 扩写；只读 E4M3FN/E5M2 定义与 Cast 两节 |
+| `asplos26-paper-101` | [RhymeRL：历史草稿与 RL 供给](../references/proceedings/ASPLOS/2026/paper-101.pdf) | 补充 | 补充／版本参照 | 8.3.1／10.5.3；选读公开 v1 页 2–12 内声明范围，正式版另核 |
+| `rhymerl-vllm-suffix-guide` | [vLLM 固定 Suffix 指南](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-suffix-guide.txt) | 补充 | 补充／版本参照 | 8.3.1 扩写；完整指南，未执行示例 |
+| `rhymerl-vllm-rejection` | [vLLM 固定 rejection sampler](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-rejection.txt) | 补充 | 补充／版本参照 | 草稿与目标概率；仅读取登记行段，不代表全部采样路径审计 |
+| `rhymerl-arctic-cache` | [Arctic 固定历史缓存](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/arctic-cache.txt) | 补充 | 补充／版本参照 | 实验 8-5／10-8；完整静态阅读，容量上限与请求数分别计量 |

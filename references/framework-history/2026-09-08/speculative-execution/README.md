@@ -17,3 +17,5 @@ vLLM 提交 `537af2c3a4ba7462ddc9bc94ec7a4ea496da6d2e`，提交时间 2026-09-07
 SGLang 提交 `c99d906effa8bd05573995127f0d4a0984c5a96a`，沿用已归档[目录身份](../overlap-placement/sglang-current-tree.json)。完整阅读[自适应步数文档](sglang-adaptive-guide.mdx)与[DSpark 成本表源码](sglang-dspark-sps.py)；[推测解码指南](sglang-spec-guide.mdx)只读第 528–598 行 DFlash 和 683–725 行 Spec V2。按 batch 的 EAGLE 档位、按请求的 DSpark 预算与不同框架的 DP 限制分别记录。
 
 采用位置为第 9.2.4、9.3 与原实验 9-4／9-5／9-6，详细的 Qwen3 矩阵、计数和时间计算见[扩写笔记](../../../../case-studies/speculative-execution.md)。这轮没有新增会议论文全文阅读或面试证据样本。
+
+后续历史草稿核对：SGLang 同一固定指南的第 725–789 行 NGRAM 说明已读取；对应 vLLM suffix 与 Arctic 源码、独立采样／成本推算见[RhymeRL 交叉核对](../../../proceedings/ASPLOS/2026/rhymerl-crosschecks/README.md)。此项落在当前 8.3.1→10.5.3、实验 8-5／10-8；上文第 9 章等采用位置保留此前阶段的编号背景。

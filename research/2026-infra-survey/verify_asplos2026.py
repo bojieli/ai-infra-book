@@ -230,7 +230,8 @@ def verify():
         from verify_superoffload import verify as verify_superoffload
         from verify_attention_tiles import verify as verify_attention
         from verify_fusion_legality import verify as verify_fusion
-        validators = {4: verify_shift, 23: verify_superoffload, 41: verify_attention, 68: verify_fusion}
+        from verify_history_speculation import verify as verify_history
+        validators = {4: verify_shift, 23: verify_superoffload, 41: verify_attention, 68: verify_fusion, 101: verify_history}
         for item in selected:
             validators[item['program_order']]()
     return dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed',
