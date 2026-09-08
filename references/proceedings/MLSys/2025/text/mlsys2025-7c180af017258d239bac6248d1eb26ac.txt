@@ -1,0 +1,1103 @@
+              M ARCONI : P REFIX C ACHING FOR THE E RA OF H YBRID LLM S
+
+
+Rui Pan 1 * Zhuang Wang 2 Zhen Jia 2 Can Karakus 2 Luca Zancato 2 Tri Dao 1 Yida Wang 2 Ravi Netravali 1
+
+
+                                                           A BSTRACT
+        Hybrid models that combine the language modeling capabilities of Attention layers with the efficiency of Recurrent
+        layers (e.g., State Space Models) have gained traction in practically supporting long contexts in Large Language
+        Model serving. Yet, the unique properties of these models complicate the usage of complementary efficiency
+        optimizations such as prefix caching that skip redundant computations across requests. Most notably, their use of
+        in-place state updates for recurrent layers precludes rolling back cache entries for partial sequence overlaps, and
+        instead mandates only exact-match cache hits; the effect is a deluge of (large) cache entries per sequence, most
+        of which yield minimal reuse opportunities. We present Marconi, the first system that supports efficient prefix
+        caching with Hybrid LLMs. Key to Marconi are its novel admission and eviction policies that more judiciously
+        assess potential cache entries based not only on recency, but also on (1) forecasts of their reuse likelihood across a
+        taxonomy of different hit scenarios, and (2) the compute savings that hits deliver relative to memory footprints.
+        Across diverse workloads and Hybrid models, Marconi achieves up to 34.4× higher token hit rates (71.1% or 617
+        ms lower TTFT) compared to state-of-the-art prefix caching systems.
+
+1       I NTRODUCTION                                                pute and memory costs for long-context serving (Fig. 1c),
+                                                                     albeit with mild accuracy degradations (Waleffe et al., 2024).
+The emergence of large language models (LLMs) has em-                These subquadratic layers are commonly mixed with several
+powered many applications including chatbots (cha, 2022),            full Attention layers to produce Hybrid LLMs (Fig. 1a) that
+AI-powered search (per, 2023), coding assistants (git, 2022),        lower serving costs while maintaining Attention’s superior
+and more. Owing to increasing workload complexity and                recall and in-context learning capabilities (Waleffe et al.,
+the evolution of inference-time enhancements such as few-            2024; Lieber et al., 2024; Team et al., 2024; Glorioso et al.,
+shot prompting (Brown, 2020) and chain-of-thoughts (Wei              2024).
+et al., 2022), recent years have witnessed a push towards
+longer context windows during serving. Indeed, the accu-             Although Hybrid LLMs improve per-request efficiency, they
+racy improvements from multi-step reasoning (Khattab et al.,         complicate the cross-request efficiency wins that prior ef-
+2023; Yao et al., 2022), detailed prompt templates (Liu et al.,      forts have shown to be especially effective in long-context
+2023), and increased samples in few-shot prompting (Brown,           scenarios, i.e., prefix caching that reuses model states for
+2020) all require expanded context sizes.                            common prefixes across requests, thereby skipping compu-
+                                                                     tation without harming accuracy (Kwon et al., 2023; Zheng
+To keep pace with these trends, traditional foundation mod-          et al., 2023b; Gao et al., 2024; Abhyankar et al.). The pri-
+els like Transformers have been extended to support longer           mary challenge is that SSM model states are updated in
+context windows, e.g., Gemini 1.5 (Team et al., 2023) and            place (Fig. 1b), so states at the end of a sequence cannot
+Claude 3 (cla, 2024b) both have 1M window size. How-                 be rolled back to represent a prefix of the sequence. This
+ever, their intrinsic reliance on the Attention mechanism            presents a dilemma for serving systems. On one hand, max-
+harms long-context serving efficiency, particularly due to its       imizing reuse opportunities for future (arbitrary) workloads
+quadratic compute complexity and large memory footprint              mandates caching fine-grained state checkpoints at regu-
+for housing KV cache states (Wu et al., 2024; Lee et al.,            lar intervals, e.g., every 256 tokens. On the other hand,
+2024). As a result, new recurrent and subquadratic model             increased checkpointing frequency inflates the number of
+architectures like State Space Models (SSMs) (Gu & Dao,              cache entries generated per sequence, each of which is large
+2023; Dao & Gu, 2024) have emerged to offer lower com-               (due to the sheer size of SSM states) but most of which
+     *
+       Work done during internship at AWS. 1 Princeton University    present limited reuse opportunities, i.e., sparsely-hit. The
+2
+    AWS. Correspondence to: Rui Pan <ruipan@princeton.edu>.          net effect is cache thrashing with low-utility entries (Fig. 2),
+                                                                     and a poor memory-vs-compute savings tradeoff (§3).
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,
+2025. Copyright 2025 by the author(s).
+                                                         Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+
+  Attention              SSM                    Attention
+
+                                                                             is              a           busy
+                                                                                                                                           Attention     SSM
+  Attention              SSM                       SSM
+                                                                                                                        Computational
+                                                                  …                                              …                           O(L2 )      O(L)
+  Attention              SSM                       SSM                   State1            State2       State3            Complexity
+                                                                                                                        Inference-Time
+  Attention              SSM                       SSM
+                                                                                                                                             O(L)        O(1)
+                                                                          NYC                is            a               Memory
+Transformers             SSMs              Hybrid Models                               (c) Prefill complexity comparison between
+                                          (b) SSMs update their states recurrently and
+                                                                                       quadratic Attention layers and subquadratic
+(a) Different model architectures. Hybrid in place.                                    SSM layers.
+models usually mix in one Attention layer
+for every 6-10 SSM layers.
+                                             Figure 1. Overview of Hybrid models.
+
+    Request 1                                               Request 2                             candidate against previously-observed sequences. In con-
+     NYC            is   a      busy        city            NYC         is        very            trast, for the latter case, Marconi assigns value only to SSM
+                                                                                                  states that represent the last decoded token (which conver-
+    SSM States               SSM States                           SSM States
+                                                                                                  sations typically resume from, as opposed to intermediate
+              NYC                      NYC is                            NYC is                   branching). We efficiently encapsulate this bookkeeping in
+    KVs                      KVs                                  KVs
+      NYC                        is                                NYC       is                   a radix tree that highlights sequence overlap, and introduce
+                                                                                                  a speculative insertion step prior to each prefill to determine
+    SSM States               SSM States                                  Reused
+            NYC is a
+                         … KVs
+                                NYC is a busy city                                                the potential reuse opportunties for the upcoming sequence
+    KVs                                                                           Prefix
+       a                        city                     Cached
+                                                                                  Cache
+                                                                                                  (and the resultant checkpointing required).
+                                                                                                  For eviction, our main observation is that, with Hybrid
+Figure 2. Prefix caching reuses model states of common prefixes
+(green) across requests, accelerating inference. Fine-grained check-
+                                                                                                  LLMs, when assigning value to the cache entry for a given
+pointing results in many sparsely-hit entries (blue).                                             sequence, we have to account for both KVs and SSM states
+                                                                                                  which exhibit different tradeoffs between memory and com-
+                                                                                                  pute savings. Specifically, whereas the size of KVs’ entries
+We present Marconi,1 the first prefix caching system de-                                          for a sequence is (linearly) proportional to the compute sav-
+signed to support Hybrid LLMs. For a given sequence, Mar-                                         ings from reusing that sequence, SSM state sizes are fixed
+coni simultaneously manages cache entries for both SSM                                            and unrelated to sequence length and compute savings. To
+states and KVs, ensuring that all of the preceding sequence                                       enable more holistic management of cache entries, Marconi
+states for each cached entry are also present to support reuse.                                   introduces a new FLOP-aware eviction policy that assesses
+Moreover, Marconi eschews traditional caching logic based                                         candidates for eviction based not only on recency/popularity,
+on recency (Kwon et al., 2023; Zheng et al., 2023b; Sri-                                          but also the potential compute savings they deliver (normal-
+vatsa et al., 2024), and instead introduces novel admission                                       ized against the space they consume in the cache). This
+and eviction strategies that value potential cache entries                                        inherently trades the hit rate of shorter sequences for longer
+with awareness of the aforementioned SSM overheads; we                                            ones – an especially desirable tradeoff given the superior
+describe these in turn.                                                                           efficiency of Hybrid models over Transformers.
+To cope with the large size and “all or nothing” nature of                                        We evaluated Marconi on a wide range of workloads, re-
+SSM cache entries (i.e., hits only arise on exact sequence                                        quest arrival patterns, cache sizes, and Hybrid model ar-
+matches, unlike with KVs), Marconi adopts a judicious ad-                                         chitectures. Overall, we find that Marconi improves cache
+mission strategy, whereby only SSM candidates with high                                           hit rates by an average of 4.5-34.4× compared to state-of-
+reuse likelihood are accepted. Our driving insight is that,                                       the-art caching systems (e.g., vLLM (Kwon et al., 2023),
+despite lacking knowledge of upcoming requests, the reuse                                         SGLang (Zheng et al., 2023b)) that are extended to support
+potential of each SSM state can be sufficiently estimated                                         Hybrid models. The win in token hit rate translates to la-
+when assessed against the taxonomy of potential prefix reuse                                      tency savings of 36.1-71.1% (103.3-617.0ms) for P95 TTFT.
+scenarios. Specifically, token redundancy arises across re-                                       Microbenchmarks show that Marconi performs better in sce-
+quests as either (a) purely-input shared prefixes, e.g., system                                   narios with longer contexts, higher ratios of SSM layers,
+prompts, or (b) a combination of input and output token shar-                                     and larger SSM state dimensions — trends that align with
+ing, e.g., conversation history. The former case typically                                        recent model developments. Marconi is open sourced at
+arises across many requests, enabling Marconi to vet each                                         https://github.com/ruipeterpan/marconi.
+   1
+    “Marconi plays the mamba, listen to the radio, don’t you
+remember?” – Lyrics of We Built This City, song by Starship
+                                     Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+2     BACKGROUND                                                  2.2   Prefix Caching
+In this section, we provide background on the efficient re-       Shared prefixes across requests, including input tokens and
+current architectures (exemplified by SSMs), Hybrid mod-          sometimes output tokens, are common across many LLM ap-
+els that contain these alternative architectures, and prefix      plications. For example, question-answering workloads of-
+caching for efficient LLM inference.                              ten share a detailed system prompt combined with few-shot
+                                                                  examples that provide instructions and demonstrations (Yao
+2.1   State Space Models and Hybrid Models                        et al., 2022). Similarly, coding agents interact with the
+                                                                  environment in multiple rounds, where each new request
+Token generation in LLM inference involves two main               consists of a trajectory of past environment interactions and
+phases. First, the prefill phase processes an input sequence,     new observations and actions (Yang et al., 2024a; Wang
+generating the model’s internal states (e.g., KV cache/KVs        et al., 2024). Redoing the prefill of these shared prefixes
+in Attention layers) for each layer of an LLM, and outputs        for all requests leads to many redundant computations, hurt-
+the first new token. The decoding phase then utilizes the         ing both throughput and latency. Prefix caching mitigates
+internal states to perform autoregressive token generation.       this by caching and reusing the model’s internal states that
+During prefill, generating the first token depends on all         represent the common prefixes (Fig. 2), achieving a lower
+previous tokens. In Transformers, the self-attention mech-        time to first token (TTFT) latency, lower tail time per token
+anism calculates how each token in the sequence “attends”         (TPT) latency2 , and higher prefill throughput (measured in
+to every other token. Consequently, the Attention mecha-          tokens/s).
+nism incurs quadratic computational complexity (Dao et al.,       Many research and production systems have been proposed
+2022), which quickly bottlenecks GPU compute as sequence          to reap the benefits of prefix caching in Transformer infer-
+lengths scale (Agrawal et al., 2024). Furthermore, the size       ence (Kwon et al., 2023; Zheng et al., 2023b; Gao et al.,
+of the KVs in Attention layers grows linearly with sequence       2024; Srivatsa et al., 2024; Abhyankar et al.; cla, 2024a; cha,
+length, resulting in a large inference-time memory require-       2024; Qin et al., 2024; ope, 2024). On startup, these systems
+ment (Wu et al., 2024; Lee et al., 2024).                         provision blocks of GPU/CPU memory for caching the pre-
+State space models (SSMs) and more generally linear RNNs          fix states. Before prefilling a new sequence, the inference
+and linear attention, such as Mamba (Gu & Dao, 2023;              engine looks up the prefix cache for the longest matching
+Dao & Gu, 2024), address these inefficiencies by selec-           prefix. Upon a cache hit, the corresponding prefix is fetched
+tively “compressing” previous context into a recurrent and        before prefilling. After decoding the final token of the se-
+compact representation. The recurrent representation is           quence, to favor recency, the system admits the model states
+used alongside the previous token to update the recurrent         of all tokens of the new sequence into the cache. To reduce
+representation in place, as shown in Fig. 1b. Because the         memory fragmentation, the KVs are usually partitioned into
+SSM states maintain a constant size, memory consumption           fixed-sized token blocks in the prefix cache, each housing
+remains fixed regardless of sequence length, and the compu-       the KVs of x tokens where x is the block size (Kwon et al.,
+tational complexity scales linearly, rather than quadratically,   2023), and existing token blocks are evicted to make room if
+with the sequence length (Fig. 1c). Although pure SSM             the cache is full. Because KVs have a sequence dimension,
+models outperform Transformers on many NLP tasks, they            managing and evicting model states is efficient and flexible.
+lag behind on certain workloads that require strong recall        E.g., if we have the KVs of a sequence of tokens 1...q and
+or in-context learning capabilities (Waleffe et al., 2024; nee,   want to retain the KVs of the prefix 1...p (p < q), tensor
+2024). To balance inference efficiency and model capability,      slicing can be performed on the sequence dimension of the
+SSM-Attention Hybrid models (Fig. 1a) have been proposed.         full KVs.
+These models blend quadratic Attention and subquadratic
+SSM layers, typically interleaved in a specific ratio (com-       3     C HALLENGES OF P REFIX C ACHING
+monly 1 Attention layer for every 6-10 SSM layers (Waleffe              WITH H YBRID LLM S
+et al., 2024; Lieber et al., 2024; Glorioso et al., 2024)).
+When compared to Transformers of equivalent scale trained         Compared to Attention, SSM’s properties greatly benefit
+on the same datasets, Hybrid models demonstrate superior          its per-request computational complexity and memory con-
+performance across a wide range of tasks while preserving         sumption. However, the very properties that make SSMs
+most of the efficiency advantages of SSM layers (up to 8×         more efficient also complicate prefix caching, an important
+faster) (Waleffe et al., 2024). Many Hybrid models have           optimization for cross-request efficiency wins. The key
+been productionized (car, 2024; Lieber et al., 2024; Team            2
+                                                                       Even though prefix caching is a prefill-only optimization, a
+et al., 2024; Glorioso et al., 2024; zam, 2024a;b; Waleffe        lower prefill latency also reduces the tail TPT for high-throughput
+et al., 2024; Ren et al., 2024), with the largest being Jamba     LLM inference engines (Agrawal et al., 2024).
+1.5 at 398B parameters (Team et al., 2024).
+                                                                         Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+                       KVs          SSM States                                                                 interval, containing KVs for x tokens and SSM states that
+                                                                                                               represent all prior tokens (Fig. 2). However, this elicits two
+% Blocks Reused
+
+
+
+
+                  30                                                         40 GB
+
+
+
+
+                                                 (MB, log-scale)
+                                                                   104                                         challenges for existing prefix caching systems. To demon-
+
+
+
+
+                                                   State Size
+                  20                                                                                           strate this, we analyze one of the experiments in §5. No
+                                                                   103
+
+
+
+                                         11.1×
+                                                                                              block_size=8
+                                                                                                               existing systems support prefix caching for Hybrid models,
+                                 27.9×
+                         65.3×
+
+
+
+
+                  10                                                                          block_size=16
+                                                                   102
+                   0
+                                                                                              block_size=32    so we extend vLLM (Kwon et al., 2023) using its caching
+                        32    64     128                                 0           5000   10000      15000   policy to support Hybrid models.
+                        Token Block Size                                             Sequence Length
+
+                                                                                                               Cache underutilization. While reusing KVs requires ac-
+(a) Token block reuse rate (b) Total size of a Hybrid model’s
+comparison between KVs cache entries as sequence length                                                        cessing all prior tokens’ KVs, reusing SSM states only needs
+and SSM states.            scales.                                                                             the last token block. This results in sparsely-hit cache entries
+                                                                                                               on a sequence level, with many low-utility SSM states never
+Figure 3. Fine-grained caching of token blocks results in many                                                 accessed after admission. Fig. 3a shows that with a block
+SSM states being cached. This creates sparsely-hit entries in                                                  size of 32, 25.0% of the token blocks’ KVs are reused by
+which many SSM states are never reused (a), underutilizing the                                                 future requests, but a mere 0.4% of SSM states are reused, a
+precious cache capacity. Worse, this creates a huge memory usage
+                                                                                                               65.3× difference. Using larger blocks mitigates both issues
+even for a single sequence of a 7B model (b), overwhelming and
+                                                                                                               by reducing the checkpointing granularity and the number
+thrashing the cache.
+                                                                                                               of SSM states checkpointed. However, the issues persist
+                                                                                                               (3.3% reuse rate for block size 128 which exceeds what
+reason lies in how SSM updates its internal states: SSMs                                                       vLLM natively supports), and larger block sizes lead to in-
+recurrently and efficiently compress the history of tokens                                                     ternal memory fragmentation of KVs within token blocks,
+into a compact state and update the recurrent state in place                                                   impacting memory utilization (Kwon et al., 2023).
+by overwriting the previous states, keeping the memory
+usage constant. Further, while SSM states are generally                                                        High memory usage. Worse, fine-grained checkpointing
+smaller than the KVs of whole sequences in Attention, they                                                     quickly leads to an excessive memory usage due to the SSM
+aim to capture the same cross-token information as KVs do                                                      states’ size. For example, with block size 16, the state size
+and thus are typically 10-100x larger than a single token’s                                                    of an SSM layer is 4×3 larger than the KVs of an Atten-
+KVs (Appendix A). In summary, SSM states exhibit the                                                           tion layer in the token block because of property 3 . Since
+following key properties:                                                                                      there are many more SSM layers than Attention layers in
+                                                                                                               Hybrid models for efficiency (Waleffe et al., 2024), their
+                   SSM State Properties                                                                        states quickly overwhelm the GPU HBM (and possibly CPU
+                                                                                                               RAM): for a 7B model, a single sequence of 10K tokens con-
+                       1. SSM states are constant-sized regardless of                                          sumes 17.4 GB (Fig. 3b), 3.3× bigger than a Transformer
+                          how many tokens they represent.                                                      of the same size. Even if sequences are short and the states
+                       2. SSM states are updated in place, so a se-                                            are evicted soon after a request finishes inference, they must
+                          quence’s states cannot be rolled back to repre-                                      still be admitted into the prefix cache, potentially requiring
+                          sent its prefixes.                                                                   eviction of entries with higher utility, leading to frequent
+                       3. SSM states are orders of magnitude larger than                                       cache thrashing and low cache hit rate.
+                          the KVs of a single token.
+                                                                                                               In conclusion, existing prefix caching systems face a
+                                                                                                               dilemma in Hybrid LLM inference: maximizing reuse op-
+The core challenge of prefix caching in Hybrid LLM infer-                                                      portunities mandates fine-grained state checkpointing but
+ence is that SSM states exhibit “all or nothing” reusability:                                                  doing so creates large yet sparsely-hit entries that over-
+To realize prefix reusing, we need all prefix tokens’ KVs                                                      whelm and thrash the limited cache capacity. Therefore,
+for each Attention layer and one SSM state that exactly                                                        a judicious cache management scheme is needed to better
+matches all prefix tokens for each SSM layer. However,                                                         reap the benefits of prefix caching in Hybrid LLM inference.
+if future requests only use a prefix of a sequence, such as
+tokens 1...p from a sequence 1...q (p < q), the SSM lay-
+ers cannot reuse states that represent 1...q (property 2 )
+                                                                                                               4    D ESIGN AND I MPLEMENTATION
+and neither can the KVs be reused by Attention layers, as                                                      Marconi is the first prefix caching system designed to ac-
+prefix reusing is bottlenecked by the layer with the least                                                     commodate the unique characteristics of Hybrid models. It
+reusing opportunities. To maximize reuse opportunities for                                                     is designed to support models with arbitrary layer compo-
+future requests that might reuse arbitrary prefixes of the                                                     sitions, including Hybrid models, pure Transformers, and
+most recent request, fine-grained checkpointing (every x                                                          3
+tokens) of many previously overwritten SSM states is re-                                                            d state /(2· block size). The 2 stands for the key and
+                                                                                                               value tensors in KVs. See Appendix A for more details.
+quired. This creates an equal-sized token block for each
+                                                         Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+                                        Prefill         Decode                                                 2022), instructions (Yao et al., 2022), few-shot exam-
+                       Sequence: NYC      is      very huge                                                    ples (Hendrycks et al., 2020), self-consistency (Wang
+                                        Branch point,
+                                                                                                               et al., 2022), long-document QA (Li et al., 2023), etc.
+                                         checkpoint                    SSM States
+                                                                                                            2. Input and output: The prefix consists of previous
+  SSM States                                                            NYC is
+   NYC is a busy city                  NYC is                          KVs
+                                                                                                               input and output tokens, such as conversation history
+  KVs                                                                   NYC      is
+   NYC    …     city                                                                                           in chatbots (Gao et al., 2024; cha, 2024; 2022), past
+                                          very          SSM States                    SSM States
+                                                         NYC is a busy city            NYC is very huge        environment interactions for LLM agents (Yang et al.,
+                           a busy                       KVs                           KVs
+                            city                           a    busy     city          very huge               2024a; Yao et al., 2022), etc.
+ (a) Original tree             (b) Speculative                   (c) Final tree after
+                                  insertion                    inserting full sequence                    This taxonomy allows Marconi to devise different mecha-
+                                                                                                          nisms for identifying and caching the corresponding states.
+Figure 4. Marconi performs a speculative insertion to check if in-                                        For the purely-input case, as the same prefix is usually
+serting the prefill segment of a sequence results in an intermediate                                      shared across many requests, Marconi can observe and com-
+node. If so, the SSM states at the branch point are checkpointed.                                         pare previous requests to identify these hot common prefixes.
+States at the last decoded token are checkpointed in any case. For                                        For the input-and-output case, Marconi only values SSM
+ease of visualization, we associate model states with nodes rather                                        states that represent the last decoded token between conver-
+than edges.                                                                                               sation rounds, which conversations typically append to, as
+                                                                                                          opposed to branch off from.
+
+pure SSMs. Its primary goal is maximizing the cache utiliza-                                              Leveraging the above insights, to estimate the reuse like-
+tion to reduce redundant computation and minimize TTFT                                                    lihood, Marconi uses a radix tree to bookkeep the request
+latency. To improve cache utilization and prevent the large                                               history, identify common prefixes, and map sequences to
+SSM states from thrashing the cache, Marconi judiciously                                                  their states. A radix tree is a space-efficient prefix tree with
+admits SSM states (§4.1), only accepting states with a high                                               edges labeled by sequences of varying lengths. Within the
+reuse likelihood based on a taxonomy of potential prefix                                                  tree, each edge is associated with the KVs of tokens it repre-
+reuse scenarios. The bookkeeping of requests is realized via                                              sents and the SSM states that represent all tokens prior to the
+a radix tree that represents past request overlap. Once admit-                                            last token in the edge (Fig. 4c). Nodes represent branch-off
+ted, as states of all layers need to work in conjunction and                                              points in sequences: those with multiple children represent
+represent the same prefix tokens to realize prefix caching,                                               prefixes that are “purely input”, whereas nodes with ≤ 1
+Marconi opts to manage different types of model states holis-                                             child may represent “input and output” prefixes of future
+tically in the same tree (Fig. 4), where each node contains                                               requests. Because nodes represent high-utility states, Mar-
+the SSM states and KVs of a sequence, rather than disag-                                                  coni caches states judiciously by only admitting SSM states
+gregating the cache space for different types of layer states.                                            represented by the last token of edges. For input-and-output
+For eviction (§4.2), to account for the different tradeoffs                                               cases, Marconi simply checkpoints the state after the last de-
+between memory and compute savings of different layers’                                                   coding step. Because the last token’s KVs include all prior
+states, Marconi introduces a FLOP-aware eviction policy                                                   tokens, all KVs of the whole sequence are still effectively
+that balances recency and potential compute savings deliv-                                                cached, which is the same as existing systems. To identify
+ered by reusing entries. We describe the implementation                                                   “purely input” prefixes, prior to prefilling each sequence,
+details in §4.3.                                                                                          Marconi employs a speculative insertion of the input tokens
+                                                                                                          to see if new intermediate nodes will be created (Fig. 4). If
+4.1      Cache Admission                                                                                  so, Marconi caches the prefix’s states during prefill.
+
+Marconi aims to cache the states with high reuse likelihood                                               Obtaining states during prefill. After prefilling KVs in
+during admission. Although prefix reuse patterns of future                                                Attention, they can be partitioned and trimmed to represent
+requests cannot be perfectly predicted, our key insight is                                                subsequences. In contrast, SSM states cannot be rolled back
+that the reuse potential can be sufficiently estimated through                                            to represent a prefix, so Marconi needs a new mechanism
+a taxonomy of potential prefix reusing scenarios. Through                                                 previously unnecessary for Transformers inference. Mar-
+extensive analysis of prefix reusing patterns in various real-                                            coni supports two main methods for checkpointing SSM
+world datasets and request traces (Qin et al., 2024; cha,                                                 states during prefill. Some SSMs (Dao & Gu, 2024; Sun
+2024; Zheng et al., 2023b) that represent traffic of both                                                 et al., 2023; Yang et al., 2023) perform chunked state pass-
+dedicated inference deployments (Jimenez et al., 2023) and                                                ing during prefill, where the input sequence is split into
+public-facing APIs (cha, 2022; sha, 2024), we classify the                                                chunks to compute intra-chunk states. For these models, we
+token composition of all reused prefixes into two types:                                                  simply materialize and cache the state of the second-to-last
+                                                                                                          chunk in the prefix. For example, when prefilling a sequence
+  1. Purely input: The prefix is a part of the input sequence                                             of 100 tokens using chunk size 32, if we need to cache the
+     from a previous input, such as system prompts (cha,
+                                       Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+state at token 80, we can checkpoint the state at token 64.                                       1e5
+                                                                                              4
+This approach may miss some prefix caching opportunities                                                Mamba
+
+
+
+
+                                                                            FLOP Saved/Byte
+within a chunk but introduces minimal runtime overhead.
+                                                                                              3         Hybrid
+Optionally, custom kernels can be developed to quickly roll
+                                                                                                        Transformer
+the state forward by a few tokens to reach the exact location.                                2
+For models that don’t support chunked state passing (Gu &
+Dao, 2023; Lieber et al., 2024), Marconi performs a two-                                      1
+pass prefill to get the precise state at the prefix. For example,
+the first pass prefills the first 80 tokens to generate the prefix                            0
+state, while the second pass starts from the prefix state and                                      0    500    1000   1500   2000
+prefills the remaining 20 tokens.                                                                         Sequence Length
+Tradeoffs. Compared to fine-grained checkpointing, Mar-
+coni’s judicious admission has slight drawbacks, but its             Figure 5. FLOP efficiency of the model states of different 7B mod-
+tremendous benefits compensate for the drawbacks. Be-                els as the sequence length scales. The more SSM layers in the
+cause the states of the last decoded token are immediately           model, the steeper the increase in FLOP efficiency.
+cached for all sequences, “input and output” prefixes can be
+reused instantaneously. In contrast, “purely input” prefixes         4.2   Cache Eviction
+only benefit from reusing starting from the third occurrence
+of the prefix, as Marconi uses the second occurrence to iden-        For eviction, our main observation is that KVs and SSMs
+tify the prefix and checkpoint its states. While this approach       in Hybrid model states exhibit different tradeoffs between
+sacrifices the benefit of reusing a “purely input” prefix on         memory and compute savings. Specifically, whereas the
+its second occurrence, these prefixes are typically shared           size of KVs for a sequence is linearly proportional to the
+across many requests. As a result, missing savings on a              sequence length and (approximately) the compute savings
+single request has a negligible impact on overall savings.           from reusing that sequence, SSM state sizes are fixed regard-
+On the other hand, judicious admission reduces coverage              less of sequence length and compute savings. To quantify
+and slightly limits the potential reusability of arbitrary pre-      this difference, we propose a new metric, FLOP efficiency,
+fixes, as only up to two SSM states are admitted per se-             to measure the compute savings (measured in the number of
+quence. However, due to the huge number of low-utility               floating operations) per unit of memory achieved by reusing
+SSM states rejected from admission by Marconi, this altru-           a prefix cache entry:
+istic approach significantly reduces the size and improves                                     Total FLOPs across layers
+                                                                      flop efficiency =
+the utility of cached Hybrid model states, enhancing overall                              Memory consumption of all states
+cache utilization.                                                                                                             (1)
+Comparison with SGLang. SGLang (Zheng et al., 2023b)                 Here, Total FLOPs across layers denotes the sum of re-
+is an existing prefix caching system for Transformers that           dundant compute across different types of layers (i.e., At-
+also leverages a radix tree for mapping sequences to to-             tention, SSM, and MLP) circumvented by reusing the prefix
+kens and their KVs. Different from SGLang, Marconi uses              entry, and Memory consumption of all states denotes
+the past requests in the radix tree to determine which SSM           the total size of all stateful layers’ states (i.e., Attention and
+states to cache by performing speculative insertions before          SSM). More details on FLOP efficiency are in Appendix A.
+prefilling an upcoming sequence. Further, Marconi’s phi-             Fig. 5 compares the FLOP efficiency of model states in
+losophy of judicious state admission fundamentally differs           three different 7B models: Transformers (Attention-only),
+from SGLang, which admits the states of all tokens dur-              Mamba (SSM-only), and Hybrid (with an Attention:SSM
+ing admission and is no different from other prefix caching          ratio of 1:6). The increase of FLOP efficiency as sequence
+systems like vLLM (Kwon et al., 2023). We show how                   length scales is steeper for models with a higher ratio of
+these differences yield superior cache efficiency in §5. Our         SSM layers as larger portions of the model states become
+system doesn’t invent new data structures for KV cache               more FLOP efficient.
+management, and instead builds on the rich prior work in             Traditional prefix caching systems designed for Transform-
+this space that also aims to manage prefixes’ model states ef-       ers don’t need to consider FLOP efficiency because KVs’
+ficiently. Our main contribution lies in being the first system      FLOP efficiency is near-constant, and most systems only
+to redesign caching policies and their interactions with these       use recency for eviction. However, ignoring it in Hybrid
+data structures to practically address the unique properties         LLM inference risks evicting states with higher FLOP ef-
+of emerging Hybrid models.                                           ficiency but do not have the best recency. To enable more
+                                                                     holistic management of cache entries, Marconi introduces a
+                                                                     FLOP-aware eviction policy that assesses candidates for
+                                    Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+eviction based not only on recency but also the potential                                                           Input      Output
+                                                                                1e3                           1e2                           1e3
+                                                                                                          8
+compute savings they deliver (normalized against the space                                                                              4
+                                                                          2.0
+                                                                                                          6                             3
+they consume in the cache). In addition to recency, Marconi
+
+
+
+
+                                                                Density
+                                                                          1.5
+                                                                                                          4                             2
+accounts for the FLOP efficiency by computing a utility                   1.0
+
+                                                                          0.5                             2                             1
+score S that represents the utility for each radix node n:
+                                                                          0.0                             0                             0
+                                                                                0     10000 20000 30000       0       2000   4000           0     10000 20000 30000
+                                                                                       # Tokens                        # Tokens                     # Tokens
+
+                                                                                      (a) LMSys                     (b) ShareGPT                (c) SWEBench
+      S (n) = recency(n) + α · flop efficiency(n)        (2)
+                                                                Figure 6. Input/output sequence length distributions per workload.
+
+This metric favors cache entries with higher recency, save
+more compute, and take less memory. Both the recency
+and flop efficiency scores are normalized to the                4.3             Implementation details
+range (0, 1) by comparing all nodes’ last-accessed times-
+                                                                Alongside the custom admission and eviction policies, we
+tamps and FLOP saved/byte in the radix tree. During evic-
+                                                                made the following changes to accommodate Hybrid model
+tion, Marconi iteratively removes nodes with the lowest
+                                                                states: (1) During eviction, all nodes with ≤ 1 children are
+utility score until there is enough space to accommodate the
+                                                                considered for eviction, not just leaf nodes. The reasoning is
+new request’s states. As such, child nodes’ FLOP savings
+                                                                that nodes with multiple children represent the common pre-
+are calculated relative to parents’ savings.
+                                                                fixes shared by multiple requests and should not be evicted
+Managing the balance. Marconi manages the balance be-           (unless they become stale, at which point all their children
+tween favoring recency and FLOP efficiency by tuning α.         will be evicted first and the ex-parent nodes will become
+A higher α emphasizes FLOP efficiency, while setting α          leafless nodes themselves, which make them subject for
+to 0 falls back to LRU. Marconi manages the balance by          eviction), whereas intermediate nodes with a single child
+observing the workload and retrospectively setting the best     are unlikely to be reused more than once and still incur a
+configuration. On startup, Marconi sets α to 0 until the        memory cost for their SSM states. When an intermediate
+first eviction. Afterward, Marconi takes a snapshot of the      node is evicted, its SSM states are released, and its KVs are
+radix tree and enters a bootstrap period, continuing to use     absorbed by its child node. (2) When a cache hit occurs,
+LRU while bookkeeping token-level information of requests       only the accessed node’s timestamp is updated, unlike in
+during the bootstrapping phase. The bootstrap period in-        existing systems where timestamps for all ancestor nodes
+cludes 5 − 15× the number of requests seen before the           are updated. In Marconi, previous SSM states are not reused
+first eviction, capturing a representative workload sample.     (Fig. 4c), and although ancestors’ KVs are accessed, their
+Once sufficient requests have been observed, Marconi asyn-      KVs will be subsumed by child nodes if evicted. Thus,
+chronously launches a grid search over possible α values        not updating ancestors’ timestamps doesn’t affect recency
+by replaying the bootstrap requests. This grid search is par-   tracking.
+allelized across CPU cores, significantly speeding up the
+tuning process, typically taking just a few seconds, often      5               E VALUATION
+shorter than the time required to prefill and decode a single
+request. After the grid search, Marconi adopts the α value      We evaluated the performance of Marconi under various
+that maximizes the hit rate.                                    workloads with different datasets, request arrival patterns,
+                                                                cache sizes, and model architectures. Our key findings are:
+Comparisons with existing size-based eviction algo-
+rithms. Cost-aware cache eviction for objects with variable          1. Overall, Marconi improves token hit rate by an average
+sizes is a well-studied problem (e.g., GDSF (Cherkasova,                of 4.5-34.4× compared to fine-grained checkpointing,
+1998)). The KV size in Attention layers scales with se-                 reducing the P95 TTFT by up to 71.1% (617.0 ms)
+quence length, serving as a proxy for compute savings from              compared to baseline prefix caching systems.
+cache hits, whereas SSM states are fixed-sized irrespective          2. Compared to LRU, Marconi’s FLOP-aware eviction
+of sequence length or compute savings. Thus, size fails as              improves the token hit rate by 19.0-219.7%. It achieves
+a proxy in Hybrid LLM inference, where longer sequences                 higher token hit rates and FLOP savings by trading off
+(with greater compute savings) are represented by equally               hit rate of shorter sequences to boost hit rate for longer
+sized SSM states. We note that our system and techniques                sequences, a desirable tradeoff given the efficiency of
+are complementary to such prior schemes; just as we com-                Hybrid models over Transformers.
+bine FLOP efficiency with recency, our focus is to augment           3. Marconi performs better when sequences are long, the
+the estimators for cache entry importance used in prior work            SSM layer ratio is high, and the SSM state dimension
+with a factor tailored specifically for Hybrid model reuse              is large – trends that align with recent model develop-
+benefits.                                                               ments.
+                                        Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+
+ Marconi                                      Marconi                                     Marconi
+
+
+  vLLM+                                        vLLM+                                       vLLM+
+
+              10        20       30     40              0   20     40      60    80                 0          20           40
+                   Token Hit Rate (%)                         Token Hit Rate (%)                           Token Hit Rate (%)
+
+                (a) LMSys                                   (b) ShareGPT                                (c) SWEBench
+Figure 7. Comparison with vLLM+. With judicious cache admission, Marconi utilizes the limited cache space to retain states with higher
+utility, improving the token hit rate significantly over vLLM+.
+5.1   Methodology                                                    uating LLM agents on real-world software issues collected
+                                                                     from GitHub. We plot the sequence length distribution in
+Baselines. We compare Marconi with the following base-
+                                                                     Fig. 6. These datasets contain multiple chat sessions, each
+lines. Note that neither vLLM nor SGLang natively supports
+                                                                     with multiple rounds of requests. We vary the inter-session
+prefix caching for Hybrid/SSM models, so we have extended
+                                                                     arrival time and inter-request arrival time to account for en-
+both to support Hybrid models favorably.
+                                                                     vironment response time (e.g., human typing, interactions
+• Vanilla inference: This baseline prefills all requests with-       with the coding IDE) and queuing delay in the inference
+  out doing prefix caching.                                          engine.
+• vLLM+ (Kwon et al., 2023): This baseline performs fine-            Models. We use a 7B Hybrid model with {4,24,28}
+  grained checkpointing and caches a state for every token           {Attention,SSM,MLP} layers in our main results. For in-
+  block. We use a token block size of 32, the largest size           sights into our wins on TTFT, we use Jamba-1.5-Mini, an
+  that vLLM supports (vll, 2024), which favors vLLM+ by              Attention-SSM Hybrid model with 12B active/52B total
+  minimizing the number of low-utility SSM states admit-             parameters, and serve it with state dimension 128 using
+  ted (Fig. 3a) while reducing memory fragmentation of               the vLLM implementation on four A100-40GB GPUs. We
+  KVs within a token block.                                          use FP16 precision in all experiments. The results apply to
+• SGLang+ (Zheng et al., 2023b): While SGLang also                   models of different sizes because the size of the prefix cache
+  uses a radix tree, it doesn’t judiciously checkpoint states        needs to be scaled accordingly.
+  during admission. We enhance it by applying the same               Setup. Experiments were run on a p4d.24xlarge AWS in-
+  judicious admission policy as Marconi; however, the evic-          stance with eight A100-40GB GPUs, 96 Intel(R) Xeon(R)
+  tion policy remains LRU, which does not account for                Platinum 8275CL CPUs, and 1152GB of DDR4 RAM.
+  FLOP efficiency.
+                                                                     5.2   End-to-End Results
+Metrics. The main metric we evaluate is token hit rate
+(%), which represents the effectiveness of the cache and             Fig. 7 shows the token hit rate of vLLM+ and Marconi
+approximates the total compute saved (FLOP) well. We                 across different traces. The boxes show different quartiles
+define token hit rate as the ratio of the number of tokens that      of the data while the whiskers on the box plots show P5
+skipped prefill over the total number of input tokens. We            and P95, allowing us to disregard extreme data and con-
+also evaluate different percentiles (P5, P50, and P95) of time       centrate on the typical cases. With its judicious admission
+to first token (TTFT, ms). FLOP saved is a reasonable proxy          strategy, Marconi avoids wasteful caching decisions and
+for compute and latency savings because prefill is easily            optimizes the cache utilization, improving the hit rate by an
+compute-bottlenecked. We do not evaluate downstream                  average of 4.5×, 7.3×, and 34.4× for LMSys, ShareGPT,
+metrics (e.g., F1 score) as prefix reusing is exact and does         and SWEBench.
+not change the LLM output.
+                                                                     Fig. 8 compares Marconi with SGLang+ to highlight the
+Workloads. In our main results, we evaluate Marconi on               benefits of FLOP-aware eviction over LRU. The win is the
+two multi-turn conversational datasets: LMSys (Zheng et al.,         most significant on SWEBench, with a P95 win of 219.7%.
+2023a) and ShareGPT (sha, 2024) with different sequence              The improvements on LMSys and ShareGPT are less pro-
+lengths distributions. The LLM output sequences in LM-               nounced, reaching a P95 win of 45.6% and 19.0%. This can
+Sys are relatively long, often reaching thousands of tokens,         be attributed to the difference in workload characteristics: as
+whereas the LLM output sequences in ShareGPT are suc-                shown in Fig. 6, SWEBench has the widest input sequence
+cinct and often take tens or hundreds of tokens. We also in-         length distribution, ranging from hundreds of tokens to tens
+clude an agentic workload: SWE-Agent (Yang et al., 2024a)            of thousands of tokens. LMSys has a narrower distribution,
+on SWE-Bench (Jimenez et al., 2023), a benchmark for eval-           with most sequences under 10K tokens, while ShareGPT
+                                                    Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+
+
+
+                                                                                    Avg Hit Rate Diff (%)
+                                                                                                                        Marconi − SGLang+
+             LMSys                                                                                          20
+
+                                                                                                            10
+       ShareGPT
+                                                                                                             0
+
+                                                                                                                    0         5       10      15        20       25            30
+      SWEBench                                                                                                                        Sequence Length (# Tokens)                    1e3
+
+
+                       0        50       100      150     200                       (a) Difference between the average token hit rate of requests in
+                    Token Hit Rate Win: Marconi over SGLang+ (%)                    Marconi and SGLang+, binned by the input sequence length.
+                                                                                                            1.00
+                                                                                                                           Marconi
+Figure 8. Comparison with SGLang+, which uses LRU as its evic-                                              0.75           SGLang+
+tion policy. Marconi balances recency and FLOPs efficiency, im-
+
+
+
+
+                                                                                    CDF
+                                                                                                            0.50           Vanilla
+
+proving the token hit rate significantly, especially for workloads                                          0.25
+with longer context.                                                                                        0.00
+                                                                                                                    0        250      500        750        1000     1250   1500    1750
+                                                                                                                                            Time to First Token (ms)
+                      Marconi                SGLang+                  vLLM+
+      1.00                                                                                                          (b) TTFT distribution of all requests in the trace.
+      0.75
+                                                                                    Figure 10. Fine-grained analysis of FLOP-aware eviction. Marconi
+CDF
+
+
+
+
+      0.50
+                                                                                    achieves a higher hit rate for longer sequences while sacrificing the
+      0.25
+                                                                                    hit rate for some shorter sequences (a), although the degradation
+      0.00
+              0.7   0.8   0.9   1.0 0.25   0.50   0.75   1.00   0.6    0.8    1.0
+                                                                                    in TTFT for shorter sequences is minimal (b).
+               (a) LMSys       (b) ShareGPT        (c) SWEBench
+                   P95 TTFT Relative to Vanilla Inference
+                                                                                    with >7K tokens, it outperforms SGLang+ with a hit rate
+Figure 9. Distribution of P95 TTFT relative to no prefix caching.                   improvement of up to 25.5%. This is due to Marconi’s
+                                                                                    FLOP-aware approach, which prioritizes caching entries
+predominantly features sequences under 2K tokens. The                               with higher FLOP efficiency under contention. Since longer
+longer the sequences, the more critical FLOP efficiency                             sequences cost more FLOP, Marconi demonstrates an over-
+becomes in eviction decisions. For workloads dominated                              all improvement of 90.3% in FLOP saved compared to
+by shorter sequences, suboptimal eviction choices in terms                          SGLang+.
+of FLOP efficiency have a smaller impact on Marconi’s
+                                                                                    Fig. 10b shows the impact of FLOP-aware eviction on TTFT
+performance gains.
+                                                                                    distribution. Due to Marconi’s lower hit rate for shorter
+Fig. 9 shows the distribution of P95 TTFT relative to no                            sequences, it suffers a slight increase in TTFT at lower
+prefix caching across different traces. Marconi’s token hit                         percentiles: Marconi’s P5 TTFT is 6.3% worse than in
+rate translates to TTFT reduction, reducing the P95 TTFT                            SGLang+. However, because Hybrid models prefill short
+by up to 36.9%, 73.2%, and 46.8% (281.4 ms, 106.3 ms,                               sequences quickly, the absolute latency reduction is min-
+and 617.0 ms) compared to vanilla inference without prefix                          imal (2.1 ms, see the magnified area in Fig. 10b). This
+caching. Compared to vLLM+, Marconi delivers up to                                  trade-off allows Marconi to achieve a lower TTFT at higher
+36.1%, 71.1%, and 46.8% (275.4 ms, 103.3 ms, and 617.0                              percentiles, reducing P50 and P95 TTFT by 13.4% and
+ms) larger P95 TTFT reductions; these numbers are 17.2%,                            22.0% (74.2 ms and 274.9 ms), respectively.
+12.8%, and 24.7% (131.1 ms, 18.5 ms, and 325.7 ms) when
+compared to SGLang+.                                                                5.4                            Microbenchmarks and Ablation Studies
+                                                                                    In these microbenchmarks, we use different representative
+5.3     Fine-Grained Analysis of FLOP-Aware Eviction
+                                                                                    traces to dissect Marconi’s performance improvements.
+To understand the performance improvement of FLOP-
+                                                                                    Impact of cache contention. In Fig. 11, we analyze
+aware eviction over LRU, we compare the caching decisions
+                                                                                    how cache contention affects Marconi’s benefits. We vary
+of Marconi with SGLang+ using a request arrival trace from
+                                                                                    the cache size from 60 GB (high contention) to 140 GB
+SWEBench. On this trace, SGLang+ achieves a 16.4% over-
+                                                                                    (low contention). Across the five cache sizes, Marconi
+all token hit rate, while Marconi achieves a significantly
+                                                                                    achieves token hit rate improvements of 24.3%, 51.5%,
+higher hit rate of 32.7%, an improvement of 99.4%.
+                                                                                    68.3%, 30.0%, and 10.0% over SGLang+, respectively. The
+In Fig. 10a, we categorize the requests by sequence length                          most significant performance gains occur under moderate
+and plot the difference in average hit rate between SGLang+                         contention, where eviction decisions are critical. In high con-
+and Marconi. Marconi shows a lower hit rate (up to -                                tention scenarios, limited cache capacity prevents caching
+3.0%) for sequences with <7K tokens, while for sequences                            many useful prefixes (resulting in a token hit rate of less than
+                                                                                                  Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+                                                                                                                                                                             Marconi          SGLang+                                       Marconi          SGLang+
+                                                                 Marconi                          SGLang+
+                                                  50
+
+
+
+
+                                                                                                                                           Token Hit Rate (%)
+
+
+
+
+                                                                                                                                                                                                           Token Hit Rate (%)
+
+
+                                                                                                                                                                                                                                     1.4×
+                                                                                                                                                                      1.4×
+                                                                                                                                                                40
+
+
+
+
+                                                                                                                                                                                                                                                      1.5×
+                             Token Hit Rate (%)                                                                                                                                                                                 20
+
+
+
+
+                                                                                                                                                                                                                                                                   1.6×
+                                                                                                                                                                                       1.5×
+
+
+
+                                                                                                                                                                                                    1.6×
+                                                  40                                                                                                            20                                                              10
+                                                  30
+                                                  20                                                                                                             0
+                                                                                                                                                                      0.5         1          2
+                                                                                                                                                                                                                                 0
+                                                                                                                                                                                                                                     5.0        7.5         10.0
+                                                                                                                                                                       Num Sessions per Second                                          Avg Response Time (s)
+                                                  10
+                                                   0                                                                                        (a) Varying session arrival rates. (b) Varying request arrival rates.
+                                                       60         80 100 120 140
+                                                                  Cache Size (GB)                                                           Figure 13. Impact of request arrival pattern on Marconi’s perfor-
+                                                                                                                                            mance. Lower reusing opportunities, denoted by a higher session
+ Figure 11. Impact of contention on FLOP-aware eviction’s benefits.                                                                         arrival rate (a) and longer time between requests within a session
+ Marconi achieves the biggest win when the cache contention is                                                                              (b), reduce the token hit rate but improve Marconi’s relative win
+ moderate and judicious eviction decisions matter the most.                                                                                 due to higher contention between requests.
+                                  Marconi              SGLang+     vLLM+                            Marconi SGLang+ vLLM+
+                      1.00                                                                       1.00
+Normalized Hit Rate
+
+
+
+
+                                                                           Normalized Hit Rate
+
+
+
+
+                                                                                                                                             5.7× to 35.4×. A larger SSM state dimension increases
+                      0.75                                                                       0.75
+                                                                                                                                  1.6×
+                                                                                                                         1.7×
+                                                                                                               1.7×
+
+
+
+                                                                                                                                             the state sizes, exacerbating the issues in §3 and making
+                                                                                                     1.9×
+
+
+
+
+                      0.50                                                                       0.50                               5.7×
+                                                                                                                                             Marconi’s judicious admission more effective.
+                      0.25                                                                       0.25
+                                                                                                                 19.9×
+
+                                                                                                                           9.6×
+                                                                                                       35.4×
+
+
+
+
+                      0.00                                                                       0.00                                       Varying request arrival patterns. Fig. 13 shows how re-
+                             (32,4) (30,5) (28,7)(24,12)(0,36)                                         128 64 32 16
+                               Layer Composition (SSM,Attn)                                                SSM State Dim                    quest arrival patterns affect Marconi’s performance. As the
+          (a) Varying layer compositions.                                      (b) Varying state dimensions.                                average number of request (chat) sessions per second in-
+                                                                                                                                            creases from 0.5 to 2, Marconi’s token hit rate decreases
+ Figure 12. Impact of model architecture on Marconi’s performance.                                                                          from 48.7% to 43.0%. Similarly, as the average response
+ Marconi performs better for models with higher ratios of SSM                                                                               time between requests in a session increases from 5 s to 10
+ layers and larger SSM state dimensions.                                                                                                    s, Marconi’s token hit rate decreases from 25.9% to 24.1%
+                                                                                                                                            due to reduced effectiveness of prefix caching from more
+                                                                                                                                            sessions sharing the fixed cache capacity and longer delays
+10%). Conversely, in low contention scenarios, the cache
+                                                                                                                                            between prefix reuses in a session. However, Marconi’s rela-
+has sufficient space to store a larger number of prefixes,
+                                                                                                                                            tive improvement over SGLang+ grows from 1.4× to 1.6×,
+and thus FLOP-unaware eviction decisions have a smaller
+                                                                                                                                            thanks to increased contention between requests across ses-
+impact on the hit rate.
+                                                                                                                                            sions.
+ Varying layer compositions. As described in §3, the ra-
+ tio of SSM layers directly affects the memory footprint of                                                                                  6                       R ELATED W ORK
+ model states. In Fig. 12a, as we increase the Attention:SSM
+ ratio from 1:2 to 1:4 to 1:8, Marconi’s token hit rate improve-                                                                            (Hybrid) recurrent subquadratic models. There has
+ ment over vLLM+ and SGLang+ increases from 13.5% and                                                                                       been a resurgence of recurrent/linear models in the recent
+ 5.8% to 66.6% and 26.0% to 2.6× and 59.7%. When serv-                                                                                      years: RWKV (Peng et al., 2023), RetNet (Sun et al., 2023),
+ ing a pure Transformer, the three systems achieve the same                                                                                 GLA (Yang et al., 2023), Griffin (De et al., 2024), Recur-
+ performance. In order to get efficiency wins while preserv-                                                                                rentGemma (Botev et al., 2024), xLSTM (Beck et al., 2024),
+ ing quality, the fundamental philosophy of Hybrid models                                                                                   Test-Time Training (TTT) (Sun et al., 2024), DeltaNet (Yang
+ is to use a majority of subquadratic layers with efficient                                                                                 et al., 2024b;c), B’MOJO (Zancato et al., 2024), Mam-
+ computational properties while mixing in a small number                                                                                    baFormer (Park et al., 2024), Titans (Behrouz et al., 2024),
+ of Attention layers to ensure model quality (Lieber et al.,                                                                                Lightning Attention (Li et al., 2025), Hunyuan-TurboS (hun,
+ 2024; Glorioso et al., 2024; Waleffe et al., 2024). Therefore,                                                                             2025), Nemotron-H (nem, 2025), etc. Importantly, although
+ we posit that Marconi will have better performance on most                                                                                 these models have different state updating rules (Yang et al.,
+ future Hybrid models.                                                                                                                      2023; 2024c), they all update their (large) model states
+                                                                                                                                            recurrently. As such, we only evaluate Mamba/SSMs, a rep-
+ Varying SSM state dimensions. As described in §3, the di-
+                                                                                                                                            resentative architecture. The properties we summarize in §3
+ mensionality of the recurrent SSM state directly affects the
+                                                                                                                                            also apply to these recurrent layers (with slight variations
+ memory consumption of model states. Notably, the recent
+                                                                                                                                            on FLOP and state size), and Marconi can be extended to
+ trend is for SSM state dimensionality to increase for better
+                                                                                                                                            support prefix caching for all Hybrid models with recurrent
+ language modeling capability (Gu & Dao, 2023; Dao & Gu,
+                                                                                                                                            layers.
+ 2024). In Fig. 12b, as we increase the state dimension of a
+ Hybrid model from 16 (Mamba1) to 128 (Mamba2), Mar-                                                                                         Prefix caching. Many recent systems have been proposed to
+ coni’s token hit rate improvement over vLLM+ grows from                                                                                     capitalize on prefix reusing opportunities in LLM inference.
+                                      Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+InferCept (Abhyankar et al.) optimizes for KVs reusing             Rene:    An Open-Source 1.3B SSM Language
+in multi-turn chat scenarios. CachedAttention (Gao et al.,           Model.       https://cartesia.ai/blog/
+2024) and Pensieve (Yu & Li, 2023) maintain hierarchical             2024-08-27-on-device, 2024.
+caches to leverage memory/storage mediums. Preble (Sri-
+vatsa et al., 2024) performs cluster-level stateful caching that   Optimizing AI   Inference   at Character.AI.
+routes requests to the GPU with the longest prefix. Prompt-          https://research.character.ai/
+Cache (Gim et al., 2024) and CacheBlend (Yao et al., 2024)           optimizing-inference/, 2024.
+reuse KVs but do approximations that lead to accuracy drops.
+All past work admits all tokens’ KVs, whereas Marconi’s            Prompt caching with Claude. https://www.
+philosophy of judicious admission is fundamentally differ-           anthropic.com/news/prompt-caching,
+ent to handle SSM state entries’ sparsity. Moreover, most            2024a.
+prior work uses LRU for eviction and none of them factored
+in FLOP efficiency.                                                Introducing the next generation of Claude. https://www.
+                                                                      anthropic.com/news/claude-3-family,
+Other LLM inference optimizations. Continuous batch-                  2024b.
+ing is easier to realize for SSM layers because the tensors in
+each step of decoding don’t have a sequence dimension and          Needle In A Haystack - Pressure Testing LLMs.
+can easily be batched even if the sequences have different           https://github.com/gkamradt/LLMTest_
+lengths, unlike in Transformers where selective batching is          NeedleInAHaystack, 2024.
+needed for applying batching only to certain operations (Yu
+et al., 2022). The SSM states of Hybrid models don’t require       Prompt caching - OpenAI API. https://platform.
+paged memory management (Kwon et al., 2023) as they are              openai.com/docs/guides/prompt-caching,
+fix-sized and don’t grow and shrink like KVs. However, the           2024.
+KVs of Attention layers still need to be managed by paging.
+Chunked prefill (Agrawal et al., 2024) for Hybrid models           ShareGPT. https://sharegpt.com/, 2024.
+requires specialized kernels under development in many
+serving frameworks (Kwon et al., 2023). Hybrid models              Engine Arguments – vLLM. https://docs.vllm.
+benefit from layer-specific optimizations like FlashAtten-           ai/en/stable/models/engine_args.html,
+tion (Dao et al., 2022; Dao, 2023; Shah et al., 2024).               2024.
+
+                                                                   Zamba2-7B.  https://www.zyphra.com/post/
+7    C ONCLUSION                                                     zamba2-7b, 2024a.
+This paper proposes Marconi, the first prefix caching sys-         Zamba2-mini (1.2B). https://www.zyphra.com/
+tem designed to accommodate the unique characteristics of            post/zamba2-mini, 2024b.
+Hybrid models. Marconi proposes novel and judicious ad-
+mission and eviction policies, achieving up to 34.4× higher        Reasoning Efficiency Redefined!  Meet Tencent’s
+token hit rates (71.1% or 617 ms lower TTFT) over extended          ‘Hunyuan-T1’—The First Mamba-Powered Ultra-Large
+versions of state-of-the-art systems.                                Model. https://llm.hunyuan.tencent.com/
+                                                                     #/blog/hy-t1?lang=en, 2025.
+ACKNOWLEDGEMENTS
+                                                                   Nemotron-H: A Family of Accurate, Efficient Hybrid
+We thank Yinwei Dai, Neil Agarwal, Mike Wong, and many               Mamba-Transformer Models . https://research.
+fellow interns at AWS for their helpful discussions and              nvidia.com/labs/adlr/nemotronh/, 2025.
+feedback.
+                                                                   Abhyankar, R., He, Z., Srivatsa, V., Zhang, H., and Zhang, Y.
+R EFERENCES                                                          Infercept: Efficient intercept support for augmented large
+                                                                     language model inference. In Forty-first International
+Introducing ChatGPT.     https://openai.com/                         Conference on Machine Learning.
+   index/chatgpt/, 2022.
+                                                                   Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,
+                                                                     N., Gulavani, B., Tumanov, A., and Ramjee, R. Taming
+Github Copilot. https://github.com/features/
+                                                                     throughput-latency tradeoff in llm inference with sarathi-
+  copilot, 2022.
+                                                                     serve. In 18th USENIX Symposium on Operating Sys-
+                                                                     tems Design and Implementation (OSDI 24), pp. 117–134,
+Perplexity. https://www.perplexity.ai/, 2023.                        2024.
+                                    Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+Beck, M., Pöppel, K., Spanring, M., Auer, A., Prudnikova,      Glorioso, P., Anthony, Q., Tokpanov, Y., Whittington, J., Pi-
+  O., Kopp, M., Klambauer, G., Brandstetter, J., and              lault, J., Ibrahim, A., and Millidge, B. Zamba: A compact
+  Hochreiter, S. xlstm: Extended long short-term mem-             7b ssm hybrid model. arXiv preprint arXiv:2405.16712,
+  ory. arXiv preprint arXiv:2405.04517, 2024.                     2024.
+
+Behrouz, A., Zhong, P., and Mirrokni, V. Titans: Learning to    Gu, A. and Dao, T. Mamba: Linear-time sequence mod-
+  memorize at test time. arXiv preprint arXiv:2501.00663,         eling with selective state spaces (2023). arXiv preprint
+  2024.                                                           arXiv:2312.00752, 2023.
+
+Botev, A., De, S., Smith, S. L., Fernando, A., Muraru, G.-      Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika,
+  C., Haroun, R., Berrada, L., Pascanu, R., Sessa, P. G.,         M., Song, D., and Steinhardt, J. Measuring mas-
+  Dadashi, R., et al. Recurrentgemma: Moving past                 sive multitask language understanding. arXiv preprint
+  transformers for efficient open language models. arXiv          arXiv:2009.03300, 2020.
+  preprint arXiv:2404.07839, 2024.
+                                                                Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press,
+Brown, T. B. Language models are few-shot learners. arXiv         O., and Narasimhan, K. Swe-bench: Can language mod-
+  preprint arXiv:2005.14165, 2020.                                els resolve real-world github issues? arXiv preprint
+                                                                  arXiv:2310.06770, 2023.
+Cherkasova, L. Improving WWW proxies performance
+  with greedy-dual-size-frequency caching policy. Hewlett-      Khattab, O., Singhvi, A., Maheshwari, P., Zhang, Z., San-
+  Packard Laboratories Palo Alto, CA, USA, 1998.                  thanam, K., Vardhamanan, S., Haq, S., Sharma, A., Joshi,
+                                                                 T. T., Moazam, H., et al. Dspy: Compiling declarative
+Dao, T. Flashattention-2: Faster attention with bet-
+                                                                  language model calls into self-improving pipelines. arXiv
+  ter parallelism and work partitioning. arXiv preprint
+                                                                  preprint arXiv:2310.03714, 2023.
+  arXiv:2307.08691, 2023.
+
+Dao, T. and Gu, A. Transformers are ssms: Generalized           Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  models and efficient algorithms through structured state       C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  space duality. arXiv preprint arXiv:2405.21060, 2024.          memory management for large language model serving
+                                                                 with pagedattention. In Proceedings of the 29th Sym-
+Dao, T., Fu, D., Ermon, S., Rudra, A., and Ré, C. Flashat-      posium on Operating Systems Principles, pp. 611–626,
+  tention: Fast and memory-efficient exact attention with        2023.
+  io-awareness. Advances in Neural Information Process-
+  ing Systems, 35:16344–16359, 2022.                            Lee, W., Lee, J., Seo, J., and Sim, J. Infinigen: Efficient gen-
+                                                                  erative inference of large language models with dynamic
+De, S., Smith, S. L., Fernando, A., Botev, A., Cristian-          kv cache management. In 18th USENIX Symposium on
+  Muraru, G., Gu, A., Haroun, R., Berrada, L., Chen, Y.,          Operating Systems Design and Implementation (OSDI
+  Srinivasan, S., et al. Griffin: Mixing gated linear recur-      24), pp. 155–172, 2024.
+  rences with local attention for efficient language models.
+  arXiv preprint arXiv:2402.19427, 2024.                        Li, A., Gong, B., Yang, B., Shan, B., Liu, C., Zhu, C.,
+                                                                  Zhang, C., Guo, C., Chen, D., Li, D., et al. Minimax-01:
+Duplyakin, D., Ricci, R., Maricq, A., Wong, G., Duerig,           Scaling foundation models with lightning attention. arXiv
+ J., Eide, E., Stoller, L., Hibler, M., Johnson, D., Webb,        preprint arXiv:2501.08313, 2025.
+  K., et al. The design and operation of cloudlab. In 2019
+ USENIX annual technical conference (USENIX ATC 19),            Li, J., Wang, M., Zheng, Z., and Zhang, M. Loogle: Can
+  pp. 1–14, 2019.                                                 long-context language models understand long contexts?
+                                                                  arXiv preprint arXiv:2311.04939, 2023.
+Gao, B., He, Z., Sharma, P., Kang, Q., Jevdjic, D., Deng, J.,
+  Yang, X., Yu, Z., and Zuo, P. Cost-efficient large language   Lieber, O., Lenz, B., Bata, H., Cohen, G., Osin, J., Dalmedi-
+  model serving for multi-turn conversations with cachedat-       gos, I., Safahi, E., Meirom, S., Belinkov, Y., Shalev-
+  tention. In 2024 USENIX Annual Technical Conference             Shwartz, S., et al. Jamba: A hybrid transformer-mamba
+ (USENIX ATC 24), pp. 111–126, 2024.                              language model. arXiv preprint arXiv:2403.19887, 2024.
+
+Gim, I., Chen, G., Lee, S.-s., Sarda, N., Khandelwal, A.,       Liu, P., Yuan, W., Fu, J., Jiang, Z., Hayashi, H., and Neubig,
+  and Zhong, L. Prompt cache: Modular attention reuse for         G. Pre-train, prompt, and predict: A systematic survey of
+  low-latency inference. Proceedings of Machine Learning          prompting methods in natural language processing. ACM
+  and Systems, 6:325–338, 2024.                                   Computing Surveys, 55(9):1–35, 2023.
+                                     Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+Park, J., Park, J., Xiong, Z., Lee, N., Cho, J., Oymak, S.,       Wang, X., Li, B., Song, Y., Xu, F. F., Tang, X., Zhuge, M.,
+  Lee, K., and Papailiopoulos, D. Can mamba learn how to           Pan, J., Song, Y., Li, B., Singh, J., et al. Opendevin: An
+  learn? a comparative study on in-context learning tasks.         open platform for ai software developers as generalist
+  arXiv preprint arXiv:2402.04248, 2024.                           agents. arXiv preprint arXiv:2407.16741, 2024.
+
+Peng, B., Alcaide, E., Anthony, Q., Albalak, A., Arcadinho,       Wei, J., Wang, X., Schuurmans, D., Bosma, M., Xia, F., Chi,
+  S., Biderman, S., Cao, H., Cheng, X., Chung, M., Grella,         E., Le, Q. V., Zhou, D., et al. Chain-of-thought prompting
+  M., et al. Rwkv: Reinventing rnns for the transformer era.       elicits reasoning in large language models. Advances in
+  arXiv preprint arXiv:2305.13048, 2023.                           neural information processing systems, 35:24824–24837,
+                                                                   2022.
+Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., and
+  Xu, X. Mooncake: Kimi’s kvcache-centric architecture            Wu, B., Liu, S., Zhong, Y., Sun, P., Liu, X., and Jin, X.
+  for llm serving. arXiv preprint arXiv:2407.00079, 2024.          Loongserve: Efficiently serving long-context large lan-
+                                                                   guage models with elastic sequence parallelism. arXiv
+Ren, L., Liu, Y., Lu, Y., Shen, Y., Liang, C., and Chen, W.
+                                                                   preprint arXiv:2404.09526, 2024.
+  Samba: Simple hybrid state space models for efficient
+  unlimited context language modeling. arXiv preprint             Yang, J., Jimenez, C. E., Wettig, A., Lieret, K., Yao,
+  arXiv:2406.07522, 2024.                                           S., Narasimhan, K., and Press, O. Swe-agent: Agent-
+Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani,            computer interfaces enable automated software engineer-
+  P., and Dao, T. Flashattention-3: Fast and accurate atten-        ing. arXiv preprint arXiv:2405.15793, 2024a.
+  tion with asynchrony and low-precision. arXiv preprint          Yang, S., Wang, B., Shen, Y., Panda, R., and Kim, Y. Gated
+  arXiv:2407.08608, 2024.                                           linear attention transformers with hardware-efficient train-
+Srivatsa, V., He, Z., Abhyankar, R., Li, D., and Zhang, Y.          ing. arXiv preprint arXiv:2312.06635, 2023.
+  Preble: Efficient distributed prompt scheduling for llm
+                                                                  Yang, S., Kautz, J., and Hatamizadeh, A. Gated delta net-
+  serving. 2024.
+                                                                    works: Improving mamba2 with delta rule. arXiv preprint
+Sun, Y., Dong, L., Huang, S., Ma, S., Xia, Y., Xue, J.,             arXiv:2412.06464, 2024b.
+  Wang, J., and Wei, F. Retentive network: A successor to
+                                                                  Yang, S., Wang, B., Zhang, Y., Shen, Y., and Kim, Y. Par-
+  transformer for large language models. arXiv preprint
+                                                                    allelizing linear transformers with the delta rule over se-
+  arXiv:2307.08621, 2023.
+                                                                    quence length. arXiv preprint arXiv:2406.06484, 2024c.
+Sun, Y., Li, X., Dalal, K., Xu, J., Vikram, A., Zhang, G.,
+  Dubois, Y., Chen, X., Wang, X., Koyejo, S., et al. Learn-       Yao, J., Li, H., Liu, Y., Ray, S., Cheng, Y., Zhang, Q., Du,
+  ing to (learn at test time): Rnns with expressive hidden          K., Lu, S., and Jiang, J. Cacheblend: Fast large language
+  states. arXiv preprint arXiv:2407.04620, 2024.                    model serving with cached knowledge fusion. arXiv
+                                                                    preprint arXiv:2405.16444, 2024.
+Team, G., Anil, R., Borgeaud, S., Wu, Y., Alayrac, J.-B., Yu,
+  J., Soricut, R., Schalkwyk, J., Dai, A. M., Hauth, A., et al.   Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan,
+  Gemini: a family of highly capable multimodal models.             K., and Cao, Y. React: Synergizing reasoning and acting
+  arXiv preprint arXiv:2312.11805, 2023.                            in language models. arXiv preprint arXiv:2210.03629,
+                                                                    2022.
+Team, J., Lenz, B., Arazi, A., Bergman, A., Manevich, A.,
+  Peleg, B., Aviram, B., Almagor, C., Fridman, C., Padnos,        Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun,
+  D., et al. Jamba-1.5: Hybrid transformer-mamba models             B.-G. Orca: A distributed serving system for transformer-
+  at scale. arXiv preprint arXiv:2408.12570, 2024.                  based generative models. In 16th USENIX Symposium
+                                                                    on Operating Systems Design and Implementation (OSDI
+Waleffe, R., Byeon, W., Riach, D., Norick, B., Kor-                 22), pp. 521–538, 2022.
+ thikanti, V., Dao, T., Gu, A., Hatamizadeh, A., Singh,
+ S., Narayanan, D., et al. An empirical study of mamba-           Yu, L. and Li, J. Stateful large language model serving with
+ based language models. arXiv preprint arXiv:2406.07887,            pensieve. arXiv preprint arXiv:2312.05516, 2023.
+ 2024.
+                                                                  Zancato, L., Seshadri, A., Dukler, Y., Golatkar, A., Shen,
+Wang, X., Wei, J., Schuurmans, D., Le, Q., Chi, E., Narang,         Y., Bowman, B., Trager, M., Achille, A., and Soatto, S.
+ S., Chowdhery, A., and Zhou, D. Self-consistency im-               B’mojo: Hybrid state space realizations of foundation
+ proves chain of thought reasoning in language models.              models with eidetic and fading memory. arXiv preprint
+ arXiv preprint arXiv:2203.11171, 2022.                             arXiv:2407.06324, 2024.
+                                     Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+Zheng, L., Chiang, W.-L., Sheng, Y., Li, T., Zhuang, S., Wu,
+  Z., Zhuang, Y., Li, Z., Lin, Z., Xing, E., et al. Lmsys-chat-
+  1m: A large-scale real-world llm conversation dataset.
+  arXiv preprint arXiv:2309.11998, 2023a.
+Zheng, L., Yin, L., Xie, Z., Huang, J., Sun, C., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+  Efficiently programming large language models using
+  sglang. arXiv preprint arXiv:2312.07104, 2023b.
+                                       Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+
+                                                           Attention                    MLP          SSM
+
+               FLOPs per layer                             8LD2 + 4L2 D                 16LD2        12LD2 + 16LDN + 10L
+               State size per layer (bytes)                4LD                          N/A          2DN
+
+               FLOPs saved per byte                        L + 2D                       N/A          L · (6D/N + 8 + 5/DN )
+
+               FLOPs saved per byte (7B model)             L + 8192                     N/A          200L
+
+Table 1. The FLOP efficiency of different layer types. As seen in the last two rows, the FLOP efficiency of SSM layers scales much more
+steeply compared to Attention layers. SSMs’ state sizes are orders of magnitude (N/2 = 64 in this 7B Hybrid model, where D = 4096
+and N = 128) bigger than the KVs of a single token.
+
+
+                                                                                  1e14
+      Notation      Description                                               5
+                                                                                         24 SSM layers
+                                                                              4          4 Attn layers
+      L             Sequence length                                                      28 MLP layers
+                                                                              3
+
+
+
+
+                                                                       FLOP
+      D             Model dimension or d model
+                                                                              2
+      N             State/feature dimension or d state
+                                                                              1
+
+          Table 2. Glossary of notation and terminology.                      0
+                                                                                    0         5000    10000      15000    20000   25000   30000
+                                                                                                              Sequence Length
+
+
+
+                                                                                   Figure 14. FLOP breakdown of a 7B Hybrid model.
+
+
+                                                                       B          A RTIFACT A PPENDIX
+A     A PPENDIX                                                        B.1         Abstract
+A.1   FLOP Efficiency Analysis                                         In this artifact, we describe how to reproduce all ex-
+In this section, we detail the math used for FLOP efficiency           periments in this paper. The evaluation utilizes request
+calculation. We list the notations used in Tab. 2.                     arrival traces from LMSys, ShareGPT, and SWEBench,
+                                                                       all tokenized using the meta-llama/Llama-2-7b-hf
+Memory footprint. Assuming inference is performed in                   tokenizer for consistency. Key experiments involve running
+FP16, the memory size of the KVs in an Attention layer is              vLLM+, eviction policies V1 (SGLang+), V2 (Marconi),
+calculated as 2 (K and V) · L · D · 2 bytes/parameter. In              and V3 (offline-optimal, static-α oracle policy – not in-
+comparison, the memory size of an SSM layer’s state is D               cluded in the paper) across various dataset/arrival rate/cache
+· N · 2 bytes/parameter. Additionally, each SSM layer in-              size combinations. This artifact supports easy customiza-
+cludes a conv 1d block with a state size of in channels                tions, including implementing additional eviction policies
+· conv kernel · 2 bytes/parameter. Since the conv 1d                   and evaluating new datasets and model configurations.
+states account for only a small fraction (6.1% for the 7B              For a detailed version of the artifact appendix, please see
+Hybrid model used throughout the paper) of the total state             https://github.com/ruipeterpan/marconi/
+size, we omit them from Tab. 1 for simplicity, but they are            blob/main/artifact_evaluation.md.
+included in all experiments in the main paper.
+FLOP efficiency of models with different layer compo-                  B.2         Artifact check-list (meta-information)
+sitions. Fig.14 shows the FLOP distribution by layer type                     • Program: Python
+in a 7B hybrid model. Attention layers contribute fewer
+FLOPs for short sequences than SSMs and MLPs. However,                        • Disk space required: ∼20 GB
+as their quadratic computational complexity kicks in with                     • Time needed to prepare workflow: ∼1 hour
+longer sequences, they consume a significant portion of total
+FLOPs, even though they make up only 7.1% of the model’s                      • Time needed to complete experiments: ∼12 hours
+layers. Tab.1 provides the FLOP breakdown by layer for a
+                                                                              • Publicly available: Yes
+7B hybrid model, showing that the FLOP efficiency of SSM
+layers scales more sharply compared to Attention layers.                      • Code licenses: CC BY-NC
+                                         Marconi: Prefix Caching for the Era of Hybrid LLMs
+
+   • Archived DOI: 10.5281/zenodo.14970139                              B.6   Evaluation and expected result
+                                                                        All plotting scripts are under /plotting and can be run once
+                                                                        the sweep of experiments on all configurations has finished:
+B.3     Description                                                     • Fig. 7: token hit rate.py
+B.3.1    How delivered                                                  • Fig. 8: sglang comparison.py
+                                                                        • Fig. 9: ttft.py
+The artifact may be downloaded from zenodo at
+https://zenodo.org/records/14970139                                     • Fig. 10: fine grained analysis.py
+or cloned from the GitHub repository at https:                          • Fig. 11: microbenchmark contention.py
+//github.com/ruipeterpan/marconi.                   The request         • Fig. 12a: microbenchmark layer composition.py
+arrival traces (with token-level information) can be downloaded
+from Google Drive by following the documentation below.                 • Fig. 12b: microbenchmark dstate.py
+                                                                        • Fig. 13a and 13b: microbenchmark arrivalrate.py
+B.3.2    Hardware dependencies
+                                                                        B.7   Experiment customization
+We have tested Marconi on Cloudlab (Duplyakin et al., 2019)
+nodes with Ubuntu 22.04 and Python 3.11.9. Due to the request           • Additional eviction policies can be easily implemented
+arrival traces containing token IDs for each request, they require a      in radix cache hybrid.py by adding a new
+total disk size of ∼7 GB to house.                                        evict policy version
+                                                                        • Additional model configurations can be applied by editing the
+B.3.3    Software dependencies                                            default configurations (NVIDIA’s Attention-Mamba2 7B Hybrid
+                                                                          model) in policy exploration.py
+We have prepared a conda environment file that lists all dependen-
+                                                                        • Additional datasets can be evaluated by produc-
+cies and their versions.
+                                                                          ing compatible traces as the ones generated by
+                                                                          /utils/generate trace.py
+B.3.4    Datasets
+To ensure consistency when evaluating the same trace on differ-         B.8   Methodology
+ent model architectures, we use the same tokenizer to produce
+the request arrival traces. For convenience, we compress the pro-       Submission, reviewing, and badging methodology:
+cessed traces (∼700M/6.3G pre/post compression) and host them
+                                                                        • http://cTuning.org/ae/submission-20190109.
+on Google Drive.
+                                                                          html
+                                                                        • http://cTuning.org/ae/reviewing-20190109.
+B.4     Installation                                                      html
+The software dependencies can be installed via conda using the          • https://www.acm.org/publications/policies/
+environment configuration file provided in the artifact. The traces       artifact-review-badging
+can be downloaded via this link.
+
+B.5     Experiment workflow
+The sweep of all experiments (combinations of different cache
+sizes and request arrival patterns on different datasets) can be
+done by running bash run all experiments.sh, which
+invokes policy exploration.py and does the following for
+each experiment configuration (dataset/arrival rate/cache size com-
+bination):
+
+• Runs vLLM+
+• Runs eviction policy V1, which represents SGLang+
+• Runs eviction policy V2, which represents Marconi
+• Runs eviction policy V3, which represents an offline-optimal,
+  static-α oracle policy (the results weren’t included in the paper).
+  This policy sweeps over possible values of α and selects the one
+  that maximizes the hit rate
+
+Running bash run all experiments.sh creates three
+log files in /logs: lmsys.txt, sharegpt.txt, and
+swebench.txt. Each file contains the output log of all evalua-
+tions on the sweep of configurations for this dataset. Once the log
+files have been generated, plotting scripts can be run to analyze
+and plot the results.
+

@@ -1,0 +1,922 @@
+S EESAW : H IGH - THROUGHPUT LLM I NFERENCE VIA M ODEL R E - SHARDING
+
+
+       Qidong Su 1 2 3 Wei hao 3 4 Xin Li 3 Muralidhar Andoorveedu 3 Chenhao Jiang 1 2 Zhanda Zhu 1 2 3
+                        Kevin Song 1 2 Christina Giannoula 1 2 3 Gennady Pekhimenko 1 2 3
+
+
+                                                       A BSTRACT
+     To improve the efficiency of distributed large language model (LLM) inference, various parallelization strategies,
+     such as tensor and pipeline parallelism, have been proposed. However, the distinct computational characteristics
+     inherent in the two stages of LLM inference—prefilling and decoding—render a single static parallelization
+     strategy insufficient for the effective optimization of both stages. To address this challenge, in this work we
+     present Seesaw, an LLM inference engine optimized for throughput-oriented tasks. The key idea behind Seesaw is
+     dynamic model re-sharding, a technique that facilitates the dynamic reconfiguration of parallelization strategies
+     across stages, thereby maximizing throughput at both phases. To mitigate re-sharding overhead and optimize
+     computational efficiency, we employ tiered KV cache buffering and transition-minimizing scheduling. These
+     approaches work synergistically to reduce the overhead caused by frequent stage transitions while ensuring
+     maximum batching efficiency. Our evaluation demonstrates that Seesaw achieves a throughput increase of up
+     to 1.78→ (1.36→ on average) compared to vLLM, the most widely used state-of-the-art LLM inference engine,
+     particularly in scenarios with low-bandwidth interconnections.
+
+1    I NTRODUCTION
+Large language models (LLMs), such as the LLaMA (Tou-
+vron et al., 2023a) and GPT (Achiam et al., 2023) families,
+have demonstrated exceptional performance across a wide
+range of tasks. Beyond their prevalent use in interactive
+applications like chatbots (OpenAI, 2024), LLMs are also
+gaining high interest in throughput-oriented offline inference
+workloads such as information extraction (Narayan et al.,                     (a) Prefill                      (b) Decode
+2022), database querying (Liu et al., 2024c), and knowledge
+                                                                  Figure 1. Breakdown of execution time for the prefill and decode
+graph processing (Edge et al., 2024). Unlike interactive          stages for LLaMA2-13B inference on 8→L4 GPUs connected with
+applications where low latency is crucial, these offline in-      PCIe. Communication overhead increases with the degree of tensor
+ference tasks prioritize high throughput over response time.      parallelism. (The global batch size is 16. Pipeline parallelism
+These offline inference workloads are widely adopted in           further divides the data into micro-batches of size 16/PP to fully
+industry (Kamsetty et al., 2023; Yu et al., 2024; Dell Tech-      utilize pipelining).
+nologies, 2024; Chan et al.), leading MLPerf to develop
+benchmarks specifically for them (MLCommons, 2024). In
+this work, we focus on improving inference efficiency for         Huang et al., 2019), have been proposed, each presenting
+offline, throughput-oriented LLM inference workloads.             distinct trade-offs in memory efficiency, inter-device com-
+As LLMs often exceed the memory capacity of individual            munication, and computational efficiency. Tensor paral-
+GPUs, parallelization is essential for their deployment (Ben-     lelism distributes model weights across devices but suffers
+Nun & Hoefler, 2019; Shoeybi et al., 2019). Several paral-        from high communication costs due to frequent all-reduce
+lelization strategies, including tensor parallelism (Shoeybi      operations at each layer (Pope et al., 2023; Chang et al.,
+et al., 2019) and pipeline parallelism (Narayanan et al., 2019;   2024). The communication cost becomes particularly severe
+                                                                  in systems connected via PCIe (Dell Technologies, 2023) or
+   1
+     University of Toronto 2 Vector Institute 3 CentML Inc        with partial high-speed connections (NVIDIA Corporation,
+4
+Stanford University.    Correspondence to: Qidong Su
+                                                                  2020). In contrast, pipeline parallelism partitions the model
+<qdsu@cs.toronto.edu>.
+                                                                  into sequential stages, reducing inter-device communica-
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,   tion by passing only activations between them. However,
+2025. Copyright 2025 by the author(s).                            to enable pipelining, each data batch needs to be divided
+                                Seesaw: High-throughput LLM Inference via Model Re-sharding
+                                                                           (a) Prefill-prioritizing       too frequent transitions
+into micro-batches, leading to extra execution overheads,          #seqs
+                                                                                                                                             GPU max #seqs
+
+since every micro-batch repeatedly loads weights into the
+                                                                              p       d     p     d   p      d           p   d       p   d        p   d
+compute units (see Section 3.1 for details).                                                                                                              time
+                                                                           (b) Decode-prioritizing under-utilize
+While numerous studies have proposed methods to optimize           #seqs
+                                                                                                                                             GPU max #seqs
+
+parallelization strategies for LLMs (Miao et al., 2023; Kwon                  p             d                        p               d
+et al., 2023; Li et al., 2023; Pope et al., 2023; Zhu et al.,                                                                                             time
+2025), prior works typically rely on a single, static configura-           (c) Tiered KV cache buffering
+                                                                              + transition-minimizing scheduling                             CPU max #seqs
+tion throughout the entire generation process. However, our        #seqs
+findings indicate that this one-size-fits-all approach is often                                                                              GPU max #seqs
+inefficient for throughput-oriented LLM inference because
+                                                                                  p               d              p               d            p
+it fails to leverage the distinct patterns between the two
+                                                                                                                                                          time
+stages in LLM generation: the prefill stage, where the input
+sequence is processed at once to produce the initial token,        Figure 2. Different scheduling policies considering transition over-
+and the decode stage, where subsequent tokens are gener-           head. Decoding throughput is positively correlated with the num-
+ated sequentially based on prior tokens. These two stages          ber of sequences in GPU memory (the maximal batch size), which
+exhibit fundamentally different computational characteris-         is highlighted as light green area.
+tics (Yuan et al., 2024). During the prefill stage, multiple
+tokens from the input prompt are processed simultaneously,
+making computation and communication the dominant con-             stages. In this setup, the decode stage operates at one-sixth
+tributors to runtime. In contrast, the decode stage processes      the throughput of the prefill stage, resulting in a significant
+one token at a time for each sequence, increasing the per-         bottleneck at the decode stage that slows down the entire
+centage of time spent on weight transfer. This difference          system (see Section 3.2 for details).
+indicates that the optimal parallelization strategy for each
+stage may also vary.                                               To address these challenges, we present Seesaw, a high-
+                                                                   throughput LLM inference engine that dynamically recon-
+To illustrate the performance limitations of applying a uni-       figures parallelization strategies between the prefill and de-
+form parallelization strategy for both prefill and decode,         code stages. The key idea behind Seesaw is model re-
+we measure the execution time of each stage under various          sharding, a novel technique that dynamically re-partitions
+combinations of tensor and pipeline parallelism, as shown          model weights and KV cache between prefill and decode
+in Figure 1. In the prefill stage, as the degree of tensor par-    stages. By tailoring parallelization strategies to the dis-
+allelism increases, the communication overhead increases           tinct computational demands of each stage, Seesaw reduces
+significantly due to additional GPUs participating in all-         communication overhead during the prefill stage, while en-
+reduce operations. As a result, tensor parallelism performs        hancing memory efficiency in the decode stage, resulting in
+significantly worse than pipeline parallelism. In contrast,        a substantial increase in overall throughput.
+during the decode stage, pipeline parallelism is slower than
+tensor parallelism, largely due to increased weight trans-         However, the overhead associated with model re-sharding
+ferring overhead caused by micro-batching required for             can be high due to frequent transitions between prefill and
+pipelining (see Section 3.1 for more details). Therefore,          decode. To maximize throughput, existing systems typi-
+we need stage-specific parallelization strategies to provide       cally adopt prefill-prioritized scheduling (Yu et al., 2022;
+better LLM inference throughput.                                   Kwon et al., 2023), which interleaves prefill and decode
+                                                                   stages across batches to achieve continuous batching. Yet,
+An existing approach is disaggregated prefill-decode (Zhong        as illustrated in Figure 2(a), integrating this approach with
+et al., 2024; Qin et al., 2024), which assigns prefill and de-     model re-sharding can result in significant overhead due
+code computation to different GPU instances. The prefill           to frequent transitions between prefill and decode. On the
+instances and decode instances form a two-stage pipeline           other hand, decode-prioritized scheduling (NVIDIA, 2024a)
+to serve inference requests. Therefore, the overall through-       completes all decode steps for a batch before proceeding to
+put of disaggregated prefill-decode is constrained by the          the next, resulting in lower re-sharding overhead. However,
+slower of the two stages, and balancing throughput between         as depicted in Figure 2(b), this method suffers from low
+these two stages is essential. The key drawback of disag-          resource utilization due to smaller batch sizes.
+gregated prefill-decode is that it can cause large amounts of
+pipeline bubbles under resource-constrained environments.          To overcome this constraint and achieve both minimal
+For example, when deploying a 70B model on 8→40GB                  re-sharding overhead and large batch size, we propose
+GPUs, even the most balanced configuration results in a            two synergetic techniques: tiered KV cache buffering
+6→ difference in throughput between the prefill and decode         and transition-minimizing scheduling. Tiered KV cache
+                                                                   buffering leverages CPU memory as auxiliary storage for
+                               Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+the KV cache, enabling Seesaw to process a larger num-           thousands of tokens long. The computation and communi-
+ber of prefill requests. Transition-minimizing scheduling        cation costs, both of which scale with the number of tokens,
+reduces re-sharding overhead by minimizing the number            dominate the runtime during this stage. Since the cost of
+of transitions to the decode stage. Seesaw transitions from      loading weights is amortized over a larger set of tokens, the
+prefill to decode only after the CPU KV cache is full. As        overall performance is primarily bound by compute and/or
+depicted in Figure 2(c), this approach maintains the maxi-       communication. In contrast, Decoding processes only the
+mal batch size during the decode stage, while significantly      newly generated tokens in each auto-regressive step and has
+reducing the frequency of stage transitions, thereby mini-       comparatively smaller computation in each step. Therefore
+mizing re-sharding overhead. Additionally, to mitigate the       the cost for loading the weight data from off-chip memory
+overhead of KV cache transfers between CPU and GPU,              to computation units has a relatively higher percentage.
+Seesaw employs asynchronous pipelining to overlap data
+                                                                 Moreover, in each generation step, the intermediate tensors
+transfers with computation.
+                                                                 K and V in each attention operator can be cached for future
+In summary, we make the following contributions.                 reuse, which is called Key-value cache (KV cache) (Pope
+                                                                 et al., 2023). While being able to accelerate computation, it
+• We identify and quantitatively analyze the different pref-     occupies a substantial amount of GPU memory proportional
+  erences for parallelisms in the prefill and decode stages of   to the total number of tokens.
+  throughput-oriented LLM inference tasks. Our analysis
+  comprehensively accounts for data movement, computa-           2.2   LLM Inference Optimization
+  tion, and communication costs.                                 Parallelism. As the size of LLMs grows, the memory
+• We propose dynamic model re-sharding, a novel technique        capacity on a single GPU becomes insufficient. Conse-
+  that dynamically reconfigures the parallelization strategies   quently, various techniques are developed to partition mod-
+  for prefill and decode stages. We address the challenge of     els onto multiple GPUs (Zheng et al., 2022). These paral-
+  transition overhead in model re-sharding with continuous       lelization strategies can be classified as (1) inter-operator,
+  batching by introducing tiered KV cache buffering and          which places different operators or layers across multiple
+  transition-minimizing scheduling. Based on these tech-         GPUs, overlapping them with pipelining (known as Pipeline
+  niques, we implement Seesaw, a high-throughput offline         parallelism, PP) (Huang et al., 2019; Narayanan et al., 2019;
+  inference system that optimizes parallelization strategies     Li et al., 2023), and (2) intra-operator, which partitions
+  for each LLM inference stage.                                  different dimensions of tensors involved in computation,
+                                                                 including data parallelism (Srivatsa et al., 2024), tensor
+• We conduct a comprehensive evaluation of Seesaw across
+                                                                 parallelism (Shoeybi et al., 2019), etc. Data parallelism du-
+  a variety of workloads and hardware configurations. Our
+                                                                 plicates models on different devices and dispatches requests
+  results show Seesaw achieves an average speedup of
+                                                                 among them. Tensor parallelism shards model weights and
+  1.36→ and a throughput improvement of up to 1.78→
+                                                                 each device performs a portion of the computation, then
+  compared to the state-of-the-art LLM inference engines.
+                                                                 aggregates these partial results to produce the final output.
+
+2     BACKGROUND                                                 Batching. Batching more tokens in a single forward pass
+2.1   LLM Inference                                              increases inference efficiency by, for example, amortizing
+                                                                 the time required to load model weights (Sheng et al., 2023;
+Transformer Architecture. Modern large language mod-             Fang et al., 2021). However, its effectiveness differs be-
+els are based on the transformer architecture (Vaswani et al.,   tween the prefilling and decoding stages (Yuan et al., 2024;
+2017), which typically consists of multiple identical decoder    He & Zhai, 2024; Agrawal et al., 2023). In decoding, where
+layers (OpenAI, 2024). Each layer includes several linear        weight-loading overhead occupies a larger portion of the
+layers and an attention layer. The weights of the linear         runtime, batching significantly boosts throughput by effec-
+layers account for the majority of the model’s parameters.       tively amortizing this overhead. Conversely, in the prefilling
+                                                                 stage, batching has a less pronounced impact since the to-
+Auto-regressive Generation. LLM inference follows an             ken count in input prompts is generally sufficient to keep
+auto-regressive paradigm (Bengio et al., 2000), which takes      the process compute-bound. Furthermore, optimal batching
+an input prompt and generates a sequence of output tokens.       strategies need to take in consideration other factors such as
+This process is divided into two stages: prefilling, which       speculative decoding (Su et al., 2023; Liu et al., 2024d) and
+processes the input tokens, and decoding, which generates a      prefix sharing (Pan et al., 2024a; Liu et al., 2024b). Overall,
+token per step. These stages exhibit distinct computational      larger batch sizes yield higher throughput, though the maxi-
+properties (Zhong et al., 2024; Yuan et al., 2024). Prefill-     mum batch size is limited by available GPU memory, as it
+ing processes the prompts that are typically hundreds to         requires additional space for activations and the KV cache.
+                                                                 Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+                                                                                                                                                      TP shards weights, so load
+                                                               Prefill                                                      Decode                      weights is parallelized
+                                                                                         per-sequence time                                                                      per-sequence time
+Tensor Parallel
+
+
+
+
+                            L1                                 L2                        0.5x load weight                         L1              L2                            0.5x load weight
+                    GPU1           S1        S2                      S1   S2                                               GPU1       S1 S2           S1 S2
+                            1/2                                1/2                                                                1/2             1/2
+                                                                                         0.5x compute
+                            L1                                 L2                                                                 L1              L2                            0.5x compute
+                    GPU2 2/2       S1        S2                      S1   S2              + allreduce                      GPU2       S1 S2           S1 S2
+                                                               2/2                                                                2/2             2/2                           + allreduce
+                                                                                        Proportion of allreduce is                                                          TP is better because of more
+                                                                                 time                                                                               time
+                                                                                           larger in prefilling                                                                   effective batching
+Pipeline Parallel
+
+
+
+
+                    GPU1     L1         S1         L1     S2         L1   S3                                               GPU1    L1   S1      L1   S2       L1   S1
+                                                                                          1x load weight                                                                        1x load weight
+
+                                                                                          0.5x compute
+                    GPU2                                                                                                   GPU2
+                                                   L2     S1         L2   S2                                                                    L2   S1       L2   S2           0.5x compute
+
+                                                                                         PP is better because of             PP has smaller                                Proportion of loading weights is
+                    batch         layer           token   sequence        allreduce     lower allreduce overhead              batch sizes                                        higher in decoding
+
+
+
+Figure 3. Different effects of tensor and pipeline parallelisms on prefilling and decoding. Tensor parallelism incurs all-reduce overhead,
+which has a higher percentage in prefilling, therefore pipeline parallelism is better for prefilling. Conversely, pipeline parallelism splits
+batches into smaller micro-batches, which leads to more forward passes and repetitive loading weights, which is insufficient in decoding.
+
+
+Continuous Batching and Scheduling. Continuous                                                                       3.1    Parallelism Analysis
+batching is an essential optimization for throughput-oriented
+                                                                                                                     Observation 1: Tensor parallelism incurs substantial
+LLM inference (Yu et al., 2022; Kwon et al., 2023). By
+                                                                                                                     communication overhead during the prefill stage, espe-
+batching multiple sequences at the token level, it allows the
+                                                                                                                     cially in environments with low-bandwidth interconnec-
+system to onboard new sequences and clear the KV cache of
+                                                                                                                     tions. In Tensor parallelism, each device performs a part
+completed sequences at any generation step. This approach
+                                                                                                                     of computation and aggregates the partial result. The activa-
+enables prefill-prioritizing scheduling, which removes se-
+                                                                                                                     tions at each layer are synchronized across all GPUs using
+quences as they finish, frees up their KV cache, and eagerly
+                                                                                                                     all-reduce operations. The overhead associated with this
+schedules the prefilling of new sequences whenever GPU
+                                                                                                                     operation can be quantified as:
+memory becomes available. This strategy maximizes the
+number of concurrent sequences being processed, resulting                                                                                    #tokens → activation size
+in higher throughput. Another alternative is to use decode-                                                                                                            ,
+                                                                                                                                              all-reduce bandwidth
+prioritizing scheduling, which minimizes the frequency of
+transitions. Instead of scheduling to prefilling eagerly, this                                                       where all-reduce bandwidth refers to the rate of data transfer
+approach waits until all sequences in a batch have finished                                                          during all-reduce operations, calculated as the size of the
+decoding before initiating the next round of prefilling. How-                                                        tensor being all-reduced divided by the all-reduce runtime.
+ever, this scheduling policy results in suboptimal decoding                                                          As the degree of tensor parallelism increases, the proportion
+throughput (Agrawal et al., 2024).                                                                                   of execution time of all-reduce operations grows substan-
+                                                                                                                     tially. This growth is attributed to two main factors. First,
+3                    M OTIVATION AND A NALYSIS                                                                       while model weights are partitioned, activations in tensor
+                                                                                                                     parallelism remain fully replicated across GPUs, leading to
+In this section, we provide an in-depth analysis of two key                                                          a constant activation size regardless of the degree of tensor
+observations we identify from Figure 1 in Section 1: (1)                                                             parallelism. Second, all-reduce bandwidth decreases as the
+Tensor parallelism often exhibits significantly worse per-                                                           number of GPUs grows, due to more complex communi-
+formance than pipeline parallelism during the prefill stage                                                          cation schemes. Therefore, increasing the degree of tensor
+due to its substantial communication overhead; (2) Pipeline                                                          parallelism not only fails to reduce the traffic of all-reduce
+parallelism tends to fall short in the decode stage owing to                                                         operations but further limits the communication bandwidth,
+the considerable weight loading overhead it incurs. We then                                                          resulting in escalated communication overhead. This is-
+argue that a dynamic parallelization strategy is essential to                                                        sue is particularly pronounced in the prefill stage, where a
+attain optimal performance across both stages.                                                                       large number of tokens are processed simultaneously, mak-
+Given the importance of batching in throughput-oriented                                                              ing communication overhead the primary bottleneck. Thus,
+tasks, it can be useful to consider how different paralleliza-                                                       tensor parallelism tends to perform worse than pipeline par-
+tion strategies impact the maximum batch size, rather than                                                           allelism due to its large communication overhead.
+assuming batch size as a tunable parameter, as is often done
+in online-serving contexts such as DistServe (Zhong et al.,                                                          Observation 2: Pipeline parallelism suffers from signifi-
+2024) and Sarathi-serve (Agrawal et al., 2024).                                                                      cant weight transferring overhead in the decode stage.
+                                                                                                                     Pipeline parallelism distributes model layers sequentially
+                               Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+across devices, with each device responsible for processing             prefill worker       prefill   decode worker      decode
+                                                                                          throughput                    throughput
+a set of consecutive layers before passing the output to the            GPU0 GPU1                      GPU4    GPU5
+
+next device. Due to the auto-regressive nature of LLM infer-            GPU2    GPU3                   GPU6    GPU7
+ence, a sequence cannot enter the pipeline until its preceding
+token is generated. As a result, at any given time step, a
+sequence can appear in only one stage of the pipeline, mak-
+ing the batches processed by each device mutually exclusive.
+However, the total number of sequences that the pipeline
+can handle at a time, referred to as the global batch size,
+is constrained by the size of KV cache. Given the mutual
+exclusion of batches at each device, pipeline parallelism can
+process only approximately 1/PP of the global batch per           Figure 4. An example of spatially disaggregating prefilling and
+forward pass. We denote this reduced batch size in pipeline       decoding has a restricted search space. Deploying a 70B model on
+parallelism as the micro-batch size.                              eight 40GiB GPUs allows only one disaggregation strategy: four
+                                                                  GPUs for prefilling and four for decoding. However, this causes
+Dividing batches into micro-batches increases the number          severe throughput mismatch between the two stages.
+of LLM forward passes required to process the same amount
+of requests. Specifically, a pipeline parallelism degree of
+PP necessitates PP times more forward passes for a given          To quantitatively analyze the trade-offs across different par-
+global batch. This repeated execution degrades inference          allelisms, we model the average runtime per sequence (the
+performance, as model weight matrices must be loaded from         inverse of throughput) as follows. Derivations and further
+global memory repeatedly. This inefficiency is especially         details are provided in the Appendix.
+significant in the decode stage, where weight-loading over-                      linear        attn
+                                                                                Tdm           Tdm   + Tcomp   Tcomm (TP)
+head accounts for a substantial portion of total execution                T ↑             +                 +
+time. As a result, pipeline parallelism generally underper-                       TP           DP · TP · PP     PP · DP
+forms relative to tensor parallelism in the decode stage due      Here Tdmlinear
+                                                                                 represents data movement for linear layers (pri-
+to the amplified weight loading overhead.                         marily model weights), Tdm   attn
+                                                                                                    represents data movement for
+Discussion on Data Parallelism. Unlike tensor and pipeline        attention layers (primarily KV cache) , Tcomp represents
+parallelism, which distribute the model across devices, data      computation time, Tcomm represents communication time.
+parallelism distributes the data while duplicating the model.     Note that Tcomm is a monotonically increasing function
+While data parallelism has minimal communication over-            with respect to TP, as all-reduce operations require more
+head, it has two key disadvantages: (1) the volume of weight      time as TP increases.
+transferring is higher by the number of duplicates compared       Tensor parallelism can effectively accelerate loading model
+to tensor parallelism; and (2) it occupies more GPU mem-                              linear
+                                                                  weights, which is Tdm      , while pipeline and data parallelism
+ory, reducing the available space for the KV cache and thus       cannot. On the other hand, pipeline and data parallelism
+limiting the maximum batch size resulting in lower through-       effectively reduce the overhead of communication, while
+put. Data parallelism can be applied orthogonally alongside       tensor parallelism contrarily increases the communication
+both tensor and pipeline parallelism. We do not dynami-           overhead. In prefilling, Tdm  linear
+                                                                                                       is negligible, and Tcomm be-
+cally adjust data parallelism, which will be explained in         comes larger, so pipeline and data parallelisms are more
+Section 4.1.                                                      preferred, while in decoding, Tdm      linear
+                                                                                                                occupies a larger pro-
+Conclusion: No one-size-fits-all When comparing these             portion so tensor parallelism is more advantageous.
+three parallelism strategies for high-throughput LLM infer-
+ence, a key observation is that prefilling and decoding stages    3.2   Why not Disaggregate Prefilling and Decoding?
+benefit from different parallelism approaches. This differ-       Spatially disaggregating prefilling and decoding with sepa-
+ence arises from the distinct characteristics of each stage, as   rate hardware resources, as done in online serving systems
+illustrated in Figure 3. Tensor parallelism is preferred for      such as DistServe (Zhong et al., 2024) and MoonCake (Qin
+decoding due to its ability to efficiently accelerate weight      et al., 2024), is one approach to separately select paralleliza-
+matrix loading. However, it incurs significant communica-         tion strategies for prefilling and decoding. Sequences are
+tion overhead, as it requires all-reduce operations at each       first processed by the devices dedicated for prefilling before
+layer. In contrast, pipeline and data parallelism have much       being transferred to decoding devices.
+lower communication overhead, making them preferable for
+prefilling. However, their decoding throughput is limited by      However, there are two obstacles when applying prefill-
+inefficient batching and additional weight-loading overhead.      decode disaggregation to purely throughput-oriented sce-
+                                                                  narios. First, since the overall throughput is bound by
+                                      Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+                 prefill                             decode                   prefill    CPU memory is                                 CPU memory is
+                                                                                                                    decoding                                      prefill
+                                                                            (warm up)        filled                                        empty
+         (pipeline parallelism)                 (tensor parallelism)
+                                                                         CPU      GPUs     CPU     GPUs             CPU   GPUs          CPU     GPUs            CPU    GPUs
+
+                                    model      L1    KV1   L2    KV2
+ GPU 1     L1        KV1
+                                               1/2   1/2   1/2   1/2
+                                  resharding
+
+ GPU 2                                         L1    KV1   L2    KV2
+           L2        KV2
+                                               2/2   2/2   2/2   2/2                asynchronous
+                                                                                       swap in
+
+
+Figure 5. Model weights and KV cache need to be re-sharded when        Figure 6. Tiered KV cache buffering and transition-minimizing
+switching between different parallelism.                               scheduling, and the change of KV cache occupancy.
+
+                                                                        CPU                        GPU 1 (worker 1)        (prefill)                             (decode)
+the slower stage, the throughput of prefilling and decod-
+                                                                                  cd                                                                              cd
+ing needs to be matched by adjusting the devices allocated                                                          cp
+
+
+
+
+                                                                             t
+                                                                            es
+                                                                        qu
+for each stage. However, it can be impractical in resource-
+
+
+
+
+                                                                       re
+constrained scenarios. As shown in Figure 4, to deploy                  cp                         GPU 2 (worker 2)
+                                                                                                   write back kv
+                                                                                                                                         CPU KV cache is empty
+
+a 70B model (which takes 140GiB memory for model                                                    after prefill
+                                                                                                                    cp                                            cd
+                                                                                                                                         CPU KV cache is full
+weights) on eight 40GiB GPUs, there is only one disag-                  scheduler
+                                                                                                           load kv before decode
+
+gregation strategy, that is four GPUs for prefilling and four
+for decoding (At least four GPUs collectively providing 160            Figure 7. KV cache re-sharding is completed during swapping,
+GiB memory are needed to fit the model weights). However,              leveraging CPU shared memory.
+it causes severe throughput mismatch where prefilling has
+more than 6→ higher throughput than decoding. Second,
+disaggregation duplicates the model weights similarly to               is performed through CPU shared memory.
+data parallelism, bringing similar drawbacks, such as lim-
+ited KV cache space and increased weight transfer. As a                The inter-device movement of tensors incurs overhead. To
+result, decoding throughput with four GPUs is only 15% of              mitigate this re-sharding cost, we design an asynchronous
+that with eight GPUs.                                                  pipeline to overlap data transfer with computation, as de-
+                                                                       tailed in Section 5.2.
+In conclusion, although disaggregation allows selecting dif-
+ferent parallelization strategies for each stage, the through-         Discussion on data parallelism. Unlike switching be-
+put mismatch (Jin et al., 2024a) between stages and limited            tween tensor and pipeline parallelism, adjusting the degree
+resources can lead to suboptimal performance. This calls               of data parallelism alters the proportion of GPU memory al-
+for a method that offers flexibility in parallelization while          located to model weights versus KV cache. This adjustment
+maximizing hardware resource utilization.                              increases system complexity or necessitates additional data
+                                                                       movement between the CPU and GPU. Therefore, we only
+4     S EESAW : K EY I DEAS                                            dynamically adjust tensor and pipeline parallelism.
+4.1   Dynamic Model Re-sharding
+                                                                       4.2       Tiered KV Cache Buffering and
+Observing that prefilling and decoding have distinct pref-                       Transition-minimizing Scheduling
+erences for parallelism, we propose a technique called dy-
+                                                                       Challenge: Transition Overhead. In practice, dynamic
+namic model re-sharding. This technique enables the se-
+                                                                       model resharding encounters an obstacle of transition
+lection of different parallelism strategies for each stage and
+                                                                       overhead, which is amplified by the widely-used contin-
+automatically transitions between them. This approach ex-
+                                                                       uous batching and prefill-prioritizing scheduling. Prefill-
+pands the configuration space, allowing for separate opti-
+                                                                       prioritizing scheduling eagerly schedules new prefilling
+mization of the two stages, potentially improving overall
+                                                                       tasks, causing frequent transitions between the two stages.
+throughput compared to using a single configuration. In the
+                                                                       As a result, directly applying model re-sharding with this in-
+following paragraphs, we denote the parallelization strategy
+                                                                       terleaved prefill-decode scheduling policy would introduce
+used in prefilling as cp and that in decoding as cd .
+                                                                       significant re-sharding overhead. On the other hand, decode-
+To support transitions between different parallelization con-          prioritizing scheduling minimizes the frequency of transi-
+figurations, the cluster must rearrange the data stored on             tions but results in suboptimal decoding throughput. Other
+each device to align with the new parallelism which involves           compromise solutions involve setting a threshold-based ap-
+both model weights and KV cache, as illustrated in Figure 5.           proach for managing the prefill-decode transition (Cheng
+In Seesaw, model weights are re-sharded by reloading the re-           et al., 2024). However, they still involve a trade-off be-
+quired shards from CPU memory, and KV cache re-sharding                tween reducing transition overhead and maximizing decod-
+                              Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+ing throughput.                                                pipeline for tiered KV cache buffering.
+To address this problem, we propose 1) tiered KV cache
+buffering, which leverages CPU memory offloading 2)            5.2   Asynchronous Pipeline
+transition-minimizing scheduling policy. These two syn-        While re-sharding and tiered KV cache buffering offer sub-
+ergistic techniques prevent frequent stage transitions and     stantial benefits, they also introduce new overhead related
+maintain a high decoding throughput.                           to moving model weights and KV cache. The overhead of
+Tiered KV cache buffering uses CPU memory as auxiliary         reloading model weights remains constant relative to batch
+storage for the KV cache, enabling the pre-computation         size, allowing it to be amortized with larger batches. In con-
+of a large batch of prefilling consecutively. During the       trast, swapping the KV cache incurs overhead proportional
+prefill stage, the generated KV cache is offloaded to CPU      to batch size, making it harder to amortize. Fortunately,
+KV cache storage, freeing it from the limitations of GPU       these overheads can be mitigated through computation-
+memory space. During decoding, continuous batching runs        communication overlap. We implement an asynchronous
+as normal, except that new sequences are on-boarded by         pipeline to overlap KV cache transfer with ongoing compu-
+swapping in its KV cache from the CPU memory.                  tation, as illustrated in Figure 8.
+
+Transition-minimizing scheduling controls the transition       Overlap swap-out with computation. The KV cache gen-
+to only happen when the CPU KV storage is either full          erated during the prefilling stage is not used until decoding
+or empty. During prefill, once the CPU KV cache storage        begins, allowing the KV cache swap-out to overlap with
+is fully utilized, re-sharding is triggered, and the cluster   other computations during prefilling. Although CPU-GPU
+transitions to decoding. During decoding, GPUs continue        data transfer is relatively slow due to PCIe bandwidth limi-
+processing requests and loading KV cache from CPU mem-         tations, it can still be overlapped with computation, given
+ory, keeping GPU KV cache fully utilized for high decod-       the high FLOPS involved in prefilling.
+ing throughput. When the entire CPU KV cache has been          In practice, CPU-GPU data transfer can only overlap with
+transferred to GPU memory, the cluster switches back to        computation when using pinned memory, but shared mem-
+prefilling. The whole process is illustrated in Figure 6.      ory cannot be pinned (AlbanD, 2023). To address this, we
+KV cache re-sharding occurs throughout this process. As        split the transfer into two stages: GPU to pinned memory
+illustrated in Figure 7, in a multi-GPU setup, the CPU KV      (overlapped with computation) and then pinned to shared
+cache storage is shared among all GPUs. During swap-out,       memory, which is a host-side operation that also runs con-
+each GPU pushes its shard (based on cp ) of the generated      currently with GPU kernels.
+KV cache to the shared CPU storage, where these shards         Asynchronous swap-in. We implement swap-in using a
+collectively form the complete KV cache. During swap-          background thread called the prefetcher on each worker, op-
+in, each GPU retrieves its required KV shard (based on         erating in a fully asynchronous paradigm. The prefetcher is
+cd ) from the shared storage. We implement the shared KV       controlled directly by the scheduler and runs independently
+cache using shared memory of the operating system.             of the main thread, whether the main thread is handling pre-
+                                                               filling or decoding. In each iteration, the scheduler creates
+5     S YSTEM D ESIGN AND I MPLEMENTATION                      new prefetching tasks when there are free slots in the GPU
+                                                               KV store. Once the prefetcher completes moving the KV
+5.1   Scheduler-worker Architecture                            cache for certain sequences, it notifies the scheduler via a
+In order to support dynamically switching parallelization      shared queue, allowing those sequences to be scheduled for
+configurations for prefilling and decoding, we build Seesaw,   decoding tasks later.
+a new LLM inference engine designed for high-throughput        Swap-in can also be well overlapped if the data movement is
+LLM inference. The overall architecture of Seesaw fol-         faster than the speed of the GPU KV cache being consumed.
+lows a single-scheduler, multi-worker design. The sched-       In practice, as long as the output length is not too short, the
+uler manages all generation requests, organizes them into      swap-in can also be well overlapped.
+batches, and sends instructions to the workers. To fully
+utilize pipelining, each decoding step processes 1/PP of the   Bandwidth-aware KV cache layout. The data layout of
+sequences in GPU KV storage. Once a batch is formed, it is     the KV cache significantly impacts the bandwidth efficiency
+sent to workers through shared queues. Each worker is re-      of data movement. There are two common layouts for stor-
+sponsible for controlling a single GPU and maintains a task    ing KV cache: (seq len, num heads, head dim) (NHD) and
+queue to receive and execute instructions sequentially. This   (num heads, seq len, head dim) (HND). NHD is less opti-
+architecture facilitates the implementation of asynchronous    mal for memory access because tensor parallelism shards
+features, such as pipeline parallelism and the asynchronous    the KV cache along the H dimension (number of heads),
+                                                               which is the second-to-last dimension, leading to more non-
+                                        Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+main thread                                   CPU KV is empty
+                                                                                                 Table 1. GPU hardware specification
+                                       scheduler          scheduler
+        qkv_proj        attn + ffn                                       decode                                     Memory
+                                        (prefill)         (decode)                  GPU Model       Memory Size                    FLOPS        NVLink
+                        swap out                                                                                   Bandwidth
+                   non-blocking copy          CPU KV is full                            A10            24 GiB       600 GiB/s       125T          ✁
+                                                                                         L4            24 GiB       300 GiB/s       121T          ✁
+prefetcher thread        CPU KV                 swap in               GPU KV            A100           40 GiB      1,555 GiB/s      312T          ✂
+
+
+Figure 8. Async pipeline of Seesaw: Swap-in overlaps with prefill
+computation, while swap-out occurs in a separate asynchronous
+prefetcher thread.
+
+
+
+contiguous memory access. Therefore, we use the HND
+layout for storing the KV cache in CPU memory.
+                                                                                         (a) arxiv-summarization                 (b) ShareGPT
+
+
+6     E VALUATION                                                                 Figure 9. Input and output length distributions of the datasets
+
+In this section, we evaluate the performance of Seesaw under
+a variety of hardware configurations and workloads.                               Baselines. We use vLLM 0.5.4 (Kwon et al., 2023) as
+                                                                                  the baseline. It is the most widely used open-source LLM
+6.1   Experiment Settings                                                         serving engine with wide support for different parallelisms.
+                                                                                  We also directly use the vLLM’s model implementation for
+Hardware. We use three types of GPUs: NVIDIA A10,
+                                                                                  a straightforward comparison. SGLang (Zheng et al., 2023)
+L4, and A100. The A10 and L4 are deployed on AWS EC2
+                                                                                  and DeepSpeed-FastGen (Holmes et al., 2024) do not sup-
+instances (g5.48xlarge and g6.48xlarge (Amazon
+                                                                                  port pipeline parallelism. TensorRT-LLM (NVIDIA, 2024b)
+Web Services, 2024)), and the A100 is used on GCP (Google
+                                                                                  is not included in the comparison because it uses a simi-
+Cloud, 2024). GPU specifications are listed in Table 1. The
+                                                                                  lar scheduling policy as vLLM, and vLLM demonstrates
+PCIe connection for each GPU is PCIe 4.0 8→, providing 16
+                                                                                  comparable performance (vLLM Team, 2024) in throughput-
+GiB/s bandwidth (PCI-SIG, 2017), while NVLink (NVIDIA
+                                                                                  oriented tasks. The techniques proposed in Seesaw can also
+Corporation, 2024) offers a bandwidth of 600 GiB/s. Addi-
+                                                                                  be applied to modifying TensorRT-LLM.
+tionally, we allocate 80 GiB of CPU memory per GPU.
+
+                                                                                  Chunked Prefill. We enable chunked prefill and tune the
+Model. We use three different LLMs with different                                 chunk size for vLLM to get the optimal throughput, follow-
+sizes: (1) a 15B variety of LLaMA3 (Elinas, 2024); (2)                            ing the practice of Sarathi-serve (Agrawal et al., 2024). Oth-
+CodeLLaMA-34B (Roziere et al., 2023); (3) LLaMA2-                                 erwise, suboptimal chunk sizes would cause severe through-
+70B (Touvron et al., 2023b). They all use Grouped Query                           put degradation.
+Attention (GQA) (Ainslie et al., 2023). For brevity, we refer
+to them as 15B, 34B, and 70B, respectively, in the following                      6.2   End-to-end Throughput on PCIe Systems
+sections. We use float16 as the data type.
+                                                                                  First, we measure the end-to-end throughput of Seesaw. We
+                                                                                  sweep over all available single parallelism configurations
+Workload. We use two different datasets in our eval-
+                                                                                  for vLLM and show the result of the best configuration. We
+uation, namely sharegpt (ShareGPT, 2023) and
+                                                                                  use four GPUs for the 15B model, and eight GPUs for the
+arxiv-summarization (Cohan et al., 2018). They
+                                                                                  34B and 70B models. The result is shown in Figure 10, with
+correspond to two different distributions of work-
+                                                                                  the used parallelism labeled above each bar.
+load. sharegpt is a dataset of chatting history, so
+its input and output have comparable lengths, while                               On A10, compared with the highest single parallelism base-
+arxiv-summarization dataset is a summarization                                    line, Seesaw achieves a geometrically average speedup of
+dataset where inputs are much longer than outputs. The                            1.45→, with up to 1.78→ speedup. On L4, Seesaw achieves
+characteristics of these two datasets are shown in Figure 9.                      a geometrically average speedup of 1.29→, with up to 1.52→
+We sample 2000 requests from the sharegpt dataset and                             speedup. The overall average speedup is 1.36→. The
+500 requests from arxiv-summarization. Addition-                                  speedup is more significant on A10, because A10 has better
+ally, we evaluate constant-length workloads in Section 6.5.                       single GPU performance than L4, while they have similar
+Since Seesaw is purely throughput-oriented, we measure                            PCIe inter-connection bandwidth, causing a higher percent-
+the end-to-end throughput as our primary metric.                                  age of communication overhead.
+                                  Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+
+
+
+                  (a) End-to-end Throughput on A10
+
+
+
+                                                                    Figure 12. Speedup breakdown. “mix” represents batches contain-
+                                                                    ing both prefilling and decoding when chunked prefill is enabled.
+                                                                    We disable chunked prefill for TP4 and PP4 in order to show the
+                                                                    reference prefilling and decoding time. TP2PP2 with chunked
+                   (b) End-to-end Throughput on L4                  prefill is the optimal parallelism for vLLM.
+
+Figure 10. End-to-end throughput comparison on PCIe systems.
+The used parallelization strategies are labelled above each bar.
+Labels such as “P4 ↑ D4” represent the parallelization strategies   mance with up to four GPUs. Nevertheless, there is still a
+for prefilling and decoding respectively in Seesaw.                 noticeable percentage of all-reduce overhead in prefilling
+                                                                    when tensor parallelism scales beyond four GPUs. Seesaw
+                                                                    can still provide speedup in this case. As shown in Fig-
+                                                                    ure 11, Seesaw still achieves a 13% throughput increase
+                                                                    over vLLM for the sharegpt dataset on LLaMA3-70B
+                                                                    on eight A100s.
+                                                                    Speedup on A100 + PCIe Besides A100 SXM with
+                                                                    NVLink inter-connection, there is also another version of
+          Figure 11. Throughput comparison on A100.
+                                                                    A100 that is inter-connected with PCIe links, where Seesaw
+                                                                    can achieve noticeable speedup. As shown in Figure 11, See-
+                                                                    saw provides 46% speedup on arxiv-summarization
+6.3   Speedup Breakdown: An Example
+                                                                    and 30% speedup on sharegpt. Seesaw brings the per-
+Runtime Breakdown Figure 12 illustrates how Seesaw                  formance of the A100 PCIe version much closer to the per-
+merges the advantages of different parallelisms. Us-                formance level of the NVLink version. vLLM gets roughly
+ing CodeLLaMA34B on the arxiv-summarization                         60% throughput on A100 PCIe compared with A100 SXM,
+dataset with four A10 GPUs as an example, we measured               while Seesaw boosts it up to 82% – 89%.
+the runtime of each stage. TP4 is optimal for decoding but
+significantly slower for prefilling, while PP4 excels at pre-       6.5   Sensitivity Study
+filling but is slower during decoding. Seesaw uses a mixed          Ratio between Input and Output Length The speedup of
+parallelism strategy, applying PP4 for prefilling and TP4           Seesaw depends on the ratio between the input and output
+for decoding, achieving performance comparable to the best          length, or P : D. Model re-sharding has the opportunity
+configuration for each stage.                                       to provide speedup when prefilling and decoding have bal-
+Compare with Chunked Prefill Compared to the optimal                anced time. To investigate to what extent model re-sharding
+single parallelism configuration (TP2PP2) with chunked              would be effective, we measure the throughput of various
+prefill, Seesaw achieves higher performance for two reasons:        parallelization strategies on synthesized datasets with uni-
+(1) chunked prefill does not piggy-back all decoding steps,         form lengths and different P : D ratios. We fix the input
+leaving some purely decoding steps, and (2) chunked prefill         length to 3000 tokens and vary the output length.
+with TP2PP2 is slower than prefilling with PP4. Considering         As shown in Figure 13, PP8 achieves the highest throughput
+other parallelization strategies with chunked prefill, PP4 is       during prefilling, while TP4PP2 excels in decoding. When
+inefficient for purely decoding steps, while TP4 suffers from       the output length equals one (prefilling only), Seesaw and
+substantial communication overhead.                                 PP8 show similar throughput, and TP4PP2 performs worse
+                                                                    due to high communication overhead. As output length
+6.4   End-to-end Throughput on A100
+                                                                    increases, the inefficiency of PP in decoding outweighs its
+Speedup on A100 + NVLink The NVLink interconnec-                    advantage in prefilling, causing PP8’s throughput to drop
+tion across A100 GPUs significantly reduces the all-reduce          rapidly. There is a range where TP2PP4 becomes optimal be-
+overhead and further scales tensor parallelism. Tensor par-         fore decoding dominates the runtime and TP4PP2 takes over
+allelism alone typically suffices to achieve optimal perfor-        as the fastest. Nonetheless, Seesaw consistently outperforms
+                                 Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+                                                                     Disaggregate Prefill and Decoding DistServe (Zhong
+                                                                     et al., 2024) proposed placing prefilling and decoding on
+                                                                     different devices to prevent interference and leverage differ-
+                                                                     ent characteristics of the two stages. Mooncake (Qin et al.,
+                                                                     2024) uses a similar approach via a distributed KV cache
+                                                                     pool. P/D-Serve (Jin et al., 2024b) uses the device-to-device
+Figure 13. Throughput of various parallelization strategies with     network to transfer the KV cache between prefill and decode
+different ratios between output and input lengths (D : P ), mea-     devices. Splitwise (Patel et al., 2024) proposes using dif-
+sured on 70B model and eight A10 GPUs.                               ferent GPU models for the two stages. TetriInfer (Hu et al.,
+                                                                     2024) further disaggregates different downstream tasks to
+                                                                     avoid interference. These works are designed for online
+                                                                     serving while Seesaw focuses on offline inference. More-
+                                                                     over, they are usually designed for large clusters.
+
+                                                                     Merge Prefill and Decode (Chunked prefill) Chunked
+                                                                     prefill, as proposed by SplitFuse (Holmes et al., 2024),
+                                                                     Sarathi (Agrawal et al., 2023), and Sarathi-serve (Agrawal
+Figure 14. Projected throughput of various parallelization strate-
+                                                                     et al., 2024), splits long prompts in the prefilling stage into
+gies with different inter-connection bandwidth, measured and
+traced on 34B model and eight A10 GPUs.                              smaller chunks, combining them with decoding steps to
+                                                                     strike a balance between data movement and computation
+                                                                     and reduce pipeline bubbles in pipeline parallelism. How-
+other strategies across all input-output length ratios. In real      ever, determining the optimal chunk size is challenging. A
+scenarios with variable input and output lengths, Seesaw is          chunk size that is too large results in excessive decode-only
+even more advantageous due to its adaptive capabilities.             steps, closely resembling traditional prefill-decode schedul-
+                                                                     ing. Conversely, a chunk size that’s too small reduces kernel
+Inter-connection Bandwidth The effectiveness of Seesaw               efficiency. Furthermore, chunked prefill cannot always per-
+also depends on the inter-connection bandwidth. We in-               fectly piggyback decoding with prefilling, leaving separate
+vestigate this by measuring the runtime and tracing all-             decode-only steps. For further performance enhancement,
+reduce operations of running arxiv-summarization                     model re-sharding can be integrated with chunked prefill
+and 34B model on eight A10s. We then mutate the all-                 to accelerate these decode-only steps. On the other side,
+reduce time to project the end-to-end throughput with dif-           the key advantage of chunked prefill is its flexibility in
+ferent inter-connection bandwidths. As shown in Figure 14,           supporting both throughput- and latency-oriented scenar-
+when the inter-connection bandwidth is slow (for example,            ios, whereas Seesaw prioritizes throughput at the cost of
+among geographically distributed devices (Borzunov et al.,           increased latency.
+2022)), pipeline parallelism is optimal; when the bandwidth
+is very high, tensor parallelism is optimal. The through-
+                                                                     7.2   Parallel and Distributed LLM Inference
+put of Seesaw is superior to fixed parallelization strategies
+on a wide range from 0.1→ to 50→ of PCIe bandwidth.                  Aside from tensor parallelism, pipeline parallelism, and data
+Our findings indicate that Seesaw primarily is suited for            parallelism discussed in Section 2.2, there are also other
+resource-constrained deployments, especially those with rel-         types of parallelisms, such as sequence parallelism (SP) (Li
+atively slower interconnections, such as clusters consisting         et al., 2021; Liu et al., 2023; Lin et al., 2024; Brandon et al.,
+of commodity-grade GPUs.                                             2023; Xue et al., 2024) and fully sharded data parallelism
+                                                                     (FSDP) (Zhao et al., 2023; Rajbhandari et al., 2020). Se-
+7     R ELATED W ORK                                                 quence parallelism is especially designed for long sequence
+                                                                     lengths, and is orthogonal with our work. FSDP requires
+7.1   Heterogenity between Prefilling and Decoding                   frequently transferring weight matrices across GPUs, thus
+                                                                     mainly used in training.
+Due to the different computational characteristics between
+prefilling and decoding leading to under-utilization of hard-        HexGen (Jiang et al., 2023), LLM-PQ (Zhao et al., 2024),
+ware resources, prior research has investigated two direc-           Helix (Mei et al., 2024) investigate parallelisms in heteroge-
+tions to address this problem, namely disaggregating or              neous clusters. Intra-device parallelism leverages overlap-
+merging the two stages. Disaggregation places prefilling             ping functions using different resources within each device,
+and decoding onto different devices to avoid their interfer-         including DeepSeek (Liu et al., 2024a), NanoFlow (Zhu
+ence while merging processes prefilling and decoding in              et al., 2024) and Liger (Du et al., 2024). Petals (Borzunov
+one batch.                                                           et al., 2022) explores LLM inference in geographically dis-
+                                Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+tributed setups, employing pipeline parallelism to minimize        Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani,
+communication costs. SpotServe (Miao et al., 2024) runs              B. S., and Ramjee, R. Sarathi: Efficient llm inference
+LLM inference on preemptible instances. Since most of                by piggybacking decodes with chunked prefills. arXiv
+these works target different scopes than Seesaw, direct com-         preprint arXiv:2308.16369, 2023.
+parisons are not applicable.
+                                                                   Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N.,
+7.3   Offloading in LLM Inference                                    Gulavani, B. S., Tumanov, A., and Ramjee, R. Taming
+                                                                     throughput-latency tradeoff in llm inference with sarathi-
+Offloading is a widely used technique to run LLM applica-            serve. arXiv preprint arXiv:2403.02310, 2024.
+tions in resource-constrained scenarios (Ren et al., 2021).
+FlexGen (Sheng et al., 2023) swaps tensors across GPU              Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+memory, CPU memory, and disks. Fiddler (Kamahori                     Lebrón, F., and Sanghai, S. Gqa: Training generalized
+et al., 2024), HeteGen (Xuanlei et al., 2024), PowerIn-              multi-query transformer models from multi-head check-
+fer (Song et al., 2023) and FastDecoder (He & Zhai, 2024)            points. arXiv preprint arXiv:2305.13245, 2023.
+perform part of computation in CPU, which require CPUs
+                                                                   AlbanD. Why not multiprocess pin memory in data loader?
+with strong compute capability or external CPU nodes con-
+                                                                     https://discuss.pytorch.org/t/why-not-multiprocess-pin-
+nected with high-bandwidth networking. Instinfer (Pan
+                                                                     memory-in-data-loader/197345/2, 2023.
+et al., 2024b) offloads computation to Computational Stor-
+age Drives. Unlike these approaches, Seesaw does not as-           Amazon Web Services. Amazon EC2 Instance Types,
+sume extremely limited GPU memory that requires frequent            2024. URL https://aws.amazon.com/ec2/
+CPU-GPU weight matrix transfers. Instead, Seesaw uses               instance-types/.
+CPU memory only as an intermediate stage for model and
+KV cache resharding.                                               Ben-Nun, T. and Hoefler, T. Demystifying parallel and dis-
+                                                                     tributed deep learning: An in-depth concurrency analysis.
+                                                                     ACM Computing Surveys (CSUR), 52(4):1–43, 2019.
+8     C ONCLUSION
+                                                                   Bengio, Y., Ducharme, R., and Vincent, P. A neural proba-
+This paper proposes Seesaw, a high-throughput LLM infer-
+                                                                     bilistic language model. Advances in neural information
+ence engine, to address the inefficiencies of fixed paralleliza-
+                                                                     processing systems, 13, 2000.
+tion by selecting different parallelization strategies for the
+prefilling and decoding stages and switching between them          Borzunov, A., Baranchuk, D., Dettmers, T., Ryabinin, M.,
+using model re-sharding. It uses tiered KV cache buffering           Belkada, Y., Chumachenko, A., Samygin, P., and Raffel,
+to minimize re-sharding overhead. Our experiments show               C. Petals: Collaborative inference and fine-tuning of
+that Seesaw outperforms widely-used open-source inference            large models. arXiv preprint arXiv:2209.01188, 2022.
+engines, with a throughput increase of 1.06-1.78→ and an
+average throughput improvement of 1.36→. These results             Brandon, W., Nrusimha, A., Qian, K., Ankner, Z., Jin, T.,
+highlight Seesaw’s effectiveness and adaptability.                   Song, Z., and Ragan-Kelley, J. Striped attention: Faster
+                                                                     ring attention for causal transformers. arXiv preprint
+                                                                     arXiv:2311.09431, 2023.
+ACKNOWLEDGMENTS
+We want to express our sincere gratitude to the anonymous          Chan, V., Zhang, H., and Wang, F. Snowflake llm
+MLSys reviewers for their valuable and constructive feed-            inference: Optimizing gpu capacity for interactive
+back and suggestions. The authors with the University of             workloads. https://www.snowflake.com/engineering-
+Toronto are supported by the Canada Foundation for In-               blog/snowflake-llm-inference-interactive-workloads/.
+novation JELF grant, NSERC Discovery grant, AWS Ma-                Chang, L., Bao, W., Hou, Q., Jiang, C., Zheng, N., Zhong,
+chine Learning Research Award (MLRA), Facebook Fac-                  Y., Zhang, X., Song, Z., Jiang, Z., Lin, H., et al. Flux: Fast
+ulty Research Award, Google Scholar Research Award, and              software-based communication overlap on gpus through
+VMware Early Career Faculty Grant.                                   kernel fusion. arXiv preprint arXiv:2406.06858, 2024.
+
+R EFERENCES                                                        Cheng, K., Hu, W., Wang, Z., Peng, H., Li, J., and Zhang,
+                                                                     S. Slice-level scheduling for high throughput and load
+Achiam, J., Adler, S., Agarwal, S., Ahmad, L., Akkaya, I.,           balanced llm serving. arXiv preprint arXiv:2406.13511,
+  Aleman, F. L., Almeida, D., Altenschmidt, J., Altman, S.,          2024.
+  Anadkat, S., et al. Gpt-4 technical report. arXiv preprint
+  arXiv:2303.08774, 2023.                                          Cohan, A., Dernoncourt, F., Kim, D. S., Bui, T., Kim, S.,
+                                                                     Chang, W., and Goharian, N. A discourse-aware attention
+                               Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+  model for abstractive summarization of long documents.         Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, D., Chen,
+  arXiv preprint arXiv:1804.05685, 2018.                           M., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., et al. Gpipe:
+                                                                   Efficient training of giant neural networks using pipeline
+Dell Technologies.   Poweredge server gpu                          parallelism. Advances in neural information processing
+  matrix,  2023.      URL     https://www.                         systems, 32, 2019.
+  delltechnologies.com/asset/en-ca/
+  products/servers/briefs-summaries/                             Jiang, Y., Yan, R., Yao, X., Zhou, Y., Chen, B., and Yuan, B.
+  poweredge-server-gpu-matrix.pdf.                                  Hexgen: Generative inference of large language model
+                                                                    over heterogeneous environment. In Forty-first Interna-
+Dell Technologies. Inferencing performance for gen-                 tional Conference on Machine Learning, 2023.
+  erative ai in the enterprise with amd accelerators.
+  https://infohub.delltechnologies.com/en-au/l/generative-       Jin, H., Lai, R., Ruan, C. F., Wang, Y., Mowry, T. C., Miao,
+  ai-in-the-enterprise-with-amd-accelerators/inferencing-           X., Jia, Z., and Chen, T. A system for microserving of
+  performance/, 2024.                                               llms. arXiv preprint arXiv:2412.12488, 2024a.
+
+Du, J., Wei, J., Jiang, J., Cheng, S., Huang, D., Chen, Z.,      Jin, Y., Wang, T., Lin, H., Song, M., Li, P., Ma, Y., Shan, Y.,
+  and Lu, Y. Liger: Interleaving intra-and inter-operator           Yuan, Z., Li, C., Sun, Y., et al. P/d-serve: Serving disag-
+  parallelism for distributed large model inference. In Pro-        gregated large language model at scale. arXiv preprint
+  ceedings of the 29th ACM SIGPLAN Annual Symposium                 arXiv:2408.08147, 2024b.
+  on Principles and Practice of Parallel Programming, pp.
+                                                                 Kamahori, K., Gu, Y., Zhu, K., and Kasikci, B. Fiddler:
+ 42–54, 2024.
+                                                                   Cpu-gpu orchestration for fast inference of mixture-of-
+Edge, D., Trinh, H., Cheng, N., Bradley, J., Chao, A., Mody,       experts models. arXiv preprint arXiv:2402.07033, 2024.
+  A., Truitt, S., and Larson, J. From local to global: A graph   Kamsetty, A., Chen, H., and Xie, L. How bytedance scales
+  rag approach to query-focused summarization. arXiv               offline inference with multi-modal llms to 200tb data.
+  preprint arXiv:2404.16130, 2024.                                 https://www.anyscale.com/blog/how-bytedance-scales-
+                                                                   offline-inference-with-multi-modal-llms-to-200TB-data,
+Elinas.         Llama-3-15b  instruct-zeroed.
+                                                                   August 2023.
+  https://huggingface.co/elinas/
+  Llama-3-15B-Instruct-zeroed, 2024.                             Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+                                                                  C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+Fang, J., Yu, Y., Zhao, C., and Zhou, J. Turbotransformers:       memory management for large language model serving
+  an efficient gpu serving system for transformer models.         with pagedattention. In Proceedings of the 29th Sym-
+  In Proceedings of the 26th ACM SIGPLAN Symposium                posium on Operating Systems Principles, pp. 611–626,
+  on Principles and Practice of Parallel Programming, pp.         2023.
+  389–402, 2021.
+                                                                 Li, S., Xue, F., Baranwal, C., Li, Y., and You, Y. Sequence
+Google Cloud. GPU platforms: A100 GPUs, 2024.                      parallelism: Long sequence training from system perspec-
+  URL https://cloud.google.com/compute/                            tive. arXiv preprint arXiv:2105.13120, 2021.
+  docs/gpus#a100-gpus.
+                                                                 Li, Z., Zheng, L., Zhong, Y., Liu, V., Sheng, Y., Jin, X.,
+He, J. and Zhai, J. Fastdecode: High-throughput gpu-               Huang, Y., Chen, Z., Zhang, H., Gonzalez, J. E., et al. Al-
+  efficient llm serving using heterogeneous pipelines. arXiv       paServe: Statistical multiplexing with model parallelism
+  preprint arXiv:2403.11421, 2024.                                 for deep learning serving. In 17th USENIX Symposium
+                                                                   on Operating Systems Design and Implementation (OSDI
+Holmes, C., Tanaka, M., Wyatt, M., Awan, A. A., Rasley, J.,        23), pp. 663–679, 2023.
+  Rajbhandari, S., Aminabadi, R. Y., Qin, H., Bakhtiari, A.,
+  Kurilenko, L., et al. Deepspeed-fastgen: High-throughput       Lin, B., Peng, T., Zhang, C., Sun, M., Li, L., Zhao, H., Xiao,
+  text generation for llms via mii and deepspeed-inference.        W., Xu, Q., Qiu, X., Li, S., et al. Infinite-llm: Efficient llm
+  arXiv preprint arXiv:2401.08671, 2024.                           service for long context with distattention and distributed
+                                                                   kvcache. arXiv preprint arXiv:2401.02669, 2024.
+Hu, C., Huang, H., Xu, L., Chen, X., Xu, J., Chen, S., Feng,
+  H., Wang, C., Wang, S., Bao, Y., et al. Inference without      Liu, A., Feng, B., Xue, B., Wang, B., Wu, B., Lu, C., Zhao,
+  interference: Disaggregate llm inference for mixed down-         C., Deng, C., Zhang, C., Ruan, C., et al. Deepseek-
+  stream workloads. arXiv preprint arXiv:2401.11181,               v3 technical report. arXiv preprint arXiv:2412.19437,
+  2024.                                                            2024a.
+                               Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+Liu, H., Zaharia, M., and Abbeel, P. Ring attention with          NVIDIA Corporation. Nvidia a100 pcie product brief, 2020.
+  blockwise transformers for near-infinite context. arXiv          URL     https://www.nvidia.com/content/
+  preprint arXiv:2310.01889, 2023.                                 dam/en-zz/Solutions/Data-Center/a100/
+                                                                   pdf/A100-PCIE-Prduct-Brief.pdf.
+Liu, S., Biswal, A., Cheng, A., Mo, X., Cao, S., Gonzalez,
+  J. E., Stoica, I., and Zaharia, M. Optimizing llm queries in    NVIDIA Corporation. NVIDIA NVLink: High-Speed GPU
+  relational workloads. arXiv preprint arXiv:2403.05821,           Interconnect, 2024. URL https://www.nvidia.
+  2024b.                                                           com/en-us/data-center/nvlink/.
+
+Liu, S., Biswal, A., Cheng, A., Mo, X., Cao, S., Gonzalez,        OpenAI. Chatgpt (gpt-4), 2024. URL https://www.
+  J. E., Stoica, I., and Zaharia, M. Optimizing llm queries in      openai.com/research/gpt-4.
+  relational workloads. arXiv preprint arXiv:2403.05821,
+                                                                  Pan, R., Wang, Z., Jia, Z., Karakus, C., Zancato, L., Dao, T.,
+  2024c.
+                                                                    Wang, Y., and Netravali, R. Marconi: Prefix caching for
+Liu, X., Daniel, C., Hu, L., Kwon, W., Li, Z., Mo, X., Che-         the era of hybrid llms. arXiv preprint arXiv:2411.19379,
+  ung, A., Deng, Z., Stoica, I., and Zhang, H. Optimizing           2024a.
+  speculative decoding for serving large language models          Pan, X., Li, E., Li, Q., Liang, S., Shan, Y., Zhou, K., Luo,
+  using goodput. arXiv preprint arXiv:2406.14066, 2024d.            Y., Wang, X., and Zhang, J. Instinfer: In-storage attention
+Mei, Y., Zhuang, Y., Miao, X., Yang, J., Jia, Z., and Vinayak,      offloading for cost-effective long-context llm inference.
+ R. Helix: Distributed serving of large language models             arXiv preprint arXiv:2409.04992, 2024b.
+ via max-flow on heterogeneous gpus. arXiv preprint               Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í., Maleki,
+ arXiv:2406.01566, 2024.                                            S., and Bianchini, R. Splitwise: Efficient generative llm
+                                                                    inference using phase splitting. In 2024 ACM/IEEE 51st
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Jin, H., Chen,
+                                                                    Annual International Symposium on Computer Architec-
+ T., and Jia, Z. Towards efficient generative large language
+                                                                    ture (ISCA), pp. 118–132. IEEE, 2024.
+ model serving: A survey from algorithms to systems.
+ arXiv preprint arXiv:2312.15234, 2023.                           PCI-SIG.    PCI-SIG Releases PCIe 4.0, Ver-
+                                                                    sion 1.0, 2017.    URL https://pcisig.
+Miao, X., Shi, C., Duan, J., Xi, X., Lin, D., Cui, B., and Jia,
+                                                                    com/pci-sig-releases-pcie%C2%
+ Z. Spotserve: Serving generative large language models
+                                                                    AE-40-version-10.
+ on preemptible instances. In Proceedings of the 29th ACM
+ International Conference on Architectural Support for            Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury,
+ Programming Languages and Operating Systems, Volume                J., Heek, J., Xiao, K., Agrawal, S., and Dean, J. Efficiently
+ 2, pp. 1112–1127, 2024.                                            scaling transformer inference. Proceedings of Machine
+                                                                    Learning and Systems, 5:606–624, 2023.
+MLCommons. Mlperf inference: Datacenter benchmark
+ suite. https://mlcommons.org/benchmarks/                         Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., and
+ inference-datacenter/, 2024.                                       Xu, X. Mooncake: Kimi’s kvcache-centric architecture
+                                                                    for llm serving. arXiv preprint arXiv:2407.00079, 2024.
+Narayan, A., Chami, I., Orr, L., Arora, S., and Ré, C. Can
+  foundation models wrangle your data? arXiv preprint             Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. Zero:
+  arXiv:2205.09911, 2022.                                           Memory optimizations toward training trillion parameter
+                                                                    models. In SC20: International Conference for High Per-
+Narayanan, D., Harlap, A., Phanishayee, A., Seshadri, V.,           formance Computing, Networking, Storage and Analysis,
+  Devanur, N. R., Ganger, G. R., Gibbons, P. B., and Za-            pp. 1–16. IEEE, 2020.
+  haria, M. Pipedream: Generalized pipeline parallelism for
+  dnn training. In Proceedings of the 27th ACM symposium          Ren, J., Rajbhandari, S., Aminabadi, R. Y., Ruwase, O.,
+  on operating systems principles, pp. 1–15, 2019.                  Yang, S., Zhang, M., Li, D., and He, Y. Zero-offload:
+                                                                    Democratizing billion-scale model training. In 2021
+NVIDIA. Fastertransformer: Transformer related optimiza-            USENIX Annual Technical Conference (USENIX ATC
+ tion, including bert, gpt. https://github.com/                     21), pp. 551–564, 2021.
+ NVIDIA/FasterTransformer, 2024a.
+                                                                  Roziere, B., Gehring, J., Gloeckle, F., Sootla, S., Gat, I.,
+NVIDIA. Tensorrt-llm: Optimized inference for large lan-            Tan, X. E., Adi, Y., Liu, J., Sauvestre, R., Remez, T., et al.
+ guage models. https://github.com/NVIDIA/                           Code llama: Open foundation models for code. arXiv
+ TensorRT-LLM, 2024b.                                               preprint arXiv:2308.12950, 2023.
+                              Seesaw: High-throughput LLM Inference via Model Re-sharding
+
+ShareGPT.    Sharegpt vicuna unfiltered dataset.                Yu, C., Lee, S., Xu, R., Lin, W., Gorthy, P.,
+  https://huggingface.co/datasets/                                and Liaw, R.    Batch llm inference on anyscale
+  anon8231489123/ShareGPT_Vicuna_                                 slashes aws bedrock costs by up to 6x, October
+  unfiltered, 2023. Apache 2.0 License.                           2024. URL https://www.anyscale.com/blog/
+                                                                  batch-llm-inference-announcement.
+Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,
+  B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen:    Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  High-throughput generative inference of large language          G. Orca: A distributed serving system for {Transformer-
+  models with a single gpu. In International Conference           Based} generative models. In 16th USENIX Symposium
+  on Machine Learning, pp. 31094–31116. PMLR, 2023.               on Operating Systems Design and Implementation (OSDI
+                                                                  22), pp. 521–538, 2022.
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,
+  J., and Catanzaro, B. Megatron-lm: Training multi-            Yuan, Z., Shang, Y., Zhou, Y., Dong, Z., Xue, C., Wu, B.,
+  billion parameter language models using model paral-            Li, Z., Gu, Q., Lee, Y. J., Yan, Y., et al. Llm inference
+  lelism. arXiv preprint arXiv:1909.08053, 2019.                  unveiled: Survey and roofline model insights. arXiv
+                                                                  preprint arXiv:2402.16363, 2024.
+Song, Y., Mi, Z., Xie, H., and Chen, H. Powerinfer: Fast
+  large language model serving with a consumer-grade gpu.       Zhao, J., Wan, B., Peng, Y., Lin, H., and Wu, C. Llm-
+  arXiv preprint arXiv:2312.12456, 2023.                          pq: Serving llm on heterogeneous clusters with phase-
+                                                                  aware partition and adaptive quantization. arXiv preprint
+Srivatsa, V., He, Z., Abhyankar, R., Li, D., and Zhang, Y.        arXiv:2403.01136, 2024.
+  Preble: Efficient distributed prompt scheduling for llm
+  serving. 2024.                                                Zhao, Y., Gu, A., Varma, R., Luo, L., Huang, C.-C., Xu, M.,
+                                                                  Wright, L., Shojanazeri, H., Ott, M., Shleifer, S., et al.
+Su, Q., Giannoula, C., and Pekhimenko, G. The synergy of          Pytorch fsdp: experiences on scaling fully sharded data
+  speculative decoding and batching in serving large lan-         parallel. arXiv preprint arXiv:2304.11277, 2023.
+  guage models. arXiv preprint arXiv:2310.18813, 2023.
+                                                                Zheng, L., Li, Z., Zhang, H., Zhuang, Y., Chen, Z., Huang,
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,      Y., Wang, Y., Xu, Y., Zhuo, D., Xing, E. P., et al. Alpa:
+  M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,        Automating inter-and {Intra-Operator} parallelism for
+  Azhar, F., et al. Llama: Open and efficient foundation lan-     distributed deep learning. In 16th USENIX Symposium
+  guage models. arXiv preprint arXiv:2302.13971, 2023a.           on Operating Systems Design and Implementation (OSDI
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,        22), pp. 559–578, 2022.
+  A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,       Zheng, L., Yin, L., Xie, Z., Huang, J., Sun, C., Yu, C. H.,
+  Bhosale, S., et al. Llama 2: Open foundation and fine-          Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+  tuned chat models. arXiv preprint arXiv:2307.09288,             Efficiently programming large language models using
+  2023b.                                                          sglang. arXiv preprint arXiv:2312.07104, 2023.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,     Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin,
+  L., Gomez, A. N., Kaiser, !., and Polosukhin, I. At-            X., and Zhang, H. Distserve: Disaggregating prefill and
+  tention is all you need. Advances in neural information         decoding for goodput-optimized large language model
+  processing systems, 30, 2017.                                   serving. arXiv preprint arXiv:2401.09670, 2024.
+vLLM Team. Performance update: Bringing vllm to the             Zhu, K., Zhao, Y., Zhao, L., Zuo, G., Gu, Y., Xie, D., Gao,
+  next level. https://blog.vllm.ai/2024/09/                       Y., Xu, Q., Tang, T., Ye, Z., et al. Nanoflow: Towards
+  05/perf-update.html, 2024.                                      optimal large language model serving throughput. arXiv
+Xuanlei, Z., Jia, B., Zhou, H., Liu, Z., Cheng, S., and You,      preprint arXiv:2408.12757, 2024.
+ Y. Hetegen: Efficient heterogeneous parallel inference for     Zhu, Z., Giannoula, C., Andoorveedu, M., Su, Q., Man-
+  large language models on resource-constrained devices.          galam, K., Zheng, B., and Pekhimenko, G. Mist: Effi-
+ Proceedings of Machine Learning and Systems, 6:162–              cient distributed training of large language models via
+ 172, 2024.                                                       memory-parallelism co-optimization. In Proceedings of
+Xue, F., Chen, Y., Li, D., Hu, Q., Zhu, L., Li, X., Fang, Y.,     the Twentieth European Conference on Computer Sys-
+ Tang, H., Yang, S., Liu, Z., et al. Longvila: Scaling long-      tems, EuroSys ’25, 2025.
+  context visual language models for long videos. arXiv
+  preprint arXiv:2408.10188, 2024.
+

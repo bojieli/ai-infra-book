@@ -1,0 +1,1004 @@
+S CALING D EEP L EARNING T RAINING WITH MPMD P IPELINE PARALLELISM
+
+
+                             Anxhelo Xhebraj 1 Sean Lee 1 Hanfeng Chen 1 Vinod Grover 1
+
+
+                                                          A BSTRACT
+        We present JaxPP, a system for efficiently scaling the training of large deep learning models with flexible
+        pipeline parallelism. We introduce a seamless programming model that allows implementing user-defined pipeline
+        schedules for gradient accumulation. JaxPP automatically distributes tasks, corresponding to pipeline stages, over
+        a cluster of nodes and automatically infers the communication among them. We implement a MPMD runtime for
+        asynchronous execution of SPMD tasks. The pipeline parallelism implementation of JaxPP improves hardware
+        utilization by up to 1.16× with respect to the best performing SPMD configuration.
+
+1       I NTRODUCTION                                              and collective operations are in place, the computation is car-
+                                                                   ried out in a Single-Program Multiple-Data (SPMD) fashion.
+The capability of deep learning models in a wide array of          This decoupling of sharding annotations from computation
+tasks has been shown to scale with model size (Brown et al.,       definitions facilitates experimentation with various intra-
+2020; Dosovitskiy et al., 2021). Consequently, researchers         operator parallelism strategies (Zheng et al., 2022) such
+are training increasingly larger models (Shoeybi et al., 2020;     as data parallelism and tensor parallelism to minimize la-
+Chowdhery et al., 2022). Considerable development ef-              tency (Fedus et al., 2022; Pope et al., 2022).
+forts are required to run such experiments, which are often
+justified only for well-performing models, thus restricting        Despite GSPMD’s near-ideal solution, the SPMD model
+the exploration of models that excel when scaled (Hooker,          works well in practice only when high-bandwidth links con-
+2020).                                                             nect accelerators, e.g., NVSwitch for GPUs and ICI for
+                                                                   TPUs. This is because the collective operations necessary
+A primary challenge in developing large models lies in their       for the SPMD computations stress the network’s bandwidth.
+efficient parallelization across various hierarchies (cores,       It is well-known that scaling high-bandwidth links to larger
+devices, hosts, data centers) to maximize resource utiliza-        device meshes quickly becomes infeasible. For example
+tion and minimize device communications and tensor layout          scaling the training of LLMs on TPUs (Chowdhery et al.,
+changes (Shoeybi et al., 2020; Narayanan et al., 2021; Fedus       2022) required designing a separate system (Barham et al.,
+et al., 2022; Pope et al., 2022). Early works concentrated         2022) to extend the SPMD model to cross low-bandwidth
+on manually re-implementing models to run them across              (DCN) domains. In settings where device connection has a
+multiple devices, which resulted in highly optimized run-          low bandwidth, communication overhead can be greatly re-
+times for specific models (Shoeybi et al., 2020; Narayanan         duced with pipeline parallelism (Huang et al., 2019), which
+et al., 2021). However, this approach is time-consuming and        requires only Point-to-Point (P2P) communication.
+error-prone.
+                                                                   GSPMD can implement only one variant of pipeline
+The GSPMD programming model, as implemented in the                 parallelism, precluding any form of pipeline parallelism
+XLA compiler (Xu et al., 2021), simplifies the paralleliza-        that requires a Multiple-Program Multiple-Data (MPMD)
+tion of linear algebra workloads. It requires only lightweight     paradigm. This limitation restricts significantly the types
+annotations that specify how tensors in a computation              of computations that can be pipelined, and precludes vari-
+should be sharded across a mesh of devices, with the com-          ous pipeline schedules that improve throughput and mem-
+piler automatically handling the placement of collective           ory usage. In practice, best performing training configura-
+operations for communication. Once the tensors are sharded         tions (Shoeybi et al., 2020) use a mix of pipeline, tensor,
+    1
+    NVIDIA, USA. Correspondence to: Anxhelo Xhebraj                and data parallelism. Tensor parallelism is mapped over the
+<axhebraj@nvidia.com>, Sean Lee <selee@nvidia.com>,                high-bandwidth mesh dimension while data and pipeline
+Hanfeng Chen <hanfengc@nvidia.com>, Vinod Grover                   parallelism are mapped over the low-bandwidth dimension.
+<vgrover@nvidia.com>.
+                                                                   Our work introduces JaxPP, a system for distributed train-
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,    ing of large models. Unlike other systems such as Mega-
+2025. Copyright 2025 by the author(s).                             tron (Shoeybi et al., 2020) and DeepSpeed (Smith et al.,
+                                Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+2022), model implementations do not have to commit to                  parallelization strategies, making distributed training more
+a concrete parallelization strategy. Instead, by building on           accessible. We now briefly describe JAX’s programming
+top of GSPMD, parallelism is decoupled from the imple-                 model for parallel computations and explore its limitations
+mentation and is introduced through lightweight sharding               for pipeline parallelism.
+annotations. Additionally, JaxPP advances beyond SPMD
+by allowing arbitrary MPMD distributed dataflow in the                 2.1   SPMD Parallelization Through Named Axes
+pipeline parallelism dimension. We make the following
+contributions:                                                         To parallelize an array computation in JAX, we arrange a set
+                                                                       of devices in a logical mesh, which is a multi-dimensional
+    • We introduce a novel programming model that enables              array of non-repeating devices. The mesh shape and device
+      users to express pipeline parallelism seamlessly. The            order can be arbitrary, but it is usually such that dimen-
+      programming model does not require any user inter-               sions of the mesh correspond to a particular communica-
+      vention to handle (potentially non-adjacent) communi-            tion bandwidth. For example, 4 nodes with 8 GPUs each
+      cation across pipeline stages.                                   could have a mesh shape of (4, 8) where each row corre-
+                                                                       sponds to the 8 devices present on each node. Therefore
+    • We present a task-graph implementation that enables
+                                                                       communication between devices within the same row is
+      JaxPP to schedule tasks over a distributed mesh of
+                                                                       faster over communication between devices across different
+      devices, infer communication among them, and per-
+                                                                       rows. The mesh dimensions can also be named, for example,
+      form resource management tasks such as allocation
+                                                                       [("data", 4) ("model", 8)].
+      and buffer deletion.
+                                                                       Given a mesh, an array can be sharded (or partitioned) by
+    • We present JaxPP’s single-controller MPMD runtime,
+                                                                       mapping some axes of the array to some axes of the mesh. If
+      that supports the execution of arbitrary user specified
+                                                                       an array axis is not mapped to any mesh axis, then that axis
+      pipeline schedules.
+                                                                       is replicated across the remaining dimensions of the mesh.
+    • We demonstrate the benefits of our design by highlight-          The snippet below shows shardings of the two-dimensional
+      ing performance characteristics of JaxPP and compare             array A arising due to different partitioning specifications.
+      it against state of the art alternatives on practical large-
+      scale training benchmarks.                                   1     # mesh.shape=[("data", 4) ("model", 8)]
+                                                                  2      # A.shape=(n, m)
+The rest of the paper is structured as follows. In Section 2,     3      shard(A, (None   , "model")) # col (n , m/8)
+                                                                  4      shard(A, ("data" , None))    # row (n/4, m )
+we motivate our system by describing the limitations of ex-       5      shard(A, ("data" , "model")) # 2D (n/4, m/8)
+isting parallelization “interfaces” when applied to pipeline
+parallelism. Then, we give an overview of JaxPP (Sec-
+tion 3) and describe its runtime (Section 4). We extensively           The examples above mentioning only one axis of the mesh,
+evaluate JaxPP’s performance characteristics and compare               will lead to the replication of the sharded tensor on the
+against other state of the art systems (Section 5). We con-            unmentioned axis of the mesh. For example, in the first case
+clude by highlighting related work (Section 6) and final               that mentions only the "model" axis, A is replicated across
+remarks (Section 7).                                                   the 4 "data" groups and sharded column-wise within each
+                                                                       of them.
+
+2    M OTIVATION : U SER -D RIVEN                                      Instead of specifying concrete mesh axes in model defini-
+     PARTITIONING B EYOND SPMD                                         tions, usually logical axis names (named axes) are used.
+                                                                       This allows exploring several parallelization strategies with
+Scaling deep learning model training to large distributed              different mesh shapes without any changes to the model
+clusters of devices requires a combination of several paral-           implementation. Axis names must be unique for the axis of
+lelization techniques. For example, the training of Llama 3            one array, but can be shared across multiple arrays.
+models (Dubey et al., 2024) used the combination of data
+                                                                       Figure 1a shows the definition of a Feed-Forward Net-
+parallelism, tensor parallelism, pipeline parallelism, and
+                                                                       work (FFN) using logical axis names. Note that the function
+context parallelism. Implementing these parallelization
+                                                                       has no collectives in its implementation and can be run on a
+strategies manually requires substantial effort.
+                                                                       single device. The function takes as argument a 2D input X
+To simplify this process, a few libraries and frameworks en-           with batch and emb (embedding) dimension and maps it to
+able the post-hoc parallelization of existing models without           the 2D output H (2) with same logical axis names. The body
+major rewrites. Notably, recent work such as GSPMD (Xu                 of the function consists of the application of two parameters
+et al., 2021), which is integrated within JAX (Bradbury et al.,        W (i) interleaved with an activation. Note that, while the
+2018), and PartIR (Alabed et al., 2024) introduce program-             input and output share logical axis names, their sizes can
+ming models that decouple model implementation from                    differ. Figure 1b specifies on what mesh dimension each
+                                         Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+
+
+ @shard(("batch", "emb"), ("emb", "mlp"), ("mlp", "emb"))
+                 (1)          (2)
+ def ffn(X , W         , W          ):
+     (1)                (1)
+   H     = relu(XW       )
+   H (1) = shard(H (1) , ("batch", "mlp"))
+   H (2) = H (1) W (2)
+                     (2)
+   return shard(H , ("batch", "emb"))
+
+
+
+        (a) Model implementation with named axes
+
+
+                       partitioning = [
+                         batch ▷ data,
+                         mlp ▷ model
+                       ]
+
+               (b) Partitioning specification                      (c) Different parallelism instantiations depending on the mesh shape
+
+Figure 1. Configurable Parallelism Through Named Axes in JAX (Bradbury et al., 2018) Top left (1a): Model implementation where
+array axes are annotated with logical names. Bottom left (1b): Partitioning specification mapping logical axis names to mesh axes.
+Right (1c): Two parallel instantiation, data-parallel on the top with mesh shape [("data", 2) ("model", 1)] while a tensor-parallel
+implementation at the bottom when the mesh shape is [("data", 1) ("model", 2)].
+
+
+logical axis name should be sharded on. The parallelization               shard. Because the mlp axis is bound to the model axis of
+of the computation is still undefined and will depend only                the mesh, which is composed of 2 devices, W (1) is parti-
+on the concrete instantiation of the device mesh.                         tioned on the output dimension (column-wise) while W (2)
+                                                                          is partitioned in the input dimension (row-wise). The input
+Data Parallelism (DP) replicates the model weights across
+                                                                          and output of the function are replicated. The collective
+devices while partitioning the batch among them. Fig-
+                                                                          necessary for performing the parallel computation is in-
+ure 1b (Top) shows the corresponding mesh instantiation
+                                                                          serted implicitly by XLA’s SPMD partitioner. The second
+of shape [("data", 2) ("model", 1)] to achieve this. Since
+                                                                          matrix-multiply operation H (1) W (2) requires only one final
+all axes of the weights W (i) are either unbound (emb) or
+                                                                          all-reduce to compute the replicated output.
+are mapped to a mesh dimension of size 1 (mlp mapped to
+model), the weights are replicated (shown as gray blocks)                 It is possible to combine DP and TP by defining a larger
+across the two devices. For training, each “replica” com-                 mesh such as [("data", 4) ("model", 8)]. In this scenario,
+putes the gradients with respect to the local batch. The                  32 GPUs are split into 4 DP “groups” each constituted by 8
+gradient computation, which is not shown in the figure, re-               TP groups. Weights are replicated across the 4 DP groups
+quires contracting the activations on the batch dimension,                and sharded across the 8 TP groups within each DP group.
+leading to an all_reduce operation (replicas synchronize                  Similarly the batch is sharded across the 4 DP groups and
+their gradients). This parallelization strategy allows training           then each shard is replicated within each TP group.
+over larger “global” batch sizes, potentially leading to faster
+                                                                          Finally, this programming model also allows more complex
+convergence.
+                                                                          parallelism strategies such as Expert Parallelism (EP) (Lep-
+Tensor Parallelism (TP) (Shoeybi et al., 2020) partitions                 ikhin et al., 2020), where expert weights and intermediate
+weights of an individual layer over multiple devices. This                activations are sharded and multiplied in parallel.
+allows running large models for which the training state
+does not fit into a single device. However, depending on                  2.2   Limitation of SPMD: Pipeline Parallelism
+the operations performed on the weights, collective opera-
+tions may be required to complete the computation. XLA                    All the parallelism strategies described so far fall into the
+inserts them automatically as needed. The “Megatron-style”                SPMD category. Under this model, a single program is
+parallelization strategy corresponding to the mesh shape                  compiled and executed across multiple devices, each pro-
+[("data", 1) ("model", 2)] is shown in Figure 1c (Bot-
+                                                                          cessing distinct input shards. This approach enables scalable
+tom). The subscript of a variable (e.g., 0 in H0 ) denotes the            deployment across thousands of partitions and simplifies
+                               Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+                                                                                                         SPMD
+scheduling, especially for collective operations. However,
+for larger scale of number of devices, collectives necessary              1 2 3 4 5 6 Z Z                        Z               Z               6               5               4       3       2      1
+in the SPMD model can greatly harm performance.                     GPipe Z 1 2 3 4 5 6 Z                        Z               6               5               4               3       2       1      Z
+                                                                          Z Z 1 2 3 4 5 6                        6               5               4               3               2       1       Z      Z
+
+Pipeline Parallelism (PP) offers an alternative by introducing                                                                                                                                                  Time
+                                                                             1 2 3                       1           4           2           5           3           6                       5          6
+temporal parallelism, dividing the computation graph into            1F1B      1 2           1       3           2           4           3           5           4           6       5           6
+stages, and performing gradient accumulation over smaller                        1   1   2       2           3           3           4           4           5           5       6       6           forward
+                                                                                                                                                                                                     backward
+partitions of the batch, called microbatches. From here, we                                              MPMD                                                                                        loss
+
+use the term actor to refer to a group of devices.
+                                                                 Figure 2. Comparison between GPipe and 1F1B. In GPipe, at
+2.2.1   The Importance of Pipeline Schedules                     any time, all pipeline-parallel groups perform the same compu-
+                                                                 tation. Bubbles are implemented as redundant discarded com-
+The first successful application of pipeline parallelism         putation (gray Z blocks). In 1F1B, all groups perform different
+with synchronous gradient application was demonstrated in        computations.
+GPipe (Huang et al., 2019). A neural network’s layers are
+split into stages. For each stage there is a forward computa-    degree of circular repeat increases, stages become smaller,
+tion and backward computation which must be scheduled in         enabling finer-grained scheduling. This approach improves
+the same actor as the forward one. Each actor is assigned        throughput, but introduces additional communication over-
+one stage, and iteratively executes the forward computation      head.
+for each microbatch by, first saving potential activations
+needed for the backward computation, and then sending the        2.2.2      SPMD Encoding of Pipeline Parallelism
+output to the next actor. At the end of all microbatches,        Xu et al. presented a clever encoding of pipeline paral-
+an actor receives the gradients of the activations from the      lelism as sharding in GSPMD. Assuming that all the stages
+succeeding actor and executes each backward computation.         have the same dataflow graph and input and output shapes
+Finally, the accumulated gradients are used to update the        (i.e. stages are homogeneous), it is possible to “stack” the
+model weights and optimizer parameters at the end of the         weights of the layer and perform all stages in parallel by
+training step. Since the activations of each microbatch have     sharding the weights on the new leading dimension. Then,
+to be stored until the corresponding backward computation,       the same computation is applied to a sharded “state” buffer
+memory usage in GPipe is proportional to the number of           for a number of times in a loop, until all the microbatches
+microbatches. Therefore, GPipe is usually combined with          have been processed. During the pipeline bubble iterations,
+activation rematerialization (Chen et al., 2016).                idling actors participate in the computation (gray Z blocks in
+Later works such as 1F1B (Narayanan et al., 2019) and            Figure 2) discarding the iteration’s result. After the pipeline
+Interleaved 1F1B (Narayanan et al., 2021) improved both          loop on the stacked layers, the outputs are used to compute
+memory usage and throughput of PP. Figure 2 shows the            the loss of the full batch.
+difference between the two schedules. The key realization        Besides being unsuitable for models with non-homogeneous
+is that the various stages of different gradient accumulation    stages, GSPMD encoding can also negatively impact perfor-
+iterations can be scheduled arbitrarily as long as data depen-   mance in the following ways: homogeneous stages forbid
+dencies are honored. Therefore, a gradient accumulation          using different rematerialization strategies across stages and
+loop can be implemented in various ways with different           strict synchronization at each loop iteration forces all pro-
+schedules which describe the order and on which actor each       cesses to wait for stragglers.
+stage’s computation (or task) is run.
+                                                                 JAX’s automatic differentiation (autodiff) generates a cor-
+The 1F1B schedule shortens the lifetime of activations by        responding loop for the backward pass consuming the ac-
+eagerly scheduling the execution of backward stages. As          tivations in reverse order. After SPMD partitioning, the
+a result, memory requirements become proportional to the         generated code corresponds to the GPipe schedule. There
+number of stages instead of the number of microbatches,          is no way for the user to control the scheduling of the sec-
+potentially translating to a 2×–3× reduction in activation       tions of the gradient accumulation loop, forgoing potential
+memory. This increased memory availability also improves         performance benefits described in Section 2.2.1. Although
+throughput since more activations can be stored and not          we do not preclude the existence of some program trans-
+rematerialized. Consequently, the end-to-end time of a train-    formations that could encode 1F1B in the SPMD paradigm
+ing step can be reduced by 20% as we explain in Section 5.3.     under further assumptions, such transformations would be
+Interleaved 1F1B further reduces idling time by assigning        inadequate. They would fail to respect the true essence
+multiple stages to each actor. The number of stages per          and flexibility of pipeline schedules, which clearly necessi-
+actor is referred to as the degree of circular repeat. As the    tate a MPMD paradigm, where at any time different actors
+                                                                 perform different stages of the loop (Figure 2 bottom).
+                                              Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+                         Driver Process Lowering and Task Scheduling                                             Remote Cluster                           SPMD Tasks Timeline
+
+  1 def train_step(W, X, y):                           def train_step(W, X, y):                                     Long-lived
+  2 X = X.reshape((n_mbs, 2, ...))                    g1 X = X.reshape((n_mbs, 2, ...))                            SPMD actors
+  3 y = (1 - a) * y + a / K                           g3 y = (1 - a) * y + a / K
+  4
+  5 @jax.grad                     Autodiff               def dloss_fn(W, mb):
+  6 def loss_fn(W, mb):                                      (W1, W2, W3), (mbX, mby) = W, mb
+  7     (W1, W2, W3), (mbX, mby) = W, mb                                                                                          g1 f1(0) f1(1) f1(2)                        b1(0)    f1(3)       b1(1)      f1(4)
+                                                       f1(i) A1, mask1 = relu(mbX @ W1)
+  8     A1 = relu(mbX @ W1)                                  A1 = pipeline_yield(A1)
+  9     A1 = pipeline_yield(A1)                        f2(i) A2, mask2 = relu(A1 @ W2)
+ 10     A2 = relu(A1 @ W2)                                   A2 = pipeline_yield(A2)
+ 11     A2 = pipeline_yield(A2)                              dA3 = dxent(A2 @ W3, mby)
+                                                     f3b3(i) mbdW3 = A2.T @ dA3
+ 12     return xent(A2 @ W3, mby)
+ 13                                                          dA2 = pipeline_yield(dA3 @ W3.T)   User Specified
+                                                                                                  Schedule                                  f2(0) f2(1)            b2(0)   f2(2)   b2(1)       f2(3)   b2(2)
+ 14 mloss_fn = partial(loss_fn, W)                           dA2 = drelu(dA2, mask2)
+ 15 dW1, dW2, dW3 = accumulate_grads(mloss_fn, 1F1B)( b2(i) mbdW2 = A1.T @ dA2
+ 16     batch=(X, y)                                         dA1 = pipeline_yield(dA2 @ W2.T)
+ 17 )                                                        dA1 = drelu(dA1, mask1)
+ 18 return (                                           b1(i) mbdW1 = mbX.T @ dA1
+ 19     W1 - lr * dW1, W2 - lr * dW2, W3 - lr * dW3          return (dW1, dW2, dW3)
+ 20 )                                                                                                                             g3                     f3b3(0)    f3b3(1)           f3b3(2)              f3b3(3)
+ 21                                                      mloss_fn = partial(dloss_fn, W)
+ 22 mesh = RemoteMesh((3,), spmd_mesh=(2, 2))            dW1, dW2, dW3 = accumulate_grads(mloss_fn, 1F1B)(
+    step_fn = mesh.distributed(train_step, ...)              batch=(X, y)
+                                                         )
+                                                         return (W1 - lr * dW1, W2 - lr * dW2, W3 - lr * dW3)
+
+
+
+
+Figure 3. System Overview. The left box shows the code in the driver process describing the computation and annotating pipeline stage
+boundaries. Auto-differentiation produces additional stages corresponding to the “backward” computations for the gradients. The user
+specifies a mapping of stages to SPMD actors and a schedule for the loop. Each call to the step_fn function schedules tasks
+
+3       JAX PP OVERVIEW                                                                               and resource management needed to perform the program’s
+                                                                                                      execution, such as send and receive operations and deal-
+We now describe JaxPP, a compiler and runtime for running                                             location of intermediate buffers. All these tasks are fused
+distributed MPMD computations. JaxPP extends JAX’s user-                                              into a single MPMD “program”, so that at each call of the
+driven SPMD parallelism by introducing task-based tempo-                                              returned step_fn function, all the tasks can be dispatched
+ral parallelism. To achieve this, it addresses two key chal-                                          into a single RPC call per SPMD actor.
+lenges: (1) User-scheduled gradient accumulation: we intro-
+duce a familiar loop construct that integrates user-defined                                           In this section we describe key features of JaxPP that enable
+schedules seamlessly in existing code; (2) Asynchronous                                               MPMD pipeline parallelism.
+task execution: we develop a runtime capable of efficiently
+executing distributed task graphs in parallel.                                                        3.1        Gradient Accumulation Loop
+Figure 3 gives an overview of the compilation and run-                                                Figure 4 highlights in teal the changes required to adopt
+time components of the system. The user’s specification                                               JaxPP in an existing JAX training program. The model
+of train_step differs only slightly from a standard train-                                            definition can leverage JAX’s sharding annotations as
+ing step in JAX without pipeline parallelism. Addition-                                               shown in Section 2.1. The code is updated to imple-
+ally, the code is updated to perform gradient accumulation                                            ment the gradient accumulation loop over the micro-
+over the microbatches with accumulate_grads (L14) and the                                             batches with accumulate_grads (Section 3.1). The argument
+model is annotated with auto-differentiable pipeline_yield                                            to accumulate_grads is a function (microbatch_grads) that
+calls marking the end of the current stage (L9, L11). The                                             given one microbatch produces the gradients and additional
+distributed function traces the auto-differentiated training                                          metrics of that microbatch. Semantically accumulate_grads
+step into an intermediate representation called Jaxpr,1 which                                         will call microbatch_grads on each microbatch in batch and
+is transformed and split into multiple tasks by the driver pro-                                       sum the gradients and collect the loss from each iteration,
+cess. These tasks are then lowered and sent to the respective                                         equivalently to the code below.
+SPMD actors as specified by the schedule to be compiled                                            1 grads = zeros_like(state.params)
+and run on the remote devices. The remote devices are al-                                          2 loss = []
+located by the driver process by instantiating a RemoteMesh.                                       3 for i in range(batch.shape):
+In the example displayed, 3 SPMD actors are provisioned,                                           4 mugrads, muloss = microbatch_grads(batch[i])
+                                                                                                   5 grads += mugrads
+each with 4 devices configured in a SPMD mesh shape
+                                                                                                   6 loss.append(muloss)
+of (2, 2). JaxPP attempts to group devices so that those
+assigned to an SPMD actor are connected through a high-                                               The API is configured by default to implement the addi-
+bandwidth interconnect. Each task is lowered and compiled                                             tion and concatenation operator on each iteration’s output
+by XLA, leading to the same exact SPMD parallelization                                                with the loop state. Internally, the API lowers to a proper
+strategy the user would expect as described in Section 2.1                                            structured “for loop” with an explicit state that is updated in
+within each task. JaxPP infers tasks for all communication                                            the loop body. This API restriction is intentional to ensure
+    1                                                                                                 that the provided loop body does not create dependencies
+        https://jax.readthedocs.io/en/latest/jaxpr.html
+                                                                                                      between earlier stages of the current iteration of the loop
+                                 Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+  with later stages of the previous iteration.                                                         @task
+                                                                                                       def s0(a, b):
+  During compilation the gradient accumulation loop is “un-                                               z = ...
+  rolled” into a task graph that is then scheduled and run on                                             x = a + b * z
+                                                                 z = ...
+  the remote devices.                                                                                     return (z, x)
+                                                                 x = a + b * z
+                                                                 y = c + d * z
+                                                                                                       @task
+ 1 @shard( () , ("emb", "mlp"), ("mlp", "emb"), ())              x = pipeline_yield(x, ’s0’)
+                                                                                                       def s1(c, d, z):
+ 2 def ffn(X , W (1) , W (2) ):                                  y = pipeline_yield(y, ’s1’)
+                                                                                                          y = c + d * z
+                                                                 w = y + 1
+ 3 H (1) = self.act(XW (1) )                                                                              w = y + 1
+                                                                 ...
+ 4 H (1) = shard(H (1) , ("batch", "mlp"))                                                                return w
+                                                                 return x, w, z ...
+ 5 A(1) = jaxpp.pipeline_yield(H (1) )
+                                                                                                       z, x = s0(a, b)
+ 6 H (2) = A(1) W (2)                                                                                  w = s1(c, d, z)
+ 7 return shard(H (2) , ("batch", "emb"))                                                              ...
+ 8
+ 9 def loss_fn(...):                                             Figure 5. Program using pipeline_yield (left) and stages inferred
+10 # calls ffn                                                   by JaxPP (right)
+11 ...
+12
+13 model, lr_scheduler, state = ...                              two stages using pipeline_yield and the resulting stages
+14                                                               inferred by JaxPP. Semantically, pipeline_yield returns the
+15 def train_step(state, batch):
+                                                                 argument(s) as result(s) and is only a marker for JaxPP to
+16 def microbatch_grads(mubatch):
+17     # mubatch.shape=rest                                      infer corresponding stages.
+18     muloss, mugrads = jax.value_and_grad(loss_fn)(
+                                                                 The key idea is that stages are defined purely by their data
+19       state.params, mubatch
+20     )                                                         dependencies: y’s computation is scheduled in s1 although
+21     # muloss.shape=()                                         its definition appears earlier than the first pipeline_yield
+22     return mugrads, muloss                                    in the initial program; z is defined on the stage that uses it
+23     #      +         ∥                                        first (s0), then it’s returned and passed as an argument to s1.
+24
+                                                                 We highlight that pipeline_yield does not necessarily mark
+25 schedule = _1F1B(stages=2)
+26                                                               the outputs of a stage, but only an approximate definition
+27 # batch.shape=(n_mbs, *rest)                                  of a stage’s end. The computation of w is placed in stage
+28 grads, loss = (                                               s1 as it depends on y, which is placed in s1, and doesn’t
+29     jaxpp.accumulate_grads(microbatch_grads, schedule)        define any computation passed to another pipeline_yield.
+30       (batch)
+                                                                 To schedule two independent computations such as the ones
+31 )
+32 # loss.shape = (n_mbs,)                                       for x and y, in the same stage, it’s sufficient to perform
+33 new_state = state.apply_gradients(grads=grads)                x, y = pipeline_yield(x, y).
+34
+35 return new_state, loss                                        Users can forego the use of pipeline_yield and define stages
+36                                                               equivalently as separate functions, writing directly the code
+37 mesh = RemoteMesh((2,), spmd_mesh=(2, 2))                     shown in Figure 5 (right). JaxPP might include other compu-
+38 jit_train_step = mesh.distributed(                            tations on such stages as deemed ideal for performance. For
+39 train_step,
+                                                                 example, in the presence of residual connections, gradient
+40 in_shardings=(state_sharding, batch_sharding),
+41 out_shardings=(state_sharding, None)                          merging operations produced by auto-differentiation will be
+42 )                                                             fused into the task that produces the latest operand.
+43
+44 for batch in dataset:                                         We’ve found that the dependency-based definition of stages
+45 state, loss = jit_train_step(state, batch)                    through pipeline_yield is less disruptive when incorporat-
+                                                                 ing JaxPP into existing codebases as it does not require
+                 Figure 4. Training loop in JaxPP                refactoring model code into separate functions.
+                                                                 Both task and pipeline_yield are trivially auto-
+  3.2   Stage Marking                                            differentiable and compose with many other JAX
+                                                                 transformations such as vmap. This enables using different
+  An operation like a, b = pipeline_yield(a, b, name=’s0’)
+                                                                 rematerialization strategies for specific subcomputations or
+  defines a corresponding “logical stage” (e.g., named com-
+                                                                 stages exactly as done in JAX2 and shown below.
+  putation), comprising of all the computations that the argu-
+  ments (a and b) depend on and that have not been sched-           2
+                                                                      https://docs.jax.dev/en/latest/jep/11830-new-remat-
+  uled in any other stage. Figure 5 shows a snippet defining     checkpoint.html#user-customizable-rematerialization-policies
+                               Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+1 def layer(...): ...                                            tion.    This corresponds to the following rewrite rule.
+2 ...
+3                                                                              #microbatches
+                                                                                   X                                    
+                                                                                                 (i)        (i)
+4 for W, policy in [(W1, p1) , (W2, p2)]:                                 g=                 g1 + g2 + . . .
+5 # JAX rematerialization API                                                     i=1
+6 h = jax.checkpoint(layer, policy)(W, h)                                        #microbatches
+                                                                                                        !         #microbatches
+                                                                                                                                         !
+7 h = pipeline_yield(h)
+                                                                                     X            (i)
+                                                                                                                      X            (i)
+                                                                           ⇝                     g1         +                     g2         + ...
+                                                                                     i=1                              i=1
+
+
+
+ 3.3   Placement Inference                                       4       S CHEDULING AND RUNTIME
+ Given the pipeline_yield annotations and the accumulation       In the previous section we introduced key Jaxpr transfor-
+ loop, JaxPP automatically infers data placement for inputs      mations and user functions in JaxPP. We now describe the
+ and outputs of the train_step function.                         runtime architecture and how tasks are dispatched.
+ In order for pipeline parallelism to work efficiently we have
+ to ensure that each computation is scheduled at the right       4.1     Architecture
+ pipeline execution unit where the data are “pinned” while at    The user program containing the code for training is run in
+ the same time minimizing communication across actors. We        a single Python process, we call driver or controller, on a
+ assume that the loop schedule maps backward computations        host possibly co-located in the datacenter where training
+ to the same actor of the corresponding forward computation.     nodes reside. The controller is responsible for the tracing
+ For example if weights W1 and W2 are placed on a specific       and transformations described in the previous section. Ad-
+ actor then all the computation corresponding to the back-       ditionally the controller allocates stateful actors managing
+ ward computation for the gradients of W1 and W2 must be         one or multiple devices possibly spanning multiple hosts.
+ scheduled on the same actor.                                    We use Ray (Moritz et al., 2018) for Remote Procedure
+ We use the following propagation heuristic to schedule          Calls (RPCs) and orchestrating worker processes running
+ operations on a task. First, a task is formed for each          XLA computations. We implement a custom on-device ob-
+ pipeline_yield operation, comprising of all computations it     ject store on each actor for storing sharded device buffers.
+ depends on. Then the remaining computations that are not        Communication is handled using NCCL P2P operations.
+ dependencies of any pipeline_yield operation are placed
+ on the same task of their operands or a new task. In the        4.1.1    Single-Controller MPMD
+ loop body we do not allow any computation replication,          Using a single-controller model is not strictly necessary
+ and instead each operation can be assigned to only one task.    for an MPMD implementation of pipeline parallelism, but
+ This step also infers the placement of inputs and outputs of    it offers several key benefits, such as easier scaling and
+ the accumulate_grads loop.                                      reduced code complexity. In contrast, a multi-controller
+ Then input placement is propagated to the computation pre-      approach can be implemented by replicating the controller
+ ceding the pipeline loop, potentially replicating computation   logic across all processes, allowing each process to gen-
+ and ensuring that the inferred placement does not overwrite     erate its own local tasks. However, this method requires
+ the current placement and similarly loop output placement       users to carefully manage code sections that need to run
+ are propagated to the computation after the loop.               in a single-threaded context and manually dispatch pro-
+                                                                 cesses to ensure correct placement—for example, keeping
+ 3.4   Weight Sharing and Gradient Accumulation                  model-parallel groups on the same host while distributing
+                                                                 pipeline-parallel groups across different hosts. With a single-
+ In the presence of weight sharing where the same weight         controller model, users can scale from a single-device setup
+ is used across multiple stages as with tied embeddings in       to multiple devices across hosts with minimal code changes.
+ Transformer models, multiple partial gradients are computed     The primary effort involves annotating the training step func-
+ from each use which are then added to form the full gradient,   tion, simplifying the transition without extensive rewrites.
+ e.g., g = ((g1 + g2 ) + g3 ) + . . . . A naive scheduling of
+ such operations would lead to sends and receives of multiple    4.2     Task Scheduling
+ partial gradients which, for embedding tables, can easily
+ consist of several Gigabytes of data.                           A user can specify a loop schedule declaratively by
+                                                                 providing a list of tasks for each actor describing the
+ JaxPP implements a loop commuting pass which                    iteration of the loop run, its type (forward or backward) and
+ substitutes the carried state of the cumulative to-             the stage index. This is shown in the listing below.
+ tal gradient g with a carried state of the partial
+ gradients g1 , g2 , g3 , . . . and a final addition opera-
+                                                      Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+ 1[
+ 2 [ # actor_1                                                                                                           Train GPT-3 175B, TP=8 x PP=8 H100, global batch size 128
+ 3   Task(i=0, ty=’fwd’, stage=0),                                                                                 450
+ 4   Task(i=1, ty=’fwd’, stage=0),                                                                                 425
+ 5   Task(i=0, ty=’fwd’, stage=2), ...
+ 6 ],                                                                                                              400
+
+
+
+
+                                                                                                 TFLOPS / device
+ 7 [ # actor_2                                                                                                     375
+ 8   Task(i=0, ty=’fwd’, stage=1),
+                                                                                                                   350
+ 9   Task(i=1, ty=’fwd’, stage=1),
+10   Task(i=0, ty=’fwd’, stage=3), ...                                                                             325
+11 ],                                                                                                              300         MBS-GA
+12 ]                                                                                                                              1-128
+                                                                                                                   275            2- 64
+                                                                                                                                  4- 32
+                                                                                                                   250
+  JaxPP builds a task graph based on task placement and task                                                               1     2      3         6        8                  12
+                                                                                                                        Circular Repeat Size
+  dependencies to then infer allocation, send, and receive op-                               Figure 7. Performance of GPT-3 175B training on 64 GPUs with
+  erations. Care has to be taken when generating the local                                   global batch size of 128 instances across various configurations
+  task schedule for each actor, especially in the generation                                 for interleaving/circular repeat and microbatch size.
+  of send and receive operations. This is because commu-
+  nication primitives, although asynchronous, still require
+  send and receive operations to have matching receive and
+  send operations in the same order respectively among the                                   4.4                   Task fusion
+  communicating processes to prevent potential deadlocks.                                    A direct implementation of task dispatch on the driver would
+  Therefore, simply iterating over each local task of an actor                               perform a separate remote procedure call. Multiple round
+  and performing receive operations for the non-local task                                   trips of “control” would lead to poor utilization, especially
+  operands, executing the task and sending the results im-                                   when running in a loop. The distributed annotation fuses
+  mediately as shown in Figure 6 can potentially result in                                   all task dispatches into a single RPC call per actor. All the
+  deadlock.                                                                                  coordination between multiple actor is resolved by send and
+                                          2
+         Actor 2 schedule                     f2(3)           b2(2)                          receive dependencies only.
+
+                                     1
+         Actor 3 schedule                b3(2)             f3(3)                             5             E VALUATION
+                                                                        Potential Deadlock
+         Actor 2 inferred tasks: [..., f2(3), send(to=3), recv(from=3), b2(2), ...]
+         Actor 3 inferred tasks: [ ..., b3(2), send(to=2), recv(from=2), f3(3), ...]         In this section, we analyze important performance character-
+         Actor 2 inferred tasks: [..., recv(from=3), f2(3), send(to=3), b2(2), ...]
+                                                                                             istics of pipeline parallelism as implemented in JaxPP (Sec-
+         Actor 3 inferred tasks: [ ..., b3(2), send(to=2), recv(from=2), f3(3), ...]         tion 5.1) and evaluate the performance gains achieved by
+  Figure 6. Inference of send and receive operations based on uses                           JaxPP in comparison to other systems that support large
+  and definitions in the task graph.                                                         language model training with various parallelism strate-
+                                                                                             gies (Section 5.2). We conducted our experiments on
+  Instead, JaxPP iterates over the tasks in their topological
+                                                                                             NVIDIA EOS cluster (eos, 2024) which is equipped with
+  order and schedules asynchronous send and receive pairs im-
+                                                                                             NVIDIA DGX H100 with the InfiniBand NDR400 intercon-
+  mediately after the corresponding task has produced the data
+                                                                                             nect. Each node consists of 8 H100 GPUs, each with 80 GB
+  to be communicated. In the example above, after scheduling
+                                                                                             of memory. We evaluate JaxPP on the training of GPT-3
+  b3 on actor numbered 3, JaxPP immediately schedules a
+                                                                                             175B (Brown et al., 2020) and Llama2 70B (Touvron et al.,
+  send and the corresponding receive on the receiving actor.
+                                                                                             2023) at BF16 precision.
+  Since receive operations are asynchronous, the computation
+  of task f2(3) is overlapped with the potential prefetching of
+                                                                                             5.1                   Performance Characteristics
+  the data from actor 3 which is used only later in task b2(2).
+                                                                                             In this section, we discuss the performance characteristics
+  4.3   Buffer Deletion                                                                      of JaxPP for specific configurations, relating them to the
+                                                                                             design of the system and its potential overheads.
+  After generating the local task schedule for each actor, a
+  buffer liveness pass inserts deletion operations for interme-
+                                                                                             5.1.1                   Interleaving and Dispatch Overhead
+  diate buffer. A buffer that is sent to an actor is tentatively
+  deleted if the corresponding send operation has completed,                                 An important distinction of JaxPP over other plain JAX
+  otherwise it is tracked into a “pending deletions” queue for                               implementations is that JaxPP splits the training step com-
+  later reclamation. Each scheduled deletion operation checks                                putation into multiple XLA SPMD tasks, e.g., forward and
+  this queue and deletes previously pending deletions.                                       backward computations for each stage. This is necessary to
+                                                       Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+
+                           Train GPT-3 175B, TP=8 x PP=8 H100, Circular Repeat Size 6                              Train GPT-3 175B, H100, global batch size = 2 * #GPUs
+                                                                                                             600
+                                                                                                                                                                JAX FSDP
+                                                                                                                                                                JaxPP
+                     400                                                                                     500
+
+                                                                                                             400
+                     300
+   TFLOPS / device
+
+
+
+
+                                                                                           TFLOPS / device
+                                                                                                             300
+                     200
+                                                                                                             200
+                              MBS
+                     100          1                                                                          100
+                                  2
+                                  4
+                       0                                                                                       0
+                             23       24      25      26       27       28      29                                    128           256           512           1024
+                        Number of Microbatches                                                                       #GPUs
+Figure 8. Performance of GPT-3 175B training on 64 GPUs with                            Figure 9. JaxPP’s weak scaling in comparison to a highly opti-
+circular repeat size of 6 and various combinations of gradient                          mized JAX FSDP implementation.
+accumulations and microbatch sizes.
+                                                                                        5.1.3                  Scalability
+
+implement the various pipeline schedules. However, it can                               In order to test the scalability of JaxPP, we conducted weak
+incur dispatch overheads. Such overheads can especially                                 scaling experiments on the GPT-3 175B model by increas-
+be exacerbated when using configurations that try to reduce                             ing the global batch sizes linearly from 128 to 2048, with
+pipeline bubbles, such as: (1) slicing the dataflow graph into                          32 microbatches, doubling the number of GPUs. 4-way
+smaller stages and using interleaved schedules (Narayanan                               tensor parallelism and 2-way data parallelism was enabled
+et al., 2021) (2) slicing the batch into smaller microbatch                             within each node containing 8 GPUs, and 8-way pipeline
+sizes resulting in more microbatches.                                                   parallelism was enabled across each group of 8 nodes, using
+                                                                                        Interleaved 1F1B as the schedule and a circular repeat of
+Smaller stages as in (1) increase the number of XLA asyn-                               size 6. We instantiate a JaxPP actor per node.
+chronous dispatches which have non-negligible cost if the
+device work dispatched is too small. Smaller microbatches                               As illustrated in Figure 9, JaxPP effectively scales GPT-3
+as in (2) can lead to poorer kernel-level device utilization                            175B training from 64 to 1024 GPUs, achieving a 98.33%
+and increase the number of collectives, e.g., the kernel time                           weak scaling efficiency. This performance improves over
+t2 for one microbatch of size 2 can be smaller than kernel                              the 93.97% efficiency demonstrated by a highly optimized
+time for 2 microbatches of size 1 each taking t1 (t2 < 2t1 ).                           system utilizing Fully-Sharded Data Parallelism (FSDP)
+                                                                                        with JAX. JaxPP exceeds the scaling efficiency of JAX
+Figure 7 explores this tradeoff. As shown in the picture                                FSDP while also delivering higher throughput and lower
+increasing the number of circular repeats of stages, leading                            end-to-end latency.
+to smaller tasks, improves for all cases up to the point when
+the tasks become too small and XLA dispatch overheads
+                                                                                        5.2                  Training Performance
+emerge and P2P latencies start becoming non-negligible.
+Increasing the microbatch size increases the bubble time but                            In this section, we compare the performance of model train-
+at the same time reduces the number of collectives per loop                             ing in JaxPP against the SPMD-based pipeline parallelism
+iteration, overall improving performance.                                               solution in JAX and the state-of-the-art implementation
+                                                                                        found in NeMo (Harper et al.). This comparison aims to
+5.1.2                  Utilization Tradeoff                                             validate our claim that JaxPP overcomes the limitations of
+                                                                                        SPMD-based pipeline parallelism without compromising
+Given a model size and a pipeline parallel configuration,
+                                                                                        performance. Additionally, we discuss how JaxPP achieves
+it is possible to increase the overall global batch size ei-
+                                                                                        performance gains in certain scenarios and explore potential
+ther by accumulating over more microbatches or scaling
+                                                                                        avenues for further improving its performance.
+in purely data-parallel fashion. Increasing the number of
+microbatches is beneficial to minimize the pipeline bubble.                             As depicted in Figure 10, when training GPT-3 175B on 16
+However, given a fixed target number of tokens to train on, it                          DGX H100 nodes (128 GPUs), JaxPP is 51.2% faster than
+increases end-to-end training time since more work is done                              SPMD pipeline parallelism, achieving 478 TFLOPS/device,
+iteratively instead of being parallelized. At the same time,                            while being more expressive and requiring 1K fewer lines
+scaling DP at low utilization is not cost effective. Figure 8                           of user code. Moreover, JaxPP improves throughput by
+shows the utilization achieved by JaxPP at different numbers                            1.16× over JAX’s FSDP. JaxPP achieves 95.6% through-
+of microbatches for multiple microbatch sizes.                                          put of NeMo’s pipeline parallelism while being entirely
+                               Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+model-agnostic. The comparison is similar when training           XLA’s compiler, making JaxPP a more general approach to
+Llama2 70B on 8 DGX H100 nodes (64 GPUs), demon-                  pipelining arbitrary computations.
+strating JaxPP effectiveness at smaller scales. JaxPP uses
+                                                                                                           Training performance comparison
+upstream JAX and XLA with no custom kernels except for
+the attention APIs from cuDNN (Chetlur et al., 2014).                                                500
+
+
+5.2.1   Pipeline Parallelism and FSDP                                                                400
+
+
+
+
+                                                                                   TFLOPS / device
+Now that we’ve shown that PP improves performance over                                               300                                             Framework
+FSDP and JaxPP considerably simplifies the adoption of PP,                                                                                            JAX SPMD PP
+                                                                                                                                                      JAX FSDP
+we describe the relation between FSDP and PP.                                                        200                                              JaxPP
+                                                                                                                                                      NeMo
+One limiting factor of pure FSDP is that when scaling on                                             100
+a large number of GPUs, the batch size for training has to
+scale proportionally (e.g., 8, 192 · k, k ∈ N for scaling to                                           0
+                                                                                                            GPT-3 175B          Llama2 70B
+8, 192 GPUs). This has been described in detail by Lamy-                                                     GBS=256             GBS=128
+                                                                                                            #GPUs=128           #GPUs=64
+Poirier (2022). Therefore FSDP is usually combined with                                                    SeqLen=2048         SeqLen=4096
+other parallelization strategies such as TP and others, which     Figure 10. Performance comparison between SPMD pipeline par-
+partition activation dimensions other than the batch one.         allelism, JaxPP, and NeMo on GPT-3 175B and Llama2 70B.
+However, depending on the parallelization strategy, overlap-
+ping multiple collectives can prove difficult.
+                                                                  5.3                Performance Breakdown
+Pure FSDP is not usually combined with PP. However,
+FSDP-like behavior can be used to enhance PP. For example,        To understand the sources of performance gains achieved by
+the optimizer state and weights can be sharded across all         JaxPP over SPMD pipeline parallelism on GPT-3 175B, we
+processes. Before the pipeline loop, weights are cast to the      present Figure 11. The most significant factor is the rema-
+corresponding datatype and an all-gather is performed to          terialization cost. SPMD pipeline parallelism employs the
+materialize the weights on each device. During the loop           GPipe schedule, which has high memory demands, whereas
+iterations, weights and gradients are partially replicated over   JaxPP utilizes the Interleaved 1F1B schedule, which re-
+the data-parallel dimension. At the end of the gradient accu-     quires less memory. This difference impacts the need for
+mulation loop, gradients are reduce-scattered to obtain the       rematerialization, subsequently affecting the overall training
+full gradients and the optimizer state and parameter shards       step time by ≈ 20%. Additionally, JaxPP further reduces
+are updated.                                                      overhead by overlapping point-to-point send and receive
+                                                                  operations, in contrast to their synchronous counterpart.
+Finally, PP is beneficial also in cases where the amount of
+GPUs is limited, but we’d like to train on a large batch size
+(e.g., 64 GPUs and GBS = 1024). By accumulating the
+                                                                  6            R ELATED W ORK
+gradients over multiple microbatches, it’s possible to train      There are numerous works to facilitate scaling the training
+over a larger effective batch size while keeping the memory       of large models (Shoeybi et al., 2020; Rasley et al., 2020;
+footprint constant.
+
+5.2.2   Comparison to NeMo                                                                                 GPT-3 175B training step time breakdown
+                                                                                              14                                      P2P
+Most parts of the parallelization configuration between                                                                               Rematerialization
+NeMo and JaxPP are similar, differing in the following                                        12                                      Compute+Collectives
+ways: (1) NeMo uses tensor sequence parallelism (Kor-                                         10
+                                                                        train step time (s)
+
+
+
+
+thikanti et al., 2023) for normalization layers while JaxPP
+shards the activation dimension. (2) NeMo uses “Async TP”                                      8
+(Collective Matmul) (Wang et al., 2022). A more important                                      6
+distinction between the two is that NeMo is a collection
+                                                                                               4
+of high-performance model implementations while JaxPP,
+by building on top of JAX and XLA, comprises of a set of                                       2
+compiler transformations and runtime for general Linear                                        0
+Algebra programs. Therefore, in JaxPP, many optimiza-                                                      JAX SPMD PP                    JaxPP
+tions such as overlapping computation with communication,         Figure 11. Overhead of JAX SPMD PP compared to JaxPP. Re-
+general scheduling, and fusion of operations are handled by       materialization cost and asynchronous point-to-point send and
+                                                                  receive operations account for the majority of the performance
+                                                                  differences.
+                                Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+                 System        GBS      GA     GPUs     PP    TP     DP    FSDP      Step Time (s)    TFLOPS / device
+                                          GPT-3 175B — BF16 — Sequence Length 2048
+                               256      32    128     8   8     2     1          9.22                        478
+                               512      32    256     8   8     4     1          9.24                        477
+                 JaxPP         1024     32     512    8   8     8     1          9.32                        473
+                               2048     32    1024    8   8    16     1          9.37                        470
+                               256       1    128     1   1     1    128        10.70                        412
+                               512       1    256     1   1     2    128        10.91                        404
+               JAX FSDP        1024      1     512    1   1     4    128        11.01                        400
+                               2048      1    1024    1   1     8    128        11.30                        390
+             JAX SPMD PP        256     128    128   16   4     2     1         13.96                        316
+                NeMo           256      64    128     8   4     4     1          8.82                        500
+                                          Llama2 70B — BF16 — Sequence Length 4096
+                 JaxPP          128     16     64     4   8     2     1          7.42                        490
+               JAX FSDP         128      1     64     1   1     1     64         8.44                        431
+                 NeMo           128     32     64     4   4     4     1          7.02                        519
+
+Table 1. Training performance of JaxPP, JAX FSDP, JAX SPMD PP, and NeMo with GPT-3 175B and Llama2 70B. Different systems
+may use different combinations of various parallelism strategies based on their resource requirements and performance characteristics.
+
+Liang et al., 2024; Jiang et al., 2024). Here we discuss             7    C ONCLUSION AND F UTURE W ORK
+systems that are closest to JaxPP and explain key design
+differences.                                                         We presented JaxPP, a system for implementing and ef-
+                                                                     ficiently running distributed dataflow computations. By
+Alpa (Zheng et al., 2022) is a system for parallelizing large        extending the SPMD programming model of JAX with tem-
+deep learning models, supporting pipeline parallelism. Sim-          poral parallelism, we showed that JaxPP provides a flexible
+ilarly to JaxPP, Alpa implements an MPMD runtime on                  environment for easily scaling training of deep learning
+top of JAX/XLA and orchestrates the execution of SPMD                models with pipeline parallelism. While the implementation
+tasks. Nonetheless, Alpa’s main focus is automatically in-           presented here builds on top of JAX and XLA, the same core
+ferring the best optimal parallel strategy with respect to a         ideas can be leveraged to implement similar transformations
+cost model. JaxPP differs from Alpa in the following ways:           as an MLIR (Lattner et al., 2021) dialect and build a MPMD
+it focuses on providing a flexible interface to let the users        runtime on other technologies.
+control parallelism instead of automating parallelism, no
+different from sharding annotations, greatly reducing com-
+pilation time; it does not fork JAX or XLA; it supports
+                                                                     ACKNOWLEDGEMENTS
+user-extensible stage execution mapping such as Interleaved          We would like to acknowledge the helpful feedback and
+1F1B (Narayanan et al., 2021).                                       shepherding provided by our reviewers, which significantly
+Pathways (Barham et al., 2022) is a single-controller dis-           improved our presentation. We extend our gratitude to
+tributed dataflow runtime for machine learning workloads.            Jonathan Dekhtiar, Nitin Nitin, Abhinav Goel, and Haixin
+While some implementation details such as parallel dis-              Liu for their invaluable and continuous feedback. We’re
+patch and MPMD support are shared between Pathways and               thankful to Oren Leung for his contributions in the initial de-
+JaxPP, Pathways is fine-tuned to time sharing and multiplex-         sign and prototype of JaxPP. Our thanks also go to Sangkug
+ing tasks, while JaxPP focuses on long-running training jobs,        Lym, Tejash Shah, and Santosh Bhavani for their assistance
+where resources such as memory, GPU, and interconnect                in evaluating JaxPP. Finally, we are grateful to Shriram
+bandwidth are fully allocated to the training job.                   Janardhan, Jeremy Wilke, Deepak Narayanan, and Georg
+                                                                     Stefan Schmid for their insightful and thought-provoking
+Finally, many recent works have proposed novel pipeline              discussions.
+schedules for specific scenarios and new applications (Lamy-
+Poirier, 2022; Huang et al., 2024; Lin et al., 2024; Qi et al.,
+2024). Although we focused on practical applications of
+                                                                     R EFERENCES
+traditional schedules, JaxPP has all the features needed to          EOS NVIDIA DGX SuperPod - NVIDIA DGX H100,
+support these novel schedules.                                         2024. URL https://www.top500.org/system/
+                                                                      180239.
+                                                                     Alabed, S., Chrzaszcz, B., Franco, J., Grewe, D., Maclaurin,
+                                                                       D., Molloy, J., Natan, T., Norman, T., Pan, X., Paszke, A.,
+                                                                       Rink, N. A., Schaarschmidt, M., Sitdikov, T., Swietlik, A.,
+                              Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+  Vytiniotis, D., and Wee, J. PartIR: Composing SPMD Par-        Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn,
+  titioning Strategies for Machine Learning, January 2024.         D., Zhai, X., Unterthiner, T., Dehghani, M., Minderer,
+  URL http://arxiv.org/abs/2401.11202.                             M., Heigold, G., Gelly, S., Uszkoreit, J., and Houlsby,
+                                                                   N. An Image is Worth 16x16 Words: Transformers for
+Barham, P., Chowdhery, A., Dean, J., Ghemawat, S., Hand,           Image Recognition at Scale. In 9th International Con-
+  S., Hurt, D., Isard, M., Lim, H., Pang, R., Roy, S.,             ference on Learning Representations, ICLR 2021, Vir-
+  Saeta, B., Schuh, P., Sepassi, R., Shafey, L. E., Thekkath,      tual Event, Austria, May 3-7, 2021. OpenReview.net,
+  C. A., and Wu, Y. Pathways: Asynchronous Distributed             2021. URL https://openreview.net/forum?
+  Dataflow for ML. In Proceedings of Machine Learning              id=YicbFdNTTy.
+  and Systems 2022, MLSys 2022, Santa Clara, CA, USA,
+  August 29 - September 1, 2022, 2022.
+                                                                 Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A.,
+Bradbury, J., Frostig, R., Hawkins, P., Johnson, M. J., Leary,     Letman, A., Mathur, A., Schelten, A., Yang, A., Fan, A.,
+  C., Maclaurin, D., Necula, G., Paszke, A., VanderPlas, J.,       Goyal, A., Hartshorn, A., Yang, A., Mitra, A., Sravanku-
+  Wanderman-Milne, S., and Zhang, Q. JAX: Composable               mar, A., Korenev, A., Hinsvark, A., Rao, A., Zhang, A.,
+  transformations of Python+NumPy programs, 2018. URL              Rodriguez, A., Gregerson, A., Spataru, A., Roziere, B.,
+  http://github.com/google/jax.                                    Biron, B., Tang, B., Chern, B., Caucheteux, C., Nayak,
+                                                                   C., Bi, C., Marra, C., McConnell, C., Keller, C., Touret,
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,        C., Wu, C., Wong, C., Ferrer, C. C., Nikolaidis, C., Al-
+  Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,            lonsius, D., Song, D., Pintz, D., Livshits, D., Esiobu, D.,
+  Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G.,          Choudhary, D., Mahajan, D., Garcia-Olano, D., Perino,
+  Henighan, T., Child, R., Ramesh, A., Ziegler, D., Wu, J.,        D., Hupkes, D., Lakomkin, E., AlBadawy, E., Lobanova,
+  Winter, C., Hesse, C., Chen, M., Sigler, E., Litwin, M.,         E., Dinan, E., Smith, E. M., Radenovic, F., Zhang, F., Syn-
+  Gray, S., Chess, B., Clark, J., Berner, C., McCandlish,          naeve, G., Lee, G., Anderson, G. L., Nail, G., Mialon, G.,
+  S., Radford, A., Sutskever, I., and Amodei, D. Language          Pang, G., Cucurell, G., Nguyen, H., Korevaar, H., Xu, H.,
+  Models are Few-Shot Learners. In Advances in Neural              Touvron, H., Zarov, I., Ibarra, I. A., Kloumann, I., Misra,
+  Information Processing Systems, volume 33, pp. 1877–             I., Evtimov, I., Copet, J., Lee, J., Geffert, J., Vranes,
+  1901. Curran Associates, Inc., 2020.                             J., Park, J., Mahadeokar, J., Shah, J., van der Linde, J.,
+                                                                   Billock, J., Hong, J., Lee, J., Fu, J., Chi, J., Huang, J.,
+Chen, T., Xu, B., Zhang, C., and Guestrin, C. Train-
+                                                                   Liu, J., Wang, J., Yu, J., Bitton, J., Spisak, J., Park, J.,
+  ing deep nets with sublinear memory cost. CoRR,
+                                                                   Rocca, J., Johnstun, J., Saxe, J., Jia, J., Alwala, K. V.,
+  abs/1604.06174, 2016. URL http://arxiv.org/
+                                                                   Upasani, K., Plawiak, K., Li, K., Heafield, K., Stone, K.,
+  abs/1604.06174.
+                                                                   El-Arini, K., Iyer, K., Malik, K., Chiu, K., Bhalla, K.,
+Chetlur, S., Woolley, C., Vandermersch, P., Cohen, J., Tran,       Rantala-Yeary, L., van der Maaten, L., Chen, L., Tan, L.,
+  J., Catanzaro, B., and Shelhamer, E. cudnn: Efficient            Jenkins, L., Martin, L., Madaan, L., Malo, L., Blecher, L.,
+  primitives for deep learning, 2014. URL https://                 Landzaat, L., de Oliveira, L., Muzzi, M., Pasupuleti, M.,
+  arxiv.org/abs/1410.0759.                                         Singh, M., Paluri, M., Kardas, M., Oldham, M., Rita, M.,
+                                                                   Pavlova, M., Kambadur, M., Lewis, M., Si, M., Singh,
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,          M. K., Hassan, M., Goyal, N., Torabi, N., Bashlykov, N.,
+  G., Roberts, A., Barham, P., Chung, H. W., Sutton,               Bogoychev, N., Chatterji, N., Duchenne, O., Çelebi, O.,
+  C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko,             Alrassy, P., Zhang, P., Li, P., Vasic, P., Weng, P., Bhargava,
+  S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer,           P., Dubal, P., Krishnan, P., Koura, P. S., Xu, P., He, Q.,
+  N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B.,           Dong, Q., Srinivasan, R., Ganapathy, R., Calderer, R.,
+  Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari,          Cabral, R. S., Stojnic, R., Raileanu, R., Girdhar, R., Patel,
+  G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S., Dev,          R., Sauvestre, R., Polidoro, R., Sumbaly, R., Taylor, R.,
+  S., Michalewski, H., Garcia, X., Misra, V., Robinson,            Silva, R., Hou, R., Wang, R., Hosseini, S., Chennabas-
+  K., Fedus, L., Zhou, D., Ippolito, D., Luan, D., Lim,            appa, S., Singh, S., Bell, S., Kim, S. S., Edunov, S., Nie,
+  H., Zoph, B., Spiridonov, A., Sepassi, R., Dohan, D.,            S., Narang, S., Raparthy, S., Shen, S., Wan, S., Bhosale,
+  Agrawal, S., Omernick, M., Dai, A. M., Pillai, T. S., Pel-       S., Zhang, S., Vandenhende, S., Batra, S., Whitman, S.,
+  lat, M., Lewkowycz, A., Moreira, E., Child, R., Polozov,         Sootla, S., Collot, S., Gururangan, S., Borodinsky, S., Her-
+  O., Lee, K., Zhou, Z., Wang, X., Saeta, B., Diaz, M.,            man, T., Fowler, T., Sheasha, T., Georgiou, T., Scialom,
+  Firat, O., Catasta, M., Wei, J., Meier-Hellstern, K., Eck,       T., Speckbacher, T., Mihaylov, T., Xiao, T., Karn, U.,
+  D., Dean, J., Petrov, S., and Fiedel, N. PaLM: Scaling           Goswami, V., Gupta, V., Ramanathan, V., Kerkez, V.,
+  Language Modeling with Pathways, October 2022. URL               Gonguet, V., Do, V., Vogeti, V., Petrovic, V., Chu, W.,
+  http://arxiv.org/abs/2204.02311.                                 Xiong, W., Fu, W., Meers, W., Martinet, X., Wang, X.,
+                             Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+Tan, X. E., Xie, X., Jia, X., Wang, X., Goldschlag, Y.,           Lindsay, S., Lindsay, S., Feng, S., Lin, S., Zha, S. C.,
+Gaur, Y., Babaei, Y., Wen, Y., Song, Y., Zhang, Y., Li, Y.,       Shankar, S., Zhang, S., Zhang, S., Wang, S., Agarwal,
+Mao, Y., Coudert, Z. D., Yan, Z., Chen, Z., Papakipos, Z.,        S., Sajuyigbe, S., Chintala, S., Max, S., Chen, S., Kehoe,
+Singh, A., Grattafiori, A., Jain, A., Kelsey, A., Shajnfeld,      S., Satterfield, S., Govindaprasad, S., Gupta, S., Cho,
+A., Gangidi, A., Victoria, A., Goldstand, A., Menon, A.,          S., Virk, S., Subramanian, S., Choudhury, S., Goldman,
+Sharma, A., Boesenberg, A., Vaughan, A., Baevski, A.,             S., Remez, T., Glaser, T., Best, T., Kohler, T., Robinson,
+Feinstein, A., Kallet, A., Sangani, A., Yunus, A., Lupu,          T., Li, T., Zhang, T., Matthews, T., Chou, T., Shaked,
+A., Alvarado, A., Caples, A., Gu, A., Ho, A., Poulton,            T., Vontimitta, V., Ajayi, V., Montanez, V., Mohan, V.,
+A., Ryan, A., Ramchandani, A., Franco, A., Saraf, A.,             Kumar, V. S., Mangla, V., Albiero, V., Ionescu, V., Poe-
+Chowdhury, A., Gabriel, A., Bharambe, A., Eisenman, A.,           naru, V., Mihailescu, V. T., Ivanov, V., Li, W., Wang, W.,
+Yazdan, A., James, B., Maurer, B., Leonhardi, B., Huang,          Jiang, W., Bouaziz, W., Constable, W., Tang, X., Wang,
+B., Loyd, B., Paola, B. D., Paranjape, B., Liu, B., Wu, B.,       X., Wu, X., Wang, X., Xia, X., Wu, X., Gao, X., Chen,
+Ni, B., Hancock, B., Wasti, B., Spence, B., Stojkovic, B.,        Y., Hu, Y., Jia, Y., Qi, Y., Li, Y., Zhang, Y., Zhang, Y.,
+Gamido, B., Montalvo, B., Parker, C., Burton, C., Mejia,          Adi, Y., Nam, Y., Yu, Wang, Hao, Y., Qian, Y., He, Y.,
+C., Wang, C., Kim, C., Zhou, C., Hu, C., Chu, C.-H.,              Rait, Z., DeVito, Z., Rosnbrick, Z., Wen, Z., Yang, Z.,
+Cai, C., Tindal, C., Feichtenhofer, C., Civin, D., Beaty,         and Zhao, Z. The llama 3 herd of models, 2024. URL
+D., Kreymer, D., Li, D., Wyatt, D., Adkins, D., Xu, D.,           https://arxiv.org/abs/2407.21783.
+Testuggine, D., David, D., Parikh, D., Liskovich, D., Foss,
+D., Wang, D., Le, D., Holland, D., Dowling, E., Jamil,          Fedus, W., Zoph, B., and Shazeer, N. Switch Transformers:
+E., Montgomery, E., Presani, E., Hahn, E., Wood, E.,              Scaling to Trillion Parameter Models with Simple and
+Brinkman, E., Arcaute, E., Dunbar, E., Smothers, E., Sun,         Efficient Sparsity, June 2022. URL http://arxiv.
+F., Kreuk, F., Tian, F., Ozgenel, F., Caggioni, F., Guzmán,      org/abs/2101.03961.
+F., Kanayet, F., Seide, F., Florez, G. M., Schwarz, G.,
+                                                                Harper, E., Majumdar, S., Kuchaiev, O., Jason, L., Zhang,
+Badeer, G., Swee, G., Halpern, G., Thattai, G., Herman,
+                                                                 Y., Bakhturina, E., Noroozi, V., Subramanian, S., Nithin,
+G., Sizov, G., Guangyi, Zhang, Lakshminarayanan, G.,
+                                                                  K., Jocelyn, H., Jia, F., Balam, J., Yang, X., Livne, M.,
+Shojanazeri, H., Zou, H., Wang, H., Zha, H., Habeeb,
+                                                                  Dong, Y., Naren, S., and Ginsburg, B. NeMo: a toolkit
+H., Rudolph, H., Suk, H., Aspegren, H., Goldman, H.,
+                                                                  for Conversational AI and Large Language Models. URL
+Damlaj, I., Molybog, I., Tufanov, I., Veliche, I.-E., Gat,
+                                                                  https://github.com/NVIDIA/NeMo.
+I., Weissman, J., Geboski, J., Kohli, J., Asher, J., Gaya,
+J.-B., Marcus, J., Tang, J., Chan, J., Zhen, J., Reizenstein,   Hooker, S. The Hardware Lottery, September 2020. URL
+J., Teboul, J., Zhong, J., Jin, J., Yang, J., Cummings, J.,       http://arxiv.org/abs/2009.06489.
+Carvill, J., Shepard, J., McPhie, J., Torres, J., Ginsburg,
+J., Wang, J., Wu, K., U, K. H., Saxena, K., Prasad, K.,         Huang, J., Zhang, Z., Zheng, S., Qin, F., and Wang,
+Khandelwal, K., Zand, K., Matosich, K., Veeraragha-              Y. DISTMM: Accelerating distributed multimodal
+van, K., Michelena, K., Li, K., Huang, K., Chawla, K.,            model training. In 21st USENIX Symposium on Net-
+Lakhotia, K., Huang, K., Chen, L., Garg, L., A, L., Silva,        worked Systems Design and Implementation (NSDI
+L., Bell, L., Zhang, L., Guo, L., Yu, L., Moshkovich,            24), pp. 1157–1171, Santa Clara, CA, April 2024.
+L., Wehrstedt, L., Khabsa, M., Avalani, M., Bhatt, M.,            USENIX Association.      ISBN 978-1-939133-39-7.
+Tsimpoukelli, M., Mankus, M., Hasson, M., Lennie, M.,             URL https://www.usenix.org/conference/
+Reso, M., Groshev, M., Naumov, M., Lathi, M., Ke-                 nsdi24/presentation/huang.
+neally, M., Seltzer, M. L., Valko, M., Restrepo, M., Patel,
+M., Vyatskov, M., Samvelyan, M., Clark, M., Macey,              Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, D., Chen,
+M., Wang, M., Hermoso, M. J., Metanat, M., Rastegari,             M. X., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., and Chen, Z.
+M., Bansal, M., Santhanam, N., Parks, N., White, N.,              GPipe: Efficient Training of Giant Neural Networks using
+Bawa, N., Singhal, N., Egebo, N., Usunier, N., Laptev,            Pipeline Parallelism. In Wallach, H. M., Larochelle, H.,
+N. P., Dong, N., Zhang, N., Cheng, N., Chernoguz, O.,             Beygelzimer, A., d’Alché-Buc, F., Fox, E. B., and Garnett,
+Hart, O., Salpekar, O., Kalinli, O., Kent, P., Parekh, P.,        R. (eds.), Advances in Neural Information Processing
+Saab, P., Balaji, P., Rittner, P., Bontrager, P., Roux, P.,       Systems 32: Annual Conference on Neural Information
+Dollar, P., Zvyagina, P., Ratanchandani, P., Yuvraj, P.,          Processing Systems 2019, NeurIPS 2019, December 8-14,
+Liang, Q., Alao, R., Rodriguez, R., Ayub, R., Murthy,             2019, Vancouver, BC, Canada, pp. 103–112, 2019.
+R., Nayani, R., Mitra, R., Li, R., Hogan, R., Battey, R.,       Jiang, Z., Lin, H., Zhong, Y., Huang, Q., Chen, Y., Zhang,
+Wang, R., Maheswari, R., Howes, R., Rinott, R., Bondu,             Z., Peng, Y., Li, X., Xie, C., Nong, S., Jia, Y., He,
+S. J., Datta, S., Chugh, S., Hunt, S., Dhillon, S., Sidorov,       S., Chen, H., Bai, Z., Hou, Q., Yan, S., Zhou, D.,
+S., Pan, S., Verma, S., Yamamoto, S., Ramaswamy, S.,               Sheng, Y., Jiang, Z., Xu, H., Wei, H., Zhang, Z., Nie,
+                              Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+  P., Zou, L., Zhao, S., Xiang, L., Liu, Z., Li, Z., Jia,          M. I., and Stoica, I. Ray: A distributed framework
+  X., Ye, J., Jin, X., and Liu, X. Megascale: Scal-                for emerging AI applications. In 13th USENIX Sym-
+  ing large language model training to more than 10,000            posium on Operating Systems Design and Implementa-
+  gpus. In Vanbever, L. and Zhang, I. (eds.), 21st USENIX          tion (OSDI 18), pp. 561–577, Carlsbad, CA, October
+  Symposium on Networked Systems Design and Imple-                 2018. USENIX Association. ISBN 978-1-939133-08-3.
+  mentation, NSDI 2024, Santa Clara, CA, April 15-                 URL https://www.usenix.org/conference/
+  17, 2024, pp. 745–760. USENIX Association, 2024.                 osdi18/presentation/moritz.
+  URL https://www.usenix.org/conference/
+  nsdi24/presentation/jiang-ziheng.                         Narayanan, D., Harlap, A., Phanishayee, A., Seshadri,
+                                                              V., Devanur, N. R., Ganger, G. R., Gibbons, P. B.,
+Korthikanti, V. A., Casper, J., Lym, S., McAfee, L.,          and Zaharia, M. PipeDream: Generalized pipeline
+  Andersch, M., Shoeybi, M., and Catanzaro, B. Reducing       parallelism for DNN training. In Proceedings of the
+  Activation Recomputation in Large Transformer Models.       27th ACM Symposium on Operating Systems Principles,
+  Proceedings of Machine Learning and Systems, 5, March       pp. 1–15, Huntsville Ontario Canada, October 2019.
+  2023.       URL https://proceedings.mlsys.                  ACM. ISBN 978-1-4503-6873-5. doi: 10.1145/3341301.
+  org/paper_files/paper/2023/hash/                            3359646. URL https://dl.acm.org/doi/10.
+  e851ca7b43815718fbbac8afb2246bf8-Abstract-mlsys2023.        1145/3341301.3359646.
+  html.
+                                                            Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Pat-
+Lamy-Poirier, J. Breadth-First Pipeline Parallelism, Novem-   wary, M., Korthikanti, V., Vainbrand, D., Kashinkunti,
+  ber 2022. URL http://arxiv.org/abs/2211.                    P., Bernauer, J., Catanzaro, B., Phanishayee, A., and Za-
+  05953.                                                      haria, M. Efficient large-scale language model training on
+Lattner, C., Amini, M., Bondhugula, U., Cohen, A., Davis,     GPU clusters using megatron-LM. In Proceedings of the
+  A., Pienaar, J., Riddle, R., Shpeisman, T., Vasilache,      International Conference for High Performance Comput-
+  N., and Zinenko, O. Mlir: Scaling compiler infras-          ing, Networking,  Storage and Analysis, SC ’21, pp. 1–15,
+  tructure for domain specific computation. In 2021           New   York, NY,   USA,   November 2021. Association for
+  IEEE/ACM International Symposium on Code Gener-             Computing   Machinery.    ISBN 978-1-4503-8442-1. doi:
+  ation and Optimization (CGO), pp. 2–14, 2021. doi:         10.1145/3458817.3476209.        URL https://dl.acm.
+  10.1109/CGO51591.2021.9370308.                              org/doi/10.1145/3458817.3476209.
+
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y.,   Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Brad-
+  Krikun, M., Shazeer, N., and Chen, Z. GShard: Scaling            bury, J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S.,
+  Giant Models with Conditional Computation and Au-                and Dean, J. Efficiently Scaling Transformer Inference,
+  tomatic Sharding, June 2020. URL http://arxiv.                   November 2022. URL http://arxiv.org/abs/
+  org/abs/2006.16668.                                              2211.05102.
+
+Liang, W., Liu, T., Wright, L., Constable, W., Gu, A.,           Qi, P., Wan, X., Huang, G., and Lin, M. Zero bubble (almost)
+  Huang, C.-C., Zhang, I., Feng, W., Huang, H., Wang,              pipeline parallelism. In The Twelfth International Confer-
+  J., Purandare, S., Nadathur, G., and Idreos, S. Torchtitan:      ence on Learning Representations, 2024. URL https:
+  One-stop pytorch native solution for production ready            //openreview.net/forum?id=tuzTN0eIO5.
+  llm pre-training, 2024. URL https://arxiv.org/
+                                                                 Rasley, J., Rajbhandari, S., Ruwase, O., and He, Y. Deep-
+  abs/2410.06511.
+                                                                   speed: System optimizations enable training deep learn-
+Lin, Z., Miao, Y., Zhang, Q., Yang, F., Zhu, Y., Li,               ing models with over 100 billion parameters. In Pro-
+  C., Maleki, S., Cao, X., Shang, N., Yang, Y., Xu,                ceedings of the 26th ACM SIGKDD International Con-
+  W., Yang, M., Zhang, L., and Zhou, L. nnScaler:                  ference on Knowledge Discovery & Data Mining, KDD
+  Constraint-Guided parallelization plan generation for           ’20, pp. 3505–3506, New York, NY, USA, 2020. Associa-
+  deep learning training.    In 18th USENIX Sympo-                 tion for Computing Machinery. ISBN 9781450379984.
+  sium on Operating Systems Design and Implementa-                 doi: 10.1145/3394486.3406703. URL https://doi.
+  tion (OSDI 24), pp. 347–363, Santa Clara, CA, July               org/10.1145/3394486.3406703.
+  2024. USENIX Association. ISBN 978-1-939133-40-3.
+  URL https://www.usenix.org/conference/                         Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,
+  osdi24/presentation/lin-zhiqi.                                   J., and Catanzaro, B. Megatron-LM: Training Multi-
+                                                                   Billion Parameter Language Models Using Model Par-
+Moritz, P., Nishihara, R., Wang, S., Tumanov, A., Liaw,            allelism, March 2020. URL http://arxiv.org/
+ R., Liang, E., Elibol, M., Yang, Z., Paul, W., Jordan,            abs/1909.08053.
+                              Scaling Deep Learning Training with MPMD Pipeline Parallelism
+
+Smith, S., Patwary, M., Norick, B., LeGresley, P., Rajbhan-
+  dari, S., Casper, J., Liu, Z., Prabhumoye, S., Zerveas, G.,
+  Korthikanti, V., Zhang, E., Child, R., Aminabadi, R. Y.,
+  Bernauer, J., Song, X., Shoeybi, M., He, Y., Houston,
+  M., Tiwary, S., and Catanzaro, B. Using DeepSpeed and
+  Megatron to Train Megatron-Turing NLG 530B, A Large-
+  Scale Generative Language Model, February 2022. URL
+  http://arxiv.org/abs/2201.11990.
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+  A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+  Bhosale, S., Bikel, D., Blecher, L., Ferrer, C. C., Chen,
+  M., Cucurull, G., Esiobu, D., Fernandes, J., Fu, J., Fu, W.,
+  Fuller, B., Gao, C., Goswami, V., Goyal, N., Hartshorn,
+  A., Hosseini, S., Hou, R., Inan, H., Kardas, M., Kerkez,
+  V., Khabsa, M., Kloumann, I., Korenev, A., Koura, P. S.,
+  Lachaux, M.-A., Lavril, T., Lee, J., Liskovich, D., Lu, Y.,
+  Mao, Y., Martinet, X., Mihaylov, T., Mishra, P., Moly-
+  bog, I., Nie, Y., Poulton, A., Reizenstein, J., Rungta, R.,
+  Saladi, K., Schelten, A., Silva, R., Smith, E. M., Subra-
+  manian, R., Tan, X. E., Tang, B., Taylor, R., Williams,
+  A., Kuan, J. X., Xu, P., Yan, Z., Zarov, I., Zhang, Y.,
+  Fan, A., Kambadur, M., Narang, S., Rodriguez, A., Sto-
+  jnic, R., Edunov, S., and Scialom, T. Llama 2: Open
+  foundation and fine-tuned chat models, 2023. URL
+  https://arxiv.org/abs/2307.09288.
+Wang, S., Wei, J., Sabne, A., Davis, A., Ilbeyi, B., Hecht-
+ man, B., Chen, D., Murthy, K. S., Maggioni, M., Zhang,
+ Q., Kumar, S., Guo, T., Xu, Y., and Zhou, Z. Over-
+ lap Communication with Dependent Computation via
+ Decomposition in Large Deep Learning Models. In Pro-
+ ceedings of the 28th ACM International Conference on
+ Architectural Support for Programming Languages and
+ Operating Systems, Volume 1, pp. 93–106, Vancouver BC
+ Canada, December 2022. ACM. ISBN 978-1-4503-9915-
+ 9. doi: 10.1145/3567955.3567959. URL https://dl.
+ acm.org/doi/10.1145/3567955.3567959.
+Xu, Y., Lee, H., Chen, D., Hechtman, B., Huang, Y., Joshi,
+  R., Krikun, M., Lepikhin, D., Ly, A., Maggioni, M., Pang,
+  R., Shazeer, N., Wang, S., Wang, T., Wu, Y., and Chen,
+  Z. GSPMD: General and Scalable Parallelization for
+  ML Computation Graphs, December 2021. URL http:
+ //arxiv.org/abs/2105.04663.
+Zheng, L., Li, Z., Zhang, H., Zhuang, Y., Chen, Z., Huang,
+  Y., Wang, Y., Xu, Y., Zhuo, D., Xing, E. P., Gonza-
+  lez, J. E., and Stoica, I. Alpa: Automating Inter- and
+  Intra-Operator Parallelism for Distributed Deep Learning.
+  In Aguilera, M. K. and Weatherspoon, H. (eds.), 16th
+  USENIX Symposium on Operating Systems Design and
+  Implementation, OSDI 2022, Carlsbad, CA, USA, July
+  11-13, 2022, pp. 559–578. USENIX Association, 2022.
+  URL https://www.usenix.org/conference/
+  osdi22/presentation/zheng-lianmin.
+

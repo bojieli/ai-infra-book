@@ -1,0 +1,794 @@
+    P IPE F ILL : U SING GPU S D URING B UBBLES IN P IPELINE - PARALLEL LLM
+                                     T RAINING
+
+
+                 Daiyaan Arfeen 1 * Zhen Zhang 2 Xinwei Fu 2 Gregory R. Ganger 1 Yida Wang 2
+
+
+                                                        A BSTRACT
+     Training Deep Neural Networks (DNNs) with billions of parameters generally involves pipeline-parallel (PP)
+     execution. Unfortunately, PP model training can use GPUs inefficiently, especially at large scale, due to idle GPU
+     time caused by pipeline bubbles, which are often 15–30% and can exceed 60% of the training job’s GPU allocation.
+     To improve the GPU utilization of PP model training, this paper describes P IPE F ILL, which fills pipeline bubbles
+     with execution of other pending jobs. By leveraging bubble GPU time, P IPE F ILL reduces the GPU utilization
+     sacrifice associated with scaling-up of large-model training. To context-switch between fill jobs and the main
+     training job with minimal overhead to the main job, and maximize fill job efficiency, P IPE F ILL carefully fits
+     fill job work to measured bubble durations and GPU memory availability, introduces explicit pipeline-bubble
+     instructions, and orchestrates placement and execution of fill jobs in pipeline bubbles. Experiments show that
+     P IPE F ILL can increase overall utilization by up to 63% for GPUs used in large-scale LLM training, with <2%
+     slowdown of the training job, and 5–15% even for low-scale LLM training. For large-scale LLM training on 8K
+     GPUs, the 63% increase translates to up to 2.6K additional GPUs worth of work completed.
+
+1    I NTRODUCTION                                                                      50
+                                                                                        40
+                                                                           TFLOPS/GPU
+
+
+
+
+DNN models with billions of parameters have exploded in                                 30
+popularity with the emergence of generative AI applications.
+For example, popular large-language models (LLMs), such                                 20
+as GPT (3) and LLaMA (26; 27), are creating disruptive
+change in many domains. But training such models can take                               10   Traditional PP (LLM only)
+                                                                                             PipeFill (LLM + Fill Jobs)
+several weeks or months even using thousands of GPUs1 .                                 00                4K              8K
+A common approach (20; 33) of training on thousands of                                                  GPU Count
+GPUs is to employ a combination of parallelization tech-
+niques. Pipeline-parallelism (PP) (19; 9) is used to parti-       Figure 1. Scaling out training of a 40B-parameter LLM from
+tion the model across multiple nodes, creating a pipeline         1K GPUs to 8K GPUs to reduce training time from 82 days to
+of stages. The full pipeline is then replicated using data-       26 days. Traditionally, the increasing pipeline bubbles when scal-
+parallelism, allowing for parallel processing of multiple data    ing out leads to over 60% lower GPU utilization at 8K. P IPE F ILL
+                                                                  is able to fill much of that bubble GPU time with useful work, with-
+samples. Within each pipeline stage, tensor-parallelism is
+                                                                  out slowing the LLM training. Section 4 details the experimental
+applied to partition the model weights, enabling parallel         setup.
+computation. Each minibatch of data is further divided
+into smaller subsets called microbatches. The forward and         much GPU time may be wasted on pipeline bubbles.
+backward passes for each microbatch are then executed in a        Pipeline bubbles occur because the pipeline must be fully
+pipelined manner across the stages.                               drained and then restarted for each minibatch, leading to
+                                                                  idle time on each of the GPUs. The greater the paral-
+Unfortunately, such highly-parallelized training can use
+                                                                  lelization is, whether from longer pipelines (taking longer
+GPUs inefficiently especially at large scale, because too
+                                                                  to fill and drain) or more pipeline replicas (reducing the
+  *
+    Work done during internship at Amazon Web Services.           number of microbatches per replica as the global minibatch
+1
+ Carnegie Mellon University 2 Amazon Web Services. Correspon-        1
+dence to: Daiyaan Arfeen <marfeen@andrew.cmu.edu>.                    This paper uses “GPU” or “device” to refer to any computation
+                                                                  accelerator for deep learning jobs, such as GPUs, TPUs (12), or
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,   AWS Trainium (1).
+2025. Copyright 2025 by the author(s).
+size needs to be fixed), the greater the inefficiency becomes      increases the gains by ≈50%. Additional results confirm
+due to bubbles. For example, Figure 1 shows that a 40B-            that P IPE F ILL’s benefits are realized for both GPipe (9)
+parameter auto-regressive-transformer LLM, parallelized            and 1F1B (19) pipeline schedules, with moderate reduction
+over 8K GPUs achieves 60% lower TFLOPS-per-GPU than                (17%) in benefits for 1F1B at low-scale and minimal dif-
+using just 1K GPUs because of pipeline bubbles—but using           ference (< 5%) at large-scale, and show fill job efficiency
+only 1K GPUs would make LLM training take over 3×                  sensitivity to changes in bubble durations, available memory
+longer (26 days vs. 82 days; shown in Figure 5a). The over-        during bubbles, and fill-job scheduling policy.
+all consequence is a major tension between LLM training
+                                                                   Contributions. This paper makes four main contributions:
+time and GPU cluster efficiency.
+                                                                   1) It introduces the concept of filling pipeline bubbles in
+P IPE F ILL is a new GPU management system that mitigates          PP model training with execution of other ML jobs; 2) It
+this tension by filling large training jobs’ pipeline bubbles      describes a system (P IPE F ILL) that realizes this concept
+with other jobs, which we call fill jobs. The GPUs for any         and can recover idle GPU-time lost to pipeline bubbles; 3)
+given pipeline stage switch to a fill job at the start of a bub-   It introduces approaches for assigning fill jobs to pipeline
+ble and switch back at the end of that bubble. By doing so,        bubbles, and for configuring fill job execution within its
+P IPE F ILL recaptures otherwise wasted GPU time to accom-         assigned bubble, to maximize efficiency of recovered GPU
+plish pending inference and training jobs, which can enable        time; 4) It experimentally shows that P IPE F ILL can signifi-
+scaling-up large-model training with much less sacrifice in        cantly increase GPU utilization for scale-out LLM training
+GPU utilization. Figure 1 shows how, with bubble filling,          without significantly harming LLM training efficiency.
+P IPE F ILL mitigates the GPU utilization penalty as LLM
+training scales out. At 8K GPUs, for example, P IPE F ILL
+increases GPU utilization by over 45% with a mix of train-
+                                                                   2    BACKGROUND AND M OTIVATION
+ing and inference fill jobs. If using just less GPU memory         DNN training involves running variants of stochastic gradi-
+intensive batch inference jobs, the GPU utilization increase       ent descent (SGD) to optimize parameters that minimize a
+grows to 63% (see Figure 5c).                                      loss function. SGD takes a number of samples (a minibatch)
+Filling pipeline bubbles effectively requires overcoming a         from a dataset on each iterations and calculates a gradient
+number of challenges. First, fill job execution needs to be        on those samples to update the parameters. Training large
+configured to fit within bubble constraints, including bubble      DNNs consumes significant GPU memory, often surpass-
+length (to minimize inter-bubble context) and available GPU        ing the capacity of a single device, necessitating the use of
+memory. P IPE F ILL introduces a Pipeline Bubble Instruc-          partitioning strategies like tensor and pipeline parallelism,
+tion to collect bubble constraints, and a Fill Job Execution       in addition to data parallelism, to distribute the workload
+Plan Algorithm to partition a fill job into chunks prior to        across multiple devices. For training large DNNs, such as
+bubble filling as necessary. Second, the right fill jobs need      LLMs, it is common to combine all three parallelization
+to be matched to the right GPUs, given that pipeline bubbles       techniques.
+exhibits heterogeneous characteristics and users may have          Tensor parallelism (TP) spreads computation across de-
+different optimization objectives. P IPE F ILL uses a Fill Job     vices and resolves data dependencies through communica-
+Scheduler, which accepts user-defined scheduling policies.         tion operations, which introduces overhead. This approach
+Our Fill Job Scheduler orchestrates the assignment of fill         is most effective within a single node with high-bandwidth
+jobs to GPUs by synergizing the user-defined policy with           connections (e.g., NVLink) to reduce communication delays
+the characterization of the main job’s pipeline bubbles.           but limits scalability to the GPU memory available within
+Experiments (real system and simulation) confirm that              that node (20; 33).
+P IPE F ILL can recapture significant GPU utilization lost         Pipeline parallelism (PP) divides the model by layers, al-
+to pipeline bubbles, allowing huge DNNs (like LLMs) to             lowing multi-node scaling by processing microbatches (par-
+be scaled out without much lower GPU efficiency conse-             titions of a minibatch) in a pipeline. However, data de-
+quences. At each scale, aggregated TFLOPS/GPU (fill jobs           pendencies and gradient synchronizations creates pipeline
+plus LLM) is higher with P IPE F ILL, from 5–15% at (slow)         bubbles which are periods of idle time when the GPUs do
+low-scale LLM training to over 63% for scaled-out training,        not yet have work to do. For unidirectional, synchronous
+with <2% slowdown of the LLM training. Detailed analysis           pipeline schedules (such as GPipe and 1F1B), the fraction
+of different fill jobs options shows that, as expected, the        of time spent in bubbles is (p − 1)/(m + p − 1), where p
+limited memory and intermittent time available for fill job        is the number of pipeline stages, and m is the number of
+execution in bubbles reduces their efficiency differently–the      microbatches that splits from minibatch (20).
+data in Figure 1 is for a fill job mix derived from an ML job
+trace, but using just bubble-efficient batch inference jobs        Data parallelism (DP) replicates model instances across de-
+                                                                   vices, each processing a distinct partition of each minibatch.
+      A model divided into 4 pipeline stages         S1 1 2            1 2   enhances training resilience at a minimal cost by filling re-
+                                                     S2 1 2          1 2
+                                                                             dundant computations into the pipeline bubbles. However,
+                                                     S3 1 2       1 2
+                                                     S4     12 1 2           the jobs filled into the pipeline bubbles by existing works
+            S1      S2      S3       S4                                      are dependent on the training job running with PP providing
+                                                          2 micro batches
+       S1 1 2 3 4          1 2 3 4            S1 1 2          1 2            extra work, making them only applicable to specific types
+       S2 1 2 3 4        1 2 3 4    Double S2 1 2           1 2
+                                   #pipelines S3 1 2
+                                                                             of training jobs (training jobs optimized using K-FAC in the
+       S3 1 2 3 4      1 2 3 4                            1 2
+       S4       1234 1 2 3 4                  S4     12 1 2                  case of PipeFischer, jobs running on faulty/spot machines
+                 4 micro batches                         2 micro batches     in the case of Bamboo).
+         Overall computation is reduced; aggregated idle time is increased   Fundamentally, pipeline bubbles exist due to data dependen-
+                                                                             cies within the computation of pipeline parallelism. Our key
+           Idle/bubble time        Forward compute       Backward compute
+                                                                             insight is that, rather than directly addressing the data de-
+                                                                             pendency issue within a training job pattern or introducing
+Figure 2. PP combined with DP. Replicating the pipeline (double              other dependencies by filling dependent jobs, we leverage
+the number of GPUs) with the overall minibatch size fixed (at                independent jobs, unrelated to the training job running with
+4 microbatches) leads to shorter per-minibatch execution time but            pipeline parallelism, to fill the pipeline bubbles. Specifically,
+a larger fraction of GPU time is lost to pipeline bubbles.                   we remove the constraint that the training job must execute
+Synchronization is maintained through collective all-reduce                  exclusively on the GPUs during the entirety of the job. One
+operations at the end of each minibatch.                                     can context-switch to a different job during the bubbles to
+                                                                             reduce the amount of idle time of GPUs, and context-switch
+2.1   Pipeline Bubbles Lower GPU Utilization                                 back to the main training job in time for the training job
+                                                                             to experience no overhead from sharing the GPU during
+In combined parallelism, training larger models requires
+                                                                             the pipeline bubbles. To fill independent jobs into pipeline
+more pipeline stages. Since TP is limited by the number of
+                                                                             bubbles, we need to address the following challenges:
+GPUs in a node, once this limit is reached, the only option
+is to increase the number of pipeline stages to ensure each                  • Memory Management. How can one fill independent
+partition fits within the available GPU memory (increasing                     jobs into the pipeline bubbles when the GPU memory is
+p in the pipeline bubble ratio). Additionally, the minibatch                   primarily occupied by the main training job? Even during
+size, or the number of samples on which each gradient up-                      pipeline bubbles, the main training job dominates the GPU
+date is calculated, is usually set by machine learning experts                 memory. Naively filling independent jobs into pipeline
+and remains constant when scaling up training. For exam-                       bubbles without careful memory management may result
+ple, both LLaMA-1 (26) and LLaMA-2 (27) training use 4                         in GPU OOM errors or sub-optimal performance of fill
+million tokens for each model update. Experts are reluctant                    jobs. Effective memory management is crucial not only to
+to increase the minibatch size, as it can hurt model quality                   mitigate OOM risks but also to optimize available memory
+at the end of training (17). With a fixed total computation                    for fill jobs.
+workload for each round of model updating, increasing DP
+results in a smaller number of microbatches, or m in the                     • Context Switching. How can one ensure that filling inde-
+pipeline bubble ratio expression. Thus, inefficient GPU                        pendent jobs into the pipeline bubbles does not incur per-
+utilization caused by pipeline bubbles is inevitable when                      formance penalties for the main training job? To maintain
+employing PP, and it becomes particularly noticeable when                      the performance of the main training job, only pipeline
+scaling up the training of large models using DP. There are                    bubbles can be utilized for running fill jobs. However, it’s
+also more advanced methods like automatically explore the                      not guaranteed that a fill job can be completed within one
+best possible sharding strategies (33) which may achieve                       bubble. Therefore, filling independent jobs into pipeline
+better training throughput than manual decisions. However,                     bubbles without carefully crafted context switching may
+all of them are inherently bounded by the total computation                    introduce performance penalties to the main training job.
+workload per model updating, hence getting diminishing                       • Fill Job Scheduling. When faced with numerous pipeline
+return while increasing the compute resource.                                  bubbles exhibiting heterogeneous characteristics, how can
+2.2   Solution: Fill Bubbles w/ Independent Jobs                               one effectively schedule the filling process to align with
+                                                                               user-specific objectives? Pipeline bubbles across various
+How can idle GPU time resulting from pipeline bubbles                          pipeline stages exhibit distinct characteristics, such as
+be utilized to improve GPU utilization? Existing works                         duration and HBM availability. Additionally, users may
+fill dependent jobs of the training job running with PP into                   harbor unique optimization goals; for instance, some pri-
+the pipeline bubbles. PipeFisher (21) accelerates conver-                      oritize GPU utilization, while others emphasize meeting
+gence by utilizing the pipeline bubbles to execute K-FAC, a                    job deadlines promptly. Naively scheduling the filling
+second-order optimization method. Similarly, Bamboo (25)                       process without accounting for bubble characteristics and
+                                                                                             Scheduler, which makes scheduling decisions about which
+                          Device i                                                           device’s pipeline bubbles to execute a fill-job on. Scheduling
+     Instrumented
+    Pipeline Engine i                                                                        policies can be defined to modify the behavior of the Sched-
+                                            Fill-Job
+    Bubble Profiling                                      Bubble Info, Job    Fill-Job
+                        Bubble duration,   Executor i
+                                                            Completion
+                                                                                             uler. Each device has a fill-job Executor process. Once a
+                           memory                                            Scheduler
+                                             Fill-Job
+     Free- Memory
+                                           Partitioning
+                                                                                             fill-job arrives at a device, the Executor uses profiling data
+        Claiming            Bubble                                           Job Scoring
+                        synchronization
+                                            Memory-       Job Placement                      to construct an execution plan for the job. The plan max-
+                                            Capping
+       Main Job                                                                              imizes the throughput of the job by choosing a batch size
+       Offloading
+                                                                                 Fill Jobx   and creating partitions of the job’s computational graph that
+                                                                                             maximize the amount of work completed during the pipeline
+                                                                                             bubbles without violating bubble duration or free-memory
+                            Figure 3. System overview                                        constraints. The Executor uses synchronization primitives
+                                                                                             to know when to begin execution of the next fill-job graph
+    users’ optimization objectives risks compromising the
+                                                                                             partition. The pipeline engine runs on every device worker.
+    performance of fill jobs and falling short of users’ expec-
+                                                                                             The pipeline engine uses the pipeline bubble instruction to
+    tations.
+                                                                                             know when a pipeline bubble is beginning so it can signal
+Other works, such as Muri (32) and Antman (29), explore                                      the Executor (using the aforementioned synchronization
+interleaving multiple jobs on shared GPUs. However, these                                    primitives) to begin execution. Before the pipeline engine
+works do not specifically address scheduling alongside a                                     signals the Executor, it tells the device memory allocator
+main job running with PP, thus failing to leverage the unique                                to release all transient/unused memory buffers to increase
+characteristics for optimization. Muri only considers job                                    the free-memory available to the Executor and waits for any
+duration of each job as a constraint and assumes all jobs                                    main-job offloading operations to complete.
+fit together in GPU memory. Thus, Muri lacks support for                                     Fill Jobs. In this work, we use deep learning training and
+guaranteeing the main job performance and also falls short                                   batch-inference jobs as fill jobs. Deep learning jobs can
+in memory management and fill job scheduling. Antman                                         be classified as training or inference. Training is typically
+utilizes device statistics to assign memory caps to jobs based                               not latency sensitive and is often long-running. Inference
+on priority and fills idle GPU cycles with opportunistic ker-                                can be broken down into real-time/online inference and
+nels. However, when a main job is running with PP, pipeline                                  batch/offline inference; the former is latency sensitive, with
+bubbles often appear as long-running communication ker-                                      SLOs being on the order of milliseconds, while the later
+nels, causing Antman to struggle in determining context                                      is often not latency sensitive. Batch inference, which is
+switches between the main job and fill jobs. Moreover, the                                   not latency-sensitive, is widely used in applications such
+main job typically consumes the majority of the memory,                                      as content recommendation systems, data analytics, and
+making simply setting memory caps insufficient for memory                                    other back-end services. Due to the intermittent property of
+management.                                                                                  pipeline bubbles, latency-sensitive jobs are not suitable for
+                                                                                             use as fill-jobs. Therefore, P IPE F ILL supports training and
+3       D ESIGN AND I MPLEMENTATION                                                          batch-inference jobs as fill-jobs. P IPE F ILL takes as input
+Shown in Figure 3, P IPE F ILL consists of three major compo-                                the model used for the fill-job, as well as valid batch-sizes;
+nents: Instrumented Pipeline Engine, Fill Job Executor, and                                  given the job configuration, it will attempt to execute the
+Fill Job Scheduler. The Instrumented Pipeline Engine uses                                    fill-job with maximum throughput.
+the pipeline bubble instruction to measure when a pipeline
+bubble begins and ends, and the available memory during a                                    3.1   Pipeline Engine Instrumentation
+pipeline bubble. The Fill Job Executor then leverages those
+                                                                                             To not impact the main job, we must keep the context switch-
+information to decide the strategy of filling a job into bub-
+                                                                                             ing and execution of fill jobs completely within the duration
+bles, including whether and how to partition a filled job into
+                                                                                             of the pipeline bubbles. We must also know exactly how
+execution chunks and whether to offload the memory of the
+                                                                                             much GPU memory the fill job can use during its execu-
+main job to free up space for the filled job. The pipeline en-
+                                                                                             tion so that the main job does not experience an OOM
+gine signals the Executor using synchronization primitives
+                                                                                             error. In order to achieve this, P IPE F ILL augments exist-
+when a bubble begins and it can begin running the fill job.
+                                                                                             ing pipeline engines with a new pipeline bubble instruction.
+The Fill Job Scheduler accepts user-defined scheduling poli-
+                                                                                             Existing pipeline engines execute a sequence of pipeline
+cies and schedules filled jobs onto device pipeline-bubbles
+                                                                                             instructions, which include sending/receiving activations
+to optimize the chosen policy and synergize the user-defined
+                                                                                             and gradients, executing forward/backward computations
+policy with the characterization of the main job’s pipeline
+                                                                                             on specific microbatches, and synchronizing parameters.
+bubbles.
+                                                                                             Taken together as a periodically repeating sequence, these
+Putting together. Fill jobs are initially received by the                                    instructions constitute a pipeline schedule, which can have
+multiple pipeline bubbles appearing as instructions that wait     overlapped with forward-pass execution, and the onloading
+on some event (e.g. activation data to arrive from the pre-       is overlapped with gradient-synchronization; a significant
+vious stage). P IPE F ILL’s bubble instruction is inserted into   amount of data can be offloaded in this fashion with no
+the schedule to indicate where large bubbles are expected to      impact to the main job. The pipeline engine forward-pass
+occur.                                                            and gradient-synchronization instructions are augmented to
+                                                                  launch these operations on a separate CUDA stream.
+Bubble characterization. Before any bubble filling, the
+pipeline engine must determine the duration of each pipeline      3.2   Executor
+bubble in the pipeline schedule and how much memory is
+available for the fill jobs to use. To this end, at the be-       The Executor is a process that executes a fill-job on a de-
+ginning of the main training job the pipeline engine does         vice’s pipeline bubbles with maximum throughput without
+profiling. For each bubble instruction, the pipeline engine       violating the bubble duration or free-memory constraints,
+will wait certain amount of time (e.g. 100 ms) before pro-        ensuring that the fill-job execution has no impact on the
+ceeding to execute the next instruction. It will then ob-         main job performance. It does this by creating an execution
+serve the main job’s throughput, if it is unaffected then         plan for the fill job that chooses a batch size and partitions
+on the next minibatch iteration it will wait 2× amount            the job’s computational graph, and it relies on signals from
+of time. This will continue until the pipeline engine ob-         the pipeline engine to know when to execute the graph par-
+serves a drop in the main job’s throughput, at which point        titions.
+it will know the duration of the pipeline bubble. To pro-         Execution plan. When created, the Executor is passed
+file the amount of memory available for the engine to use         a sequence of bubble durations and free-memory capaci-
+for the fill job during a pipeline bubble, the engine relies      ties from the pipeline engine. This sequence describes the
+on PyTorch’s torch.cuda.memory_allocated()                        pipeline bubbles, the resources and durations that they each
+function to know how much memory is held by the main              make available as well as their order. This sequence of
+training job during the bubble; the remaining device memory       bubbles is a cycle of bubbles that repeats every minibatch
+is considered free, but to ensure there are no out-of-memory      iteration of the main job. When a fill-job is passed to the Ex-
+errors P IPE F ILL may opt only to allocate some fraction of      ecutor, it is accompanied with a set of profiles containing the
+the free memory. Additionally, to ensure transient/tempo-         execution time and memory requirement of each node in the
+rary memory buffers are not counted as allocated by the           computational graph under a specific configuration . Config-
+main job (and instead can be used by the fill-jobs), the en-      urations can be different batch sizes and different execution
+gine will tell the memory allocator to free all such buffers      techniques (e.g. CPU-offloading or NVMe-offloading of
+(by calling torch.cuda.empty cache()). The bubble duration        parameters/gradients/optimizer states, activation checkpoint-
+and free-memory capacity is passed to the Executor so it          ing/offloading). The Executor linearizes the computational
+can avoid violating those constraints.                            graph and its profiles, turning it into a sequence of nodes
+Bubble signaling. Once the engine has characterized the           with sequential dependency. For each configuration, the
+pipeline bubbles they can be filled. The engine starts a new      Executor packs the computational graph into as few bub-
+Executor process (with a shared synchronization primitive)        ble cycles as possible (without violating duration and free-
+and passes the bubble information to it. When a new fill-job      memory constraints). The Executor runs a greedy algorithm
+is sent by the Scheduler, the engine passes the job descrip-      (shown in Algorithm 1) that does the following: 1) replicate
+tion (as well as the necessary profiles) to the Executor. Every   the graph enough times (each replica represents an iteration)
+time the pipeline engine reaches a bubble instruction, it 1)      that the total execution time is as high as possible without ex-
+tells the memory allocator to free all unused memory 2)           ceeding the total bubble time (lines 3-6), 2) iteratively packs
+waits for any main job offloading operations to complete 3)       as many source nodes of the remainder of the computational
+signals the Executor to begin running its fill-job.               graph as possible into the next bubble (lines 7-14) without
+Main job offloading. In some cases, it may be beneficial to       exceeding its duration or memory limits. This sequence
+increase the amount of free-memory available to the fill-jobs.    of computational graph partitions represents the Executor’s
+To achieve this, P IPE F ILL enables offloading of main job       plan for the fill-job.
+data from device to CPU memory. In order to do this in a
+way that is transparent to the main job and does not sacrifice    Bubble synchronization and memory capping. When
+its performance, which data is offloaded must be carefully        executing the fill-job plan, the Executor waits for
+chosen and the data transfer operations must be coordinated       signals from the pipeline engine to know when the
+so the main job is never blocked on them. P IPE F ILL enables     main job has entered a pipeline bubble. When it re-
+offloading of the main job optimizer states (e.g. moment es-      ceives a signal, it first sets a cap on the amount of
+timates for Adam(13)) because this data is only required by       device memory that it can use (by using PyTorch’s
+the main job during the optimizer updates. The offloading is      cuda.set_per_process_memory_fraction
+                                                                  function) to the amount of free-memory available in the
+bubble; if the Executor somehow exceeds this memory                the maximum busy time across all Executors, thereby min-
+capacity, it will experience an OOM error, but this error          imizing makespan. By defining the policy using weighted
+will be isolated to the Executor process and will not affect       compositions of multiple functions, hierarchical policies can
+the main job. The Executor will execute the current graph          be defined that behave differently under different circum-
+partition on the current bubble, and then wait for the next        stances. For example, policies can be defined that prioritize
+signal from the pipeline engine.                                   proximity-to-deadline as a feature, but default to more stan-
+                                                                   dard policies (e.g. SJF, FIFO) when there are no jobs with
+Algorithm 1 Partition fill job onto bubbles                        deadlines.
+ 1: Input: A list B of the bubble durations, a list M of bubble    Since the Scheduler knows how long the currently executing
+    free-memory capacities, a list F of the graph-node durations   fill-jobs will take to complete, as well as the order in which
+    and memory requirements
+ 2: Output: List P of graph partitions where duration of           the queued fill-jobs will be executed, users can query the
+    P [i] ≤ B[i mod len(B)] and memory of P [i] ≤ M [i             Scheduler to know when a currently submitted fill-job is
+    mod len(M )]                                                   expected to complete or whether a fill-job’s deadline can be
+ 3: F ′ ← F                                                        met under current conditions. This can be used by a higher-
+ 4: while dur(F ′ ) + dur(F ) <
+                                  P
+                                     B do                          level scheduler, which manages other resources in addition
+ 5:    F′ ← F′ + F
+ 6: end while                                                      to the pipeline bubbles, to make scheduling decisions about
+ 7: F ← F ′ ; P ← []; i ← 0                                        which of its jobs can be submitted to the Scheduler.
+ 8: while len(F ) > 0 do
+ 9:    P ′ ← []                                                    3.4   Implementation
+10:    while len(F ) > 0 and dur(P ′ ) + dur(F [0]) < B[i] and
+       mem(F [0]) ≤ M [i] do                                       Our implementation is based on DeepSpeed (18) . Like
+11:       P ′ ← P ′ + F [0]; F ← F [1 :]                           many distributed training frameworks, DeepSpeed creates
+12:    end while                                                   a process to manage each GPU and processes are grouped
+13:    P ← P + P ′ ; i ← (i + 1) mod len(B)                        by their membership in tensor, data, and pipeline parallel
+14: end while
+15: return P                                                       communication groups. Each process uses a pipeline engine
+                                                                   to execute a pipeline schedule. We augment the DeepSpeed
+                                                                   pipeline engine and schedule with the instrumentation for
+3.3   Scheduler                                                    bubble filling and main job offloading. Figure 4 shows an
+The Scheduler is the interface between the pipeline bubbles        example of a pipeline schedule (implemented as a function)
+of the main job and outside higher-level cluster schedulers,       which bubble filling inserted. P IPE F ILL additional creates
+making the bubbles available as additional resources. The          a new Executor process for each GPU (which also uses
+Scheduler is also responsible for scheduling the fill-jobs         DeepSpeed to execute the fill jobs). The main job train-
+onto the pipeline bubbles. The Scheduler has access to the         ing process uses IPC to signal it’s corresponding Executor
+fill-job profiles, partitioning algorithm, and bubble descrip-     process when bubbles occur and the GPU is free for the Ex-
+tions of every device. Using this information, the Scheduler       ecutor to run fill jobs. To support large-model fill-jobs with
+is able to calculate any fill-job’s throughput/processing-time     limited GPU free-memory, the Executor is enabled with
+on any device. The Scheduler exposes the scheduling policy         fill-job configurations that use CPU-offloading and activa-
+by defining a function that takes as input a job’s information     tion checkpointing. In particular, the Executor will consider
+(arrival time, processing-time on every possible device, and       using ZeRO-Offload(23) and ZeRO-Infinity(22) to offload
+deadline) as well as the current state of all the Executors in     optimizer states, gradients, activations, and parameters of
+the system, and outputs a score. When a device completes           the fill-job.
+a fill-job, the Scheduler chooses which job to submit to           Main job pipeline schedule. We consider GPipe(9) and
+the device by choosing the job which maximizes the score.          1F1B(19) schedules for the main job. Both schedules ex-
+This allows specifying a variety of different scheduling poli-     hibit two-phase bubble behavior: one bubble occurs be-
+cies. For example, to specify a Shortest-Job-First policy the      tween the drain of the previous minibatch iteration and the
+                                                      1
+function can be defined as: f (j, s, i) = min(j.proc    times)     fill of the next iteration (fill-drain), and the other bubble
+where j.proc times is a list containing the job’s process-         occurs between the forward-pass pipeline saturation and
+ing times on all devices, s is the current state of all Ex-        the backward pass (fwd-bwd). The fill-drain bubble of
+ecutors, and i is the index of the Executor which is to            both schedules is the same, but the fwd-bwd bubbles can
+be filled. A more complex example is a policy that mini-           be different. For GPipe, the fwd-bwd bubble duration is
+mizes the makespan, which can be specified with the func-          (num stages − stage id − 1) ∗ (tf wd + tbwd ) whereas for
+                                        1
+tion: f (j, s, i) = max(j.proc times[i],s.rem    times) where      1F1B its duration is (num stages − stage id − 1) ∗ tbwd +
+s.rem times is a list containing the remaining amount of           max(0, num stages − stage id − m) ∗ tf wd . 1F1B addi-
+time each Executor will be busy. This policy will minimize         tionally has some non-contiguous bubbles (which P IPE F ILL
+           size         model            # parameters     job type       of the main training jobs’ pipeline instructions and the fill
+            S      EfficientNet(24)          117M           CV
+                                                                         jobs’ layers (under different configurations). The events in
+            S        Bert-base(4)            109M           NLP
+            M        Bert-large(4)           334M           NLP          our simulator are the arrivals and completions of fill-jobs
+            M       Swin-large(16)           779M           CV           (since these are when the state of the system can change),
+            L     XLM-Roberta-XL(6)          2.8B           NLP          and we simulate the time between these events using the
+                        S: small   M: medium   L: large                  profiled execution times and the job arrivals from the trace.
+
+                        Table 1. Fill job category.                      Main Jobs Our physical cluster experiments use a 5B pa-
+                                                                         rameter LLM training job as the main job, and are exe-
+     does not fill), which makes the total bubble time the same          cuted on 16 GPUs on separate machines (16 pipeline-stages,
+     for both schedules.                                                 no tensor-parallelism). We also collect profiles of a 40B
+                                                                         parameter LLM training job executed using 8-way tensor-
+ 1       def gpipe_steps(self):                                          parallelism (8 GPUs per machine) and 16-stage pipeline-
+ 2           total_steps = 2 * (self.micro_batches + self.               parallelism (16 machines). The simulator main job has
+                  stages - 1)
+ 3           for step_id in range(total_steps):                          almost the same settings as the physical cluster job, only
+ 4               # Map steps to micro-batch id, fwd vs bwd               scaled up using tensor-parallelism ; consequently the bubble
+ 5               micro_batch_id, is_forward = self.
+                      _step_to_micro_batch(step_id)                      sizes are almost identical. We use the profiles of the 40B
+ 6                                                                       model training job to seed our simulator, which we use for
+ 7                 cmds = []
+ 8                 # Exchange activations                                sensitivity studies done in simulation.
+ 9                 if is_forward:
+10                         SendRecvActivation()                          Both main jobs use sequence length of 2048 tokens per
+11                 else:
+12                         SendRecvGrad()
+                                                                         sample, 2 samples per microbatch, and 1024 samples per
+13                                                                       minibatch (across all data-parallel replicas); both jobs use
+14                 # Computation
+15                 if self._valid_micro_batch(micro_batch_id):
+                                                                         the Adam(13) optimizer. We use the GPipe schedule by
+16                     if is_forward:                                    default, unless otherwise specified. Data-parallel execution
+17                         ForwardPass()
+18                     else:
+                                                                         has been shown to be predictable(14), so we run only one
+19                         BackwardPass()                                data-parallel replica across all our experiments, varying the
+20
+21                 if micro_batch_id == self.micro_batches and
+                                                                         number of microbatches according to different data-parallel
+                         is_forward:                                     configurations.
+22                     FillBubble()
+23                                                                       Fill Jobs We create our fill-job traces in two steps. First, we
+24                 # Model step at the end of the batch
+25                 if step_id == total_steps - 1:                        construct a fill-job model distribution. We extract all model
+26                     ReduceGrads()                                     sizes and model types from the HuggingFace (HF) Model
+27                     OptimizerStep()
+28                     FillBubble()                                      Hub(10); we filter for models uploaded in the last year with
+29                                                                       over 100K downloads. We find among these models, 71%
+30                 yield cmds
+                                                                         have less than 3B parameters, so we filter out all models with
+                                                                         greater than 3B parameters. Among the remaining models,
+     Figure 4. Example python code for GPipe schedule function, and      we find 10.4% are CNNs (the remainder being transformer
+     how pipeline bubble filling is inserted. FillBubble function uses   models). We choose a representative set of models shown
+     IPC to signal the Executor to start running fill jobs.
+                                                                         in Table 1, and set sampling probabilities to each model to
+                                                                         match the distribution of model sizes and types from the HF
+                                                                         Model Hub.
+     4    E XPERIMENTAL S ETUP
+                                                                         For sampling job arrivals, we use public traces from
+     Hardware and Simulator We use a cluster of 16 AWS EC2               Alibaba(28) collected on real GPU clusters. These traces
+     p3.16xlarge instances to run small-scale experiments and to         provide arrival times, GPUs requested, service times, and
+     collect traces for large-scale simulation experiments. Each         quality-of-service for each job. We filter out jobs that have
+     node contains 8 NVIDIA V100 GPUs, each equipped with                ”latency-sensitive” quality-of-service, and we convert GPUs
+     16GB HBM and 125 TFLOPS of peak compute. GPUs on                    requested and service time to GPU-hours (by multiplying
+     the same machine are connected with NVLink, and separate            the two). We filter out jobs greater than 9 GPU-minutes for
+     machines are connected with 25 Gbps network bandwidth.              the physical cluster experiments (leaving 55% of all jobs)
+     To evaluate our system on multiple large-scale settings, we         and 1 GPU-hour for the simulation experiments (leaving
+     create an event-driven simulator. Deep learning jobs have           81.6% of all jobs), and we bucket the remaining GPU-hours
+     repetitive patterns, so an accurate simulator only needs to         distribution according to the sampling probabilities of the
+     profile a pattern once to simulate the time and resources it        models from Table 1 so that every job arrival in the trace is
+     takes to repeat that pattern. Our simulator relies on profiles      mapped to a specific model. For smaller models (<700M
+parameters) we set the job to training or batch-inference          the GPU utilization of traditional PP at 4K GPUs by 6.5%.
+with equal probability; for larger models we always set the        These results show that P IPE F ILL enables strong-scaling by
+job to batch-inference. To determine how many samples a            an additional 2× with virtually no loss in GPU utilization,
+job should process, we divide the job-size (in GPU-hours)          and at higher scales can even increase GPU utilization while
+by the max throughput the job-type can achieve when ex-            strong-scaling. Additionally, due to the high bubble ratios
+ecuted in isolation on one GPU. This yields a trace that           and the relatively modest slowdowns experienced by the
+contains job arrivals, job models, job category (training vs       fill-jobs, the amount of GPUs worth of work being done by
+batch-inference), and job samples.                                 P IPE F ILL using only the pipeline bubbles is notable. Gener-
+                                                                   ally, for a main job using C GPUs with a bubble ratio of B
+5     E VALUATION                                                  and fill-job relative performance of P , we can approximate
+                                                                   the GPUs saved by filling as C ∗ B ∗ P . Depending on
+We present the amount of GPU utilization recovered by              the workload, P IPE F ILL can run 200-300 GPUs worth of
+P IPE F ILL at different scales (Section 5.1); we then vali-       fill-job when when the main job is using 2K GPUs, 600-900
+date the accuracy of the simulator by comparing simulator          GPUs worth of work when using 4K GPUs, and 1500-2600
+results against physical cluster results (Section 5.1); we         GPUs when using 8K GPUs.
+discuss how fill job characterization affects P IPE F ILL’s per-
+                                                                   Physical cluster results. We confirm P IPE F ILL’s effec-
+formance (Section 5.2); and we provide sensitive studies
+                                                                   tiveness and validate the fidelity of the simulator results by
+of pipeline schedule algorithm, fill-job scheduling policy,
+                                                                   evaluating a subset of the settings on a small physical clus-
+bubble duration and free memory (Section 5.3).
+                                                                   ter with a 5B parameter LLM training job. We measure the
+5.1   P IPE F ILL Recovers GPU Utilization                         free-memory quantity in the bubbles to be 4.5GB without
+                                                                   main-job offloading; when we measured the free-memory
+Simulator Results To evaluate the GPU utilization recov-           of the larger training job, it was also 4.5GB, so we use this
+ered by P IPE F ILL, we scale the 40B parameter LLM train-         value in our simulator. We run the 5B parameter main job
+ing job trace using DP up to 8K GPUs in our simulation.            using 8 microbatches per minibatch per DP replica; this
+We measure the GPU utilization of filling inference jobs           corresponds to using 64-way DP and results in a bubble
+only, and filling both training and inference jobs. We use         ratio of 65%, which is comparable to the 8K GPU setting in
+the GPU utilization without P IPE F ILL as the baseline. To        Figure 5. We also use the full fill-job trace distribution for
+calculate the additional GPU FLOPS utilization recovered           the physical cluster experiments, unless specified otherwise.
+by P IPE F ILL, we use the measured total FLOPs (floating-
+point operations) executed to complete the fill-jobs (from         First, we evaluate whether the recovered GPU utilization
+PyTorch profiling) and divide this by the simulated fill-job       and low overhead to the main job predicted by the simulator
+completion times (wall-clock time); we average this value          is observed in a physical environment. In Figure 7c, we vary
+across all GPUs across the duration of the main job.               the percentage of the bubble duration that P IPE F ILL’s Ex-
+Figure 5 shows the results of main job training time, pipeline     ecutor’s attempt to fill. We find that the overhead to the main
+bubble ratio, and GPU utilization from using 1-8K GPUs.            job is <2% for up to 68% of the bubble duration filled by
+Even at low-scales (1K-2K GPUs), P IPE F ILL improves              the Executor; at higher fill percentages, the overhead to the
+GPU utilization by 5-10%. However, at higher scales                main job can be substantial (though the total GPU FLOPS
+P IPE F ILL’s potential is shown. Scaling the main job from        utilization continues to increase). We find the threshold
+2K to 6K GPUs reduces training time from 50 days to 29             of bubble filling without main job overhead to be around
+days; however, this results in a 40% drop in GPU utilization.      this value for all fill job types. Also at 68% we see that
+With P IPE F ILL, we are able to limit the drop in GPU uti-        the TFLOPS/GPU recovered is around 7.39; this is within
+lization to <23%. At 4K GPUs (reducing main job training           5% of the TFLOPS predicted by the simulator at the same
+time by 16 days compared to 2K GPUs), P IPE F ILL is able          bubble ratio. This is because, in our simulator results, the
+to get 89% of the GPU utilization of traditional PP at 2K          Fill Job Executors fill the same percentage of the bubble
+GPUs; at 8K GPUs (reducing main job training time by 9             duration by default.
+days compared to 4K GPUs), P IPE F ILL is able to get 92%          Next, we evaluate whether the types of fill-job being run
+of the GPU utilization of traditional PP at 4K GPUs.               affect the main job overhead. In Figure 6, we take two
+P IPE F ILL’s performance is even higher with a more bubble-       very different job types from our trace: batch-inference with
+friendly fill-job workload; in Figure 5 we also plot the GPU       XLM (the largest model) and training with EfficientNet (the
+utilization recovered when filling with only BERT infer-           smallest model and the only CNN). We fix the percentage of
+ence jobs. With this workload, P IPE F ILL improves GPU            the bubble duration filled by the Executor at 68%, and vary
+utilization by 7.8-15.6% at low scales (1-2K GPUs). At 4K          the fill-jobs from being all XLM to all EfficientNet; we find
+GPUs, P IPE F ILL gets’s 96.7% of the GPU utilization of tra-      that the overhead to the main job does not vary significantly.
+ditional PP at 2K GPUs; and at 8K GPUs P IPE F ILL exceeds
+                      80                                     1.0
+                                Traditional PP
+                                PipeFill                     0.8                                    40
+          Days to Train
+                      60
+
+
+
+
+                                                                                           TFLOPS/GPU
+                                                  Bubble Ratio
+                                                             0.6
+                      40
+                                                             0.4                                    20       Traditional PP (LLM only)
+                      20                                     0.2                                             PipeFill w/ Trace Mix
+                                                                                                             PipeFill w/ BERT Inf
+                          00   4K          8K                0.00   4K        8K                        00          4K                   8K
+                               GPUs                                 GPUs                                           GPU Count
+            (a) Main Job Training v.s.            (b) Bubble Ratio v.s. # GPUs           (c) GPU Utilization v.s. # GPUs
+            # GPUs
+                        Figure 5. Simulator results of running a 40B LLM training job using 1-8K GPUs.
+
+
+                                                                      during its execution; for comparison, the main job is able
+                                                                      to utilize 60 TFLOPS when it is executing. Our first obser-
+                                                                      vation is that batch inference jobs are able to reach higher
+                                                                      FLOPS utilization than training jobs; this is because infer-
+                                                                      ence jobs have low memory requirements and thus can use
+                                                                      higher batch sizes under the free memory constraints of the
+                                                                      bubbles than training jobs can. Among training jobs, large-
+                                                                      model training jobs have particularly poor performance;
+                                                                      this is because the much larger activation footprint of these
+                                                                      models requires CPU-offloading of the activations. When
+Figure 6. Simulator and physical cluster results of running a 5B      comparing models, we see that Swin and EfficientNet per-
+LLM with varying distributions of fill job types.                     form particularly poorly. The Swin model is a non-uniform
+                                                                      vision-transfomer model that uses a specialized attention
+This shows that the overhead to the main job is independent
+                                                                      operator; the memory-overhead of the larger layers limit
+of the types of fill-jobs being executed; instead it is only
+                                                                      the batch size, which further hurts the GPU utilization of
+affected by the percentage of the bubble duration being
+                                                                      the smaller layers, and the specialized attention operator is
+filled. Figure 6 also plots the fill-job recovered-FLOPS
+                                                                      not well-optimized in our implementation. The EfficientNet
+predicted by the profile-based simulator and observed in
+                                                                      model is small compared to the other models, but since it
+physical execution—the maximum error of the simulator is
+                                                                      is a CNN it has particularly large activation sizes; the low
+<2%.
+                                                                      free-memory in the bubbles limits the batch size that we can
+5.2   Fill job characterization                                       use, and since the model is small, the batch sizes that fit in
+                                                                      the free-memory are not large enough to reach high GPU
+This subsection discusses how fill job characterization af-           utilization.
+fects P IPE F ILL’s performance. This study helps understand
+the tradeoffs in which workloads are used as fill jobs. In            Fill job slowdown. TFLOPS recovered lets us compare
+the experiments, we evaluate training and inference of five           the GPU utilization recovered across fill-job types, but we
+different models as fill jobs. We measure the GPU FLOPS               would also like to know the slowdown experienced by the
+utilization they are able to achieve during their execution as        fill jobs relative to their performance if they were run on
+fill-jobs and compare to the GPU FLOPS utilization they               exclusive GPUs. This analysis lets us approximate how
+achieve when run in isolated resources. Here we divide the            many GPUs can be saved during the duration of the main
+FLOPs (floating-point operations) executed to complete the            job by filling its bubbles with certain fill-job types. In Fig-
+fill-jobs by the total duration that they are executed (sum of        ure 7b, we again see that the slowdown varies substantially
+all bubble durations used to complete the fill-job). This is          across fill-job types. As expected, all fill-jobs experience
+in contrast to dividing by the wall-clock completion time,            substantial slowdown due to several factors that put fill-job
+which we did in section 5.1 in order to understand the perfor-        execution at a disadvantage compared to exclusive execu-
+mance of the fill-jobs when they are executing (as opposed            tion: 1) the fill-jobs can only use a fraction of the GPU
+to the FLOPS utilization they can recover).                           memory (about 25%) which can necessitate CPU-offloading
+                                                                      and limit batch-sizes, 2) the fill-job execution is interrupted
+GPU FLOPS. Different fill jobs are able to utilize the GPU            every time a bubble ends, introducing unavoidable ineffi-
+FLOPS to varying degrees; there are several reasons for this,         ciencies in the Executor’s plan, and 3) because the fill-job
+some related to the jobs’ fundamental characteristics and             execution can only run for a short period of time, each bub-
+some related to the bubble constraints. In Figure 7a we plot          ble, it often can only run a single iteration of a subset of
+the GPU FLOPS that each model and each job type (i.e.,                the model, which is not enough to warmup the GPU caches.
+training vs. batch inference) is able to utilize on average
+  (a) GPU TFLOPS v.s. fill job types             (b) Job slowdown v.s. fill job types           (c) TFLOPS of 5B LLM on physical clus-
+                                                                                                ter, varying filled bubble durations.
+
+                                    Figure 7. Fill job characterization and physical cluster results
+
+
+However, we see that these factors affect different fill-job          ciency has a larger impact.
+types to varying degrees. In particular, we see that although
+                                                                      Bubble durations and free memory. Main job characteris-
+XLM inference recovers similar TFLOPS as BERT infer-
+                                                                      tics affect the pipeline bubble durations and free-memory;
+ence, it experiences more slowdown; this is because XLM
+                                                                      for example, a deeper pipeline or a wider main job model
+requires aggressive CPU-offloading, but because the model
+                                                                      (with longer forward and backward times) can increase the
+is large it can still submit enough computation work to keep
+                                                                      bubble durations. Meanwhile, a larger main job model could
+the GPU busy. We hypothesize that on newer hardware-
+                                                                      also reduce the bubble free-memory. Here we analyze the
+systems that have higher bandwidth between CPU and GPU
+                                                                      effects of these factors on P IPE F ILL’s effectiveness.
+memory (e.g., newer PCIe generations, NVLink-C2C), the
+                                                                      In Figure 9a, we scale the bubble size by equally scaling the
+fill-job slowdown from offloading could be substantially
+                                                                      main job model width and depth. We scale the original main
+lower. Regardless, most of the fill-job workloads we evalu-
+                                                                      job from section 5.1, from 50% to 200% of the original
+ate experience around 30% of exclusive execution.
+                                                                      model size; we fix the free memory at 4.5GB. We see little
+5.3   Sensitivity studies                                             difference in the recovered TFLOPS, though shrinking the
+                                                                      bubble duration by 50% reduced TFLOPS by 5.3%.
+Main job pipeline schedule. We compare P IPE F ILL with               In Figure 9b, we fix the main job model size (and thus the
+the main job using a GPipe schedule to using a 1F1B sched-            bubble duration) and vary the free-memory from 2GB to
+ule, using the same main job as the simulator in section              8GB. We find free-memory to have larger impact on re-
+5.1 and using the full fill-job trace. We vary the number of          covered TFLOPS, though with diminishing returns: 4GB
+GPUs from 2K (18.9% bubble ratio) to 16K (78.9% bubble                recovers 30% more TFLOPS than 2GB, but 8GB only re-
+ratio). We find that the at smaller scales P IPE F ILL recovers       covers 12.2% more TFLOPS than 4GB.
+20% more GPU utilization when the main job uses GPipe,
+but at larger scales the gap closes to 5%. This is because
+1F1B contains some non-contiguous bubbles that are not
+within the fill-drain bubble or the fwd-bwd bubble, which
+P IPE F ILL does not fill; at larger scales these non-contiguous
+bubbles become a smaller proportion of the total bubbles.
+We also simulate 1F1B-interleave schedule (20), and find it
+recovers 10-30% less TFLOPS than 1F1B; note that inter-
+leaving increases PP communication and can reduce main                       (a) Average JCT                        (b) Makespan
+job efficiency if there is insufficient network bandwidth.                  Figure 8. Sensitivity study of fill job schedule policy.
+
+Fill-job scheduling policy. P IPE F ILL allows the scheduling
+policy to be configured by the user; this section evaluates
+two possible policies. In Figures 8a and 8b, we implement a
+Shortest-Job-First policy and a Makespan-Minimizing pol-
+icy. We see that the SJF policy is able to achieve lower
+average JCTs, especially at lower loads where completion
+time is not as dominated by queueing time. Conversely, the              (a) TFLOPS v.s. bubble sizes      (b) TFLOPS v.s. free mem
+Makespan-Minimizing policy is able to reduce makespan,                Figure 9. Sensitivity study of bubble size and free memory.
+especially at higher loads where maximizing fill-job effi-
+6 R ELATED W ORK                                                     {PipeSwitch}: Fast pipelined context switching for
+Pipeline optimizations. There are many prior works on in-            deep learning applications. In 14th USENIX Sympo-
+creasing pipeline-parallel efficiency. Chimera (15) proposes         sium on Operating Systems Design and Implementa-
+bidirectional pipelines to reduce pipeline bubbles at the cost       tion (OSDI 20), pages 499–514, 2020.
+of increasing the memory overhead on each device. In prac-
+tice, it is not possible due to limited GPU memory for large     [3] Tom Brown, Benjamin Mann, Nick Ryder, Melanie
+LLM training jobs. Megatron-3D (20) proposes interleaved             Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind
+pipelines, which requires the number of microbatches to be           Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+a multiple of the number of pipeline stages. It has limited          Askell, et al. Language models are few-shot learners.
+applicability, since minibatch sizes are fixed, as large-model       Advances in neural information processing systems,
+training is scaled up using data parallelism the number of           33:1877–1901, 2020.
+microbatches per stage decreases quickly to be less than         [4] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+the number of pipeline stages. Alpa (33), FlexFlow (11),             Kristina Toutanova. BERT: Pre-training of deep bidi-
+Dapple (5) aim to search for optimal pipeline partition con-         rectional transformers for language understanding. In
+figuration for the training, which cannot eliminate bubbles.         Proceedings of the 2019 Conference of the North Amer-
+As discussed, Bamboo (25) and Pipefischer (21) fill pipeline         ican Chapter of the Association for Computational
+bubbles with work that is dependant on the main job. Hy-             Linguistics: Human Language Technologies, Volume
+dro (8) fills bubbles with hyperparameter-tuning jobs (in            1 (Long and Short Papers), Minneapolis, Minnesota,
+particular, trials which are not critical and can be early-          2019. Association for Computational Linguistics.
+terminated) for small models which requrie very little mem-
+ory and can complete training iterations within a single         [5] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao,
+bubble.                                                              Siyu Wang, Zhen Zheng, Chuan Wu, Guoping Long,
+                                                                     Jun Yang, Lixue Xia, Lansong Diao, Xiaoyong Liu,
+Resource sharing. Many prior works have identified and               and Wei Lin. Dapple: A pipelined data parallel ap-
+addressed the data-center GPU under-utilization issue by             proach for training large models. In Proceedings of the
+GPU-sharing. AntMan (29) provides the elasticity for DL              26th ACM SIGPLAN Symposium on Principles and
+training jobs to scale up and down for better efficiency.            Practice of Parallel Programming, PPoPP ’21, page
+Salus (30) puts multiple DL jobs on the same device to im-           431–445, New York, NY, USA, 2021. Association for
+prove the utilization. PipeSwitch (2) allows time-sharing            Computing Machinery.
+of clusters for inference jobs with training jobs, when user
+demands of inference job is at valley. REEF (7) enables          [6] Naman Goyal, Jingfei Du, Myle Ott, Giri Ananthara-
+kernel-level preemption and concurrent execution for shar-           man, and Alexis Conneau. Larger-scale transform-
+ing GPUs with multiple inference jobs. PilotFish (31) ex-            ers for multilingual masked language modeling. In
+ploits the spare resources on Cloud gaming platform for DL           Proceedings of the 6th Workshop on Representation
+training. Muri (32) interleaves the usages of multiple hard-         Learning for NLP (RepL4NLP-2021). Association for
+ware resources (e.g., network, GPU, etc.) among multiple             Computational Linguistics, 2021.
+DL jobs. These prior works do not address the pipeline bub-
+bles of large model training like LLMs with tens-of-billions     [7] Mingcong Han, Hanze Zhang, Rong Chen, and Haibo
+parameters.                                                          Chen. Microsecond-scale preemption for concur-
+                                                                     rent {GPU-accelerated}{DNN} inferences. In 16th
+7    C ONCLUSION                                                     USENIX Symposium on Operating Systems Design
+                                                                     and Implementation (OSDI 22), pages 539–558, 2022.
+P IPE F ILL fills the pipeline bubbles of huge DNN training
+jobs with other jobs, significantly reducing the traditional     [8] Qinghao Hu, Zhisheng Ye, Meng Zhang, Qiaoling
+GPU utilization penalty associated with extreme scale-out            Chen, Peng Sun, Yonggang Wen, and Tianwei Zhang.
+for such jobs. Experiments confirm that P IPE F ILL can in-          Hydro: Surrogate-Based hyperparameter tuning ser-
+crease GPU utilization by up to 63% when LLM training is             vice in datacenters. In 17th USENIX Symposium on
+scaled-out, with <2% increase in LLM training time.                  Operating Systems Design and Implementation (OSDI
+                                                                     23), pages 757–777, Boston, MA, July 2023. USENIX
+R EFERENCES                                                          Association.
+
+ [1] Aws trainium.   https://aws.amazon.com/                     [9] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan
+     machine-learning/trainium/,     (accessed                       Firat, Mia Xu Chen, Dehao Chen, HyoukJoong Lee,
+     December 2023).                                                 Jiquan Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng
+                                                                     Chen. GPipe: Efficient Training of Giant Neural Net-
+ [2] Zhihao Bai, Zhen Zhang, Yibo Zhu, and Xin Jin.                  works Using Pipeline Parallelism. 2019.
+[10] Hugging Face Inc. Hugging face model hub. https:          [20] Deepak Narayanan, Mohammad Shoeybi, Jared
+     //huggingface.co/models, 2024. Accessed:                       Casper, Patrick LeGresley, Mostofa Patwary, Vijay Ko-
+     2024-04-20.                                                    rthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie
+                                                                    Bernauer, Bryan Catanzaro, Amar Phanishayee, and
+[11] Zhihao Jia, Matei Zaharia, and Alex Aiken. Beyond              Matei Zaharia. Efficient large-scale language model
+     data and model parallelism for deep neural networks.           training on gpu clusters using megatron-lm. In Pro-
+     Proceedings of Machine Learning and Systems, 1:1–              ceedings of the International Conference for High Per-
+     13, 2019.                                                      formance Computing, Networking, Storage and Anal-
+[12] Norman P Jouppi, Cliff Young, Nishant Patil, David             ysis, SC ’21. Association for Computing Machinery,
+     Patterson, Gaurav Agrawal, Raminder Bajwa, Sarah               2021.
+     Bates, Suresh Bhatia, Nan Boden, Al Borchers, et al.
+                                                               [21] Kazuki Osawa, Shigang Li, and Torsten Hoefler.
+     In-datacenter performance analysis of a tensor pro-
+                                                                    Pipefisher: Efficient training of large language models
+     cessing unit. In Proceedings of the 44th annual inter-
+                                                                    using pipelining and fisher information matrices. Pro-
+     national symposium on computer architecture, pages
+                                                                    ceedings of Machine Learning and Systems, 5, 2023.
+     1–12, 2017.
+
+[13] Diederik P. Kingma and Jimmy Ba. Adam: A method           [22] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley,
+     for stochastic optimization. In 3rd International Con-         Shaden Smith, and Yuxiong He. Zero-infinity: break-
+     ference on Learning Representations, ICLR 2015, San            ing the gpu memory wall for extreme scale deep learn-
+     Diego, CA, USA, May 7-9, 2015, Conference Track                ing. In Proceedings of the International Conference
+     Proceedings, 2015.                                             for High Performance Computing, Networking, Stor-
+                                                                    age and Analysis, SC ’21. Association for Computing
+[14] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar,              Machinery, 2021.
+     Pieter Noordhuis, Teng Li, Adam Paszke, Jeff Smith,
+     Brian Vaughan, Pritam Damania, and Soumith Chin-          [23] Jie Ren, Samyam Rajbhandari, Reza Yazdani Am-
+     tala. Pytorch distributed: Experiences on accelerating         inabadi, Olatunji Ruwase, Shuangyan Yang, Minjia
+     data parallel training. CoRR, abs/2006.15704, 2020.            Zhang, Dong Li, and Yuxiong He. ZeRO-Offload:
+                                                                    Democratizing Billion-Scale model training. In 2021
+[15] Shigang Li and Torsten Hoefler. Chimera: Efficiently           USENIX Annual Technical Conference (USENIX ATC
+     training large-scale neural networks with bidirectional        21). USENIX Association, 2021.
+     pipelines. In Proceedings of the International Confer-
+     ence for High Performance Computing, Networking,          [24] Mingxing Tan and Quoc Le. Efficientnet: Rethinking
+     Storage and Analysis, SC ’21, New York, NY, USA,               model scaling for convolutional neural networks. In
+     2021. Association for Computing Machinery.                     International conference on machine learning, pages
+                                                                    6105–6114. PMLR, 2019.
+[16] Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei,
+     Zheng Zhang, Stephen Lin, and Baining Guo. Swin           [25] John Thorpe, Pengzhan Zhao, Jonathan Eyolfson, Yi-
+     transformer: Hierarchical vision transformer using             fan Qiao, Zhihao Jia, Minjia Zhang, Ravi Netravali,
+     shifted windows. In Proceedings of the IEEE/CVF                and Guoqing Harry Xu. Bamboo: Making preemptible
+     International Conference on Computer Vision (ICCV),            instances resilient for affordable training of large
+     2021.                                                          DNNs. In 20th USENIX Symposium on Networked
+[17] Sam McCandlish, Jared Kaplan, Dario Amodei, and                Systems Design and Implementation (NSDI 23), pages
+     OpenAI Dota Team. An empirical model of large-                 497–513, Boston, MA, April 2023. USENIX Associa-
+     batch training. arXiv preprint arXiv:1812.06162,               tion.
+     2018.
+                                                               [26] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+[18] Microsoft. microsoft/deepspeed, October 2024.                  Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+                                                                    Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal
+[19] Deepak Narayanan, Aaron Harlap, Amar Phanishayee,              Azhar, et al. Llama: Open and efficient foundation
+     Vivek Seshadri, Nikhil R. Devanur, Gregory R. Ganger,          language models. arXiv preprint arXiv:2302.13971,
+     Phillip B. Gibbons, and Matei Zaharia. Pipedream:              2023.
+     Generalized pipeline parallelism for dnn training. In
+     Proceedings of the 27th ACM Symposium on Oper-            [27] Hugo Touvron, Louis Martin, Kevin Stone, Peter
+     ating Systems Principles, SOSP ’19. Association for            Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+     Computing Machinery, 2019.                                     Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+     Bhosale, et al. Llama 2: Open foundation and fine-
+     tuned chat models. arXiv preprint arXiv:2307.09288,
+     2023.
+[28] Qizhen Weng, Lingyun Yang, Yinghao Yu, Wei Wang,
+     Xiaochuan Tang, Guodong Yang, and Liping Zhang.
+     Beware of fragmentation: Scheduling {GPU-Sharing}
+     workloads with fragmentation gradient descent. In
+     2023 USENIX Annual Technical Conference (USENIX
+     ATC 23), pages 995–1008, 2023.
+[29] Wencong Xiao, Shiru Ren, Yong Li, Yang Zhang,
+     Pengyang Hou, Zhi Li, Yihui Feng, Wei Lin, and
+     Yangqing Jia. Antman: Dynamic scaling on gpu clus-
+     ters for deep learning. In Proceedings of the 14th
+     USENIX Conference on Operating Systems Design
+     and Implementation, OSDI’20. USENIX Association,
+     2020.
+[30] Peifeng Yu and Mosharaf Chowdhury. Salus: Fine-
+     grained gpu sharing primitives for deep learning appli-
+     cations. arXiv preprint arXiv:1902.04610, 2019.
+[31] Wei Zhang, Binghao Chen, Zhenhua Han, Quan Chen,
+     Peng Cheng, Fan Yang, Ran Shu, Yuqing Yang, and
+     Minyi Guo. {PilotFish}: Harvesting free cycles of
+     cloud gaming with deep learning training. In 2022
+     USENIX Annual Technical Conference (USENIX ATC
+     22), pages 217–232, 2022.
+[32] Yihao Zhao, Yuanqiang Liu, Yanghua Peng, Yibo Zhu,
+     Xuanzhe Liu, and Xin Jin. Multi-resource interleav-
+     ing for deep learning training. In Proceedings of the
+     ACM SIGCOMM 2022 Conference, SIGCOMM ’22.
+     Association for Computing Machinery, 2022.
+[33] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao
+     Zhuang, Zhifeng Chen, Yanping Huang, Yida Wang,
+     Yuanzhong Xu, Danyang Zhuo, Eric P. Xing, Joseph E.
+     Gonzalez, and Ion Stoica. Alpa: Automating inter- and
+     Intra-Operator parallelism for distributed deep learn-
+     ing. In 16th USENIX Symposium on Operating Sys-
+     tems Design and Implementation (OSDI 22). USENIX
+     Association, 2022.
+

@@ -1,0 +1,1108 @@
+        FAST T REE : O PTIMIZING ATTENTION K ERNEL AND RUNTIME FOR
+                      T REE -S TRUCTURED LLM I NFERENCE
+
+
+      Zaifeng Pan 1 Yitong Ding 1 Yue Guan 1 Zheng Wang 1 Zhongkai Yu 1 Xulong Tang 2 Yida Wang 3
+                                               Yufei Ding 1
+
+
+                                                       A BSTRACT
+     Tree-structured prefix sharing is prevalent in recent large language model (LLM) applications. Existing LLM
+     serving systems use a radix tree to organize the global key-value (KV) cache, facilitating cache reuse across
+     different queries and thus reducing unnecessary memory use. Despite this, these systems still rely on conven-
+     tional computation patterns for attention operations, resulting in redundant memory loads and GPU tensor core
+     underutilization. To address these limitations, we present FastTree, which introduces GPU kernels tailored for
+     efficiently processing queries that share contexts through the radix tree. To effectively employ the FastTree
+     kernels, a significant challenge arises in finding optimal context-queries groups with a given KV cache tree,
+     as the varying shared prefixes between queries create a giant decision space. To tackle this, we propose tree
+     structure-adaptive runtime optimization within FastTree, applying a greedy heuristic to partition the tree to
+     minimize overhead and splitting lengthy contexts to mitigate the tail effect. FastTree is built upon SGLang, and
+     extensive experiments demonstrate that it improves the throughput of SGLang by up to 2.2×. FastTree’s code is
+     available at https://github.com/PanZaifeng/FastTree-Artifact.
+
+1    I NTRODUCTION                                                looking the opportunity to reuse the shared KV cache be-
+                                                                  tween queries. To address this problem, radix tree optimiza-
+Large language models (LLMs) (OpenAI et al., 2023; Tou-           tion (Zheng et al., 2023a) has been proposed to organize
+vron et al., 2023; Jiang et al., 2023; Bai et al., 2023) have     the entire system-level KV caches as a tree illustrated in
+been increasingly deployed across various domains, achiev-        Figure 1(b). In this way, the systems can reduce the GPU
+ing remarkable performance in applications like text gen-         memory usage significantly, leading to higher throughput
+eration (Li et al., 2024), program synthesis and optimiza-        by serving more concurrent requests.
+tion (Gur et al., 2023; Cummins et al., 2024), and informa-
+tion retrieval (Zhu et al., 2023; Gao et al., 2023). Recently,    However, although optimizing the memory layouts with a
+to solve more complicated tasks, the usage of tree-structured     radix tree, existing systems (Zheng et al., 2023a) still utilize
+LLM programs has increased rapidly, including few-shot            the conventional attention kernels (Dao et al., 2023; Flash-
+learning (Brown, 2020), document QA (Ye et al., 2024b),           Infer, 2024) shown in Figure 1(c), which concatenate the
+tree of thoughts (Yao et al., 2024b), etc. Due to this, it has    KV cache for each query and dispatch its computation into
+become typical for different queries within a program to          an individual GPU thread block. Such a naively separated
+share common token prefixes. Besides, different program           computation pattern suffers from the inefficient usage of
+instances can also share common parts, such as a long sys-        shared memory and tensor cores on the GPU. It requires
+tem prompt (TheBigPromptLibrary, 2024). In this paper, we         redundantly loading the shared KV cache from slow global
+refer to the LLM inference procedure under tree-structured        memory for every query and cannot meet the minimum
+prefix sharing as tree-structured LLM inference.                  shape requirements for tensor cores without padding.
+In conventional LLM serving systems (NVIDIA, 2024; Hug-           To bridge this gap, we propose FastTree, an LLM serv-
+gingFace, 2024; Microsoft, 2024), each query holds its            ing system that leverages the tree-structured KV cache at
+own key-value (KV) caches, as Figure 1(a) shows, over-            the memory level to guide the computation optimization
+   1
+                                                                  of attention operations. It comprises efficient GPU ker-
+     University of California, San Diego, CA, USA 2 University    nels to process aggregated queries and their shared context
+of Pittsburgh, PA, USA 3 AWS, CA, USA. Correspondence to:
+Zaifeng Pan <zapan@ucsd.edu>.
+                                                                  together, leading to reduced memory transactions and in-
+                                                                  creased FLOPS due to the utilization of fast shared memory
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,   and high-performance tensor cores on the GPU.
+2025. Copyright 2025 by the author(s).
+                    FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+                                                                                                  Redundant KV load!
+                                                                                               SM1
+                                                                                                      A1 B1 C1 Q1            K^T
+                                                                   C1         Q1              SRAM                          Q×
+
+
+
+
+                                                                                                                                           Qlen=1
+        A1     B1     C1        Q1
+                                                        B1
+                                                                                               SM2
+
+
+
+
+                                                                                       HBM
+        A1     B1     C2        Q2          A1                     C2         Q2              SRAM     A1 B1 C2 Q2
+                                                                                                                        Tensor core-inefficient!
+
+        A1     B2          Q3                                                                  SM3
+                                                        B2        Q3                                   A1 B2 Q3
+                                                                                              SRAM                                TC
+
+
+ (a) Queries with their own KV caches     (b) KV cache sharing through Radix Tree            (c) Computation pattern of existing system
+
+
+Figure 1. Existing systems optimize the memory layouts by organizing KV caches as a radix tree, but they still rely on the conventional
+computation patterns to perform the attention operations, causing significant performance issues.
+
+
+The key challenge in effectively utilizing the FastTree ker-                • We propose FastTree to accelerate the tree-structured
+nels is identifying the optimal context-queries groups, which                 LLM inference with efficient kernels and runtime op-
+defines how to partition the shared contexts and aggregate                    timizations. FastTree effectively searches the context-
+queries accordingly. With a given radix tree of the KV cache                  queries groups with a greedy heuristic and improves
+at runtime, we can generate enormous grouping plans by                        GPU utilization when performing attention operations.
+changing the shared contexts used for query aggregation,
+as the different queries can share varied prefixes. More-                   • We implement FastTree based on SGLang, and ex-
+over, the plan selection can significantly affect the execution               tensive experiments show that FastTree achieves up
+performance of the attention kernel, as different plans can                   to 2.2× throughput improvement over the highly-
+introduce distinct overheads, including wasted shared mem-                    optimized FlashInfer backend.
+ory and computation due to tile padding and IO cost due to
+increased intermediate results (detailed in Section 4).                 2     BACKGROUND
+To tackle this challenge, we propose the tree structure-                2.1   LLM Inference
+adaptive runtime optimization within FastTree. We for-
+mulate the optimal context-queries grouping problem as a                The core of LLMs lies in the transformer architecture, which
+binary edge assignment task, and the runtime then applies               leverages self-attention (Vaswani et al., 2017) mechanisms
+an overhead-aware greedy heuristic to search the results out            to capture the dependencies between different tokens, en-
+of the giant decision space efficiently by choosing the as-             abling powerful contextual understanding capabilities. Self-
+signment with minimal overhead at each step. Besides, we                attention mechanisms project each token into three vectors:
+observe the GPU unsaturation problem due to insufficient                query (Q), key (K), and value (V), and the output is calcu-
+block parallelism or long tail effect, and the runtime solves           lated by the equation:
+this problem by splitting lengthy contexts.
+                                                                                                              QK T
+We build FastTree as a plugin for SGLang (Zheng et al.,                         Attention(Q, K, V ) = softmax( √ )V                                 (1)
+                                                                                                                d
+2023a), which is an LLM serving framework with radix tree
+optimization. We evaluate the attention kernel performance              where d is the head dimension.
+of FastTree across various configurations on an NVIDIA
+                                                                        LLM inference is typically performed in an auto-regressive
+H100 GPU, and experimental results demonstrate that Fast-
+                                                                        manner, where each token is generated based on the hidden
+Tree delivers on average 5.1×, 4.2×, 10.6×, and 2.1×
+                                                                        state of the last token. The inference process is divided
+speedups over FlashAttention (Dao et al., 2022; Dao, 2023;
+                                                                        into two main phases: prefill and decoding. In the prefill
+Dao et al., 2023), FlashInfer (FlashInfer, 2024), DeFT (Yao
+                                                                        phase, the initial input sequence is processed in a single
+et al., 2024a), and Multi-Level Cascade Attention (Ye et al.,
+                                                                        forward pass, generating the attention outputs for all tokens
+2024b). We also evaluate the end-to-end performance of
+                                                                        simultaneously. During the decoding phase, tokens are gen-
+FastTree on models including Llama (Touvron et al., 2023)
+                                                                        erated one by one, so at each step, the model only calculates
+and Mistral (Jiang et al., 2023), showing up to a 2.2× im-
+                                                                        the attention between the last token’s query vector and all
+provement over SGLang across four benchmarks. In sum-
+                                                                        previous tokens’ key vectors.
+mary, we have the following contributions:
+                                                                        Attention operations can account for a substantial portion
+                                                                        of the time during LLM inference, especially when the se-
+   • We reveal the limitations of existing LLM serving sys-             quence length is long. Figure 2 shows the Llama-2-7B (Tou-
+     tems with radix tree optimizations, whose computation              vron et al., 2023) execution time breakdown during decoding
+     ignores the multi-level shareable memory patterns.                 with batch size 32 and different sequence lengths. When the
+                              FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+                          GEMM              Attention        Others                 Client                Client                   Client
+ Percentage (%)
+
+
+                  100                                                                 Q1                   Q2 Q3                    Q4 Q5
+                   80
+                   60
+                   40                                                         LLM Serving System
+                   20                                                                                                     FastTree
+                    0                                                          KV Cache Radix Tree
+                        128      256        512       1024   2048                                                   Tree Structure-Adaptive
+                                                                                               B1
+                                       Sequence Length                                                             Runtime Optimization (§4)
+                                                                                    A1
+                                                                                               B2
+                                                                                                                      Overhead-Guided
+Figure 2. Llama-2-7B execution time breakdown during decoding                     Context-Queries                   Greedy Heuristic (§4.2)
+on the H100 GPU. The batch size is 32.                                             Grouping Plan
+                                                                                                                     GPU-Efficient Long
+                                                                                 A1 B1        A1 B2                 Context Splitting (§4.3)
+                                                                                Q1 Q2 Q3      Q4 Q5
+sequence length becomes 2048, the attention computations
+                                                                                                    GPU
+can account for 65% of the model forward time on the GPU.                                                          Efficient Tree-Structured
+                                                                          Tensor core and shared
+                                                                          memory utilization                         Attention Kernel (§5)
+Therefore, it is crucial to optimize the attention GPU kernels
+to reduce the LLM inference latency.
+                                                                                             Figure 3. Overview of FastTree.
+2.2                Radix Tree-Based KV Cache Sharing
+KV cache is an important optimization technique widely
+used in LLM serving systems. In the decoding phase, the                  of each other for data reuse. As shown in Figure 1(c), the
+KV caches store the KV vectors from previous tokens, thus                KV cache, even shared across multiple queries, has to be
+eliminating the need to recompute the KV matrices for each               loaded from the slow global memory redundantly for each
+new token and improving the inference efficiency.                        query, with bandwidth ten times lower than shared mem-
+                                                                         ory. Besides, during decoding, the Q matrix involved in
+Existing systems adopt the memory paging optimiza-
+                                                                         the computation of each query is a vector because we only
+tion (Kwon et al., 2023), which stores KV cache in non-
+                                                                         have one query token. Therefore, the basic computation
+contiguous blocks to reduce memory fragments. Based
+                                                                         within the attention transforms from the matrix-matrix mul-
+on this, they explore the KV cache sharing in specific
+                                                                         tiplication (GEMM) to the GPU-inefficient matrix-vector
+scenarios like beam search (Sutskever et al., 2014) and
+                                                                         multiplication (GEMV). For GEMV operations, it is hard
+single-level prefix sharing. Observing the opportunities
+                                                                         for the kernels to effectively utilize the high-performance
+of multi-level prefix sharing in recent complicated tasks,
+                                                                         tensor cores on the GPU, which have specific input matrix
+later works (Zheng et al., 2023a) further propose to manage
+                                                                         shapes. The kernels have to resort to the CUDA cores with
+the system-level KV cache as a radix tree, thus enabling the
+                                                                         much lower FLOPS (FlashInfer, 2024) or pad the Q vector
+cache reuse across queries and reducing memory usage.
+                                                                         with wasted computation (Dao et al., 2023). According
+We use Figure 1 (b) as an example to illustrate how the radix            to our experiments, FlashAttention (Dao et al., 2022; Dao,
+tree works. The context associated with the root node A1                 2023; Dao et al., 2023) only have less than 1% effective com-
+can be “You are a helpful assistant”, a system prompt used               putation after padding the Q matrix. Note that batching (Yu
+to set the model’s role. We can then provide two different               et al., 2022) queries can only help increase the computation
+few-shot learning examples in formats like “Q1:· · · ; A1:· · · ;        intensity of projection and MLP layers (Microsoft, 2024;
+Q2:· · · ; A2:· · · ;” to the model, storing the corresponding           Agrawal et al., 2024) during decoding but cannot benefit the
+KV cache in B1 and B2 respectively. With this in-context                 attention directly due to the separate computation of queries.
+learning pattern, a single model can be deployed as different
+                                                                         In this paper, we explore how to leverage the tree-structured
+applications to address multiple kinds of tasks. Each appli-
+                                                                         KV cache sharing at the memory level to guide the compu-
+cation can serve many requests, resulting in its own sub-tree
+                                                                         tation optimization for attention operations.
+of the KV cache, as shown in the figure.
+However, we notice a significant gap between the tree-                   3    OVERVIEW
+structured memory layout and the query-separated com-
+putation pattern of existing systems. As Figure 1(c) depicts,            We present the overview of FastTree in Figure 3, which
+they compute the attention of each query by separate blocks,             serves as a plugin for the existing LLM serving system.
+failing to take advantage of the KV cache sharing based on               During processing the queries sent from clients, the LLM
+the radix tree. Such a computation pattern leads to severe               serving system organizes the global KV cache as a radix tree
+performance issues. First, the fast on-chip shared memory                and inputs it to FastTree. FastTree’s tree structure-adaptive
+on the GPU is used insufficiently as the thread blocks for               runtime (Section 4) will then generate the context-queries
+different queries cannot directly access the shared memory               grouping plan to aggregate queries on the fly, thus enabling
+                   FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+the memory layout-guided computation optimizations and            M=N=128, both plans can fully utilize the shared memory
+balancing different overheads. It leverages the overhead-         and tensor cores. However, as plan 1 separates A1 from B1
+guided greedy heuristic (Section 4.2) to search the optimal       and B2, there will be more intermediate results stored on the
+plan out of a giant search space effectively and the long         slow global memory and requires more sequential reduction
+context splitting (Section 4.3) to avoid GPU underutilization.    steps in the subsequent GPU kernel (Dao et al., 2023). Sup-
+With the grouping plan, FastTree then replaces the original       pose that both plans have enough block parallelism, i.e., the
+attention kernel of the serving system with its efficient tree-   launched GPU blocks can fully occupy all the SMs. Then,
+structured attention kernels (Section 5). FastTree processes      this memory transaction and reduction overhead introduced
+each context-queries group in FlashAttention style, reducing      by plan 1 can cause a higher execution latency than plan 2.
+the redundant memory loads and improving tensor core
+                                                                  Decision space formulation. It is crucial to effectively find
+utilization significantly.
+                                                                  the optimal context-queries grouping plan for a given tree
+                                                                  to balance different overheads at runtime. Directly formu-
+4     T REE S TRUCTURE -A DAPTIVE RUNTIME                         lating the problem as a searching process of a (context,
+      O PTIMIZATION                                               {queries}) list is not easy, because we have to add com-
+                                                                  plicated constraints to ensure that the results meet the im-
+At runtime, the structure of the KV cache tree varies across      plicit tree-structure requirements. Instead, we formulate the
+time, requiring adaptive optimization on the fly to maximize      problem as a binary edge-assignment task. We assign a bi-
+the underlying GPU kernel performance. In this section, we        nary value to each edge in a tree, where a value of 1 indicates
+detail the design of FastTree’s runtime optimization.             that the two connected nodes are “concatenated”. Each time
+                                                                  a node is concatenated to a leaf node, we “replicate” that
+4.1   Problem Formulation                                         node, such that each replica is individually concatenated to
+Context-queries grouping. To enable the tensor core uti-          a different leaf node. This process produces a new virtual
+lization and reduce context memory reloading, we need             tree structure based on the assigned values. Note that this
+to aggregate queries that share the same context prefix           virtual tree does not alter the actual storage, such as memory
+and process them together. However, the shared prefixes           replication, but serves as a guide for the grouping strategy.
+can vary significantly between different queries, so there        With this virtual tree, we can determine the shared contexts
+can be many different grouping plans with a given con-            by directly using the tree nodes. Then, we can maximize the
+text tree at runtime. For example, in Figure 4, queries Q1        aggregated queries of each context by using the node-centric
+to QM share the same prefix A1 and B1, while queries              query aggregating to generate the grouping plan. That is,
+QM +1 to QM +N share A1 and B2. By directly aggre-                we generate the context-queries grouping plan by traversing
+gating all associated queries for each node in the tree,          each node and aggregating all queries that share the context
+we can get the grouping plan 1 shown in Figure 4(b),              associated with that node.
+which is (A1, {Q1 , · · · , QM +N }), (B1, {Q1 , · · · ,          For example, as shown in Figure 5(a), we assign the red
+QM }), and (B2, {QM +1 , · · · , QM +N }). Then, by               values to the edges of the tree, concatenating A1+B1 and
+concatenating A1+B1 and A1+B2 respectively, we can ob-            A1+B2. This assignment generates a virtual tree shown in
+tain another grouping plan (A1+B1, {Q1 , · · · , QM })            Figure 5(b). Based on this virtual tree, we then group a
+and (A1+B2, {QM +1 , · · · , QM +N }), as shown in                node’s context with all its associated queries like plan 1 in
+Figure 4(c).                                                      Figure 4(b) does.
+Different grouping plans change the computation-batching          Formally, given a KV cache tree T = (V, E) at runtime,
+and memory-sharing patterns, which affects the perfor-            where V represents the set of vertices and E the set of
+mance of the final attention kernel significantly. Moreover,      edges, the objective is to determine an assignment function
+even with the same tree topology, the performance of the          f : E → {0, 1} that minimizes the latency of GPU kernel
+same plan can vary in different cases. For example, in the        execution. Specifically, we aim to solve:
+case shown in Figure 4(d), the queries associated with B1
+and B2 are both 8, while the kernel requires a tile size of 16              min Latency(Groups(VT(T, f (E))))
+                                                                             f
+to utilize the memory and computing resources fully. Hence,                                                                  (2)
+for plan 2, the GPU kernel has to rely on input padding to                   s.t.   f (e) ∈ {0, 1},   ∀e ∈ E,
+meet the hardware requirements for all groups, while plan
+                                                                  where:
+1 can avoid this for the long-context A1 group. As a result,
+plan 2 introduces much more wasted computation, making               • VT(T, f (E)) transforms the original tree T into a vir-
+its performance worse than plan 1.                                     tual tree based on the binary edge assignment f (E).
+                                                                     • Groups(·) maps the virtual tree to a grouping plan.
+In contrast, in another case shown in Figure 4(e), where
+                                                                     • Latency(·) evaluates the GPU kernel latency based on
+                              FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+                                            128
+                                                                  Q1                                                                              Q1 … QM
+                     128                                                                                              B1                                                     B1
+                                               B1                 …
+                                                                                               A1                  Q1 … QM                           A1
+                                                                  QM
+                     A1                     128                                             Q1 … QM+N
+                                                                 QM+1
+                                                                                                                      B2                          QM+1 … QM+N                B2
+                                               B2                …
+                                                                                                                  QM+1 … QM+N
+                                                                 QM+N
+
+               (a) An example radix tree with M+N queries                                        (b) Grouping plan 1                                  (c) Grouping plan 2
+
+
+
+                           Case 1: M=N=8                                                                               Case 2: M=N=128
+        Attention                                                                                    Attention
+       Computation                                                                    K^T           Computation
+          Time                                                                                         Time
+
+
+                                                                         Q                                                                                  Q1-A1       Q1-B1         Q1
+
+                                                                                                                                                           QM+1-A1     QM+1-B2       QM+1
+                                                                                                                                   1          2
+                        ree       lan
+                                      1        n2           Padding to meet tile size requirement                    ree       lan        lan
+                     stT        gP          Pla                                                                   stT        gP         gP
+                   Fa        pin        ing                                                                   o Fa        pin        pin
+                                                                                                                                                          More intermediate results on HBM
+               w/o         ou         up                           Wasted shared memory                    w /          ou        ou                      & more sequential reduction steps!
+                         Gr        Gro
+                                                                      & computation!                                  Gr        Gr
+
+
+
+              (d) In case 1, the wasted memory and computation due to padding                                (e) In case 2, the more memory transactions and reduction steps
+                   cause the performance of pairing plan 2 worse than plan 1.                                         introduced by plan 1 makes it slower than plan 2.
+
+
+
+Figure 4. Illustration of two context-queries grouping plans. In different cases, the two plans each have their performance problems.
+
+
+                                                          virtual nodes                                  BFS order (Line 3) and enumerate the leaf nodes for each
+                       0     C1           Q1                                     C1            Q1
+          1     B1                                          A1      B1
+                                                                                                         node v (Line 6). For each leaf node l, we estimate the costs
+  A1                   0     C2           Q2                                     C2            Q2
+                                                                                                         of assigning different values to the edge v → l in Lines 8-9
+         1
+                B2          Q3                              A1      B2         Q3                        based on the query numbers and context lengths of v and l,
+        (a) Binary edge assignment                  (b) Virtual tree based on the assignment
+                                                                                                         i.e., nQcurr , nQl , lenv , and lenl . The detailed cost analysis
+                                                                                                         is discussed in the next paragraph. Finally, we assign the
+                                                                                                         value to the edge by comparing the costs in Lines 10-16. If v
+Figure 5. Example of edge assignment and virtual tree generation.
+                                                                                                         and l are concatenated by assigning value 1 to the edge, we
+                                                                                                         should also update the nQcurr and L[l] accordingly. This
+        the given grouping plan.                                                                         is because after concatenating, the nQl queries should be
+                                                                                                         grouped with the concatenated node rather than the original
+4.2      Overhead-Guided Greedy Heuristic                                                                node v, so nQcurr should be decreased. Meanwhile, for
+                                                                                                         node l, we should increase its context length by the length
+In practice, the structure of the radix tree is dynamic (Zheng                                           of v. We use Figure 6 to illustrate what the variables used
+et al., 2023a) across time, so we need to update the grouping                                            above represent and how the concatenation between v and l
+plan accordingly on the fly. Therefore, the runtime search                                               affects their aggregated query numbers and context lengths.
+for the optimal edge assignment should be lightweight, oth-
+erwise the overall inference performance can be affected.                                                In the next part, we introduce how we construct the cost
+Enumerating all possible candidates thus becomes infea-                                                  models based on the overhead analysis. Our insight is that
+sible as we have 2|E| plans, and it is difficult to quickly                                              although it is difficult to predict the accurate cost, leveraging
+predict the latency of the GPU kernels whose blocks are                                                  a lightweight overhead estimation is yet effective in guiding
+heterogeneous without actual evaluation.                                                                 the greedy search.
+
+We resort to a greedy heuristic to solve the search problem                                              Cost due to padding. After grouping, the GPU kernel
+in linear time. We traverse the tree in a breadth-first search                                           will process each group tile-by-tile, looping over query and
+(BFS) order and determine the value of each edge by com-                                                 context dimensions. Tile shapes are specified based on
+paring the estimated costs of the two different assignments.                                             the hardware features to take full advantage of the on-chip
+                                                                                                         shared memory and high-performance tensor cores, which
+We illustrate the detailed assignment process with the greedy                                            are fixed across thread blocks. However, the dimensions
+heuristic in Algorithm 1. We first initialize arrays A and                                               may not always be perfectly divisible by the tile size. In
+L in Lines 1-2 to represent the current aggregated query                                                 such cases, padding is required to fill the last several tiles,
+number and context length of each node by assuming all                                                   wasting the shared memory resources. The padding area in
+nodes are separated. Their values can be updated if two                                                  a given dimension can be computed based on the tile size
+nodes are concatenated. We then traverse the entire tree in a
+                   FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+Algorithm 1 Greedy Binary Edge Assignment                                 𝑙𝑒𝑛!             𝑙𝑒𝑛"               𝑙𝑒𝑛!                 𝑙𝑒𝑛! + 𝑙𝑒𝑛"
+
+  Input: Radix tree T = (V, E)                                                      0                                               1
+                                                                           A1              B1                 A1            A1             B1
+ 1: Initialize A as the number of all associated queries of            Q1 Q2 Q3           Q1 Q2            Q1 Q2 Q3                      Q1 Q2
+    each node in V                                                       𝑛𝑄#$%%            𝑛𝑄"               𝑛𝑄#$%% − 𝑛𝑄"                  𝑛𝑄"
+ 2: Initialize L as the context length of each node                 (a) Illustration of used variables    (b) Variable updates after concatenating
+ 3: for node v in BFS(V ) do
+ 4:    nQcurr = A[v]          ▷ current #aggregated queries      Figure 6. Illustrating example for the variables used in Algo-
+ 5:    lenv = L[v]            ▷ accumulated context length       rithm 1.
+ 6:    for l in leaves(v) do
+ 7:       nQl = A[l], lenl = L[l]
+ 8:       C0 = SplitKVCost(nQcurr , nQl , lenl , lenv )          where T Sc is the tile size for the context dimension and β is
+ 9:       C1 = SplitQCost(nQcurr , nQl , lenl , lenv )           another empirical coefficient. The difference from the cost
+10:       if C0 ≥ C1 then                                        for query dimension is that we only consider the overhead
+11:          Assign 1 to edge v → l                              when the current context length is smaller than the tile size.
+12:          nQcurr = nQcurr − nQl                               This is because, unlike the number of aggregated queries,
+13:          L[l] = lenl + lenv                                  the context length can grow during tree traversal through
+14:       else                                                   concatenation. Once it exceeds the tile size, the overhead
+15:          Assign 0 to edge v → l                              due to padding becomes difficult to estimate at each traversal
+16:       end if                                                 step. Then, we define the overall padding cost of a virtual
+17:    end for                                                   node as:
+18: end for
+                                                                             CP (nQ, len) = α · CP,q (nQ, len)
+                                                                                                         + β · CP,kv (nQ, len)                    (7)
+T S and the dimension size N through the function:
+                                                                 where α and β are two empirical coefficients.
+        Pad(T S, N ) = T S − ((N − 1)%T S + 1)            (3)    Then, according to the computation patterns shown in Fig-
+                                                                 ure 6, we construct the costs for the two assignments as:
+Concatenating v and l requires splitting the Q matrix of
+                                                                          SplitKVCostP = CP (nQcurr , lenv )
+v in the query dimension, as nQl queries associated with
+l should be separated from the nQcurr queries associated                                             + CP (nQl , lenl )                           (8)
+with v. Such splitting will either keep the padding area                   SplitQCost             = CP (nQcurr − nQl , lenv )
+unchanged or exacerbate the problem because we always                                                + CP (nQl , lenv + lenl )                    (9)
+have the following inequality:
+
+   Pad(T S, M + N ) ≤ Pad(T S, M ) + Pad(T S, N )         (4)    Cost due to intermediate results. Besides padding, split-
+                                                                 ting the KV matrices at the context dimension (i.e., assign
+                                                                 0 to the edge) can introduce more intermediate results and
+Padding introduces two primary sources of performance            cause additional overhead. This is because the attention
+overhead. First, it leads to inefficient utilization of shared   computation requires reducing all elements across the con-
+memory, which could otherwise be used to cache additional        text dimension. After context splitting, different groups
+aggregated queries for improved data reuse and reduced           are processed by separate thread blocks, so the intermedi-
+global memory access. Second, padding results in redun-          ate partial reduction results should be stored in the global
+dant computations that do not contribute to the final output.    memory (Dao et al., 2023), which causes extra memory
+To estimate the overhead due to padding at the query dimen-      transaction overhead and brings more sequential reduction
+sion, we define its cost function by combining the increased     steps in the next stage to compute the final results. These
+memory loading and floating-point operations:                    overheads can accumulate and become significant when the
+                                                                 plan contains lots of dependent groups with short contexts.
+         CP,q (nQ, len) = Pad(T Sq , nQ) · len · d        (5)
+                                                                 We use the number of the increased intermediate elements
+                                                                 along with an empirical coefficient γ to model this cost:
+where nQ represents the query number, len is the context
+length, T Sq is the tile size, and d is the head dimension.                             SplitKVCostR = γ · nQl · d                               (10)
+Similarly, we have the cost function for padding at the con-
+text dimension:                                                  Then, the total cost of assigning a value of 0 is:
+
+ CP,c (nQ, len) = nQ · Pad(T Sc , min (len, T Sc )) · d (6)         SplitKVCost = SplitKVCostP + SplitKVCostR                                    (11)
+                   FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+By adjusting the empirical coefficients based on profiling the                                                                        GPU Block
+underlying hardware, we can reconcile the two overheads              SM1                                                                   SM1
+to leverage the greedy heuristic shown in Algorithm 1 to             SM2                                                                   SM2
+                                                                                                                                                            GPU underutilization
+generate the context-queries groups effectively at runtime.          SM3          Unused SMs        SM3                                                     due to long tail block
+                                                                     SM4       due to small #blocks SM4
+4.3   GPU-Efficient Long Context Splitting                                                      Timeline                                                             Timeline
+
+Our greedy heuristics consider the overhead introduced by
+different grouping plans, but the GPU can still be under-         Figure 7. Two performance issues that can be solved by splitting
+utilized in certain cases. We propose runtime long context        long contexts.
+splitting to enhance GPU utilization, overcoming two prob-
+lems that affect the attention kernel performance.                                           Tree-Structured Attention Kernel
+
+                                                                   Parallelize with different                                                  Loop within a block
+The first problem is that sometimes the group-level paral-
+
+
+
+
+                                                                                                  Parallelize with different blocks
+                                                                    sets of thread blocks
+                                                                                                                                                                K^T
+lelisms can be insufficient to fully occupy the GPU, i.e., the
+                                                                                      B1
+total launched thread block numbers are smaller than the                                                                                   ×
+
+
+
+
+                                                                                                                                                                               Loop within a block
+                                                                      A1           Q1 … QM
+                                                                                                                                                                                                     =
+GPU capacity. The maximum block number that can reside             Q1 … QM+N                                                                                ×
+                                                                                      B2
+on the GPU simultaneously is the product of the GPU SM                           QM+1 … QM+N
+
+number and the maximum block number per SM, where                                                                                      Q         Online softmax                                          O L
+the latter is determined by the shared memory and register                                                                                     in shared memory          V
+
+usage. With a small number of blocks, the GPU can fail to
+                                                                                GPU
+hide the instruction latency through warp scheduling and                                                                              Sub-core Sub-core                      FP32                        FP64
+                                                                       SM        SM          SM                                                                 Tensor
+even have SMs idle, as shown in the left part of Figure 7.                                                                            Sub-core Sub-core          core
+                                                                       SM        …           SM                                                                              INT32                        …
+                                                                                                                                       Shared memory
+The second problem is that partial tree nodes can have ex-                                                                                (30TB/s)
+                                                                                                                                                                         Registers
+                                                                      Global memory (3TB/s)
+tremely long contexts, causing a significant tail effect like
+the right part of the figure shows. In this case, some blocks
+can consume much more execution time than others, so              Figure 8. The design of the attention kernel in FastTree. The colors
+in the last waves, the active block number is very small,         of tiles in the dotted rectangle indicate their memory location,
+causing the same issue as in the first case.                      according to the simplified GPU architecture figure at the bottom.
+
+For both of the above problems, we find that splitting the
+nodes with context lengths larger than a certain threshold        only increases the block parallelism but also eliminates the
+at runtime can solve them effectively. Although context-          kernel launch overhead (Zhuang et al., 2024; Zheng et al.,
+splitting introduces the intermediate result reduction over-      2022; Pan et al., 2023).
+head, experiments (detailed in Section 6.1) demonstrate that
+the performance improvement it brings can totally hide the        Flash-Attn style group processing. Within the kernel, we
+overhead when GPU SMs are underutilized.                          perform the attention operation tile-by-tile. For each group,
+                                                                  we divide the QKV matrices associated with it into multiple
+5     E FFICIENT T REE -S TRUCTURED                               tiles and parallelize the tiles across the query dimension
+      ATTENTION K ERNEL D ESIGN                                   by dispatching the Q matrix tiles into different blocks. In
+                                                                  contrast, we sequentially iterate the K and V tiles within a
+Existing GPU kernels designed for LLM inference (Dao              block due to the inter-tile dependency of the outputs across
+et al., 2023; FlashInfer, 2024) do not consider the radix tree-   the context dimension. We first copy the QKV tiles from
+based KV cache sharing. They separate the computation             the GPU global memory to the fast on-chip shared mem-
+of different queries into individual thread blocks, ignoring      ory, as Figure 8 depicts, and then utilize the online softmax
+the opportunity to enable the tensor core usage and reuse         technology (Rabe & Staats, 2021; Milakov & Gimelshein,
+the KV tiles in shared memory through query aggregation.          2018; Dao et al., 2022; Dao, 2023) to store all partial soft-
+By generating the context-queries groups based on the tree        max results in the shared memory. Compared with existing
+structures and hardware features, we can then utilize more        approaches (Dao et al., 2023; FlashInfer, 2024) that sep-
+efficient GPU kernels to address the above issues.                arate each query, we are able to reduce the slow global
+                                                                  memory transactions significantly, as for all queries within
+In detail, we use a single GPU kernel to process different
+                                                                  a Q tile, we only need to load the K matrix once and reuse
+groups in the tree in parallel, with each context-queries
+                                                                  them through the shared memory. Moreover, by aggregat-
+group dispatched to an individual block set, as Figure 8
+                                                                  ing queries, we can transform the GEMV operation into
+shows. Such a one-kernel-accommodating-all design not
+                                                                  the GEMM operation, thus enabling the effective usage of
+                    FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+tensor cores on the GPU, as shown in the figure.                    context length of the root node is 128 while the context
+                                                                    lengths of all other nodes are 32. Each node in the second
+After executing the attention kernel, we will obtain an in-
+                                                                    level has 4/2 = 2 child nodes. Besides, we benchmark the
+termediate output matrix O and a LogSumExp vector L
+                                                                    trees with grouped-query attention (GQA) (Ainslie et al.,
+for every group, stored in the GPU global memory, as
+                                                                    2023) ratios 1, 4, and 16, respectively. The head dimension
+shown in the right of Figure 8. We then launch another
+                                                                    we use is 128.
+lightweight GPU kernel to reduce the intermediate outputs
+for each query to get the final results, while leveraging the       Baselines. We compare the kernel execution time of
+LogSumExp vectors for re-scaling (Dao et al., 2023).                FastTree against various state-of-the-art baselines, includ-
+                                                                    ing FlashAttention (Dao et al., 2022; Dao, 2023; Dao
+Multi-phase tiling. We adaptively select the tile size for
+                                                                    et al., 2023) v2.6.3, FlashInfer (FlashInfer, 2024) v0.1.6,
+the query dimension to efficiently handle different parts in
+                                                                    and Triton-implemented (Tillet et al., 2019) kernels from
+the tree. This optimization is based on the fact that nodes
+                                                                    SGLang (Zheng et al., 2023a) v0.2.13. SGLang adapts
+closer to the root in the tree tend to aggregate more queries,
+                                                                    the Triton kernels from the token attention implementa-
+requiring larger tile sizes to maximize KV reuse and reduce
+                                                                    tion in LightLLM (ModelTC, 2024). We use Triton ver-
+redundant memory loads. On the other hand, nodes near
+                                                                    sion 3.0.0 during evaluation. We also evaluate the perfor-
+the leaves often have fewer queries, so we choose smaller
+                                                                    mance of FlashInfer’s Multi-level Cascade Attention (Cas-
+tile sizes to avoid shared memory wastage and improve SM
+                                                                    cadeAttn) (Ye et al., 2024b) and DeFT (Yao et al., 2024a),
+occupancy (NVIDIA, 2025; Pan et al., 2024) to hide instruc-
+                                                                    which are two concurrent works optimizing attention opera-
+tion latency. Our current implementation simply partitions
+                                                                    tions under tree-structured KV cache sharing.
+the tree into multiple phases and utilizes separate kernels
+with distinct tile sizes to process them. We apply this op-         Results. Figure 9 presents the GPU kernel performance
+timization only when the block-level parallelism is large           of FastTree and the baselines across different tree shapes
+enough for each phase, ensuring that all the SMs on the             and GQA ratios. We normalize the performance to the best-
+GPU can be utilized.                                                performing one for each configuration. Experimental results
+                                                                    show that on average, FastTree achieves 5.1×, 9.2×, 4.2×,
+6     E VALUATION                                                   10.6×, and 2.1× speedups over FlashAttention, SGLang’s
+                                                                    Triton kernels, FlashInfer, DeFT, and CascadeAttn, respec-
+We build FastTree as a plugin of SGLang (Zheng et al.,              tively. The performance improvement of FastTree comes
+2023a) and implement the attention kernels with Tri-                from the tree-structured attention kernel designs that reduce
+ton (Tillet et al., 2019) for quick prototyping and verification.   HBM accesses and improve tensor core utilization as well
+We optimize the attention operations during decoding while          as the runtime optimization that effectively identifies the
+using the kernels in FlashInfer (FlashInfer, 2024) during pre-      efficient grouping plan.
+fill. There are no fundamental reasons preventing FastTree
+                                                                    We observe that when the GQA ratio is low, FastTree
+from optimizing the batched prefills or the mixed prefill
+                                                                    achieves significantly higher speedups over FlashAttention
+and decoding except the engineering efforts. However, the
+                                                                    and FlashInfer compared to configurations with a high GQA
+benefit will be limited as the prefill stages often do not
+                                                                    ratio. This is because GQA can explicitly aggregate multi-
+suffer from the redundant KV cache loads and tensor core
+                                                                    ple query heads into a single KV head, alleviating the issues
+underutilization.
+                                                                    of shared memory waste and low tensor core utilization.
+We evaluate FastTree on an NVIDIA H100 GPU (80GB)                   However, even at a GQA ratio of 16, where FlashAttention
+with the support of CUDA 12.2. Our current implementation           and FlashInfer can effectively leverage tensor cores, Fast-
+does not utilize Hopper-specific features (e.g., TMA), and          Tree still outperforms these query-separate kernels across
+we leave this as future work for further optimization.              different tree shapes. This advantage arises from FastTree’s
+                                                                    ability to use larger tile sizes that aggregate more queries
+6.1   Kernel Benchmark                                              for KV reuse, thereby reducing redundant memory accesses
+                                                                    effectively. SGLang’s Triton kernel has not yet integrated
+Workloads and settings. We benchmark the GPU kernel                 GQA-specific optimizations, resulting in poor performance
+performance for the attention operations with various con-          even when GQA is enabled.
+figurations. We utilize two arrays to generate benchmarks
+with different tree shapes of the KV cache, which are the           Even without greedy search, FastTree outperforms DeFT
+tree node number of each level (N) and the per-node context         and CascadeAttn, both of which also leverage tree-
+length of each level (C), respectively. The size of these           structured optimizations. This performance gap is attributed
+arrays is equal to the number of levels in the tree, that is,       to a series of kernel and runtime-level optimizations em-
+the tree depth. For example, a three-level tree with N=1,2,4        ployed by FastTree. For instance, by adaptively partitioning
+and C=128,32,32 contains 1 + 2 + 4 = 7 total nodes. The             the tree into phases with distinct tile sizes and selectively
+                                                     FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+                                               FlashAttn              SGLang              FlashInfer             DeFT             CascadeAttn                FastTree w/o Greedy                 FastTree
+                                   1.0
+                                                                                                     Query Heads=32 KV Heads=32
+                                 1.0
+
+                                 0.5
+ Normalized Kernel Performance
+
+
+
+
+                                  0.8
+
+
+
+
+                                 0.0
+                                                                                                      Query Heads=32 KV Heads=8
+                                 1.0
+                                  0.6
+
+
+
+
+                                 0.5
+                                   0.4
+
+                                 0.0
+                                                                                                      Query Heads=16 KV Heads=1
+                                 1.0
+                                   0.2
+
+
+                                 0.5
+
+                                 0.0
+                                  0.0
+                                     0.0                               0.2 4                                     0.4 6                            0.6 4                            0.8 4                    1.0
+                                          0         6         24                          6               4                         2       24                  24          24                   24   24
+                                       1,1 0     ,25 2      10 2
+                                                                            6
+                                                                        ,2, 2         ,25 2          6,6 2          ,25 2        ,51 2    10 6
+                                                                                                                                                     2
+                                                                                                                                                   10 6      10 6       10 6        10 6
+                                                                                                                                                                                        2
+                                                                                                                                                                                               10 6 10 6
+                                     N: ,40 N: 1 6,3 : 1, 8,3 N: 1 6,3 : 1,4 6,3 : 1,1 6,3 ,4,8 6,3 4,16 8,3 56, ,25 28, 6,1 56, 6,1 28, 6,1 56, 6,1 28, 6,1 28, 6,1
+                                      0 0       2 5    N 04           , 2 5   N    , 2 5     N    , 2 5     : 1 ,25      1  , ,12 4,2 ,32 4,1 6,1 4,2 6,1 4,1 6,1 4,2 6,1 4,1 6,1 4,1 6,1
+                                    40       C:        C:
+                                                          2
+                                                                 C:
+                                                                    8
+                                                                              C:
+                                                                                 8             24          N 56       N: 256 6,6 ,64 2,6 4,1 2,6 4,1 2,6 6,1 2,6 6,1 2,6 6,1 2,6 6,1
+                                 C:                                                         10             8,2            ,      1    6 6,3 8,6 6,3 8,6 6,3 4,1 6,3 4,1 6,3 6,1 6,3 6,1
+                                                                                         C:             C:             24     ,4, 25
+                                                                                                                  : 10 N: 1 6,8, : 1,1 6,12 : 1,1 6,12 1,8,1 28,6 1,8,1 28,6 4,8,1,16,1 4,8,1,16,1
+                                                                                                                C            2 5     N 25     N 25 N: 6,1 N: 6,1 ,2, 16                 ,2, 64
+                                                                                                                          C:          C:       C:       25         25 N: 1 ,16, N: 1 128,
+                                                                                                                                                     C:         C:         16          6,
+                                                                                                                                                                       C :         2 5
+                                                                                                                                                                                C:
+
+
+
+Figure 9. Normalized GPU kernel performance of FastTree and the baselines for the attention operation across various configurations. N:
+node number of each level. C: per-node context length of each level.
+
+
+splitting the context, FastTree strikes a balance between                                                                the final few levels of the tree and use a small tile size of
+parallelism and data reuse, leading to improved GPU utiliza-                                                             16. In contrast, direct aggregation may increase data reuse
+tion. In contrast, DeFT uses a fixed tile size, which results                                                            with larger tile sizes but also introduces excessive padding
+in substantial shared memory waste in many configurations,                                                               and lowers occupancy, ultimately leading to performance
+particularly with a high GQA ratio. Furthermore, DeFT                                                                    degradation.
+introduces additional masking operations, which incur re-
+                                                                                                                         Additionally, we study the impact of GPU-efficient long
+dundant computation and further degrade performance.
+                                                                                                                         context splitting (Section 4.3) on performance. In specific
+Optimization ablation. In the figure, we also include the                                                                configurations such as N=1,10 and C=4000,400, this split-
+performance of FastTree without greedy optimization (Sec-                                                                ting optimization can yield up to a 1.9× speedup. This
+tion 4.2), where context-query groups are aggregated di-                                                                 is because, in these settings, the number of context-query
+rectly based on the original tree structure. Unlike the full                                                             groups that can be parallelized is limited and there exist
+version of FastTree, this variant does not employ a greedy                                                               nodes with very long contexts, leading to severe GPU SM
+heuristic to construct a virtual tree before aggregation. The                                                            under-utilization issues.
+figure shows that when the tree structure is relatively sim-
+ple and shallow, the greedy heuristic in FastTree tends to                                                               6.2      End-to-end Performance
+produce a grouping plan similar to direct aggregation. In
+such cases, it prefers to separate different levels to aggre-                                                            We benchmark the end-to-end performance of FastTree by
+gate more queries and maximize data reuse. On the other                                                                  integrating it into SGLang v0.2.13. For comparison, we
+hand, as the tree becomes deeper and structurally more                                                                   evaluate SGLang using both Triton and FlashInfer as atten-
+complex, the greedy heuristic can effectively identify more                                                              tion operation backends. We measure the inference time for
+efficient grouping plans, achieving up to a 2.2× speedup.                                                                a batch of requests that share common prefixes to report the
+For instance, regarding the configuration in the bottom-right                                                            system throughput.
+corner of the figure, FastTree tends to concatenate nodes for                                                            Workloads. We test FastTree on models Llama-2-7B (Tou-
+                   FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+
+
+
+                                                                  Normalized Performance
+vron et al., 2023) and Mistral-7B (Jiang et al., 2023), whose                                                     SGLang w/ Triton                                FastTree (Ours)
+GQA ratios are 1 and 4, respectively. We adopt the Meta                                                           SGLang w/ FlashInfer
+                                                                                              1.0
+AI system prompt from The Big Prompt Library (TheBig-                                      1.0
+                                                                                              0.8
+PromptLibrary, 2024) to imitate the LLM applications used
+                                                                                              0.6
+in production, which contains 3193 tokens (with Llama                                      0.5
+                                                                                             0.4
+
+tokenizer). We then combine it with the following bench-                                      0.2
+
+marks, where questions are collected from the GSM8K                                        0.0
+                                                                                             0.0
+
+dataset (Cobbe et al., 2021):
+                                                                                                0.0
+                                                                                                             A           B
+                                                                                                                         0.2
+                                                                                                                                      C   0.4
+                                                                                                                                                D       A0.6          B      0.8
+                                                                                                                                                                                   C       D 1.0
+                                                                                                                    Llama-7B                                      Mistral-7B
+(A) Multi-level system prompt: a system prompt sets the ini-
+tial guidelines for how an LLM model should respond, defin-       Figure 10. End-to-end performance comparison across bench-
+ing its tone, role, and focus, while some aspects can vary        marks. A: multi-level system prompt. B: multiple few-shot learn-
+between users based on individual needs or session settings.      ing. C: multi-chain reasoning. D: multi-document QA.
+In this benchmark, we randomly replace the user country
+and response language in the Meta AI system prompt with                                                       Prefill                 Decoding          Preprocess                     Other
+different values, splitting into four levels with 459, 38, 584,                                     1.0
+
+                                                                                FastTree
+and 2112 tokens, respectively.
+                                                                     FlashInfer
+                                                                             0.8
+
+
+(B) Multiple few-shot learning: few-shot learning (Brown,                           SGLang
+2020) is an extensively used in-context learning method that                                        0.6
+                                                                                                    0.00          0.25         0.50    0.75     1.00 0.00      0.25       0.50     0.75    1.00
+                                                                                                             Multi-Level System Prompt                 Multiple Few-Shot Learning
+lets LLMs learn from the few-shot examples provided in the
+                                                                                                    0.4
+prompt. We create the benchmark by constructing a three-                        FastTree
+level tree structure consisting of a system prompt, multiple         FlashInfer
+                                                                             0.2
+
+(8 in our experiments) few-shot example combinations, and                           SGLang
+corresponding question-answer (QA) pairs. We let each                                               0.0
+                                                                                                    0.00
+                                                                                                       0.0        0.25         0.50
+                                                                                                                               0.2     0.75 0.41.00 0.00    0.60.25       0.500.8 0.75     1.00
+                                                                                                                                                                                              1.0
+
+combination contain 20-shot examples, with subsequent 16                                                         Multi-Chain Reasoning                         Multi-Document QA
+
+individual questions.
+                                                                  Figure 11. End-to-end execution time breakdown comparison on
+(C) Multi-chain reasoning: Multi-chain reasoning (Yoran           Llama. For abbreviation, we use “SGLang” to represent SGLang
+et al., 2023) invokes multiple distinct chains of logic and       with Triton-implemented kernels and “FlashInfer” to represent
+then combines them to solve complex problems. In this             SGLang with FlashInfer backend. The horizontal axis is the nor-
+benchmark, we construct four chains for each question.            malized execution time.
+(D) Multi-document QA: In multi-document QA, questions
+can be input into the LLM with multiple documents in the          and we provide a detailed analysis in the following parts.
+prompt as the information sources (Jin et al., 2024). The
+used documents across questions can then form a radix tree        We find that the Triton-implemented attention kernels in
+with multi-level sharing. We split the Llama-2 report (Tou-       SGLang are generally slower than FlashInfer. This is be-
+vron et al., 2023) into different parts and use these parts to    cause FlashInfer is a more comprehensive CUDA kernel
+form the multi-document prompts. In this benchmark, we            library optimized for various conditions.
+do not add the Meta AI system prompt at the beginning.            Breakdown analysis. We report the latency breakdown on
+For all benchmarks, we keep the total number of parallel          Llama in Figure 11 for performance analysis. We find that
+requests within a batch as 128 and set the generated token        with FastTree, the decoding latency shrinks substantially for
+number of each request as 256.                                    all benchmarks due to more efficient attention operations,
+                                                                  with average speedups of 2.3× and 1.9× over SGLang-
+Results. We present the normalized performance of Fast-           Triton and SGLang-FlashInfer. Besides, the preprocessing
+Tree and the baselines in Figure 10. Experimental re-             overhead on the CPU introduced by generating context-
+sults demonstrate that FastTree consistently outperforms          query groups in FastTree is negligible in these benchmarks.
+the baselines across the benchmarks. Compared to SGLang           This is due to two main reasons. First, when the batch size
+with Triton-implemented kernels, FastTree achieves average        and context length are sufficiently large, the GPU kernel exe-
+speedups of 2.4× and 3.1× on Llama and Mistral, respec-           cution time dominates the overall inference process, making
+tively. As for SGLang with FlashInfer backend, the average        the CPU preprocessing overhead relatively small. Second,
+speedups are 1.6× and 1.9×, respectively. Overall, Fast-          SGLang performs multiple consecutive decoding steps after
+Tree improves the throughput of SGLang by up to 2.2×              scheduling a batch to amortize the scheduling overhead. As
+compared to FlashInfer backend. The improvement comes             a result, the preprocessing overhead introduced by FastTree
+from accelerating the time-consuming attention operation,         is also effectively amortized. Furthermore, it is possible
+                           FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+           Attention (Prefill)             GEMM                      Memcpy           Attention kernel optimization. Many works study the
+           Attention (Decode)              Mem-Intensive                              GPU kernel optimization to accelerate attention computa-
+          1.0
+
+    FastTree                                                                          tion. FlashAttention (Dao et al., 2022; Dao, 2023; Dao
+ FlashInfer
+         0.8
+                                                                                      et al., 2023) fuses attention computation into one single
+                                                                                      GPU kernel by leveraging online softmax (Rabe & Staats,
+    SGLang
+          0.6                                                                         2021; Milakov & Gimelshein, 2018), storing all interme-
+          0.00      0.25   0.50   0.75   1.00 0.00    0.25    0.50   0.75    1.00
+                Multi-Level System Prompt        Multiple Few-Shot Learning           diate results on the shared memory and reducing IO cost
+          0.4
+    FastTree
+                                                                                      significantly. Several works (Ye et al., 2024a; Zhu et al.,
+                                                                                      2024; Lin et al., 2024; Zheng et al., 2024) improve the at-
+ FlashInfer
+         0.2
+                                                                                      tention computation under single-level prefix sharing. Con-
+    SGLang
+          0.0
+                                                                                      current works (Ye et al., 2024b; Yao et al., 2024a; Juravsky
+          0.00
+             0.0    0.25   0.50
+                           0.2    0.75 0.41.00 0.00 0.60.25   0.500.8 0.75   1.00
+                                                                                1.0
+
+                   Multi-Chain Reasoning             Multi-Document QA                et al., 2024) also optimize the attention kernel under tree-
+                                                                                      structured KV cache sharing, but they do not identify and
+Figure 12. Execution time breakdown of GPU kernels on Llama.                          handle the context-queries grouping challenge as FastTree.
+The CPU operations and overhead are not reported here. The                            Meanwhile, machine learning compilers (Chen et al., 2018;
+horizontal axis is the normalized execution time.                                     Zheng et al., 2020; Lattner et al., 2021; Zheng et al., 2023b;
+                                                                                      Tillet et al., 2019; Huang et al., 2023) are extensively used
+                                                                                      to generate efficient GPU kernel codes. We implement Fast-
+to overlap the CPU-side preprocessing with GPU computa-                               Tree with Triton (Tillet et al., 2019), which allows users to
+tion (Team, 2024b), which can further reduce overhead and                             write fast GPU kernels with Python conveniently.
+deliver more robust performance gains.
+                                                                                      CUDAGraph (Gray, 2019) is often used during decoding
+GPU kernel execution time breakdown. Moreover, we                                     to reduce CPU overhead by capturing and replaying GPU
+show the breakdown of GPU kernels in Figure 12. We find                               workloads, but it requires static inputs and fixed launch
+that compared to GEMM operations in QKV projections and                               configurations to enable graph construction. To be compat-
+MLP layers, the unoptimized attention operations occupy                               ible with CUDAGraph optimization, we can integrate the
+substantial portions of the total kernel execution time across                        persistent threads (Aila & Laine, 2009; Boyer et al., 2009)
+the tree-structured benchmarks. In contrast, with FastTree,                           technique to fix the launched blocks with FastTree, or we
+the attention computation time can be reduced significantly.                          can leverage the PyTorch CUDAGraph Trees (Team, 2024a)
+According to the figure, other kernels, which are mainly                              to only capture the non-attention parts during decoding.
+invoked by the element-wise and reduction operations in
+the model, only contribute to a small portion of the entire
+execution time.
+                                                                                      8    C ONCLUSION
+                                                                                      In this paper, we identify the inefficient computation lim-
+7      R ELATED W ORK                                                                 itations of existing serving systems with tree-structured
+                                                                                      KV cache sharing. To address these, we introduce Fast-
+LLM serving systems. LLM serving systems are responsi-                                Tree, which improves the inference performance with tree
+ble for efficiently deploying models and managing inference                           structure-tailored attention kernel and runtime optimization.
+requests, which have gained increasing attention in recent re-                        FastTree applies a greedy heuristic to effectively search
+search. Many works optimize the request scheduling strate-                            for the efficient context-queries groups at runtime and then
+gies of LLM serving systems. For example, Orca (Yu et al.,                            performs the attention operations with shared memory and
+2022) proposes iteration-level scheduling (or continuous                              tensor core-friendly kernels. Our experiments show that
+batching), which continuously schedules new requests to                               FastTree significantly improves the attention computation
+form a batch rather than waiting for the completion of pre-                           performance under the tree-structured KV cache.
+vious requests. Another line of work focuses on efficient
+memory management during serving. vLLM (Kwon et al.,
+2023) adopts the paged KV cache mechanism to reduce
+                                                                                      9    ACKNOWLEDGMENT
+memory fragments. CachedAttention (Gao et al., 2024) and                              We sincerely thank the anonymous MLSys reviewers for
+Pensieve (Yu et al., 2023) maintain the multi-turn chat his-                          their valuable feedback and insightful suggestions. We also
+tory to eliminate redundant computation. SGLang (Zheng                                appreciate the UCSD MLSys Group for their helpful com-
+et al., 2023a) organizes the KV cache as a radix tree to                              ments. This work was supported in part by NSF Award
+enable multi-level prefix sharing, but it overlooks the tree                          2124039 and the Amazon Research Awards. We use Chat-
+structure-unaware computation problem. In contrast, Fast-                             GPT to polish the paper writing and help write some scripts.
+Tree optimizes the attention kernel performance guided by
+the tree-structured KV cache.
+                  FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+R EFERENCES                                                     Dao, T. Flashattention-2: Faster attention with bet-
+                                                                  ter parallelism and work partitioning. arXiv preprint
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,
+                                                                  arXiv:2307.08691, 2023.
+  N., Gulavani, B., Tumanov, A., and Ramjee, R. Taming
+  {Throughput-Latency} tradeoff in {LLM} inference with         Dao, T., Fu, D., Ermon, S., Rudra, A., and Ré, C. Flashat-
+  {Sarathi-Serve}. In 18th USENIX Symposium on Operat-            tention: Fast and memory-efficient exact attention with
+  ing Systems Design and Implementation (OSDI 24), pp.            io-awareness. Advances in Neural Information Process-
+ 117–134, 2024.                                                   ing Systems, 35:16344–16359, 2022.
+Aila, T. and Laine, S. Understanding the efficiency of ray      Dao, T., Haziza, D., Massa, F., and Sizov, G.
+  traversal on gpus. In Proceedings of the conference on          Flash-Decoding  for  long-context  inference.
+  high performance graphics 2009, pp. 145–149, 2009.              https://crfm.stanford.edu/2023/10/
+                                                                  12/flashdecoding.html, 2023.
+Ainslie, J., Lee-Thorp, J., De Jong, M., Zemlyanskiy, Y.,
+  Lebrón, F., and Sanghai, S. Gqa: Training generalized        FlashInfer. FlashInfer. https://github.com/
+  multi-query transformer models from multi-head check-           flashinfer-ai/flashinfer, 2024.
+  points. arXiv preprint arXiv:2305.13245, 2023.
+                                                                Gao, B., He, Z., Sharma, P., Kang, Q., Jevdjic, D., Deng,
+Bai, J., Bai, S., Chu, Y., Cui, Z., Dang, K., Deng, X., Fan,      J., Yang, X., Yu, Z., and Zuo, P. {Cost-Efficient} large
+  Y., Ge, W., Han, Y., Huang, F., Hui, B., Ji, L., Li, M.,        language model serving for multi-turn conversations with
+  Lin, J., Lin, R., Liu, D., Liu, G., Lu, C., Lu, K., Ma, J.,     {CachedAttention}. In 2024 USENIX Annual Technical
+  Men, R., Ren, X., Ren, X., Tan, C., Tan, S., Tu, J., Wang,      Conference (USENIX ATC 24), pp. 111–126, 2024.
+  P., Wang, S., Wang, W., Wu, S., Xu, B., Xu, J., Yang,
+  A., Yang, H., Yang, J., Yang, S., Yao, Y., Yu, B., Yuan,      Gao, Y., Xiong, Y., Gao, X., Jia, K., Pan, J., Bi, Y., Dai, Y.,
+  H., Yuan, Z., Zhang, J., Zhang, X., Zhang, Y., Zhang, Z.,       Sun, J., and Wang, H. Retrieval-augmented generation
+  Zhou, C., Zhou, J., Zhou, X., and Zhu, T. Qwen technical        for large language models: A survey. arXiv preprint
+  report. arXiv preprint arXiv:2309.16609, 2023.                  arXiv:2312.10997, 2023.
+Boyer, M., Tarjan, D., Acton, S. T., and Skadron, K. Ac-        Gray, A.   Getting Started with CUDA Graphs.
+  celerating leukocyte tracking using cuda: A case study in       https://developer.nvidia.com/blog/
+  leveraging manycore coprocessors. In 2009 IEEE inter-           cuda-graphs/, September 2019.
+  national symposium on parallel & distributed processing,
+  pp. 1–12. IEEE, 2009.                                         Gur, I., Furuta, H., Huang, A., Safdari, M., Matsuo, Y., Eck,
+                                                                  D., and Faust, A. A real-world webagent with planning,
+Brown, T. B. Language models are few-shot learners. arXiv         long context understanding, and program synthesis. arXiv
+  preprint arXiv:2005.14165, 2020.                                preprint arXiv:2307.12856, 2023.
+Chen, T., Moreau, T., Jiang, Z., Zheng, L., Yan, E., Shen,      Huang, G., Bai, Y., Liu, L., Wang, Y., Yu, B., Ding, Y.,
+  H., Cowan, M., Wang, L., Hu, Y., Ceze, L., Guestrin, C.,        and Xie, Y. Alcop: Automatic load-compute pipelining
+  and Krishnamurthy, A. TVM: An automated End-to-End              in deep learning compiler for ai-gpus. Proceedings of
+  optimizing compiler for deep learning. In 13th USENIX          Machine Learning and Systems, 5:680–694, 2023.
+  Symposium on Operating Systems Design and Implemen-
+  tation (OSDI 18), pp. 578–594, Carlsbad, CA, October          HuggingFace.     Text  Generation  Inference.
+  2018. USENIX Association. ISBN 978-1-939133-08-3.               https://github.com/huggingface/
+  URL https://www.usenix.org/conference/                          text-generation-inference, 2024.
+  osdi18/presentation/chen.
+                                                                Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,          Chaplot, D. S., de las Casas, D., Bressand, F., Lengyel,
+  Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,        G., Lample, G., Saulnier, L., Lavaud, L. R., Lachaux,
+  R., Hesse, C., and Schulman, J. Training verifiers to solve      M.-A., Stock, P., Scao, T. L., Lavril, T., Wang, T.,
+  math word problems. arXiv preprint arXiv:2110.14168,             Lacroix, T., and Sayed, W. E. Mistral 7b. arXiv preprint
+  2021.                                                            arXiv:2310.06825, 2023.
+
+Cummins, C., Seeker, V., Grubisic, D., Roziere, B., Gehring,    Jin, C., Zhang, Z., Jiang, X., Liu, F., Liu, X., Liu, X., and Jin,
+  J., Synnaeve, G., and Leather, H. Meta large language            X. Ragcache: Efficient knowledge caching for retrieval-
+  model compiler: Foundation models of compiler opti-              augmented generation. arXiv preprint arXiv:2404.12457,
+  mization. arXiv preprint arXiv:2407.02524, 2024.                 2024.
+                   FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+Juravsky, J., Brown, B., Ehrlich, R., Fu, D. Y., Ré, C., and      B., Cho, C., Chu, C., Chung, H. W., Cummings, D., Cur-
+  Mirhoseini, A. Hydragen: High-throughput llm inference           rier, J., Dai, Y., Decareaux, C., Degry, T., Deutsch, N.,
+  with shared prefixes. arXiv preprint arXiv:2402.05099,           Deville, D., Dhar, A., Dohan, D., Dowling, S., Dunning,
+  2024.                                                            S., Ecoffet, A., Eleti, A., Eloundou, T., Farhi, D., Fedus,
+                                                                   L., Felix, N., Fishman, S. P., Forte, J., Fulford, I., Gao, L.,
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,            Georges, E., Gibson, C., Goel, V., Gogineni, T., Goh, G.,
+ C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient       Gontijo-Lopes, R., Gordon, J., Grafstein, M., Gray, S.,
+ memory management for large language model serving                Greene, R., Gross, J., Gu, S. S., Guo, Y., Hallacy, C., Han,
+ with pagedattention. In Proceedings of the ACM SIGOPS             J., Harris, J., He, Y., Heaton, M., Heidecke, J., Hesse,
+ 29th Symposium on Operating Systems Principles, 2023.             C., Hickey, A., Hickey, W., Hoeschele, P., Houghton, B.,
+                                                                   Hsu, K., Hu, S., Hu, X., Huizinga, J., Jain, S., Jain, S.,
+Lattner, C., Amini, M., Bondhugula, U., Cohen, A., Davis,
+                                                                   Jang, J., Jiang, A., Jiang, R., Jin, H., Jin, D., Jomoto, S.,
+  A., Pienaar, J., Riddle, R., Shpeisman, T., Vasilache, N.,
+                                                                   Jonn, B., Jun, H., Kaftan, T., Łukasz Kaiser, Kamali, A.,
+  and Zinenko, O. Mlir: Scaling compiler infrastructure
+                                                                   Kanitscheider, I., Keskar, N. S., Khan, T., Kilpatrick, L.,
+  for domain specific computation. In 2021 IEEE/ACM
+                                                                   Kim, J. W., Kim, C., Kim, Y., Kirchner, J. H., Kiros, J.,
+  International Symposium on Code Generation and Opti-
+                                                                   Knight, M., Kokotajlo, D., Łukasz Kondraciuk, Kondrich,
+  mization (CGO), pp. 2–14. IEEE, 2021.
+                                                                   A., Konstantinidis, A., Kosic, K., Krueger, G., Kuo, V.,
+Li, J., Tang, T., Zhao, W. X., Nie, J.-Y., and Wen, J.-R. Pre-     Lampe, M., Lan, I., Lee, T., Leike, J., Leung, J., Levy, D.,
+  trained language models for text generation: A survey.           Li, C. M., Lim, R., Lin, M., Lin, S., Litwin, M., Lopez, T.,
+  ACM Computing Surveys, 56(9):1–39, 2024.                         Lowe, R., Lue, P., Makanju, A., Malfacini, K., Manning,
+                                                                   S., Markov, T., Markovski, Y., Martin, B., Mayer, K.,
+Lin, C., Han, Z., Zhang, C., Yang, Y., Yang, F., Chen, C.,         Mayne, A., McGrew, B., McKinney, S. M., McLeavey, C.,
+  and Qiu, L. Parrot: Efficient serving of {LLM-based}             McMillan, P., McNeil, J., Medina, D., Mehta, A., Menick,
+  applications with semantic variable. In 18th USENIX              J., Metz, L., Mishchenko, A., Mishkin, P., Monaco, V.,
+  Symposium on Operating Systems Design and Implemen-              Morikawa, E., Mossing, D., Mu, T., Murati, M., Murk, O.,
+  tation (OSDI 24), pp. 929–945, 2024.                             Mély, D., Nair, A., Nakano, R., Nayak, R., Neelakantan,
+                                                                   A., Ngo, R., Noh, H., Ouyang, L., O’Keefe, C., Pachocki,
+Microsoft. DeepSpeed-MII. https://github.com/                      J., Paino, A., Palermo, J., Pantuliano, A., Parascandolo,
+ microsoft/DeepSpeed-MII, 2024.                                    G., Parish, J., Parparita, E., Passos, A., Pavlov, M., Peng,
+                                                                   A., Perelman, A., de Avila Belbute Peres, F., Petrov, M.,
+Milakov, M. and Gimelshein, N. Online normalizer cal-
+                                                                   de Oliveira Pinto, H. P., Michael, Pokorny, Pokrass, M.,
+ culation for softmax. arXiv preprint arXiv:1805.02867,
+                                                                   Pong, V. H., Powell, T., Power, A., Power, B., Proehl, E.,
+ 2018.
+                                                                   Puri, R., Radford, A., Rae, J., Ramesh, A., Raymond, C.,
+ModelTC. LightLLM: A Light and Fast Inference Ser-                 Real, F., Rimbach, K., Ross, C., Rotsted, B., Roussez,
+ vice for LLM. https://github.com/ModelTC/                         H., Ryder, N., Saltarelli, M., Sanders, T., Santurkar, S.,
+ lightllm, 2024.                                                   Sastry, G., Schmidt, H., Schnurr, D., Schulman, J., Sel-
+                                                                   sam, D., Sheppard, K., Sherbakov, T., Shieh, J., Shoker,
+NVIDIA. TensorRT-LLM. https://github.com/                          S., Shyam, P., Sidor, S., Sigler, E., Simens, M., Sitkin,
+ NVIDIA/TensorRT-LLM, 2024.                                        J., Slama, K., Sohl, I., Sokolowsky, B., Song, Y., Stau-
+                                                                   dacher, N., Such, F. P., Summers, N., Sutskever, I., Tang,
+NVIDIA. Programming Guide :: CUDA Toolkit Docu-                    J., Tezak, N., Thompson, M. B., Tillet, P., Tootoonchian,
+ mentation. https://docs.nvidia.com/cuda/                          A., Tseng, E., Tuggle, P., Turley, N., Tworek, J., Uribe, J.
+ cuda-c-programming-guide/index.html,                              F. C., Vallone, A., Vijayvergiya, A., Voss, C., Wainwright,
+ 2025.                                                             C., Wang, J. J., Wang, A., Wang, B., Ward, J., Wei, J.,
+OpenAI, Achiam, J., Adler, S., Agarwal, S., Ahmad, L.,             Weinmann, C., Welihinda, A., Welinder, P., Weng, J.,
+ Akkaya, I., Aleman, F. L., Almeida, D., Altenschmidt, J.,         Weng, L., Wiethoff, M., Willner, D., Winter, C., Wolrich,
+ Altman, S., Anadkat, S., Avila, R., Babuschkin, I., Bal-          S., Wong, H., Workman, L., Wu, S., Wu, J., Wu, M.,
+  aji, S., Balcom, V., Baltescu, P., Bao, H., Bavarian, M.,        Xiao, K., Xu, T., Yoo, S., Yu, K., Yuan, Q., Zaremba,
+  Belgum, J., Bello, I., Berdine, J., Bernadett-Shapiro, G.,       W., Zellers, R., Zhang, C., Zhang, M., Zhao, S., Zheng,
+  Berner, C., Bogdonoff, L., Boiko, O., Boyd, M., Brakman,         T., Zhuang, J., Zhuk, W., and Zoph, B. Gpt-4 technical
+ A.-L., Brockman, G., Brooks, T., Brundage, M., Button,            report. arXiv preprint arXiv:2303.08774, 2023.
+  K., Cai, T., Campbell, R., Cann, A., Carey, B., Carlson,
+  C., Carmichael, R., Chan, B., Chang, C., Chantzis, F.,         Pan, Z., Zheng, Z., Zhang, F., Wu, R., Liang, H., Wang, D.,
+  Chen, D., Chen, S., Chen, R., Chen, J., Chen, M., Chess,         Qiu, X., Bai, J., Lin, W., and Du, X. Recom: A compiler
+                   FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+  approach to accelerating recommendation model infer-             Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+  ence with massive embedding columns. In Proceedings of             L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Atten-
+  the 28th ACM International Conference on Architectural             tion is all you need. Advances in Neural Information
+  Support for Programming Languages and Operating Sys-               Processing Systems, 2017.
+  tems, Volume 4, pp. 268–286, 2023.
+                                                                   Yao, J., Chen, K., Zhang, K., You, J., Yuan, B., Wang, Z.,
+Pan, Z., Zheng, Z., Zhang, F., Xie, B., Wu, R., Smith, S.,           and Lin, T. Deft: Decoding with flash tree-attention for
+  Liu, C., Ruwase, O., Du, X., and Ding, Y. Recflex:                 efficient tree-structured llm inference. arXiv preprint
+  Enabling feature heterogeneity-aware optimization for              arXiv:2404.00242, 2024a.
+  deep recommendation models with flexible schedules. In
+  SC24: International Conference for High Performance              Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T., Cao, Y.,
+  Computing, Networking, Storage and Analysis, pp. 1–15.             and Narasimhan, K. Tree of thoughts: Deliberate problem
+  IEEE, 2024.                                                        solving with large language models. Advances in Neural
+                                                                     Information Processing Systems, 36, 2024b.
+Rabe, M. N. and Staats, C. Self-attention does not need
+  o(n2 ) memory. arXiv preprint arXiv:2112.05682, 2021.            Ye, L., Tao, Z., Huang, Y., and Li, Y. Chunkattention:
+                                                                     Efficient self-attention with prefix-aware kv cache and
+Sutskever, I., Vinyals, O., and Le, Q. V. Sequence to se-
+                                                                     two-phase partition. arXiv preprint arXiv:2402.15220,
+  quence learning with neural networks. In Proceedings of
+                                                                     2024a.
+  the 27th International Conference on Neural Information
+  Processing Systems - Volume 2, NIPS’14, pp. 3104–3112,           Ye, Z., Lai, R., Lu, B.-R., Lin, C.-Y., Zheng, S., Chen,
+  Cambridge, MA, USA, 2014. MIT Press.                               L., Chen, T., and Ceze, L. Cascade Inference: Mem-
+Team, T. P.    CUDAGraph Trees.     https:                           ory Bandwidth Efficient Shared Prefix Batch Decod-
+  //pytorch.org/docs/stable/torch.                                   ing. https://flashinfer.ai/2024/02/02/
+  compiler_cudagraph_trees.html, 2024a.                              cascade-inference.html, 2024b.
+
+Team, T. S.     SGLang v0.4: Zero-Overhead Batch                   Yoran, O., Wolfson, T., Bogin, B., Katz, U., Deutch,
+  Scheduler, Cache-Aware Load Balancer, Faster Struc-                D., and Berant, J. Answering questions by meta-
+  tured Outputs.     https://lmsys.org/blog/                         reasoning over multiple chains of thought. arXiv preprint
+  2024-12-04-sglang-v0-4/, December 2024b.                           arXiv:2304.13007, 2023.
+TheBigPromptLibrary. The Big Prompt Library. https:                Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  //github.com/0xeb/TheBigPromptLibrary,                             G. Orca: A distributed serving system for {Transformer-
+  2024.                                                              Based} generative models. In 16th USENIX Symposium
+Tillet, P., Kung, H.-T., and Cox, D. Triton: an intermediate         on Operating Systems Design and Implementation (OSDI
+   language and compiler for tiled neural network computa-           22), pp. 521–538, 2022.
+   tions. In Proceedings of the 3rd ACM SIGPLAN Interna-           Yu, L., Lin, J., and Li, J. Stateful large language model
+   tional Workshop on Machine Learning and Programming               serving with pensieve. arXiv preprint arXiv:2312.05516,
+  Languages, pp. 10–19, 2019.                                        2023.
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+                                                                   Zheng, L., Jia, C., Sun, M., Wu, Z., Yu, C. H., Haj-Ali, A.,
+  A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+                                                                     Wang, Y., Yang, J., Zhuo, D., Sen, K., Gonzalez, J. E., and
+  Bhosale, S., Bikel, D., Blecher, L., Ferrer, C. C., Chen,
+                                                                     Stoica, I. Ansor: Generating {High-Performance} tensor
+  M., Cucurull, G., Esiobu, D., Fernandes, J., Fu, J., Fu, W.,
+                                                                     programs for deep learning. In 14th USENIX symposium
+  Fuller, B., Gao, C., Goswami, V., Goyal, N., Hartshorn,
+                                                                     on operating systems design and implementation (OSDI
+  A., Hosseini, S., Hou, R., Inan, H., Kardas, M., Kerkez,
+                                                                     20), pp. 863–879, 2020.
+  V., Khabsa, M., Kloumann, I., Korenev, A., Koura, P. S.,
+  Lachaux, M.-A., Lavril, T., Lee, J., Liskovich, D., Lu, Y.,      Zheng, L., Yin, L., Xie, Z., Huang, J., Sun, C., Yu, C. H.,
+  Mao, Y., Martinet, X., Mihaylov, T., Mishra, P., Molybog,          Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Barrett,
+  I., Nie, Y., Poulton, A., Reizenstein, J., Rungta, R., Saladi,     C. W., and Sheng, Y. Efficiently Programming Large
+  K., Schelten, A., Silva, R., Smith, E. M., Subramanian, R.,        Language Models using SGLang. CoRR, abs/2312.07104,
+  Tan, X. E., Tang, B., Taylor, R., Williams, A., Kuan, J. X.,       2023a. doi: 10.48550/ARXIV.2312.07104. URL https:
+  Xu, P., Yan, Z., Zarov, I., Zhang, Y., Fan, A., Kambadur,          //doi.org/10.48550/arXiv.2312.07104.
+  M., Narang, S., Rodriguez, A., Stojnic, R., Edunov, S.,
+  and Scialom, T. Llama 2: Open foundation and fine-tuned          Zheng, Z., Yang, X., Zhao, P., Long, G., Zhu, K., Zhu, F.,
+  chat models. arXiv preprint arXiv:2307.09288, 2023.                Zhao, W., Liu, X., Yang, J., Zhai, J., Song, S. L., and
+                  FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference
+
+  Lin, W. Astitch: Enabling a new multi-dimensional op-         A.2     Artifact check-list (meta-information)
+  timization space for memory-intensive ML training and            • Run-time environment: Docker and NVIDIA container
+  inference on modern SIMT architectures. In Falsafi, B.,            toolkit.
+  Ferdman, M., Lu, S., and Wenisch, T. F. (eds.), ASPLOS
+ ’22: 27th ACM International Conference on Architectural           • Hardware: An NVIDIA H100 GPU.
+  Support for Programming Languages and Operating Sys-             • Experiments: The attention computation latency of Fast-
+  tems, Lausanne, Switzerland, 28 February 2022 - 4 March            Tree and baselines across different configurations.
+  2022, pp. 359–373. ACM, 2022.
+                                                                   • How much time is needed to complete experiments (ap-
+                                                                     proximately)?: 20 minutes.
+Zheng, Z., Pan, Z., Wang, D., Zhu, K., Zhao, W., Guo, T.,
+  Qiu, X., Sun, M., Bai, J., Zhang, F., Du, X., Zhai, J., and      • Publicly available?: Yes, at https://github.com/
+  Lin, W. Bladedisc: Optimizing dynamic shape machine                PanZaifeng/FastTree-Artifact.
+  learning workloads via compiler approach. Proceedings            • Code licenses (if publicly available)?: Apache-2.0.
+  of the ACM on Management of Data, 1(3):1–29, 2023b.
+                                                                A.3     Description
+Zheng, Z., Ji, X., Fang, T., Zhou, F., Liu, C., and Peng,
+  G. Batchllm: Optimizing large batched llm inference           A.3.1    How delivered
+  with global prefix sharing and throughput-oriented token
+                                                                The artifact is provided as a public GitHub repository at https:
+  batching. arXiv preprint arXiv:2412.03594, 2024.              //github.com/PanZaifeng/FastTree-Artifact.
+
+Zhu, L., Wang, X., Zhang, W., and Lau, R. W. Relayatten-        A.3.2    Hardware dependencies
+  tion for efficient large language model serving with long
+  system prompts. arXiv preprint arXiv:2402.14808, 2024.        We use an NVIDIA H100 GPU for evaluation in the paper. Since
+                                                                FastTree is implemented with Triton and does not leverage Hopper-
+                                                                specific features, it should work on other GPUs. However, the
+Zhu, Y., Yuan, H., Wang, S., Liu, J., Liu, W., Deng, C.,        provided hyperparameters are only tuned for H100.
+  Chen, H., Dou, Z., and Wen, J.-R. Large language mod-
+  els for information retrieval: A survey. arXiv preprint       A.3.3    Software dependencies
+  arXiv:2308.07107, 2023.
+                                                                We provide a Dockerfile to streamline the setup of the experi-
+                                                                mental environment, eliminating concerns about software depen-
+Zhuang, D., Zheng, Z., Xia, H., Qiu, X., Bai, J., Lin, W.,      dencies. Inside the Docker container, we include the following
+  and Song, S. L. MonoNN: Enabling a new monolithic             specific software:
+  optimization space for neural network inference tasks
+                                                                   • CUDA 12.2.
+  on modern GPU-Centric architectures. In 18th USENIX              • SGLang 0.2.13 (including PyTorch 2.4.0 and Triton 3.0.0).
+  Symposium on Operating Systems Design and Implemen-              • Flash Attention 2.6.3.
+  tation (OSDI 24), pp. 989–1005, Santa Clara, CA, July            • FlashInfer 0.1.6.
+  2024. USENIX Association. ISBN 978-1-939133-40-3.
+  URL https://www.usenix.org/conference/                        A.4     Installation
+  osdi24/presentation/zhuang.
+                                                                Users can effortlessly set up the environment and conduct eval-
+                                                                uations by running the script kernel bench/run.sh.
+                                                                Alternatively, they can manually build the Docker
+                                                                image using the provided Dockerfile located at
+A     A RTIFACT A PPENDIX                                       kernel bench/Dockerfile.
+A.1   Abstract
+                                                                A.5     Evaluation and expected result
+This artifact provides the kernel benchmark code for Fast-
+Tree, a system designed to optimize attention computation       Running the provided script will measure the attention compu-
+                                                                tation latency of FastTree and baseline methods across various
+with a tree-structured KV cache. The artifact enables the       configurations. Upon completion, it will generate a normalized
+reproduction of kernel performance results presented in the     performance plot at kernel bench/norm perf.pdf. Users
+paper across various tree configurations and different GQA      can expect to observe that FastTree outperforms the baselines and
+ratios. The evaluation compares FastTree against conven-        achieves significant speedups across different configurations.
+tional attention kernels from FlashAttention, SGLang Triton,
+and FlashInfer. It also compares against DeFT and Flash-
+Infer’s Multi-Level Cascade Attention, which are two con-
+current works that target optimizations for tree-structured
+attention as well.
+

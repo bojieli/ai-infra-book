@@ -1,0 +1,1146 @@
+        XG RAMMAR : F LEXIBLE AND E FFICIENT S TRUCTURED G ENERATION
+                   E NGINE F OR L ARGE L ANGUAGE M ODELS
+
+
+         Yixin Dong 1 Charlie F. Ruan 1 Yaxing Cai 2 Ruihang Lai 1 Ziyi Xu 3 Yilong Zhao 4 Tianqi Chen 1 2
+
+
+                                                          A BSTRACT
+        The applications of LLM Agents are becoming increasingly complex and diverse, leading to a high demand for
+        structured outputs that can be parsed into code, structured function calls, and embodied agent commands. These
+        developments bring significant demands for structured generation in LLM inference. Context-free grammar is
+        a flexible approach to enable structured generation via constrained decoding. However, executing context-free
+        grammar requires going through several stack states over all tokens in vocabulary during runtime, bringing
+        non-negligible overhead for structured generation. In this paper, we propose XGrammar, a flexible and efficient
+        structure generation engine for large language models. XGrammar accelerates context-free grammar execution by
+        dividing the vocabulary into context-independent tokens that can be prechecked and context-dependent tokens
+        that need to be interpreted during runtime. We further build transformations to expand the grammar context and
+        reduce the number of context-independent tokens. Additionally, we build an efficient persistent stack to accelerate
+        the context-dependent token checks. Finally, we co-design the grammar engine with LLM inference engine to
+        overlap grammar computation with GPU executions. Evaluation results show that XGrammar can achieve up
+        to 100x speedup over existing solutions. Combined with an LLM inference engine, it can generate near-zero
+        overhead structure generation in end-to-end low-LLM serving.
+
+1       I NTRODUCTION                                              To support the rich structure formats arising in diverse appli-
+                                                                   cations, a flexible mechanism is needed to specify and check
+Recent advancements in large language models (LLMs)                the constraints. Context-free grammar (CFG) (Chomsky,
+have created new possibilities for complex applications such       1956; Poesia et al., 2022; Scholak et al., 2021) provides a
+as code generation (Chen et al., 2021; Wang et al., 2021),         general approach for defining structures through a set of
+debugging (Pearce et al., 2022; Mozannar et al., 2024), exter-     rules. Each rule contains a sequence of characters or other
+nal tool invocation through function calling (OpenAI, 2024;        rules, allowing recursive composition to represent complex
+LangChain, 2024), and robotic control (Liu et al., 2023).          structures. Compared to alternative formats such as regular
+These applications bring great demand for the structured           expressions, CFGs offer greater flexibility by allowing re-
+generation problem, which requires the output of LLMs              cursive structures, making them suitable for describing com-
+conforms to specific formats or grammars, such as JSON,            mon languages such as JSON, SQL, and domain-specific
+SQL or other formats tailored to the task. The downstream          languages (DSLs).
+applications can then organically consume the structured
+outputs to perform followup interactions with the system.          However, naively applying CFG to constrained decoding is
+                                                                   not efficient because of its flexible nature. First, each de-
+Constrained decoding (Deutsch et al., 2019; Kuchnik et al.,        coding step needs to interpret CFG for every possible token
+2023) is a commonly adopted method for structured gen-             in the vocabulary, which can be as large as 128k in Llama
+eration. It guarantees the output of LLMs adheres to the           3.1 (Dubey et al., 2024a). Additionally, CFG interpretation
+specified structure through only allowing tokens that con-         requires a stack state that tracks the recursive rules matched
+form to the structure to be generated at each decoding step.       so far, making it impossible to precompute and cache all
+At each step, constrained decoding first scans the entire          combinatorial combinations of stack patterns ahead of time.
+vocabulary to identify invalid tokens and sets their probabil-     Finally, each token in the LLM generation comprises multi-
+ities to zero, thereby preventing them from being generated.       ple characters, which may cross the boundaries of grammar
+    1
+     Carnegie Mellon University 2 NVIDIA 3 Shanghai Jiao Tong      elements and cause further recursion or stack pop during
+University 4 University of California, Berkeley. Correspondence    runtime execution. The misaligned boundaries bring the
+to: Yixin Dong <yixind@andrew.cmu.edu>.                            need to handle them carefully during grammar execution.
+                                                                   In this paper, we introduce XGrammar, a flexible and effi-
+                  XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+
+                        Pushdown Automata                                                           Efficient Mask Generation
+                             [0] <array>                    ● Automata
+                                                                                                                           Prior LLM        ● Overlapping
+      main:          a                          b
+                                                              optimization (§3.4)                                  ["a     Output             with LLM
+                                                                                                                                              engine (§3.5)
+                                                                                                Use pushdown
+                              [1] <str>                                                       automata to parse
+                                              e                          g
+                            [3] <str>                                                                      [0]  array
+                                                      ','                                                   [0]<array>     Matching Stack States
+                                   [4] <array>                        [7] ']'                               [3]  str
+                                                                                                             [3]<str>      ● Maintained by
+                                                                                                                             persistent execution stacks
+     array:             c     [2] '['         d        [5] <str>         f                                   Node
+                                                                                                              Node ll        (§3.3)
+                                                      [6] <array>
+                                      [9] [^"\]                                                                      Retrieve token mask cache
+                                                                                                                     from stack top
+      str:          h       [8] '"'      l      [10] '"'       m
+                                                                                                                                               Partial
+                                                                                                                                             Token Mask
+                                                  Vocabulary                              Context-independent:       Context-dependent:
+        Adaptive                                                                           Fetched from cache        Checked at runtime
+    Token Mask Cache                                                                            (fast, majority)         (slow, minority)
+    ● Preprocessed for                                                                                                                        Complete
+                               Known accepted
+      every node (§3.1)                               Context-independent tokens
+                               Known rejected                                                                                                Token Mask
+    ● Enhanced with
+      context expansion        Context-dependent tokens (minority)                                           Vocabulary
+      (§3.2)
+
+
+
+
+Figure 1. Overview of our approach. XGrammar first uses a pushdown automaton to parse the prior LLM output, flexibly supporting
+diverse grammars and producing the matching stack states. It then uses the stack top to index into the adaptive token mask cache—our
+key optimization—to retrieve a partial mask. Most of the partial mask consists of context-independent tokens and is determined during
+preprocessing. A small portion, however, is context-dependent and resolved at runtime. This yields the complete token mask, thus
+enabling efficient constraint decoding.
+
+
+cient structured generation engine for large language mod-                                 duces mask generation overhead.
+els to address the above challenges. XGrammar builds a
+byte-level pushdown automaton to represent context-free                                 • We design a persistent execution stack that enables fast
+grammars (CFGs). Our main insight(shown in Figure 1)                                      rollback operations, rapid state branching, and rollback,
+is to categorize the tokens into context-independent to-                                  expediting context-dependent token processing.
+kens that can be decided only from the local context of                                 • We built an efficient grammar engine co-designed with
+automata and context-dependent tokens that require the                                    the LLM serving framework to achieve minimal struc-
+entire stack state. We precompute the token correctness for                               tured generation overhead.
+all context-independent tokens and store them in an adaptive
+token mask cache with specific storage formats tailored to
+each automata location. We also build algorithms to expand                          Evaluation shows that XGrammar can achieve up to 100x
+the context of each local rule and reduce the number of                             reduction in per-token latency for context-free grammar
+context-dependent tokens. Additionally, we build a persis-                          compared to current state-of-the-art methods. Additionally,
+tent stack-based system to enable rapid state branching and                         the XGrammar-integrated LLM serving engine for Llama-
+rollback, expediting context-dependent token checks and                             3.1 models achieves up to an 80x speedup in end-to-end
+cache preprocessing. Finally, we co-designed the grammar                            LLM serving with structured output on the H100 GPU. We
+engine with LLM inference engines to overlap the grammar                            are open-sourcing XGrammar and integrating it into major
+computations with GPU computations, bringing minimal                                open-source LLM frameworks.
+overhead for structured generation.
+The main contribution of this paper is as follows:
+                                                                                    2      BACKGROUND
+                                                                                    2.1     LLM Constrained Generation
+   • We introduce an adaptive token mask cache that lever-                          Large Language Models (LLMs) like GPT-4 (OpenAI et al.,
+     ages context-independent tokens and significantly re-                          2024), Llama (Dubey et al., 2024a), and Mistral (Jiang et al.,
+                  XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+
+                  LLM Inference                       Prior                         Context-free Grammar
+                                         Structure
+                                                     Output
+  Output Logits                                                          main ::= <array> | <str>
+            3 -2 4 5 1.1 3.2 -5 -1                                       array ::= '[' (<str> | <array> ',')*
+                                         1 0 0 1 0 1 0 1                           <str> | <array> ']'
+  Masked Logits                                                          str ::= '"' [^"\]* '"'
+            3 -∞ -∞ 5 -∞ 3.2 -∞ -1          Per-token Mask
+
+  Prob. Distribution        Softmax                                             Matching Stacks for Input ["a
+            0.1 0 0 0.76 0 0.13 0 1e-3
+                                                                                                    Expanding edge
+                                                                                  [0]<array>        [0] <array>
+                            Sampler
+                                                                                                    Expanding edge
+          Sampled
+                        3                                                         [3]<str>          [3] <str>
+           Token
+                                                                                    Node l          Now at node l
+                                                                                                    of rule <str>
+                                                                                   Stack Top
+Figure 2. Constrained decoding with per-token mask. The per-
+                                                                                                    Expanding edge
+token mask prevents LLM from generating tokens that would be                      [0]<array>        [0] <array>
+invalid according to the structure at that step.
+                                                                                                    Expanding edge
+                                                                                  [5]<str>          [5] <str>
+                                                                                                    Now at node l
+                                                                                    Node l          of rule <str>
+2023) generate text in an auto-regressive manner, predicting                       Stack Top
+one token at a time based on preceding sequence of tokens.
+The process starts with an initial prompt and continues as
+the model iteratively appends tokens until the response is
+complete. In LLMs, tokens serve as the basic input and
+output units. Each token represents a fixed string but may
+not correspond to a complete semantic unit or may break a         Figure 3. Up: A context-free grammar for arrays and strings that
+Unicode character (Wang et al., 2019), creating challenges        can be recursively composed. This CFG is converted into the push-
+for structured text generation. At each step, the model           down automata in Figure 1. [ˆ"\] denotes every character except
+produces a logits vector across its vocabulary, which is then     " and \. Down: Two possible matching stacks for matching the
+converted into a probability distribution using the softmax       string ["a to the CFG. Each stack represents a possible expansion
+function (Bridle, 1989). A sampler then selects the next          of the rules in the CFG. The edges and nodes in the stack corre-
+                                                                  spond to the transitions and states in the PDA in Figure 1.
+token from this distribution.
+Constrained decoding guides the structure of LLM-
+generated text by restricting available tokens at each step,      applied in LLM structured generation.
+as illustrated in Figure 2. At each step, tokens that would
+violate the required structure are identified as invalid. Their   Pushdown automata (PDA) (Schützenberger, 1963; Evey,
+logits are set to −∞, effectively assigning them zero prob-       1963) are typically used to recognize languages generated by
+ability after the softmax operation and preserving the rel-       CFGs, as they employ a stack to manage nested structures.
+ative probabilities of other valid tokens. This ensures that      In this paper, we use a definition of PDA that is equivalent
+only valid tokens are sampled. Efficiently identifying and        to the original one, but more conducive to explaining the
+masking invalid tokens is essential, as it directly impacts       algorithm. An example of PDA is shown in Figure 1, and
+generation speed.                                                 its stacks are shown in detail in Figure 3. A PDA consists
+                                                                  of multiple finite state automata (FSA), each representing
+                                                                  a grammar rule, with the stack handling recursive rule ex-
+2.2   Context-free Grammar and Pushdown Automata
+                                                                  pansions. The transitions in the FSA include two types:
+Context-free grammar (CFG) (Chomsky, 1956) is widely              character edges, which accept specific characters, and rule
+used to define structures in structured generation. With an       reference edges, which allow recursive entry into other rules.
+example shown in Figure 3, CFG contains multiple rules,           A formal definition of the PDA is provided in Appendix A.
+each including characters or references to other rules, al-       To match a string, the PDA begins with the main rule, recur-
+lowing recursive composition to define complex structures.        sively expanding child rules by pushing rule-reference edges
+This makes CFG suitable for languages such as JSON, SQL,          onto the stack; once a rule is fully matched, it pops the stack
+and various domain-specific languages. CFG’s recursive            to return to the previous rule. The top of the stack holds the
+nature provides greater expressive power than simpler pat-        current node reached. If the grammar is non-deterministic,
+terns, such as regular expressions, which are also frequently     meaning there can be multiple possible transitions in the
+                    XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                                     [9] [^"\]                           ing but are relatively few. This token classification relates to
+                                                                         how tokens are validated by the pushdown automaton. We
+      str:         h       [8] '"'      l     [10] '"'      m            found that, considering the transition of the stack state, the
+                                                                         process of matching tokens to the automaton can be divided
+                                            Vocabulary                   into three categories:
+
+                                                                           1. The matching process expands into a child rule, push-
+       Context-independent     a      ab"        Reaches l or m from l        ing new elements onto the stack.
+       (Accepted)
+       Context-independent     \      \ab        Cannot match from l       2. The matching process advances within the current rule,
+       (Rejected)
+                                                 Reaches m from l but         updating the stack top node to a new position.
+       Context-dependent     "ab      a"b        have remaining part
+
+                                                                           3. The matching process reaches the end of the current
+Figure 4. An example for the token mask cache. Tokens are cate-               rule and returns to a parent rule, popping elements
+gorized into three types: context-independent (accepted), context-            from the stack.
+independent (rejected), and context-dependent. The first two types
+can be directly determined for mask generation at runtime.               Validating tokens in the former two cases only relies on the
+                                                                         stack top node, which represents the position within the cur-
+                                                                         rent rule, so we define these tokens as context-independent
+PDA for the same input character, the PDA can maintain                   tokens. The tokens in the third type, however, requires
+multiple parallel stacks for each path, ensuring flexibility.            inspecting the entire running stack in validation, and are
+However, the unbounded stack length results in an infinite               defined as context-dependent tokens. For every node of the
+number of possible states, making it impractical to precom-              pushdown automaton, there is a set of context-independent
+pute token masks for all scenarios, thus posing challenges               tokens with this node being at the top of the stack at run-
+for efficient constrained decoding.                                      time, and their validity can be determined ahead of time.
+                                                                         Therefore, we precompute the validity of these tokens and
+3     XG RAMMAR                                                          store them in a cache with the stack top node as the key,
+                                                                         which we refer to as the adaptive token mask cache. It also
+As shown in Figure 1, XGrammar utilizes a byte-level push-               adaptively selects the most efficient storage format based on
+down automaton to interpret the context-free grammar. This               the cache’s contents, as explained in the next paragraph.
+byte-level design allows each character edge to include one
+or more bytes, handling irregular token boundaries and sup-              At runtime, we retrieve the validity of context-independent
+porting tokens containing sub-UTF8 characters. The au-                   tokens directly based on the top of the stack to generate the
+tomaton’s structure is optimized to accelerate matching,                 token mask. The remaining few context-dependent tokens
+as described in §3.4. In the preprocessing phase, we gen-                are validated by executing the pushdown automaton with
+erate an adaptive token mask cache, as detailed in §3.1,                 the full stack. If parallel stacks exist due to the ambiguity
+which accelerates runtime mask generation by precomput-                  of the grammar, the token masks for every stack is merged
+ing context-independent tokens. The effectiveness of this                into a final token mask by finding the union of the accepted
+cache is further enhanced by context extension in §3.2. At               tokens in each mask. The computation for the token mask
+runtime, the token mask cache quickly generates most of the              is significantly reduced because our method do not need
+mask, while the persistent execution stack in §3.3 efficiently           to check context-independent tokens at runtime. Experi-
+processes the rest context-dependent tokens. Additionally,               ments show that context-dependent tokens account for only
+mask generation and LLM inference are overlapped in §3.5                 a minor proportion, amounting to less than 1% (1134 out of
+to minimize the overhead of constrained decoding. Once the               128k) for the Llama-3.1 model using JSON grammar.
+LLM generates a new token under the mask constraint, this
+token is then used to update the stack state of the pushdown             Adaptive storage. The token mask cache adopts an adap-
+automaton for the next mask generation.                                  tive storage format to reduce memory usage, as illustrated
+                                                                         in Figure 5. For each automaton node, the token mask cache
+                                                                         divides the vocabulary into three parts: the accepted context-
+3.1    Adaptive Token Mask Cache
+                                                                         independent tokens, the rejected context-independent to-
+To accelerate the generation of the token mask cache, the                kens, and the context-dependent tokens. Since these three
+adaptive token cache categorizes tokens into two types                   parts together cover all tokens, it is sufficient to store only
+(Figure 4): context-independent tokens, which constitute                 the two smaller subsets. We observe that, for a set of context-
+the vast majority and can be pre-computed, and context-                  independent tokens, they tend to be either almost entirely
+dependent tokens, which require slower, on-the-fly process-              accepted, namely accept-heavy cases, or almost entirely
+                 XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                                                                     with P artialRej. For a reject-heavy mask (many rejected
+                                                                     tokens, storing only accepted tokens), it combines accepted
+                                                                     tokens with P artialAcc. In the final mask, the rejected to-
+            Accept-heavy Cases: Store                                kens are the set difference P artialRej \ P artialAcc. This
+                                                                     algorithm limits set operations to small token subsets, thus
+                                                                     enhancing efficiency.
+
+            Reject-heavy Cases: Store
+                                                                     Algorithm 1 Efficiently Merge Token Masks
+                                                                       Input: Token masks for k parallel stacks {Mi =
+                                                                       (Acci , Reji )}ki=1 , vocabulary V.
+            Equal Cases: Very rare, store bitsets                      Output: The final token mask M = (Acc, Rej).
+                                                                       Initialize P artialAcc ← ∅, P artialRej ← V
+                                                                       for i = 1 to k do
+Figure 5. The adaptive storage format. In accept-heavy cases, we         if Mi is accept-heavy then
+store the rejected tokens and context-dependent tokens. In reject-           Mi only stores rejected token list Reji
+heavy cases, we store the accepted tokens and context-dependent              P artialRej ← P artialRej ∩ Reji
+tokens. In rare cases where two kinds of tokens are equal, we            else
+compress the accepted and rejected tokens into a bitset of the               Mi only stores accepted token list Acci
+vocabulary size.                                                             P artialAcc ← P artialAcc ∪ Acci
+                                                                         end if
+rejected, namely reject-heavy cases. This arises because, if           end for
+wildcards can be matched from the current node, such as the            M ← (V \ (P artialRej \ P artialAcc),
+wildcard [ˆ"\]* in the rule of string, nearly all tokens are                     P artialRej \ P artialAcc)
+valid; whereas if the node only accepts a few specific charac-
+ters, nearly all tokens are invalid. Based on this observation,
+we designed the following adaptive storage format:
+                                                                     3.2   Context Expansion
+  1. For accept-heavy cases, we store the rejected context-          Although the adaptive token mask cache effectively re-
+     independent tokens and context-dependent tokens in              duces the number of tokens checked at runtime, checking
+     two arrays.                                                     all context-dependent tokens remains an efficiency bottle-
+                                                                     neck at runtime. To further reduce the number of context-
+  2. For reject-heavy cases, we store the accepted context-          dependent tokens, XGrammar introduces context expansion,
+     independent tokens and context-dependent tokens in              which leverages the grammar’s context information to reject
+     two arrays.                                                     more context-dependent tokens during preprocessing, as
+  3. For rare cases where the accepted and rejected tokens           shown in Figure 6.
+     are roughly equal, we store the accepted and rejected           As described in the last section, a token is context-dependent
+     context-independent tokens and compress them into a             when we reach the end of the current rule during matching,
+     bitset matching the vocabulary size.                            but there is still a remaining part of the token that requires
+                                                                     further checking by returning to the parent rules. However,
+Thus, in both accept-heavy and reject-heavy cases, the adap-         through analysis of the grammar, we can observe that in a
+tive storage format only requires storing a small subset of          large portion of the cases, the remaining part of a token is
+tokens, significantly reducing memory usage. In practice,            invalid. This is because, for many rules, when they reach
+we will enumerate the three storage types, calculate their re-       their end, there are only a limited number of positions they
+spective costs, and choose the storage type with the smallest        can return to within their parent rules, and the set of strings
+size. For Llama-3.1 model and JSON grammar, this adap-               that can be further matched from those positions is also
+tive storage method can effectively reduce the total memory          limited.
+usage to 0.2% (from 160 MB to 0.46 MB).
+                                                                     Based on this observation, context expansion precomputes,
+Additionally, when multiple parallel stacks exists, we need          for each rule, the set of strings that can be accepted after
+to merge the token masks. The merging algorithm of token             returning to the parent rules, called the expanded suffix.
+masks is optimized based on storage type, as shown in Algo-          The remaining unmatched part of the context-dependent
+rithm 1. For an accept-heavy mask (many accepted tokens,             tokens should either be a prefix of the expanded suffix or
+storing only rejected tokens), it intersects the rejected tokens     start with the expanded suffix. Otherwise, they are rejected.
+                 XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                                                                    Algorithm 2 Extract the Expanded Suffix Automaton
+                             [9] [^"\]
+   str:
+                                                                      Input: Pushdown automaton P, rule R
+          h      [8] '"'        l     [10] '"'       m                Output: Expanded context FSA Actx
+                                                                                                      R for R
+                                                                      Initialize Actx
+                                                                                  R   as an empty FSA
+                                                                                   R
+                                                                      for edge s −→ t in P referencing R do
+                Before Context Expansion                                { Aδ is an FSA for the partial result }
+                                                                        Initialize Aδ as an empty FSA, visited ← {}
+                                                                        Add node t to Aδ
+                                       "ab     a"b
+                                                                        E XTRACT O NE(t, Aδ , visited)
+              Context-dependent
+                                                                        { Merge the partial result into the final result }
+                                       ",      "]
+                                                                        Actx                   ctx
+                                                                           R ← FSAU NION (AR , Aδ )
+                                                                      end for
+   Expanded Suffix                           Rejected by the
+                         ,      ]
+       for str                               expanded suffix          function E XTRACT O NE(start, Aδ , visited)
+                                                                        if start in visited then
+                After Context Expansion                                    return
+                                                                        end if
+                                                                        Add start to visited
+              Context-dependent   ",           "]                       { Stop search for nodes with rule-referencing edges }
+              Context-independent "ab         a"b                       if start is a final node in P or
+              (Rejected)                                                      has an edge referencing another rule then
+                                                                           Mark start as final in Aδ
+                                                                           return
+                                                                        end if
+                                                                        {Now all outward edges of start are character edges}
+                                                                                          c
+                                                                        for edge start → − end from start do
+                                                                                                 c
+                                                                           Add end and start →  − end to Aδ
+                                                                           E XTRACT O NE(end, Aδ , visited)
+Figure 6. The context expansion. Each rule obtains a set of ex-         end for
+panded suffices, representing the set of strings that must be         end function
+matched after completing this rule. The remaining unmatched
+part of the context-dependent tokens should either be a prefix of
+the expanded suffix or start with the expanded suffix. Otherwise,
+they are rejected.                                                  If a node has both character edges and edges referencing
+                                                                    other rules, we will stop the search at this node. The ex-
+                                                                    tracted subgraph is then merged into Actx  R . This process is
+This filtering process effectively reduces the number of            repeated for all rules, and the extracted Actx
+                                                                                                                R is used to reject
+context-dependent tokens by eliminating those that would            context-dependent tokens cannot match any string in it after
+fail in higher-level rule contexts. Applied to the Llama-3.1        finishing matching rule R.
+model and JSON grammar, this technique reduces context-
+dependent tokens by 90% (from 1,134 to 120).                        Although we do not consider rule-referencing edges when
+                                                                    extracting the expanded context automata, this algorithm
+Algorithm 2 describes the context expansion process that            can still extract many useful context information. That is
+finds the expanded suffix of each rule. For a rule R, we            because the inlining optimization introduced in §3.4 inlines
+utilize a finite state automaton (FSA) Actx
+                                          R (ctx is the abbre-      fragment rules into their parent rules, reducing the need to
+viation for context) to represent the expanded suffix, and that     check into child rules to reject context-dependent tokens.
+is extracted from the pushdown automata. We first find all
+edges e = (s, t) in the pushdown automata that references
+                                                                    3.3   Persistent Execution Stack
+R and belongs to rule R′ . R′ is not necessarily different
+from R. Then we find a subgraph of the automaton of rule            As the grammar engine still needs to handle context-
+R′ starting from t to represent the possible strings that can       dependent tokens, we need to efficiently execute the push-
+follow R via depth-first search (DFS). However, we will not         down automata for these tokens. Additionally, we also need
+consider edges in the subgraph that reference other rules           to execute the pushdown automata for preprocessing the
+to avoid recursive references between rules, so the edges           context-independent token sets for all positions in the push-
+in the extracted subgraph will only have character labels.          down automata. In both cases, we need to maintain multiple
+                 XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                                                                       current stack pointers, which requires constant time. This
+            Stacks of                     Stacks from                  rollback operation is particularly useful for checking a large
+         the current step                previous steps                set of tokens, as many tokens share a common prefix with
+                                                                       other tokens, such as read, ready, and reader all sharing
+   [0]<array>     [0]<array>           Node a     [0]<array>           the prefix read. All the checked tokens are sorted in lexico-
+                                                                       graphical order to find the maximum length of the common
+    [3]<str>       [5]<str>                          Node d
+                                                                       prefixes. Then the tokens are checked one by one, and be-
+     Node l          Node l                                            fore checking each token, the state rolls back to just after
+                                                                       the common prefix with the previous token. Therefore, we
+                                                                       can avoid the redundant checks of these common prefixes,
+                               Root                                    reducing the number of characters that need to be checked.
+                                                                       For Llama-3.1 model and JSON grammar, this approach
+                    Node a
+                                                                       reduces the number of characters that need to be checked
+    Persistent                    [0] array
+                                                                       across the entire vocabulary to 30%, significantly speeding
+    Execution
+      Stack                                                            up the preprocessing stage.
+                      Node d          [3] str      [5] str
+                                                                       The rollback operation enables more applications with
+                                      Node l        Node l             efficient structured generation. There are many LLM ap-
+                                                                       plications that involve rolling back the output to a previous
+                                                                       token. For instance, the jump-forward decoding (Yin et al.,
+Figure 7. The persistent stack organizes multiple matching stacks      2024) requires retokenization, which involves rolling back
+from the current step, as well as stacks from previous steps, into a   some tokens in the context and then inserting new tokens. To
+single tree. It reduces memory consumption and supports rolling        ensure structured generation can continue after rolling back
+the state back to previous steps.                                      tokens, we can roll back the automaton state simultaneously
+                                                                       with the output token rollback. There are also many LLM
+                                                                       applications that requires LLMs generate in a tree struc-
+parallel stacks and branch out as we match the characters              ture, such as in Tree-of-thought (Yao et al., 2024), SGLang
+in each token. To support efficient state branching, we in-            (Zheng et al., 2024), and the speculative model in the spec-
+troduce the persistent execution stack (Driscoll et al., 1989)         ulative decoding algorithm SpecInfer (Miao et al., 2024).
+to manage the multiple stacks and efficiently execute the              We can maintain the automata state for every branch of the
+pushdown automata. It can also manage the stacks from                  output tree, and when the output branches, we can quickly
+previous time points and enable the state rollback opera-              split the automaton state, maintaining separate matching
+tion, effectively speeding up the execution of the pushdown            states for each output branch. This branching is fast because
+automata on a set of tokens.                                           we only need to maintain the stack top pointer on the tree
+                                                                       for every branch. Therefore, the persistent execution stack
+As shown in Figure 7, the persistent execution stack man-
+                                                                       enables us to ensure efficient structured generation for all
+ages a set of stacks, which are either the parallel stacks
+                                                                       these applications.
+from the current time point or the stacks from previous time
+points, into a single tree, and every stack is represented by a
+path from the root node on the tree. The stack top node is             3.4   Pushdown Automata Structure Optimizations
+stored as a pointer to the node in the tree. Since the stacks          We will perform additional optimizations to improve the
+from adjacent time points often share most of the deeper               structure of pushdown automata to speed up the efficiency
+elements and only a few nodes are pushed or popped, this               of final execution. These optimizations draw from tradi-
+merging avoids memory redundancy for storing multiple                  tional compiler optimization concepts, but we find them
+stacks. When matching a new character from a token, we                 particularly useful for efficient constrained decoding.
+may need to split the stack into multiple stacks due to the
+ambiguity of the grammar, each corresponding to a different
+                                                                       Rule inlining. There could be many fragment rules, i.e.
+expansion of grammar rules. In this case, we only need to
+                                                                       rules with only a few elements, in the specified context-free
+split the branch for that stack instead of copying the whole
+                                                                       grammar, which are then converted into small FSA in the
+stack, which reduces the overhead of state branching.
+                                                                       pushdown automaton. On the one hand, this increases the
+Additionally, the persistent execution stack enables fast state        ambiguity of the grammar since we need to inspect into
+rollback by maintaining the stack from previous time points.           these fragment rules and check during the execution of the
+At runtime, a sliding window of history is maintained. To              pushdown automata. On the other hands, during context
+roll back to a previous state, we only need to change the              expansion, references to fragment rules are not considered,
+                XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+so the extracted context automata will be smaller. We will
+miss the opportunity to reject context-dependent tokens                                      Mask                  Mask
+                                                                    CPU   Build Mask Cache
+                                                                                             Gen                   Gen
+
+
+
+
+                                                                                                    Sync
+
+
+
+
+                                                                                                                                   Sync
+based on the structure of these fragment rules.
+                                                                    GPU         LLM Prefilling             Sampling LLM Decoding          Sampling
+To address this issue, we introduce an automatic inlining
+strategy (Scheifler, 1977) for fragment rules. We iteratively
+pick rules that do not reference other rules and inline them
+into the parent rules. To avoid the explosion of the automa-    Figure 8. Overlapping building the mask cache with LLM prefill-
+ton size, we limit the size of the inlined rule and the size    ing, and mask generation with LLM decoding to minimize the
+of inlined result to constants. This inlining process almost    overhead.
+eliminated fragment rules, thereby improving the efficiency
+of token checking and enhancing the effectiveness of the        depends on the previously generated tokens. The LLM infer-
+context expansion.                                              ence process except the sampling stage only requires GPU,
+                                                                and also only depends on the previously generated tokens.
+Pushdown automata node merging. For pushdown au-                Therefore, we can parallelize the mask generation process
+tomata, in many cases, the ambiguity comes from multiple        on the CPU with the LLM inference process on the GPU.
+outward edges of a node with the same label. When match-        We will synchronize before sampling, and the GPU will ob-
+ing tokens, if we arrive at this node, and the next character   tain the mask from the CPU and perform masked sampling
+just matches the label, the matching stack will be split into   to generate the new token. Additionally, the preprocessing
+multiple stacks, one for each outward edge. The increase in     stage can also be overlapped with the LLM prefilling stage,
+the number of stacks increases the computation as we need       where the LLM processes the prompt. This orchestration
+to check the context-dependent tokens for each stack and        between CPU and GPU ensures that the token restrictions
+merge the token masks. To reduce this kind of ambiguity,        are applied seamlessly, with almost zero overhead for LLM
+the node merging algorithm merges the subsequent nodes          inference. In practice, the time for mask generation is less
+that satisfy: a) they are pointed to by edges with the same     than the time for LLM inference, so the mask generation
+label originating from the same point b) they are not pointed   process will not become the bottleneck of the generation
+to by other edges.                                              process.
+Additionally, the epsilon edge also increases the ambigu-
+                                                    ϵ
+ity of the matching process. An epsilon edge s →    − t in      4     E VALUATION
+the automata means that the matching process can directly
+                                                                We implement XGrammar in 12,000 lines of core C++ code,
+move from s to t without consuming any characters. If the
+                                                                and we provide Python bindings to facilitate seamless inte-
+matching process arrives at s, the execution stack will split
+                                                                gration with LLM inference frameworks. In this section, we
+into two stacks, one with s at the top and the other with t,
+                                                                evaluate XGrammar to answer the following questions:
+both of which can continue matching. To reduce this kind
+of ambiguity, the node merging algorithm also merges the
+nodes s and t into a single node, as long as s has no other         • Can XGrammar efficiently support each step of con-
+outward edge or t has no zero inward edge.                            strained decoding? (§4.1)
+
+These two optimizations preserves the equivalence of the            • Does XGrammar achieve minimal overhead for end-to-
+automaton, but reduces the number of nodes and edges. At              end structured generation in LLM serving? (§4.2)
+runtime, the number of stacks and the computation required          • How effective is each optimization technique intro-
+for token checking are reduced, speeding up the mask gen-             duced in XGrammar? (§4.3)
+eration process.
+                                                                    • How does XGrammar effect downstream structured
+3.5   Overlapping Mask Generation and LLM                             generation tasks? (§4.4)
+      Inference
+                                                                4.1   Mask generation efficiency
+With the optimizations mentioned above, the token mask
+generation process is significantly accelerated, but it still   This section evaluates the efficiency of mask generation to
+requires CPU computation. To further eliminate the over-        measure the overhead introduced by constraint decoding.
+head of constrained decoding, we overlap the computation        We first assess regex-based methods using JSON schemas,
+for mask generation with the LLM inference process, as          which can be converted into regex. To test more complex
+shown in Figure 8. We observed that the mask generation         cases beyond regex capabilities, we evaluate context-free
+process and LLM inference process can be overlapped. That       grammars, including unconstrained JSON (from ECMA-
+is because the mask generation only requires CPU, and only      404 (Ecma International, 2013)), XML (based on the XML
+                               XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                              XGrammar                llama.cpp-Grammar
+                              Outlines                lm-format-enforcer                     Table 1. End-to-end structured generation efficiency across differ-
+                                                                                             ent models, measured in time per output token (ms) on the JSON
+                            JSON Schema                           CFG (Unconstrained JSON)   Schema task and the Llama-3.1 8B model. XGrammar demon-
+                104                 7069 6147                 104                    9353
+                                                                             4711            strates superior performance across different models.
+  Time (us/token)
+
+
+
+
+                                                Time (us/token)
+                                                                                                                           SGLang           SGLang
+                103                                           103                                       Model
+                                                                                                                          + Outlines      + XGrammar
+                              125                                                                  Llama-3.1 8B              44.2             6.8
+                102                                           102
+                       36                                             36                         DeepSeek-V2-Lite
+                                                                                                                              15.8              4.8
+                                                                                                    16B MOE
+                106          CFG (XML)                        106    CFG (Python DSL)
+                               382126                                       427285
+                105                                           105                    42577
+  Time (us/token)
+
+
+
+
+                                                Time (us/token)
+
+
+
+                                        18231
+                104                                           104                            XGrammar’s adaptability and efficiency across different
+                                                                                             deployment environments.
+                103                                           103
+                                                                      191                    We first compare the efficiency of several LLM engines
+                102     52                                    102
+                                                                                             that support structured generation, including vLLM (Kwon
+                                                                                             et al., 2023b) (v0.6.3) with Outlines and llama.cpp with
+Figure 9. Per token mask generation latency. XGrammar consis-                                its built-in grammar engine. Efficiency is measured by the
+tently outperforms existing constrained decoding libraries.                                  average time per output token (TPOT), which reflects the
+                                                                                             overhead of applying constraints during token generation.
+                                                                                             The evaluations are conducted using Llama-3.1-8B-Instruct
+1.0 standard (Bray et al., 2008)), and a Python DSL (adapted                                 under both JSON schema and CFG (unconstrained JSON).
+from the Python Grammar Specification (Python Software                                       All tests are run in an online serving setting with fixed batch
+Foundation, 2024)). Unconstrained JSON cannot be han-                                        sizes, on hardware with an AMD EPYC 7R13 CPU and an
+dled by regex-based methods due to its support for arbitrar-                                 NVIDIA H100 GPU. To ensure a fair comparison, we set
+ily nested lists and objects. The Python DSL covers basic                                    a fixed maximum output length. On average, the input has
+control flow (if, for, while) and data types (str, int, float,                               139 tokens, and the generated output has 53 tokens.
+bool) but ignores indentation. For JSON schema and uncon-                                    The experiment results are shown in Figure 10. XGrammar
+strained JSON, we use the JSON-mode-eval dataset (Nous-                                      achieves the best TPOT among all baselines for both JSON
+Research, 2024), and for XML and Python, we use a syn-                                       Schema and CFG. The computation of vLLM and llama.cpp
+thetic dataset. For baselines, we choose three popular con-                                  is hindered by their grammar engines’ longer preprocessing
+strained generation libraries: Outlines (Willard & Louf,                                     and per-token processing time. The decrease in TPOT speed
+2023) (v1.0), the grammar engine in llama.cpp (Gerganov,                                     in vLLM becomes particularly noticeable with larger batch
+2023) (b3998), and lm-format-enforcer (Gat et al., 2025)                                     sizes. This is because a larger batch size leads to higher
+(v0.10.9, a regex-based method that does not support CFG).                                   throughput, putting greater pressure on grammar processing
+All methods are evaluated on Llama-3.1-8B-Instruct using                                     on the CPU side. Overall the XGrammar-based structured
+an AMD Ryzen 9 7950X CPU and an NVIDIA RTX 4090                                              generation solutions can bring up to 80x output token rate
+GPU.                                                                                         compared to existing solutions. This proves the effective-
+The results are shown in Figure 9. XGrammar consistently                                     ness of XGrammar’s system optimizations and its co-design
+achieves the lowest latency across all tasks, with under                                     with the serving engine.
+40 µs per token for JSON Schema and CFG (JSON), and                                          We also study the effectiveness of XGrammar across differ-
+under 200 µs for XML and Python DSL. It delivers up to 3x                                    ent models in end-to-end serving scenarios. As the result
+speedup on JSON Schema and over 100x on CFG, compared                                        shown in Table 1, for various models, SGLang integrated
+to the best baseline in each case.                                                           with XGrammar consistently outperforms its integration
+                                                                                             with Outlines, demonstrating the robustness of XGrammar’s
+4.2                 End-to-End LLM Engine Evaluation                                         effectiveness across model architectures. This experiment
+                                                                                             also provides direct evidence that XGrammar outperforms
+This section evaluates XGrammar in LLM serving scenarios.
+                                                                                             other constrained decoding library when running on the
+We co-design XGrammar with the serving engines using the
+                                                                                             same serving engine.
+overlapping technique introduced in §3.5. We integrate it
+into widely used end-to-end LLM serving engines, including                                   Additionally, we examine the overhead of XGrammar’s con-
+the C++-based MLC-LLM (MLC team, 2023a) and the                                              strained decoding in end-to-end scenarios by measuring
+Python-based SGLang (Zheng et al., 2024), showcasing                                         performance on the MLC-LLM engine with and without
+                                         XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                                             llama.cpp           vLLM (w/ Outlines)                 SGLang (w/ XGrammar)                                        XGrammar Engine
+                                                               JSON Schema                                                                 Context-free Grammar (JSON)
+          Time per output token (ms)
+
+
+
+
+                                                                                                    Time per output token (ms)
+                                       104                                                                                       104
+                                                                                                                                                         2311
+                                                                                   1432                                                                               1252
+                                       103                      790                                                              103                   736
+                                              187                                     164                                               185137
+                                       102                            93                                                         102
+                                                    11                     10 9             12 12                                                             10 9            13 12
+                                       101               7 6                                                                     101             7 6
+                                                                                                                                                                         ×
+                                                    1             16                  32                                                   1             16              32
+                                                                Batch Size                                                                             Batch Size
+
+Figure 10. End-to-end evaluation on Llama 3.1 inference with structured constraints. Some results with a batch size of 32 are not reported
+because their API call time exceeded the API timeout limit of 600 seconds.
+
+
+
+Table 2. The impact on performance of enabling and disabling                                                        Table 4. Impact of XGrammar on structured generation tasks.
+XGrammar tested on the MLC-LLM Engine and the Llama-3.1                                                             XGrammar ensures 100% syntactic correctness of the generated
+8B model. TPOT (ms) is reported. XGrammar introduces minimal                                                        outputs.
+overhead to the serving engine with better generation quality.
+                                                                                                                                                            Accuracy w/o         Accuracy w/
+                                                                                                                                 Task
+                                               Batch       TPOT w/o                TPOT w/                                                                   XGrammar            XGrammar
+       Task
+                                                Size       XGrammar               XGrammar                                       Function calling               62%                 100%
+                                                  1           6.2                    6.3                                         XML code generation            80%                 100%
+  JSON Schema
+                                                 16           9.0                    9.2
+                                                  1           6.3                    6.3
+   CFG (JSON)
+                                                 16           9.0                    9.1
+                                                                                                                     inlining, and context expansion. For each configuration, we
+                                                                                                                     measure the average mask generation time on the CFG (un-
+Table 3. Ablation study of optimization techniques in XGrammar.
+                                                                                                                     constrained JSON) task with the Llama-3.1 8B model and
+                                                                                                                     the json-mode-eval dataset. As shown in Table 3, the results
+ Optimization                                                    Per-token latency (ms)                              show that the adaptive token mask cache has the greatest
+ PDA Baseline                                                    65.776                                              impact in terms of speedup, while other techniques, includ-
+ + Node merging                                                  38.280 (1.7×↓)                                      ing node merging, rule inlining, and context expansion, also
+ + Adaptive token mask cache                                     0.154 (248.6×↓)                                     yield noticeable improvements.
+ + Rule inlining                                                 0.035 (4.4×↓)
+ + Context Expansion                                             0.018 (1.9×↓)                                       4.4               Impact of XGrammar on Structured Generation
+                                                                                                                                       Tasks
+
+XGrammar. As shown in Table 2, enabling XGrammar en-                                                                XGrammar can improve the generation quality of LLMs by
+hances output quality with nearly zero overhead in TPOT.                                                            ensuring that the output strictly adheres to the given format.
+This is attributed to efficient mask generation and the over-                                                       We evaluate the impact of XGrammar on two strcutured
+lapping of grammar processing with GPU execution.                                                                   generation tasks: function calling (i.e., JSON generation
+                                                                                                                    guided by a JSON schema) and XML code generation. For
+                                                                                                                    function calling, we use the json-mode-eval dataset, while
+4.3   Ablation Study of Optimization Techniques
+                                                                                                                    for XML code generation, we rely on a synthetic dataset.
+In this section, we investigate the impact of various opti-                                                         We measure the syntactic correctness of the generated func-
+mizations introduced in xgrammar on mask generation per-                                                            tion calling outputs and XML code using LLaMA-3.1 8B.
+formance, to better illustrate our design decisions. We begin                                                       As shown in Table 4, XGrammar significantly improves
+by implementing a baseline using a pushdown automaton                                                               generation accuracy. We observe that without XGrammar,
+parser without any optimizations, where each token mask is                                                          the model often includes additional explanations alongside
+generated by checking the entire vocabulary to determine                                                            the intended code output, or the generated JSON contains
+whether parsing can proceed. Building on this baseline, we                                                          an unexpected type. This makes the output unsuitable for
+progressively add the optimizations described in this paper,                                                        direct use by downstream applications. XGrammar avoids
+namely node merging, the adaptive token mask cache, rule                                                            this issue by enforcing grammar constraints.
+               XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+5   R ELATED W ORK                                              6   C ONCLUSION
+Several works looked at algorithm improvements for struc-       We proposed XGrammar, a flexible and efficient structured
+tured generation. (Koo et al., 2024) proposes an algorithm      generation engine for LLMs. XGrammar separates the
+to convert character-level pushdown automata to token-level     vocabulary into context-independent tokens and context-
+pushdown automata. (Wang et al., 2023) specifies LLM            dependent ones. It prechecks the context-dependent tokens
+output structure through prompting. (Rozière et al., 2024;     and stores the result in an adaptive token mask cache. We
+Chaudhary, 2023; Li et al., 2023) explore finetuning LLMs       further introduce a persistent stack to speed up the execu-
+for higher quality structured generation. XGrammar’s ap-        tion of context-dependent checks. Finally, we co-design
+proach is orthogonal to these methods and can be combined       the grammar engine with LLM inference to overlap gram-
+with these approaches.                                          mar execution with GPU computation. Our system greatly
+                                                                speeds up the token mask generation process in token mask
+There has also been some previous work focusing on con-
+                                                                and enables zero overhead structure generation in end-to-
+strained decoding. Some methods use regex to represent
+                                                                end LLM inference flows. We hope our system can enable
+syntax, such as lm-format-enforcer (Gat, 2024), but they
+                                                                a broader range of structure generation across platforms.
+cannot handle more complex CFGs. Synchromesh (Poesia
+et al., 2022) and llama.cpp (Gerganov, 2023) utilizes LR
+parser and PDA respectively to handle CFG and generate          ACKNOWLEDGEMENTS
+the mask, but requires checking the entire vocabulary at
+                                                                This work was supported in part by NSF award CNS-
+runtime, which incurs large overhead. Outlines (Willard
+                                                                2211882, and gifts from OctoAI, Qualcomm, and CMU
+& Louf, 2023) handles the grammar through a lexer and
+                                                                opensource software fellowships. We are grateful to Sasa
+parser, and uses caching to accelerate mask generation, but
+                                                                Misailovic for his guidance as the shepherd of this paper.
+it only considers the most recent lexer token, which may
+                                                                We also appreciate the valuable feedback and discussions
+lead to incorrect judgments when LLM tokens span across
+                                                                from the DeepSeek, SGLang, TensorRT-LLM, vLLM, and
+multiple lexer tokens (Appendix A in (Koo et al., 2024)).
+                                                                WebLLM teams (listed alphabetically). Additionally, we
+Syncode (Ugare et al., 2024) uses a lexer and parser with a
+                                                                thank Weihua Du, Haoran Peng, Xinyu Yang, Zihao Ye,
+cache spanning multiple lexer tokens, but requires all tokens
+                                                                Jieyu Zhang, Zhihao Zhang, and Ligeng Zhu for their in-
+to be processed offline, leading to substantial preprocessing
+                                                                sightful input and thoughtful conversations.
+overhead. In this work, XGrammar leverages a PDA to sup-
+port CFGs and introduces an adaptive token mask cache to
+adaptively handle tokens during preprocessing and runtime,      R EFERENCES
+combining other system optimizations to achieve minimal         Beurer-Kellner, L. GitHub - eth-sri/lmql: A language
+overhead in both stages.                                          for constraint-guided and efficient LLM programming.
+Guidance (Guidance-ai, 2024), LMQL (Beurer-Kellner,              — github.com. https://github.com/eth-sri/
+2023), SGLang (Zheng et al., 2024) provide flexible ways          lmql, 2023. [Accessed 31-10-2024].
+to declare the structures. XGrammar is complementary to
+these improvements and can be used as the backend engine        Bray, T., Paoli, J., Sperberg-McQueen, C. M., Maler, E.,
+to speedup their execution.                                       and Yergeau, F. Extensible Markup Language (XML) 1.0
+                                                                  (Fifth Edition). https://www.w3.org/TR/xml,
+LLM serving engines (MLC team, 2023a; Zheng et al.,               November 2008. W3C Recommendation, 26 Novem-
+2024; Kwon et al., 2023a; hiworldwzj et al., 2024) em-            ber 2008.
+ploy various techniques to support efficient LLM generation
+for multiple concurrent users, including engine-level tech-     Bridle, J. Training stochastic model recognition al-
+niques such as continuous batching (Yu et al., 2022) for          gorithms as networks can lead to maximum mutual
+dyanmic request scheduling, and low-level KV cache tech-          information estimation of parameters.  In Touret-
+nique PagedKVCache (Kwon et al., 2023a) for efficient             zky, D. (ed.), Advances in Neural Information
+memory management. Also, AICI (Moskal et al., 2024)               Processing Systems, volume 2. Morgan-Kaufmann,
+proposes a CPU-GPU parallel computation paradigm to ac-           1989. URL https://proceedings.neurips.
+celerate structured generation. These LLM serving engines         cc/paper_files/paper/1989/file/
+can leverage XGrammar for efficient, structured generation        0336dcbab05b9d5ad24f4333c7658a0e-Paper.
+on top of their existing LLM inference techniques.                pdf.
+
+                                                                Chaudhary, S. Code alpaca: An instruction-following llama
+                                                                  model for code generation. https://github.com/
+                                                                  sahil280114/codealpaca, 2023.
+               XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,     Liu, J., Wang, J., Yu, J., Bitton, J., Spisak, J., Park, J.,
+  H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,        Rocca, J., Johnstun, J., Saxe, J., Jia, J., Alwala, K. V.,
+  Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,         Upasani, K., Plawiak, K., Li, K., Heafield, K., Stone, K.,
+  M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,      El-Arini, K., Iyer, K., Malik, K., Chiu, K., Bhalla, K.,
+  S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-      Rantala-Yeary, L., van der Maaten, L., Chen, L., Tan, L.,
+  ian, M., Winter, C., Tillet, P., Such, F. P., Cummings,       Jenkins, L., Martin, L., Madaan, L., Malo, L., Blecher, L.,
+  D., Plappert, M., Chantzis, F., Barnes, E., Herbert-          Landzaat, L., de Oliveira, L., Muzzi, M., Pasupuleti, M.,
+  Voss, A., Guss, W. H., Nichol, A., Paino, A., Tezak,          Singh, M., Paluri, M., Kardas, M., Oldham, M., Rita, M.,
+  N., Tang, J., Babuschkin, I., Balaji, S., Jain, S., Saun-     Pavlova, M., Kambadur, M., Lewis, M., Si, M., Singh,
+  ders, W., Hesse, C., Carr, A. N., Leike, J., Achiam,          M. K., Hassan, M., Goyal, N., Torabi, N., Bashlykov, N.,
+  J., Misra, V., Morikawa, E., Radford, A., Knight, M.,         Bogoychev, N., Chatterji, N., Duchenne, O., Çelebi, O.,
+  Brundage, M., Murati, M., Mayer, K., Welinder, P., Mc-        Alrassy, P., Zhang, P., Li, P., Vasic, P., Weng, P., Bhargava,
+  Grew, B., Amodei, D., McCandlish, S., Sutskever, I., and      P., Dubal, P., Krishnan, P., Koura, P. S., Xu, P., He, Q.,
+  Zaremba, W. Evaluating large language models trained          Dong, Q., Srinivasan, R., Ganapathy, R., Calderer, R.,
+  on code, 2021. URL https://arxiv.org/abs/                     Cabral, R. S., Stojnic, R., Raileanu, R., Girdhar, R., Patel,
+  2107.03374.                                                   R., Sauvestre, R., Polidoro, R., Sumbaly, R., Taylor, R.,
+                                                                Silva, R., Hou, R., Wang, R., Hosseini, S., Chennabas-
+Chomsky, N. Three models for the description of language.       appa, S., Singh, S., Bell, S., Kim, S. S., Edunov, S., Nie,
+  IRE Transactions on Information Theory, 2(3):113–124,         S., Narang, S., Raparthy, S., Shen, S., Wan, S., Bhosale,
+  1956. doi: 10.1109/TIT.1956.1056813.                          S., Zhang, S., Vandenhende, S., Batra, S., Whitman, S.,
+Deutsch, D., Upadhyay, S., and Roth, D. A general-              Sootla, S., Collot, S., Gururangan, S., Borodinsky, S., Her-
+  purpose algorithm for constrained sequential inference.       man, T., Fowler, T., Sheasha, T., Georgiou, T., Scialom,
+  In Bansal, M. and Villavicencio, A. (eds.), Proceed-          T., Speckbacher, T., Mihaylov, T., Xiao, T., Karn, U.,
+  ings of the 23rd Conference on Computational Natu-            Goswami, V., Gupta, V., Ramanathan, V., Kerkez, V.,
+  ral Language Learning (CoNLL), pp. 482–492, Hong              Gonguet, V., Do, V., Vogeti, V., Petrovic, V., Chu, W.,
+  Kong, China, November 2019. Association for Compu-            Xiong, W., Fu, W., Meers, W., Martinet, X., Wang, X.,
+  tational Linguistics. doi: 10.18653/v1/K19-1045. URL          Tan, X. E., Xie, X., Jia, X., Wang, X., Goldschlag, Y.,
+  https://aclanthology.org/K19-1045.                            Gaur, Y., Babaei, Y., Wen, Y., Song, Y., Zhang, Y., Li, Y.,
+                                                                Mao, Y., Coudert, Z. D., Yan, Z., Chen, Z., Papakipos, Z.,
+Driscoll, J. R., Sarnak, N., Sleator, D. D., and                Singh, A., Grattafiori, A., Jain, A., Kelsey, A., Shajnfeld,
+  Tarjan, R. E.         Making data structures persis-          A., Gangidi, A., Victoria, A., Goldstand, A., Menon, A.,
+  tent.    Journal of Computer and System Sciences,             Sharma, A., Boesenberg, A., Vaughan, A., Baevski, A.,
+  38(1):86–124, 1989.        ISSN 0022-0000.     doi:           Feinstein, A., Kallet, A., Sangani, A., Yunus, A., Lupu,
+  https://doi.org/10.1016/0022-0000(89)90034-2.                 A., Alvarado, A., Caples, A., Gu, A., Ho, A., Poulton,
+  URL         https://www.sciencedirect.com/                    A., Ryan, A., Ramchandani, A., Franco, A., Saraf, A.,
+  science/article/pii/0022000089900342.                         Chowdhury, A., Gabriel, A., Bharambe, A., Eisenman, A.,
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A.,    Yazdan, A., James, B., Maurer, B., Leonhardi, B., Huang,
+  Letman, A., Mathur, A., Schelten, A., Yang, A., Fan, A.,      B., Loyd, B., Paola, B. D., Paranjape, B., Liu, B., Wu, B.,
+  Goyal, A., Hartshorn, A., Yang, A., Mitra, A., Sravanku-      Ni, B., Hancock, B., Wasti, B., Spence, B., Stojkovic, B.,
+  mar, A., Korenev, A., Hinsvark, A., Rao, A., Zhang, A.,       Gamido, B., Montalvo, B., Parker, C., Burton, C., Mejia,
+  Rodriguez, A., Gregerson, A., Spataru, A., Roziere, B.,       C., Wang, C., Kim, C., Zhou, C., Hu, C., Chu, C.-H.,
+  Biron, B., Tang, B., Chern, B., Caucheteux, C., Nayak,        Cai, C., Tindal, C., Feichtenhofer, C., Civin, D., Beaty,
+  C., Bi, C., Marra, C., McConnell, C., Keller, C., Touret,     D., Kreymer, D., Li, D., Wyatt, D., Adkins, D., Xu, D.,
+  C., Wu, C., Wong, C., Ferrer, C. C., Nikolaidis, C., Al-      Testuggine, D., David, D., Parikh, D., Liskovich, D., Foss,
+  lonsius, D., Song, D., Pintz, D., Livshits, D., Esiobu, D.,   D., Wang, D., Le, D., Holland, D., Dowling, E., Jamil,
+  Choudhary, D., Mahajan, D., Garcia-Olano, D., Perino,         E., Montgomery, E., Presani, E., Hahn, E., Wood, E.,
+  D., Hupkes, D., Lakomkin, E., AlBadawy, E., Lobanova,         Brinkman, E., Arcaute, E., Dunbar, E., Smothers, E., Sun,
+  E., Dinan, E., Smith, E. M., Radenovic, F., Zhang, F., Syn-   F., Kreuk, F., Tian, F., Ozgenel, F., Caggioni, F., Guzmán,
+  naeve, G., Lee, G., Anderson, G. L., Nail, G., Mialon, G.,    F., Kanayet, F., Seide, F., Florez, G. M., Schwarz, G.,
+  Pang, G., Cucurell, G., Nguyen, H., Korevaar, H., Xu, H.,     Badeer, G., Swee, G., Halpern, G., Thattai, G., Herman,
+  Touvron, H., Zarov, I., Ibarra, I. A., Kloumann, I., Misra,   G., Sizov, G., Guangyi, Zhang, Lakshminarayanan, G.,
+  I., Evtimov, I., Copet, J., Lee, J., Geffert, J., Vranes,     Shojanazeri, H., Zou, H., Wang, H., Zha, H., Habeeb,
+  J., Park, J., Mahadeokar, J., Shah, J., van der Linde, J.,    H., Rudolph, H., Suk, H., Aspegren, H., Goldman, H.,
+  Billock, J., Hong, J., Lee, J., Fu, J., Chi, J., Huang, J.,   Damlaj, I., Molybog, I., Tufanov, I., Veliche, I.-E., Gat,
+                XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+  I., Weissman, J., Geboski, J., Kohli, J., Asher, J., Gaya,      Evey, R. The Theory and Applications of Pushdown Store
+  J.-B., Marcus, J., Tang, J., Chan, J., Zhen, J., Reizenstein,     Machines. Mathematical linguistic and automatic trans-
+  J., Teboul, J., Zhong, J., Jin, J., Yang, J., Cummings, J.,       lation: Report to National Science Foundation. Harvard
+  Carvill, J., Shepard, J., McPhie, J., Torres, J., Ginsburg,       University, 1963. URL https://books.google.
+  J., Wang, J., Wu, K., U, K. H., Saxena, K., Prasad, K.,           com/books?id=mg4yAAAAIAAJ.
+  Khandelwal, K., Zand, K., Matosich, K., Veeraragha-
+  van, K., Michelena, K., Li, K., Huang, K., Chawla, K.,          Gat, N. GitHub - noamgat/lm-format-enforcer: Enforce the
+  Lakhotia, K., Huang, K., Chen, L., Garg, L., A, L., Silva,        output format (JSON Schema, Regex etc) of a language
+  L., Bell, L., Zhang, L., Guo, L., Yu, L., Moshkovich,             model — github.com.       https://github.com/
+  L., Wehrstedt, L., Khabsa, M., Avalani, M., Bhatt, M.,            noamgat/lm-format-enforcer, 2024.                [Ac-
+  Tsimpoukelli, M., Mankus, M., Hasson, M., Lennie, M.,             cessed 31-10-2024].
+  Reso, M., Groshev, M., Naumov, M., Lathi, M., Keneally,         Gat, N. et al. lm-format-enforcer. https://github.
+  M., Seltzer, M. L., Valko, M., Restrepo, M., Patel, M.,           com/noamgat/lm-format-enforcer, 2025. Ac-
+  Vyatskov, M., Samvelyan, M., Clark, M., Macey, M.,                cessed: 2025-03-27.
+  Wang, M., Hermoso, M. J., Metanat, M., Rastegari, M.,
+  Bansal, M., Santhanam, N., Parks, N., White, N., Bawa,          Gerganov, G. GitHub - ggerganov/llama.cpp: LLM in-
+  N., Singhal, N., Egebo, N., Usunier, N., Laptev, N. P.,           ference in C/C++ — github.com. https://github.
+  Dong, N., Zhang, N., Cheng, N., Chernoguz, O., Hart,              com/ggerganov/llama.cpp, 2023. [Accessed 31-
+  O., Salpekar, O., Kalinli, O., Kent, P., Parekh, P., Saab,       10-2024].
+  P., Balaji, P., Rittner, P., Bontrager, P., Roux, P., Dollar,
+  P., Zvyagina, P., Ratanchandani, P., Yuvraj, P., Liang, Q.,     Guidance-ai.   GitHub - guidance-ai/guidance: A
+  Alao, R., Rodriguez, R., Ayub, R., Murthy, R., Nayani,            guidance language for controlling large language
+  R., Mitra, R., Li, R., Hogan, R., Battey, R., Wang, R.,           models. — github.com. https://github.com/
+  Maheswari, R., Howes, R., Rinott, R., Bondu, S. J., Datta,        guidance-ai/guidance, 2024. [Accessed 31-10-
+  S., Chugh, S., Hunt, S., Dhillon, S., Sidorov, S., Pan, S.,       2024].
+  Verma, S., Yamamoto, S., Ramaswamy, S., Lindsay, S.,
+                                                                  Haas, A., Rossberg, A., Schuff, D. L., Titzer, B. L., Holman,
+  Lindsay, S., Feng, S., Lin, S., Zha, S. C., Shankar, S.,
+                                                                    M., Gohman, D., Wagner, L., Zakai, A., and Bastien,
+  Zhang, S., Zhang, S., Wang, S., Agarwal, S., Sajuyigbe,
+                                                                    J. Bringing the web up to speed with webassembly. In
+  S., Chintala, S., Max, S., Chen, S., Kehoe, S., Satter-
+                                                                    Proceedings of the 38th ACM SIGPLAN Conference on
+  field, S., Govindaprasad, S., Gupta, S., Cho, S., Virk,
+                                                                    Programming Language Design and Implementation, pp.
+  S., Subramanian, S., Choudhury, S., Goldman, S., Re-
+                                                                   185–200, 2017.
+  mez, T., Glaser, T., Best, T., Kohler, T., Robinson, T., Li,
+  T., Zhang, T., Matthews, T., Chou, T., Shaked, T., Von-         hiworldwzj, shihaobai, sufubao, WANDY666, FlyingFlame,
+  timitta, V., Ajayi, V., Montanez, V., Mohan, V., Kumar,           llehtahw, LiangLiu, wxd000000, fuheaven, XHPlus,
+  V. S., Mangla, V., Albiero, V., Ionescu, V., Poenaru, V.,         Chielo, Yong, Y., and gate, sangchengmeng, wangzhi-
+  Mihailescu, V. T., Ivanov, V., Li, W., Wang, W., Jiang,           hong, singularity, Yang, S., SiYu, W., Tracin, Granger,
+  W., Bouaziz, W., Constable, W., Tang, X., Wang, X.,               E., Husain, H., R, S. A. G. A., SunXiaoye, Peng, T.,
+  Wu, X., Wang, X., Xia, X., Wu, X., Gao, X., Chen, Y.,             Uranus, Bai, Y., Fan, Y., bingo, liuhuakai, and XF-
+  Hu, Y., Jia, Y., Qi, Y., Li, Y., Zhang, Y., Zhang, Y., Adi,       Plus. ModelTC/lightllm. 10 2024. URL https:
+  Y., Nam, Y., Yu, Wang, Hao, Y., Qian, Y., He, Y., Rait,           //github.com/ModelTC/lightllm.
+  Z., DeVito, Z., Rosnbrick, Z., Wen, Z., Yang, Z., and
+  Zhao, Z. The llama 3 herd of models, 2024a. URL                 Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,
+  https://arxiv.org/abs/2407.21783.                                  Chaplot, D. S., de las Casas, D., Bressand, F., Lengyel,
+                                                                     G., Lample, G., Saulnier, L., Lavaud, L. R., Lachaux, M.-
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,             A., Stock, P., Scao, T. L., Lavril, T., Wang, T., Lacroix,
+ A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,            T., and Sayed, W. E. Mistral 7b, 2023. URL https:
+ A., et al. The llama 3 herd of models. arXiv preprint               //arxiv.org/abs/2310.06825.
+  arXiv:2407.21783, 2024b.
+                                                                  Koo, T., Liu, F., and He, L. Automata-based constraints
+                                                                    for language model decoding, 2024. URL https://
+Ecma International.     ECMA-404 The JSON                           arxiv.org/abs/2407.08103.
+  Data Interchange Standard.    Online, 2013.
+  https://www.ecma-international.org/                             Kuchnik, M., Smith, V., and Amvrosiadis, G. Validating
+  publications-and-standards/standards/                             large language models with relm. Proceedings of Ma-
+  ecma-404/.                                                        chine Learning and Systems, 5:457–476, 2023.
+               XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,        Moskal, M., Musuvathi, M., and Kıcıman, E. AI Controller
+ C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient    Interface. https://github.com/microsoft/
+ memory management for large language model serving             aici/, 2024.
+ with pagedattention. In Proceedings of the ACM SIGOPS
+ 29th Symposium on Operating Systems Principles, 2023a.        Mozannar, H., Bansal, G., Fourney, A., and Horvitz, E.
+                                                                Reading between the lines: Modeling user behavior and
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,         costs in ai-assisted programming. In Proceedings of the
+ C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient    CHI Conference on Human Factors in Computing Sys-
+ memory management for large language model serving             tems, pp. 1–16, 2024.
+ with pagedattention, 2023b. URL https://arxiv.
+                                                               NousResearch.         NousResearch/json-mode-eval ·
+ org/abs/2309.06180.
+                                                                 Datasets at Hugging Face — huggingface.co.
+LangChain.       Tool Calling with LangChain —                   https://huggingface.co/datasets/
+  blog.langchain.dev. https://blog.langchain.                    NousResearch/json-mode-eval, 2024. [Ac-
+  dev/tool-calling-with-langchain/, 2024.                        cessed 31-10-2024].
+  [Accessed 26-10-2024].
+                                                               OpenAI.        Function Calling - OpenAI API.
+Li, R., Allal, L. B., Zi, Y., Muennighoff, N., Kocetkov, D.,     https://platform.openai.com/docs/
+  Mou, C., Marone, M., Akiki, C., Li, J., Chim, J., Liu, Q.,     guides/function-calling, 2024. [Accessed
+  Zheltonozhskii, E., Zhuo, T. Y., Wang, T., Dehaene, O.,        26-10-2024].
+  Davaadorj, M., Lamy-Poirier, J., Monteiro, J., Shliazhko,
+                                                               OpenAI, Achiam, J., Adler, S., Agarwal, S., Ahmad, L.,
+  O., Gontier, N., Meade, N., Zebaze, A., Yee, M.-H., Uma-
+                                                                Akkaya, I., Aleman, F. L., Almeida, D., Altenschmidt, J.,
+  pathi, L. K., Zhu, J., Lipkin, B., Oblokulov, M., Wang,
+                                                                Altman, S., Anadkat, S., Avila, R., Babuschkin, I., Bal-
+  Z., Murthy, R., Stillerman, J., Patel, S. S., Abulkhanov,
+                                                                 aji, S., Balcom, V., Baltescu, P., Bao, H., Bavarian, M.,
+  D., Zocca, M., Dey, M., Zhang, Z., Fahmy, N., Bhat-
+                                                                 Belgum, J., Bello, I., Berdine, J., Bernadett-Shapiro, G.,
+  tacharyya, U., Yu, W., Singh, S., Luccioni, S., Villegas,
+                                                                 Berner, C., Bogdonoff, L., Boiko, O., Boyd, M., Brakman,
+  P., Kunakov, M., Zhdanov, F., Romero, M., Lee, T., Timor,
+                                                                A.-L., Brockman, G., Brooks, T., Brundage, M., Button,
+  N., Ding, J., Schlesinger, C., Schoelkopf, H., Ebert, J.,
+                                                                 K., Cai, T., Campbell, R., Cann, A., Carey, B., Carlson,
+  Dao, T., Mishra, M., Gu, A., Robinson, J., Anderson,
+                                                                 C., Carmichael, R., Chan, B., Chang, C., Chantzis, F.,
+  C. J., Dolan-Gavitt, B., Contractor, D., Reddy, S., Fried,
+                                                                 Chen, D., Chen, S., Chen, R., Chen, J., Chen, M., Chess,
+  D., Bahdanau, D., Jernite, Y., Ferrandis, C. M., Hughes,
+                                                                 B., Cho, C., Chu, C., Chung, H. W., Cummings, D., Cur-
+  S., Wolf, T., Guha, A., von Werra, L., and de Vries, H.
+                                                                 rier, J., Dai, Y., Decareaux, C., Degry, T., Deutsch, N.,
+  Starcoder: may the source be with you!, 2023. URL
+                                                                 Deville, D., Dhar, A., Dohan, D., Dowling, S., Dunning,
+  https://arxiv.org/abs/2305.06161.
+                                                                 S., Ecoffet, A., Eleti, A., Eloundou, T., Farhi, D., Fedus,
+Liu, B., Jiang, Y., Zhang, X., Liu, Q., Zhang, S., Biswas,       L., Felix, N., Fishman, S. P., Forte, J., Fulford, I., Gao, L.,
+  J., and Stone, P. Llm+p: Empowering large language             Georges, E., Gibson, C., Goel, V., Gogineni, T., Goh, G.,
+  models with optimal planning proficiency, 2023. URL            Gontijo-Lopes, R., Gordon, J., Grafstein, M., Gray, S.,
+  https://arxiv.org/abs/2304.11477.                              Greene, R., Gross, J., Gu, S. S., Guo, Y., Hallacy, C., Han,
+                                                                J., Harris, J., He, Y., Heaton, M., Heidecke, J., Hesse,
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z.,            C., Hickey, A., Hickey, W., Hoeschele, P., Houghton, B.,
+ Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi,              Hsu, K., Hu, S., Hu, X., Huizinga, J., Jain, S., Jain, S.,
+ X., Shi, C., Chen, Z., Arfeen, D., Abhyankar, R., and          Jang, J., Jiang, A., Jiang, R., Jin, H., Jin, D., Jomoto, S.,
+ Jia, Z. Specinfer: Accelerating large language model           Jonn, B., Jun, H., Kaftan, T., Łukasz Kaiser, Kamali, A.,
+ serving with tree-based speculative inference and ver-          Kanitscheider, I., Keskar, N. S., Khan, T., Kilpatrick, L.,
+ ification. In Proceedings of the 29th ACM Interna-              Kim, J. W., Kim, C., Kim, Y., Kirchner, J. H., Kiros, J.,
+ tional Conference on Architectural Support for Pro-             Knight, M., Kokotajlo, D., Łukasz Kondraciuk, Kondrich,
+ gramming Languages and Operating Systems, Volume               A., Konstantinidis, A., Kosic, K., Krueger, G., Kuo, V.,
+ 3, ASPLOS ’24, pp. 932–949. ACM, April 2024. doi:               Lampe, M., Lan, I., Lee, T., Leike, J., Leung, J., Levy, D.,
+ 10.1145/3620666.3651335. URL http://dx.doi.                     Li, C. M., Lim, R., Lin, M., Lin, S., Litwin, M., Lopez, T.,
+ org/10.1145/3620666.3651335.                                    Lowe, R., Lue, P., Makanju, A., Malfacini, K., Manning,
+MLC team. MLC-LLM, 2023a. URL https://github.                    S., Markov, T., Markovski, Y., Martin, B., Mayer, K.,
+ com/mlc-ai/mlc-llm.                                             Mayne, A., McGrew, B., McKinney, S. M., McLeavey, C.,
+                                                                 McMillan, P., McNeil, J., Medina, D., Mehta, A., Menick,
+MLC team. WebLLM, 2023b. URL https://github.                    J., Metz, L., Mishchenko, A., Mishkin, P., Monaco, V.,
+ com/mlc-ai/web-llm.                                             Morikawa, E., Mossing, D., Mu, T., Murati, M., Murk, O.,
+                XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+  Mély, D., Nair, A., Nakano, R., Nayak, R., Neelakantan,         Scholak, T., Schucher, N., and Bahdanau, D. PICARD:
+  A., Ngo, R., Noh, H., Ouyang, L., O’Keefe, C., Pachocki,           Parsing incrementally for constrained auto-regressive
+  J., Paino, A., Palermo, J., Pantuliano, A., Parascandolo,          decoding from language models. In Moens, M.-F.,
+  G., Parish, J., Parparita, E., Passos, A., Pavlov, M., Peng,       Huang, X., Specia, L., and Yih, S. W.-t. (eds.), Pro-
+  A., Perelman, A., de Avila Belbute Peres, F., Petrov, M.,          ceedings of the 2021 Conference on Empirical Methods
+  de Oliveira Pinto, H. P., Michael, Pokorny, Pokrass, M.,           in Natural Language Processing, pp. 9895–9901, On-
+  Pong, V. H., Powell, T., Power, A., Power, B., Proehl, E.,         line and Punta Cana, Dominican Republic, November
+  Puri, R., Radford, A., Rae, J., Ramesh, A., Raymond, C.,           2021. Association for Computational Linguistics. doi:
+  Real, F., Rimbach, K., Ross, C., Rotsted, B., Roussez, H.,         10.18653/v1/2021.emnlp-main.779. URL https://
+  Ryder, N., Saltarelli, M., Sanders, T., Santurkar, S., Sastry,     aclanthology.org/2021.emnlp-main.779.
+  G., Schmidt, H., Schnurr, D., Schulman, J., Selsam, D.,
+  Sheppard, K., Sherbakov, T., Shieh, J., Shoker, S., Shyam,       Schützenberger, M.     On context-free languages and
+  P., Sidor, S., Sigler, E., Simens, M., Sitkin, J., Slama, K.,      push-down automata.        Information and Control,
+  Sohl, I., Sokolowsky, B., Song, Y., Staudacher, N., Such,          6(3):246–264, 1963.        ISSN 0019-9958.      doi:
+  F. P., Summers, N., Sutskever, I., Tang, J., Tezak, N.,            https://doi.org/10.1016/S0019-9958(63)90306-1.
+  Thompson, M. B., Tillet, P., Tootoonchian, A., Tseng, E.,          URL         https://www.sciencedirect.com/
+  Tuggle, P., Turley, N., Tworek, J., Uribe, J. F. C., Vallone,      science/article/pii/S0019995863903061.
+  A., Vijayvergiya, A., Voss, C., Wainwright, C., Wang,
+  J. J., Wang, A., Wang, B., Ward, J., Wei, J., Weinmann,          Ugare, S., Suresh, T., Kang, H., Misailovic, S., and Singh,
+  C., Welihinda, A., Welinder, P., Weng, J., Weng, L., Wi-           G. Syncode: Llm generation with grammar augmenta-
+  ethoff, M., Willner, D., Winter, C., Wolrich, S., Wong,            tion, 2024. URL https://arxiv.org/abs/2403.
+  H., Workman, L., Wu, S., Wu, J., Wu, M., Xiao, K., Xu,             01632.
+  T., Yoo, S., Yu, K., Yuan, Q., Zaremba, W., Zellers, R.,
+                                                                   Wang, B., Wang, Z., Wang, X., Cao, Y., Saurous, R. A.,
+  Zhang, C., Zhang, M., Zhao, S., Zheng, T., Zhuang, J.,
+                                                                    and Kim, Y. Grammar prompting for domain-specific
+  Zhuk, W., and Zoph, B. Gpt-4 technical report, 2024.
+                                                                    language generation with large language models, 2023.
+  URL https://arxiv.org/abs/2303.08774.
+                                                                    URL https://arxiv.org/abs/2305.19234.
+Pearce, H., Tan, B., Ahmad, B., Karri, R., and Dolan-Gavitt,
+  B. Examining zero-shot vulnerability repair with large           Wang, C., Cho, K., and Gu, J. Neural machine trans-
+  language models, 2022. URL https://arxiv.org/                     lation with byte-level subwords, 2019. URL https:
+  abs/2112.02125.                                                   //arxiv.org/abs/1909.03341.
+
+Poesia, G., Polozov, O., Le, V., Tiwari, A., Soares, G., Meek,     Wang, Y., Wang, W., Joty, S., and Hoi, S. C. H. Codet5:
+  C., and Gulwani, S. Synchromesh: Reliable code gener-             Identifier-aware unified pre-trained encoder-decoder mod-
+  ation from pre-trained language models. arXiv preprint            els for code understanding and generation, 2021. URL
+  arXiv:2201.11227, 2022.                                           https://arxiv.org/abs/2109.00859.
+
+Python Software Foundation. Python full grammar                    Willard, B. T. and Louf, R. Efficient guided generation for
+  specification. https://docs.python.org/3/                         llms. arXiv preprint arXiv:2307.09702, 2023.
+  reference/grammar.html, 2024. Accessed: 2025-
+  03-05.                                                           Yang, A., Yang, B., Hui, B., Zheng, B., Yu, B., Zhou, C.,
+                                                                     Li, C., Li, C., Liu, D., Huang, F., et al. Qwen2 technical
+Rozière, B., Gehring, J., Gloeckle, F., Sootla, S., Gat, I.,        report. arXiv preprint arXiv:2407.10671, 2024.
+  Tan, X. E., Adi, Y., Liu, J., Sauvestre, R., Remez, T.,
+  Rapin, J., Kozhevnikov, A., Evtimov, I., Bitton, J., Bhatt,      Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T. L., Cao, Y.,
+  M., Ferrer, C. C., Grattafiori, A., Xiong, W., Défossez,          and Narasimhan, K. Tree of thoughts: deliberate problem
+  A., Copet, J., Azhar, F., Touvron, H., Martin, L., Usunier,        solving with large language models. In Proceedings of
+  N., Scialom, T., and Synnaeve, G. Code llama: Open                 the 37th International Conference on Neural Information
+  foundation models for code, 2024. URL https://                     Processing Systems, NIPS ’23, Red Hook, NY, USA,
+  arxiv.org/abs/2308.12950.                                          2024. Curran Associates Inc.
+
+Scheifler, R. W. An analysis of inline substitution for a          Yin, L., Sheng, Y., and Zheng, L.     Fast json
+  structured programming language. Commun. ACM, 20                   decoding for local llms with compressed finite
+  (9):647–654, September 1977. ISSN 0001-0782. doi:                  state machine.      https://lmsys.org/blog/
+  10.1145/359810.359830. URL https://doi.org/                        2024-02-05-compressed-fsm/, February 2024.
+  10.1145/359810.359830.                                             Accessed: 2025-03-26.
+                 XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-                   – Rule reference transitions: When in a state q ∈
+  G. Orca: A distributed serving system for Transformer-                        Qr , a transition labeled by a rule reference to
+  Based generative models. In 16th USENIX Sympo-                                s ∈ R allows the PDA to push the current return
+  sium on Operating Systems Design and Implementa-                              information onto the stack and jump to the start
+  tion (OSDI 22), pp. 521–538, Carlsbad, CA, July                               state qsstart of As .
+  2022. USENIX Association. ISBN 978-1-939133-28-1.
+  URL https://www.usenix.org/conference/                              The parsing state is represented by a set of pairs {(si , qi )},
+  osdi22/presentation/yu.                                             where si denotes the content of the stack (encoding return
+                                                                      information), qi is the current state (with qi ∈ Qr for some
+Zakai, A. Emscripten: an llvm-to-javascript compiler. In
+                                                                      r ∈ R). There can be multiple such pairs because the push-
+  Proceedings of the ACM international conference com-
+                                                                      down automaton can contain non-deterministic transitions,
+  panion on Object oriented programming systems lan-
+                                                                      which means there could be multiple possible parsing stacks
+  guages and applications companion, pp. 301–312, 2011.
+                                                                      and states. In the main body of the paper, for simplicity, we
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,           place the current state qi at the top of the stack. Thus, the
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-           parsing state is represented as a set of parsing stacks.
+  rett, C., and Sheng, Y. Sglang: Efficient execution                 We now describe a formal transformation that converts the
+  of structured language model programs, 2024. URL                    above variant PDA definition into a standard PDA. To obtain
+  https://arxiv.org/abs/2312.07104.                                   a standard PDA, we construct a new pushdown automaton
+
+
+                                                                                        P ′ = Q, Σ, Γ, δ ′ , q0 , F
+                                                                                                                      
+A     F ORMAL D EFINITION OF THE PDA
+      VARIANT
+                                                                      as follows. The state set Q is defined as the union of all
+In our paper, we define a variant of the pushdown automaton           states from the FSAs:
+(PDA) that is equivalent to the original definition, but is                                      [
+designed to facilitate the description of the parsing algorithm                             Q=        Qr ,
+and the construction of the token mask cache, since the keys                                        r∈R
+
+of the token mask cache are precisely the states in this PDA.         and we set the initial state to be q0 = qmain . The stack
+It is defined as the tuple                                            alphabet Γ is chosen to record return information; we define
+                                                
+               P = R, Σ, {Ar }r∈R , qmain , δ ,                                     Γ = { (r, q) | r ∈ R, q ∈ Qr },
+where:                                                                so that each symbol (r, q) encodes the context of a rule call,
+                                                                      namely the originating rule and the return state.
+    • R is a finite set of grammar rules.
+                                                                      The transition function δ ′ of the standard PDA is then de-
+    • Σ is a finite input alphabet.                                   fined to simulate the behavior of the variant PDA. For each
+    • For each rule r ∈ R, the corresponding finite state             character transition in some δr , if
+      automaton is given by                                                         a
+                                                                                  → q′
+                                                                                 q−         with a ∈ Σ and q, q ′ ∈ Qr ,
+                Ar = Qr , Σ ∪ R, qrstart , Fr , δr ,
+                                                  
+                                                                      we include in δ ′ the transition
+      where Qr is a finite set of states, qrstart ∈ Qr is the start
+                                                                                  δ ′ (q, a, γ) ∋ (q ′ , γ) for all γ ∈ Γ.
+      state, Fr ⊆ Qr is the set of accepting states, and δr is
+      the transition function defined over Qr . The transition        For each rule reference transition in δr , if
+      labels in Ar are drawn from the alphabet Σ ∪ R, which
+                                                                                             s
+      includes both input characters and rule references.                                  → q′
+                                                                                          q−         with s ∈ R,
+    • qmain is the start state corresponding to the main rule.        we simulate the recursive call by defining an ϵ-transition
+                                                                      that pushes the return information and transfers control to
+    • δ is the global transition function that governs the oper-
+                                                                      the called rule. Formally, we set
+      ation of the PDA by handling two kinds of transitions:
+                                                                                                                   
+         – Character transitions: When in a state q ∈ Qr ,                  δ ′ (q, ϵ, γ) ∋ qsstart , (r, q ′ ) · γ   for all γ ∈ Γ,
+           reading an input symbol a ∈ Σ may lead to a
+                                                         a
+           transition within the same automaton, i.e., q −
+                                                         →            where q belongs to the automaton Ar , and (r, q ′ ) · γ denotes
+             ′
+           q.                                                         the stack obtained by pushing (r, q ′ ) onto γ. Finally, when
+                XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+                                                                                                                                                   Outlines                                      XGrammar
+
+
+
+
+                                                                                                      Time per output token (ms)
+an automaton Ar reaches an accepting state q ∈ Fr , the
+standard PDA simulates the return from a recursive call by                                                                              44.2
+popping the top of the stack. That is, if the current stack has                                                                40                                                                 31.5
+the form (r′ , q ′ ) · γ, we define
+                                                                                                                               20
+                  δ ′ (q, ϵ, (r′ , q ′ )) ∋ (q ′ , γ).                                                                                              6.8                                                         5.4
+                                                                                                                                   0        w/o                                                        w/
+S set of accepting states F is defined as those states in
+The
+                                                                                                                                        jump-forward                                              jump-forward
+ r∈R Fr that are reached with an empty stack.
+
+This construction shows that character transitions in the            Figure 11. The performance comparison with and without jump-
+variant PDA directly correspond to state transitions with-           forward decoding on the JSON schema task and the SGLang en-
+out stack operations in P ′ , while rule reference transitions       gine. XGrammar combined with jump-forward can achieve opti-
+correspond to stack push and jump operations. Similarly,             mal TPOT.
+completing the match of an FSA and returning to the par-
+ent rule is achieved by a stack pop and a transition to the                                                                                 Structured w/ XGrammar                                  Unstructured
+stored return state. In this way, the standard PDA P ′ exactly                                                                                                                              60
+simulates the recursive behavior of our variant PDA.                                          1600 1531.9
+                                                                                                                                                                                            50                        48.1 47.3
+                                                                                              1400                                 1365.1
+B    S YNERGY BETWEEN XG RAMMAR AND
+
+
+
+
+                                                                                                                                                               Time per Output Token (ms)
+     J UMP - FORWARD D ECODING                                                                1200                                              1179.1
+                                                                   Time to First Token (ms)                                                                                                 40
+
+Jump-forward decoding is a technique designed to acceler-                                     1000                                                   955.5                                        31.9
+ate structured generation. When, based on the current input,                                                                                                                                30           29.7
+                                                                                               800
+the following output can be deterministically inferred from
+the grammar, it bypasses LLM decoding and sampling by                                          600                                                                                          20
+directly tokenizing and appending the output to the context.
+This improves the end-to-end efficiency of LLM generation.                                     400
+This technique is orthogonal to the constrained decoding                                                                                                                                    10
+                                                                                               200
+adopted by XGrammar. XGrammar further supports jump-
+forward decoding and demonstrates that the two can be                                            0                                                                                           0
+effectively combined to further improve efficiency.                                                  Llama-3.1-8B Qwen-2.5-0.5B                                                                  Llama-3.1-8B Qwen-2.5-0.5B
+                                                                                                       (M3 Max) (iPhone 14 Pro Max)                                                                (M3 Max) (iPhone 14 Pro Max)
+We evaluate performance using the Llama-3.1-8B-Instruct
+model served through the SGLang engine, running on a ma-             Figure 12. End-to-end performance comparison between struc-
+                                                                     tured generation with XGrammar and unstructured generation
+chine with an AMD Ryzen 9 7950X CPU and an NVIDIA
+                                                                     in browser JavaScript environment.
+RTX 4090 GPU. All experiments are conducted with a batch
+size of 1. We compare our method, XGrammar, against the
+existing decoding backend Outlines, testing both with and
+without jump-forward decoding enabled. We measure time               and mobile phones. We further integrate the web-binding
+per output token as the evaluation metric.                           with the in-browser LLM inference framework WebLLM
+                                                                     (MLC team, 2023b) to enable structured generation.
+As shown in Figure 11, XGrammar consistently outperforms
+Outlines, and achieves the best efficiency overall when com-         We evaluate the end-to-end performance with the JSON-
+bined with jump-forward decoding—demonstrating its abil-             mode-eval dataset, using 4-bit quantized models Llama-3.1-
+ity to better leverage structural constraints for faster genera-     8B-Instruct (Dubey et al., 2024b) on a MacBook Pro M3
+tion.                                                                Max (MacOS 14.5) with Google Chrome, and Qwen-2.5-
+                                                                     0.5B-Instruct (Yang et al., 2024) on an iPhone 14 Pro Max
+                                                                     (iOS 18) with Safari.
+C    C ROSS - PLATFORM D EPLOYMENT OF
+     XG RAMMAR                                                        The results are shown in Figure 12. We compare the time
+                                                                      to first token (TTFT) and time per output token (TPOT)
+We study bringing XGrammar to a wide variety of plat-                 between structured generation with XGrammar and non-
+forms. We leverage Emscripten (Zakai, 2011) to compile                structured generation while ensuring the number of gener-
+XGrammar into WebAssembly (Haas et al., 2017) and build               ated tokens is the same. The results show that XGrammar
+a JavaScript binding. This approach enables XGrammar to               brings close to zero overhead in both settings, enabling a
+run in client-side browsers on portable devices like laptops          great potential to support future on-device agents with high
+               XGrammar: Flexible and Efficient Structured Generation Engine For Large Language Models
+
+performance.
+

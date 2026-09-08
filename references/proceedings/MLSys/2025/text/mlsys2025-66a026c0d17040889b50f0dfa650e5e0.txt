@@ -1,0 +1,1095 @@
+             N EO : S AVING GPU M EMORY C RISIS WITH CPU O FFLOADING
+                             FOR O NLINE LLM I NFERENCE
+
+
+
+                          Xuanlin Jiang 1 Yang Zhou 2 3 Shiyi Cao 2 Ion Stoica 2 Minlan Yu 4
+
+
+                                                           A BSTRACT
+        Online LLM inference powers many exciting applications such as intelligent chatbots and autonomous agents.
+        Modern LLM inference engines widely rely on request batching to improve inference throughput, aiming to make
+        it cost-efficient when running on expensive GPU accelerators. However, the limited GPU memory has largely
+        limited the batch size achieved in practice, leaving significant GPU compute resources wasted.
+        We present N EO, an online LLM inference system that offloads part of attention compute and KV cache states
+        from the GPU to the local host CPU, effectively increasing the GPU batch size and thus inference throughput. To
+        this end, N EO proposes asymmetric GPU-CPU pipelining and load-aware scheduling to balance GPU and CPU
+        loads and fully utilize their compute and memory resources. We evaluate N EO on a wide range of workloads
+        (i.e., code generation, text summarization), GPUs (i.e., T4, A10G, H100), and LLM models (i.e., 7B, 8B,
+        70B). N EO achieves up to 7.5×, 26%, and 14% higher throughput compared to GPU-only approach on T4,
+        A10G, and H100 GPUs, respectively, while maintaining the same latency; with more powerful CPUs, N EO
+        achieves up to 79.3% throughput gain on A10G GPU. To facilitate future research, we open-source our code at
+        https://github.com/NEO-MLSys25/NEO.
+
+1       I NTRODUCTION                                               have created the GPU memory crisis where people demand
+The advent of auto-regressive transformer-based large lan-          expensive high-end GPUs with large memory sizes.
+guage models (LLMs) has significantly reshaped existing             Prior work has recognized this problem and proposed var-
+technologies such as search engines and chatbots and em-            ious solutions. One line of work is on model quantiza-
+powered various new ones, such as autonomous agents and             tion (Zhao et al., 2024b; Xiao et al., 2023b) to reduce model
+programming assistants. In these online scenarios, LLM in-          memory consumption. However, they come at the cost of
+ference is directly user-facing and thus requires low latency       lower accuracy. Another line of work is offloading model
+for immersive interaction; it also desires high throughput,         weights, KV cache, and compute to the CPU, such as Flex-
+typically via request batching, to efficiently leverage expen-      Gen (Sheng et al., 2023), PowerInfer (Song et al., 2024),
+sive hardware accelerators like GPUs (Kwon et al., 2023).           TwinPilots (Yu et al., 2024), HeteGen (Zhao et al., 2024a),
+However, to achieve large batch sizes for high throughput,          and FastDecode (He & Zhai, 2024). Memory offloading
+online LLM inference requires huge GPU memory, but                  could increase request batch sizes on the GPU, potentially
+GPUs have limited memory resources. Nowadays LLM                    increasing overall inference throughput; compute offload-
+models have billions of parameters (e.g., 70B LLaMa-3.1             ing avoids repetitively swapping the KV cache between the
+model (Dubey et al., 2024)) that occupy dozens to hundreds          GPU and CPU, thus preventing PCIe bandwidth from be-
+of GB GPU memory; modern LLM inference engines like                 coming the bottleneck. Unfortunately, most of these work
+vLLM (Kwon et al., 2023) additionally store KV cache in             trades inference latency for throughput by using huge GPU
+the GPU memory to reuse previous computations, whose                batch sizes and layer-by-layer swapping (Sheng et al., 2023).
+size increases linearly with prompt and output length. As           The former means they sacrifice latency for throughput, and
+a result, the memory-bounded LLM inference workloads                the latter means they need to swap the KV-cache back-and-
+                                                                    forth between the GPU and CPU, making communication
+    1
+    Peking University 2 University of California, Berkeley          bandwidth the bottleneck. Thus, these designs are not suit-
+3
+ University of California, Davis 4 Harvard University. Correspon-   able for online inference; the exception is FastDecode, but it
+dence to: Xuanlin Jiang <xljiang@stu.pku.edu.cn>, Yang Zhou
+<yangzhou.rpc@gmail.com>.
+                                                                    uses 8 32-core AMD Epyc CPUs in remote servers to handle
+                                                                    the offloaded compute of only one A10G GPU, where the
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,     CPUs cost much more than the GPU.
+2025. Copyright 2025 by the author(s).
+                                                                    This paper aims to achieve higher throughput for online
+                         N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+LLM inference without compromising accuracy or latency             efficient CPU kernels for attention computations. We thor-
+in a cost-efficient way—only using local host CPUs as the          oughly evaluate N EO on AWS GPU instances (g4 with a T4
+offloading target that comes with the GPU “as free”. Achiev-       GPU and g5 with an A10G GPU) and our local 8×H100
+ing this goal faces two main challenges. First, within each        testbed, both with only the host CPU and memory for of-
+inference iteration, how to balance the compute happening          floading. Our evaluation covers two public online inference
+on GPU and CPU to fully utilize their compute and memory           datasets and three popular LLM models ranging from 7B,
+resources, while not overloading them? This is challeng-           8B, to 70B. N EO achieves up to 14%-7.5× (depending on
+ing because of the vastly different characteristics between        GPUs) higher throughput over the non-offloaded version
+GPUs and CPUs. For example, a low-end GPU could eas-               while keeping the same inference latency; it further achieves
+ily have nearly TB/s memory bandwidth and hundreds of              up to 79.3% performance gains with more power CPUs.
+TFLOPS compute, while a high-end CPU server has only a
+                                                                   To the best of our knowledge, N EO is the first CPU offload-
+few hundreds of GB/s memory bandwidth and few TFLOPS
+                                                                   ing system for online LLM inference that achieves perfor-
+compute (He & Zhai, 2024). Prior work like FastDecode
+                                                                   mance gains over GPU-only systems with the same hard-
+fully offloads the KV cache and attention computation to
+                                                                   ware cost and inference accuracy. We hope this opens a
+the CPU, making the CPU severely bottleneck the system.
+                                                                   new door for cost-efficient LLM inference research.
+Second, across inference iterations, how to adaptively de-
+cide the offloading policy for real-world workloads with           2     BACKGROUND AND M OTIVATION
+dynamic input/output lengths? Prior work like FlexGen and
+FastDecode assumes fixed input/output lengths across re-           2.1   LLM Inference and Performance Bottleneck
+quests, and leverages static optimal offloading policies that      Auto-regressive transformer-based LLMs (Vaswani, 2017)
+were determined by one-time offline profiling. As inference        perceive tokens as the basic elements of languages, with
+iterations proceed, dynamic input/output lengths of requests       the main task of predicting the next token of the given se-
+in real-world workloads would easily break the optimality          quence. Formally, given [t1 , t2 , . . . , tn ] as input, for each
+of such policies.                                                  token x in the vocabulary, an LLM needs to return the
+To address these two challenges, we present N EO1 with             probability that x is the next token of the sequence, i.e.
+two key designs: asymmetric GPU-CPU pipelining within              Pr[tn+1 = x | t1 , . . . , tn ]. To do this prediction, as illus-
+each inference iteration, and load-aware scheduling across         trated in Figure 1, the transformer-based LLM first converts
+iterations. Asymmetric pipelining runs two asymmetric              tokens to embedding vectors. These vectors are then passed
+sub-batches concurrently: one offloads the decoding atten-         through a series of primary blocks called transformer lay-
+tion computation and KV cache of a subset of requests into         ers, leveraging the attention mechanism (Vaswani, 2017).
+the CPU, and another one runs the rest in the GPU; these           The embedding vectors remain the same shape but become
+two sub-batches overlap with each other to balance GPU             more precise and context-aware after passing through each
+and CPU loads. This partial offloading will help keep the          transformer layer, before finally getting through a final fully
+offloaded compute and memory bandwidth consumption                 connected layer that converts embedding vectors to corre-
+within CPU capacity. Load-aware scheduling online mon-             sponding probabilities for each possible token.
+itors various request waiting and running queues (for the          One inference request typically consists of prefilling and
+CPU and GPU), then dynamically decides which requests              decoding stages and heavily involves the KV cache on GPU
+should be offloaded to the CPU and how to form request             memory to reuse previous computations. The prefilling
+batches, based on principled heuristics to optimize for the        stage generates the initial KV cache after consuming all
+highest throughput.                                                input tokens, while the decoding stage repetitively read-
+Perhaps the closest work to N EO is FastDecode, but N EO           and-appends the KV cache and auto-regressively generates
+differs in several important designs: 1) it features partial       output tokens until an EOS (End Of Sequence). To op-
+offloading to limit the offloaded computation and memory           timize this process, modern LLM inference engines like
+bandwidth consumption without overloading the CPU, 2) it           vLLM (Kwon et al., 2023) leverage iteration-level schedul-
+adaptively finds the optimal point to balance GPU and CPU          ing (Yu et al., 2022) to accommodate various input/output
+loads for dynamically-changing real-world workloads.               lengths of requests, selective batching (Yu et al., 2022) to
+                                                                   increase performance by batching matrix multiplications,
+N EO is implemented based on SwiftLLM (interest-                   and paged attention to efficiently manage GPU memory.
+ingLSY/swiftLLM), a simplified copy of vLLM with similar
+performance, but could be adapted to other frameworks like         The throughput of LLM inference highly depends on the
+vLLM (Kwon et al., 2023) and SGLang (Zheng et al., 2023).          batch size the engine can achieve, which is essentially
+It leverages the Intel ISPC compiler (ispc/ispc) to generate       bounded by the GPU memory size due to the large KV
+                                                                   cache (Kwon et al., 2023). Prior work (He & Zhai, 2024;
+   1
+       Neo is the protagonist in The Matrix who saves humankind.   Zhu et al., 2024) has demonstrated that the throughput would
+                      N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+
+
+
+                                     Figure 1. Workflow of transformer-based LLM Inference.
+
+increase almost linearly as the batch size increases up to hun-   nication can be perfectly hidden by GPU computation.
+dreds on modern A10, V100, and H100 GPUs; meanwhile,
+unfortunately, these GPUs fail to accommodate hundreds or         2.3   Challenges
+even dozens of batch size, leaving significant GPU compute
+                                                                  Despite being promising, there are several challenges when
+resources unutilized.
+                                                                  building an efficient LLM inference system that offloads
+                                                                  decoding attention compute and memory to CPUs. These
+2.2   CPU Memory as a Possible Rescue
+                                                                  challenges stem from the fundamentally different capabili-
+One approach to increase batch size is storing the overflow-      ties between GPUs and CPUs (in terms of memory and com-
+ing KV cache in the main memory of the CPU, transferring          pute power), and get amplified in real-world dynamically-
+it to the GPU when needed, and transferring it back when          changing inference workloads (e.g., various input/output
+not needed. However, such repetitive KV cache swap-ins            lengths).
+and -outs make the system severely bounded by GPU-CPU
+                                                                  Challenge #1: How to efficiently overlap the GPU and CPU
+PCIe bandwidth, as shown by prior work (Sheng et al.,
+                                                                  within each inference iteration? GPUs have more compute
+2023). Fortunately, only the decoding-phase attention opera-
+                                                                  and memory bandwidth but are limited in memory size,
+tion relies on the KV cache, therefore offloading this part of
+                                                                  while CPUs have more memory and a decent amount of
+computation to the CPU would help avoid repetitively trans-
+                                                                  memory bandwidth, but lack strong compute power. There-
+ferring the KV cache between the GPU and CPU. Moreover,
+                                                                  fore, we must carefully restructure the pipeline of LLM
+this operation only takes a tiny proportion of computation
+                                                                  inference to fit different pipeline modules into the right
+(compared to other parts in the transformer architecture) and
+                                                                  hardware, while not overloading any hardware. Such re-
+doesn’t require loading model weights.
+                                                                  structuring also needs to take care of the complex inter- and
+The decoding attention operation is memory-bandwidth-             intra-transformer-layer data dependencies, without breaking
+bounded on both GPU and CPU due to low arithmetic inten-          transformer semantics.
+sity (i.e., FLOP per memory load) (He & Zhai, 2024; Zhu
+                                                                  Challenge #2: How to schedule inference requests to the
+et al., 2024). The memory bandwidth gap between GPUs
+                                                                  GPU and CPU across inference iterations to maintain high
+and CPUs is much smaller than their compute gap. For
+                                                                  performance in dynamically-changing workloads? Prior
+example, an A10G GPU features 600 GB/s memory band-
+                                                                  work like FastDecode (He & Zhai, 2024), FlexGen (Sheng
+width and 125 TFLOPS, while a modern x86 server has
+                                                                  et al., 2023), and more (Chen et al., 2024) only consider
+around 200 GB/s memory bandwidth with 1.2 TFLOPS (He
+                                                                  idealistic settings where request input and output lengths are
+& Zhai, 2024; Zhu et al., 2024); modern ARM processors
+                                                                  fixed, and adopt a static scheduling policy (e.g., obtained
+like AWS Graviton4 offer 537.6 GB/s memory bandwidth
+                                                                  from offline profiling) to assign requests across the GPU
+per socket (WikiChip). Therefore, although there may seem
+                                                                  and CPU. However, in real-world dynamic settings, vastly
+to be a huge compute gap between GPUs and CPUs (i.e.,
+                                                                  different input/output lengths would make static scheduling
+125 vs. 1.2 TFLOPS), the actual performance gap for the
+                                                                  no longer work efficiently; instead, it would require an
+decoding attention operation is relatively small because their
+                                                                  adaptive scheduling policy to determine the best request
+memory bandwidths are closer (i.e., 600 vs. 200 GB/s).
+                                                                  assignments at the per-iteration level.
+Frequent CPU-GPU communication could be another con-
+cern for CPU offloading. Fortunately, according to our ex-        3     N EO D ESIGN
+periments on AWS g5 instances with LLaMa-3-8B model,              Figure 2 shows the high-level architecture of N EO. N EO
+dense operations on the GPU take 5-10 times the time of           consists of a request scheduler running on the CPU and a
+communication for every input token, which means commu-           set of executors running across the CPU and GPUs. The
+                                      N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+          input tokens       output tokens                                               a single decoding batch into two sub-batches, and overlap
+                                                                         Worker1         their linear operations (on the GPU) and attention opera-
+                 Prefilling                                  CPU core CPU KV
+                                                                                         tions (on the CPU), as shown in Figure 4. For the prefilling
+                                                     GPU1 group        cache1
+                waitqueue             batching &
+                                                                   1
+
+                                      swapping
+                                                                                         batch, symmetric pipelining just runs it on the GPU without
+                                                                  ...
+                                                     NCCL
+                                       schedule                          Workern         offloading, as the prefilling stage requires high computa-
+         GPU      swap-in      CPU
+       decoding              decoding   output       GPU n
+                                                             CPU core CPU KV             tion for matrix multiplication while not consuming much
+                                                              groupn   cachen
+                 swap-out
+         runQ                  runQ     tokens                                           memory (Zhu et al., 2024). The output of the symmetric
+                Scheduler                                      Executor
+                                                                                         pipelining, i.e., the KV cache, will be swapped out to the
+                                                                                         CPU for offloading. This technique has been used by prior
+      Figure 2. Overall architecture of N EO. “runQ” means “runqueue”.
+                                                                                         work like FastDecode (He & Zhai, 2024) and more (Chen
+                    Prefilling Stage                                                     et al., 2024). Nevertheless, seemingly efficient, this design
+                   GPU pre-layer       pr       attn      po
+      request scheduler maintains a prefilling waitqueue, a GPU                          suffers from three major issues.
+                                                                        post-layer swap out
+
+       decoding runqueue, and a CPU decoding runqueue; this
+Decoding Stage                                                                                  • Firstly, this design results in significant underutilization
+       scheduler makes iteration-level adaptive scheduling deci-
+               pr0     pr1               po0    pr0      po1
+       sions on whether to run the incoming requests on GPU or
+GPU pre-layer
+                                                                 pr1       po0                      ofpoGPU1         memory. In this scheme, the GPU solely re-
+                                                                                                                     post-layer
+
+CPU    CPU. The executors  attn0 accept batching
+                                          attn1     and swapping
+                                                          attn0       schedule
+                                                                            attn1
+                                                                                                    tains the model weights and runtime activations, while
+       from the scheduler, and returns back output tokens that are                                  the rest of the memory—which stores the KV cache in
+       generated collaboratively by the CPU and GPUs. N EO fea-                                     non-offloading settings—remains unused.
+       tures two key techniques: 1) asymmetric pipelining to fully                              • Secondly, this design fails to achieve balanced GPU-CPU
+       leverage the compute resource of both GPU and CPU with-                                      overlapping. This is because 1) it entirely overlooks
+       out overloading them (§3.1), and 2) load-aware scheduling                                    the prefilling stage and KV cache swap-out time, dur-
+       to handle   dynamically-changing          workloads,     e.g., different                     ing which the CPU stays idle; 2) the linear stage of a
+              pr 0  pr   1            po     0   pr  0 po pr
+                                                           1   1          po  0               1        po
+    pre-layer
+       input/output galengths across requests (§3.2). ga
+                             0                                     0
+                                                                                                    decoding          sub-batch on the GPU is typically much shorter
+                                                                                                               post-layer
+
+                       ca        0           ca  1             0    ca            1     ca          than the attention stage on the CPU, due to the attention’s
+                                    so                                          so
+       3.1 Asymmetric Pipelining                                                                    auto-regressive nature and high memory bandwidth con-
+                                                                                                    sumption. As a result, the duration of the attention stage
+       N EO proposes asymmetric pipelining to address the GPU-                                      will     likely exceed that of the linear stage, causing the CPU
+              pr pre-projection          ga GPU (prefilling + decoding) attention       so swapping out
+       CPU overlapping challenge in §2.3. This design offloads                                      to become the bottleneck.
+       decoding
+             po   attention+ ffn
+                 post-projection   (both caits CPU
+                                                compute         and KV cache) of a
+                                                    (decoding) attention                        • Finally, it is challenging to split two batches evenly in
+       selected portion       of
+                 batch 0 data flow
+                                  inference     requests        to
+                                                batch 1 data flow
+                                                                   the   CPU.     It forms          practice. In real-world workloads, it is nearly impossi-
+                                                                                           swapping data flow
+       two sub-batches of requests—one mostly runs on the GPU                                       ble to ensure that a single batch can be divided into two
+       while another runs across the GPU and CPU, and overlaps                                      identical sub-batches, due to different input lengths and
+       these two sub-batches to balance the load of GPU and CPU.                                    unpredictable output lengths. The discrepancies between
+                                                                                                    the batches would likely result in a significant number of
+       To motivate this design, we first explore a simple strawman
+                                                                                                    idle periods or “bubbles” in the pipeline.
+       called simple offloading that offloads compute and KV cache
+       to the CPU but leaves the GPU idle. Next, we examine a
+                                                                                                Asymmetric pipelining, as shown in Figure 5, offers a
+       more intricate strawman called symmetric pipelining used
+                                                                                                solution to the aforementioned problems. To fully utilize
+       by prior work (He & Zhai, 2024; Chen et al., 2024) that
+                                                                                                GPU memory, N EO does partial offloading. The KV cache
+       tends to leave the GPU idle. Finally, we will arrive at our
+                                                                                                system of N EO is divided into two separate components: the
+       design of asymmetric pipelining, and show how it effectively
+                                                                                                “GPU-cache” located in the GPU’s HBM, and the “CPU-
+       addresses the issues in the simple offloading and symmetric
+                                                                                                cache” located in the CPU main memory. For any request
+       pipelining designs.
+                                                                                                that has already been prefilled in the system, its KV cache
+       Strawman #1: simple offloading. As shown in Figure 3,                                    will either reside entirely in the GPU-cache—designated as a
+       this design extracts the decoding attention and offloads its                             “GPU-request”—or entirely in the CPU-cache—designated
+       compute and KV cache to the CPU, while leaving the rest                                  as a “CPU-request”. Requests are prioritized for storage in
+       to the GPU. The rest includes prefilling attention and token-                            the GPU-cache to maximize GPU memory utilization.
+       wise independent operations—referred to as the linear oper-
+                                                                                                To achieve full GPU-CPU overlapping, N EO integrates the
+       ations that mainly involve matrix multiplications. However,
+                                                                                                prefilling stage computation into the GPU decoding sub-
+       during these linear operations, the CPU always remains idle.
+                                                                                                batch, so that the prefilling stage computation (in GPU) also
+       As a result, this design fails to leverage the compute and
+                                                                                                happens in parallel with the CPU attention computation.
+       memory resources of CPUs.
+                                                                                                This shares a similar spirit as the selective batching tech-
+       Strawman #2: symmetric pipelining. A straightforward                                     nique used in Orca (Yu et al., 2022). In our context, this
+       approach to reducing the CPU idle time is to evenly split                                selective batching largely extends the duration of the GPU
+                       N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+
+
+
+Figure 3. Simple offloading strawman offloads all requests’ KV cache and decoding attention computation to the CPU. “Comm” stands
+for GPU-CPU communication; “TrQKV” means transferring Q,K,V tensors to CPU; “TrO” means transferring attention output to GPU.
+
+
+
+
+Figure 4. Symmetric pipelining strawman forms two identical sub-batches and overlaps linear and attention operations for the decoding
+stage. The red and blue arrows depict the data flows of the two sub-batches. “pr” means pre-projection and “po” means post-projection +
+FFN operations; together they form the linear stage. “attn” means attention operations. “TrQKV”s and “TrO”s are omitted for simplicity.
+
+
+
+
+Figure 5. Asymmetric pipelining integrates the prefilling stage into one sub-batch (red arrows) and most of the decoding attention
+operations into another (blue arrows). “pr” means pre-projection, while “po” means post-projection + FFN operations; “ca” means
+attention operations done on CPU; “ga” means attention operations done on GPU; “Comm” stands for GPU-CPU communication.
+
+compute, allowing for a longer overall CPU computing time            stage. This arrangement not only simplifies system imple-
+and enabling more CPU-requests to be incorporated into the           mentation, but also facilitates effective overlapping between
+batch. Further, N EO leverages the layer-wise swapping tech-         the two batches, resulting in an inference iteration character-
+nique to facilitate the overlapping of KV value transmission         ized by alternative “long-stages” and “short-stages”, rather
+with computation. Given that the KV values of newly pre-             than uniform stages.
+filled requests are computed layer by layer, we can initiate
+                                                                     Asymmetric pipelining offers even more benefits. As shown
+PCIe transmission immediately after each layer’s KV value
+                                                                     in Figure 5, the non-overlapping segments at the beginning
+is computed, rather than deferring this process until the end
+                                                                     and end are minimized due to this intentional asymmetry.
+of the entire iteration.
+                                                                     Furthermore, this approach reduces GPU kernel launching
+To simplify the batch division scheme and minimize idle              overhead, which can be substantial in Python due to its lim-
+periods, N EO introduces asymmetric batch division. Instead          ited multi-threading parallelism, consuming considerable
+of attempting to create two identical batches, we consolidate        CPU time. In asymmetric pipelining, the GPU attention
+all prefilling requests and GPU decoding requests with a             kernel is only invoked once per iteration, as only one sub-
+few CPU decoding requests to batch-0, while dispatching              batch will need the GPU attention, compared to twice in
+the majority of CPU decoding requests to batch-1. The two            symmetric pipelining.
+batches are complementary: batch-0 features a long linear
+stage with little CPU attention computation, whereas batch-
+1 includes a lengthy attention stage with a very short linear
+                      N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+3.2    Load-Aware Scheduling                                    tion time for batch-x, respectively. For simplicity, we define
+                                                                Tlx = Tpox + Tprx , which stands for time mainly con-
+Real-world inference workloads are complex, irregular, and
+                                                                sumed by multiplying activations with model weights in
+dynamically changing, e.g., different input/output lengths
+                                                                one transformer layer. To estimate Tl , Tga , and Tca , N EO
+across requests. N EO scheduler considers asymmetric
+                                                                does offline profiling for typical input/output lengths and
+pipelining and adaptively determines whether the incoming
+                                                                uses linear interpolation to approximate the values for other
+request should be placed on the GPU or CPU, to keep both
+                                                                lengths. Overall, to stick to principles of “Balancing” and
+busy while not overloading anyone.
+                                                                “Hiding GPU”, we would like to guarantee Tl0 ≥ Tca1 and
+N EO faces a more challenging problem than prior GPU-           Tl1 + Tga0 ≥ Tca0 , and minimize the gap between the
+only inference engines like vLLM. First, N EO needs to form     left-hand side and right-hand side of both inequations.
+two sub-batches in each iteration, which means we need
+                                                                Based on the analysis above, we present our load-aware
+to consider batch selection and batch splitting at the same
+                                                                scheduler, with the following procedures on each iteration:
+time. Secondly, blindly putting as many requests as possi-
+ble into the CPU decoding runqueue does not work well.          1. Initialization. Initialize two empty batch schedules:
+This is because too many CPU requests might overload the           batch-0 would mostly run on the GPU and contain re-
+CPU capacity either in memory bandwidth or compute. Fi-            quests in both prefilling and decoding phases; batch-1
+nally, the two-batch asymmetric pipelining does not always         would mostly run on the CPU and only contain requests
+work better than GPU-only inference. This is because in            that calculate decoding attention.
+asymmetric pipelining, the GPU memory needs to hold two         2. Schedule GPU decoding requests. Try to put every re-
+concurrently running sub-batches, and each sub-batch can           quest from the GPU decoding runqueue into batch-0.
+only achieve half of the maximum batch size; if N EO can-          Then swap out requests until GPU memory can hold all
+not offload enough KV caches, the sub-batch size might be          new KV cache, or swap in requests if there is ample
+even smaller than the GPU-only inference, yielding lower           space on GPU (Maximizing GPU).
+throughput.                                                     3. Schedule prefilling requests. Pop the prefilling waitqueue
+                                                                   and put requests into batch-0: keep the generated KV
+To address these challenges, N EO follows several principles:
+                                                                   cache on GPU if there is enough GPU memory, other-
+• Greedy: At the beginning of each iteration, N EO’s sched-        wise, swap out the generated KV cache. Do this repeat-
+  uler would make a GPU-only inference schedule and a              edly until the GPU cannot hold the activations in the
+  two-batch asymmetric pipelining schedule, and would              batch (Maximizing GPU).
+  choose the one with higher estimated throughput as the        4. Schedule CPU decoding requests. Scan the CPU de-
+  final decision.                                                  coding runqueue and put requests into either batch-0 or
+• Balancing: For asymmetric pipelining, the scheduler              batch-1, maintaining Tca0 ≤ Tl1 + Tga0 and Tca1 ≤ Tl0 .
+  should minimize pipeline “bubbles”. That is, the esti-           If putting a request into either batch would violate the
+  mated CPU busy time and GPU busy time should be as               inequations, skip this request and leave it for the next
+  close as possible.                                               iteration (Balancing and hiding CPU).
+• Hiding CPU: For asymmetric pipelining, there shouldn’t        5. Reduce prefilling requests. Remove any prefilling re-
+  be cases when the CPU is busy but the GPU is idle.               quest from batch-0 that would require swapping out the
+• Maximizing GPU: For asymmetric pipelining, in each               generated KV cache, as long as the above inequations
+  iteration, the scheduler should pick as many requests as         hold. This is to avoid the CPU being idle (Balancing).
+  possible from the prefilling waitqueue, and GPU and CPU       6. Make decisions. Now the two-batch schedule is made;
+  decoding runqueues (that hold requests running on GPU            we make the GPU-only schedule by taking batch-0 and
+  and CPU respectively).                                           excluding all the CPU decoding requests added in step
+                                                                   4. Finally, we compare their estimated Ttr /x values and
+Concretely, denote each iteration time as T and batch size as
+                                                                   pick the schedule with a smaller one (Greed).
+x, N EO’s goal is to minimize T /x. As shown in Figure 5, T
+consists of the following components: pre-layer time Tprl ,     We further measure and find that the scheduling overhead
+transformer layer time Ttr , post-layer time Tpol , while Ttr   is less than 3ms per iteration, while each iteration takes
+is the major part that usually takes more than 95% of time      hundreds of milliseconds. Therefore, its overhead would not
+in each iteration. Therefore, we can estimate T as below:       have a big impact on the end-to-end performance. Interested
+                                                                readers can refer to appendix A for more details of the
+      T ≈ Ttr = L × ( max{Tpo0 + Tpr0 , Tca1 }+                 scheduling algorithm.
+                      max{Tpo1 + Tpr1 + Tga0 , Tca0 })
+
+where Tpox , Tprx , Tgax , and Tcax denote time for post-
+projection, pre-projection, GPU attention, and CPU atten-
+                      N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+4    I MPLEMENTATION                                              as it originally only supported single-GPU inference. We
+We implement N EO based on SwiftLLM (interest-                    utilize Ray actors (Moritz et al., 2018) to hold shards of the
+ingLSY/swiftLLM)—a tiny yet powerful LLM inference                model and use PyTorch’s pre-built communication library ,
+system for research purposes. SwiftLLM achieves vLLM-             which is a wrapper of NCCL, to handle cross-GPU commu-
+equivalent (single GPU, default scheduling policy) perfor-        nication. The underlying mechanism of splitting tensors and
+mance with around 2K lines of code. Our N EO implementa-          collecting results across GPUs is the same as vLLM (Kwon
+tion consists of 4K lines of Python and 1.5K lines of C++.        et al., 2023). As a standard approach, each Ray actor also
+                                                                  has its partition of CPU KV cache, each responsible for a
+Efficient CPU Kernels. Existing vendor-supplied CPU ker-          portion of KV heads to avoid cross-CPU communication.
+nel libraries don’t support paged attention algorithm, where
+the inputs are non-continuous tensors and indexed by a block      5     E VALUATION
+table. Therefore, we implement a custom C++ torch exten-          5.1   Experiment Setup
+sion library called Paged-Attention-for-CPU (PACPU) and
+plug it into SwiftLLM. The PyTorch runtime will directly          Testbeds. We run our experiments on multiple types of
+call a multi-threaded procedure written in C++. Under the         single-GPU instances on the AWS EC2 public cloud, includ-
+hood, PACPU calls yet another extension library written in        ing g5.2/4/8/16xlarge with an A10G GPU and g4dn.4xlarge
+ISPC (ispc/ispc)—a language for writing SPMD programs             with a T4 GPU. By default, we use g5.4xlarge for all A10G
+on CPUs. ISPC code can be compiled to targets with differ-        experiments. We also run on an 8×H100 SXM local server
+ent sets of vectorized instructions, such as AVX2, AVX512,        to test multi-GPU performance. The specifications of hard-
+and ARM Neon, making it perfectly portable between dif-           ware are listed in Table 1. Note that the HGX machine has
+ferent types of CPUs. PACPU utilizes a paged KV cache             4 CPU NUMA nodes. We confine our system to running on
+similar to vLLM with the Paged Attention algorithm to             a single NUMA node (thus 1/4th of the total memory size
+mitigate memory fragmentation.                                    and bandwidth) when running 2-GPU experiments.
+N EO optimizes memory access performance for decod-
+ing attention on CPU, as the decoding attention is heavily            Name           GPU          CPU (#cores)        Memory
+bounded by memory bandwidth (even with GQA) (Agrawal                  g5.nxlarge    A10G        EPYC 7R32 (2n)        16n GB
+et al., 2024; Zhu et al., 2024). 1) Within a single CPU core,         g4.4xlarge     T4        Xeon P-8259CL (8)       64 GB
+we utilize SIMD memory load/store instructions (features              HGX          8×H100      Xeon 8462Y+ (64)         2 TB
+provided by ISPC) to minimize instruction overhead and
+                                                                          Table 1. Hardware specifications of our testbeds.
+enhance memory throughput. Additionally, we carefully
+organize the memory access order to ensure its contiguity.
+2) Across different CPU cores, we use a parallelism strategy      Models. We evaluate N EO on the representative Llama
+similar to Flash Decoding (Dao et al.). For each request,         models including Llama-3.1-8B, Llama-3.1-70B (Dubey
+we partition its computation into individual tasks along the      et al., 2024) and Llam-2-7B (Touvron et al., 2023).
+request dimension, allowing each task to access unique and        Baselines. We consider three baselines in our evaluation.
+continuous memory at block granularity. These tasks are
+evenly dispatched to all threads with each thread having an       • vLLM (Kwon et al., 2023) is a popular state-of-the-art
+equal number of blocks to process. Finally, we aggregate            LLM inference system. vLLM’s default scheduling pol-
+the partial outputs of each request to obtain the final result.     icy doesn’t include selective batching; so we set the
+                                                                   --enable-chunked-prefill flag to enable it.
+Reducing Kernel Launching Overhead. Due to Python’s               • FastDecode (He & Zhai, 2024) is an LLM inference sys-
+poor multi-threaded execution performance incurred by its           tem that offloads full decoding attention. Since the origi-
+global interpreter lock (GIL), the data plane CPU kernels           nal work didn’t consider the prefilling stage or implement
+could not run in parallel with the control plane CUDA kernel        an end-to-end system, we implemented our own version
+launching calls, making kernel launching blocking on the            of FastDecode+ . It leverages N EO’s asymmetric pipelin-
+critical path. To reduce kernel launching overhead, we              ing and load-aware scheduling, but offloads all requests’
+replaced most of SwiftLLM’s Triton-JIT (Tillet et al., 2019;        decoding attention to the host CPU.
+Tillet) kernels with kernels written in CUDA C++. This            • SwiftLLM (interestingLSY/swiftLLM) is a simplified ver-
+can effectively reduce the additional kernel selection and          sion of vLLM with similar Pythonic implementation and
+launching overhead brought by Triton-JIT. With custom               without offloading, upon which N EO is built. We also
+GPU kernels, we reduced the kernel launching overhead of            make simple modifications to SwiftLLM to support multi-
+LLaMa-3-8B from 1.2ms to 0.6ms per layer.                           GPU inference. It achieves comparable performance with
+Multi-GPU inference. We redesigned SwiftLLM’s archi-                vLLM on a single GPU, and slightly lower performance
+tecture to support model sharding and tensor parallelism,           than vLLM in 2-GPU settings (§5.5).
+                                                 N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+                                                                              Neo (ours)          vLLM
+                                2.00                                  2.00                                       2.00
+Average per token latency (s)
+
+
+
+                                1.60                                  1.60                                       1.60
+                                1.20                                  1.20                                       1.20
+                                0.80                                  0.80                                       0.80
+                                0.40                                  0.40                                       0.40
+                                0.00                                0.00                                         0.00
+                                    0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5     0.0      0.5    1.0       1.5      2.0       0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5
+                                            Ruquest rate (req/s)                  Ruquest rate (req/s)                       Ruquest rate (req/s)
+                                 (a) 2xH100 + Llama-3.1-70B + AC.         (b) A10G + Llama-3.1-8B + AC.                 (c) T4 + Llama-2-7B + OSC.
+ Figure 6. Load-latency curve comparison between N EO and vLLM on 3 different settings. For each request, we compute its per-token
+ latency by dividing its full latency by its output token number, and then we take the average among all requests.
+
+ Workloads. We use real-world workloads as well as syn-                                    is because of the two-fold impact of increasing the batch
+ thetic ones to evaluate our system.                                                       size. On the negative side, it will slightly increase execution
+                                                                                           latency because more requests get batched together; on the
+  • Azure LLM inference trace for coding (AC) (Microsoft;
+                                                                                           positive side, it improves throughput thus reducing queueing
+    Patel et al., 2024) is a LLM coding trace collected from
+                                                                                           delay. These impacts vary at different request rates. When
+    Azure cloud’s production environment.
+                                                                                           the request rate is very low, batching has a tiny impact since
+  • OpenAI summarization comparison (OSC) (CarperAI)
+                                                                                           requests are processed one by one and won’t queue up. As
+    is an open dataset of input text, chosen summary, and
+                                                                                           the request rate grows, the execution delay penalty grows
+    rejected summary produced in real-world human chatbot
+                                                                                           slightly faster than the queueing reduction at first, but will
+    interactions.
+                                                                                           be overtaken shortly as the queue expands.
+  • Synthetic workloads with various input and output lengths.
+    For a pair of input length li and output length lo , we                                There are two additional reasons for N EO’s higher latency
+    synthesize requests with input and output lengths sam-                                 within the intermediate range: 1) vLLM is heavily opti-
+    pled independently and uniformly from [0.9li , 1.1li ] and                             mized, while N EO features less engineering optimizations
+    [0.9lo , 1.1lo ], respectively.                                                        for simplicity and performance clarity—this is especially
+                                                                                           true in multi-GPU settings. 2) N EO actively seeks oppor-
+ We use the AC trace with relatively longer requests on the
+                                                                                           tunities to offload requests, even though offloading may
+ H100 and A10G GPUs, while using the OSC trace with
+                                                                                           not help, which consequently leads to more system-level
+ shorter requests on the lower-end T4 GPU.
+                                                                                           overheads in scheduling and swapping.
+  5.2                             Online Latency vs. Load                                  Figure 7 further compares the latency distributions of N EO
+                                                                                           and vLLM, and shows that our throughput gains do not come
+We evaluate the online latency of N EO under various request
+                                                                                           at the cost of latency. Our inference latency is comparable
+rates. We sample request arrival timestamps following the
+                                                                                           to vLLM’s at all percentages.
+Poisson process. As Figure 6 shows, N EO sustains higher
+loads than vLLM in all listed hardware/model settings while
+                                                                                           5.3   Comparison with FastDecode+
+providing comparable latencies at low rates. N EO achieves
+14.3% higher throughput on H100 (at 2 sec latency), 6.40%                                  We compare N EO and FastDecode+ in terms of both la-
+higher on A10G (at 2 sec latency), and 563% higher on T4                                   tency and throughput. The results are shown in Figure 8.
+(at 1 sec latency). In the T4+Llama-2-7B setting, we achieve                               FastDecode+ ’s higher latency is caused by its inflexibility
+nearly 6× throughput gains over vLLM; this is because the                                  to tackle irregular workloads. When there are many requests
+T4 GPU has an extremely constrained memory budget for                                      in the CPU decoding runqueue but few or no requests in the
+the KV cache, severely limiting vLLM batch size, while                                     prefilling waitqueue, FastDecode+ would have no choice
+N EO could offload the KV cache to the CPU, achieving a                                    but to launch CPU batches to make progress, hindering
+much larger batch size.                                                                    overall performance, while N EO could simply launch GPU
+                                                                                           batches to utilize GPU resources.
+  Figure 6 also shows that NEO achieves comparable latencies
+  at low request rates, slightly higher latencies at intermediate                          Furthermore, N EO is always better in throughput than base-
+  rates, and significantly lower latencies at large rates. This                            line because its scheduler can always decide to fall back
+                                             N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+                      1.0                                                                                                Neo (ours)             FastDecode +                            baseline
+                                                         Neo (ours)
+                                                         vLLM                                         2.00                                                               1.10
+
+
+
+
+                                                                      Average per token latency (s)
+                      0.8
+
+
+
+
+                                                                                                                                                   Relative throughput
+                                                                                                      1.60                                                               1.00
+                      0.6
+                                                                                                      1.20                                                               0.90
+ CDF
+
+
+
+
+                      0.4                                                                                                                                                0.80
+                                                                                                      0.80
+                      0.2                                                                                                                                                0.70
+                                                                                                      0.40
+                                                                                                                                                                         0.60
+                      0.0                                                                             0.00
+                            0     1       2        3        4                                             0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5                                       50    100 150 200 250 300
+                                 Average per token latency (s)
+                                                                                                                  Ruquest rate (req/s)                                                  Avg. output length
+                                                                                                              (a) Online latency.                                                (b) Offline throughput.
+Figure 7. Latency distributions of N EO and
+vLLM in A10G+Llama-3.1-8B+AC setting                                   Figure 8. Comparison of N EO and FastDecode+ in 2xH100+Llama-3.1-70B setting. Fig-
+at request rate of 1.6/s. The distributions are                        ure (a) compares their latency on the AC dataset. Figure (b) shows their relative throughput
+both skewed because of the skewed request                              to the baseline, where we fix the input length to 2000 and vary the output length. We use
+length distribution of the dataset.                                    the GPU-only version of N EO (i.e., SwiftLLM) as the baseline.
+                      1.15                                                     1.25
+                                                    avg. input=500                                                            avg. input=500
+                      1.12                          avg. input=1000                                                           avg. input=1000           8.00
+Relative throughput
+
+
+
+
+                      1.10                          avg. input=2000            1.20                                           avg. input=2000
+                                                    baseline                                                                  baseline                  6.00                                       avg. input=100
+                      1.08                                                     1.15                                                                                                                avg. input=200
+                      1.05                                                                                                                                                                         avg. input=500
+                                                                               1.10                                                                     4.00                                       baseline
+                      1.03
+                      1.00                                                     1.05
+                                                                                                                                                        2.00
+                      0.98                                                     1.00
+                                 50 100 150 200 250 300                                                  50   100 150 200 250 300                                                50        100      150       200
+                                    Avg. output length                                                          Avg. output length                                                    Avg. output length
+        (a) 2xH100 + Llama-3.1-70B.                       (b) A10G + Llama-3.1-8B.                      (c) T4 + Llama-2-7B.
+Figure 9. Relative throughput in different settings and different synthetic workloads, with GPU-only N EO (i.e., SwiftLLM) as the baseline.
+
+ to GPU-only mode. However, as output length grows,                                                                     5.5     Sensitivity Study
+ FastDecode+ becomes CPU bounded, and its performance
+                                                                                                                        Impact of CPU capacity. We first study the impact of CPU
+ drops quickly to less than 60% of baseline’s performance.
+                                                                                                                        capacity on throughput gains. To examine the impact of
+                                                                                                                        CPU memory bandwidth, we use 4 kinds of AWS EC2 in-
+ 5.4                        Varying Input/Output Lengths
+                                                                                                                        stances, namely g5.2xlarge, g5.4xlarge (what we used in
+We further examine N EO’s performance over various work-                                                                previous experiments), g5.8xlarge, and g5.16xlarge. These
+loads with different input/output lengths. As shown in Fig-                                                             instances all have 1 A10G GPU and thus the same baseline
+ure 9, where we fix input length and tweak output length,                                                               (non-offloading) performance. However, their offloading
+N EO achieve up to 14%, 26%, and 750% throughput gains                                                                  performance varies due to different CPU cores, memory
+on H100, A10G, and T4, respectively. When the output                                                                    sizes, and memory bandwidths. A g5.nxlarge generally
+length is short, N EO may perform slightly worse than the                                                               has 2n CPU cores (i.e., 4n hyperthreads) and 16n GB CPU
+baseline because N EO still attempts to put some requests                                                               memory; g5.2xlarge has nearly the same peak memory band-
+onto the CPU and swap them back in later, incurring slight                                                              width as g5.4xlarge, while g5.8xlarge has about twice the
+overheads. As the output length increases, N EO’s gains first                                                           bandwidth of g5.4xlarge, and g5.16xlarge has about twice
+grow to the maximum point, where GPU and CPU times                                                                      the bandwidth of g5.8xlarge. In experiments, we set the
+are exactly balanced, then gradually drop as the system                                                                 CPU KV cache size proportionally to the number of cores.
+launches a larger proportion of GPU-only batches. N EO                                                                  Figure 10a shows the results. N EO achieves up to 12.2%,
+performance would be close to the baseline when output                                                                  13.3%, 29.7%, and 79.3% higher throughput over the base-
+length gets large enough, sometimes slightly worse due to                                                               line under different CPU capacities. When the output length
+suboptimal scheduling decisions caused by the inevitable                                                                is short, these instances have nearly the same throughput
+inaccuracy of the offline performance profiling.                                                                        gains as the workload mainly runs on the GPU. As output
+                                                                                                                        length increases, the instances with less CPU memory band-
+                                                                                                                        width start to drop performance earlier. The peak throughput
+                                        N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+                                     1.80     x2large
+                                                                                                          6000
+                                                                                                                 SwiftLLM
+                                              x4large                                                     5000   vLLM
+
+
+
+
+                                                                                  Throughput (tokens/s)
+               Relative throughput
+                                     1.60     x8large
+                                              x16large                                                    4000
+                                              baseline
+                                     1.40                                                                 3000
+                                     1.20                                                                 2000
+                                                                                                          1000
+                                     1.00                                                                    0
+                                             100        200      300    400                                      A10G+8B    2xH100+70B
+                                                   Avg. output length
+                              (a) CPU sensitivity.                                   (b) SwiftLLM vs. vLLM.
+Figure 10. Sensitivity study. Figure (a) shows the relative throughput of N EO on different AWS EC2 g5 instances, with GPU-only N EO
+(i.e., SwiftLLM) as the baseline. Figure (b) compares SwiftLLM’s throughput on the AC dataset with vLLM in both multiple and single
+GPU settings. Note that we implement the multi-GPU support for SwiftLLM (§4).
+
+gain is positively related to the CPU memory bandwidth.                        to compute for the subsequent chunk (Zhong et al., 2024).
+This supports the fact that the memory bandwidth, rather                       Second, chunking-prefill would not work well on memory-
+than computing power (i.e., number of cores), is the factor                    constrained GPUs, because the resulting small batch size
+that determines the performance of attention operation on                      would limit the opportunity of piggybacking decode on pre-
+CPUs.                                                                          fill chunks while saturating the GPU. In contrast, N EO relies
+                                                                               on large CPU memory to ensure throughput gains. Readers
+SwiftLLM vs. vLLM. We now examine the gap between
+                                                                               can refer to appendix B for more experimental results.
+our baseline system and vLLM. We feed the Azure Code
+trace all at once to both systems and examine the GPU token                    Nevertheless, we believe N EO could integrate with chunked-
+throughput, i.e., the total time elapsed divided by the total                  prefill N EO can compute all chunked prefilling on the GPU,
+number of tokens processed (input length + output length).                     and doesn’t offload the KV-cache until the full prompt of a
+We evaluate in both single-GPU (A10G + Llama-3.1-8B)                           request is prefilled. With chunked prefill, we can modify the
+and multi-GPU (2xH100 + Llama-3.1-70B) settings.                               step 5 of N EO’s load-aware scheduling: instead of removing
+                                                                               the whole prefilling requests, NEO could remove chunks of
+Figure 10b shows the results. As SwiftLLM is initially
+                                                                               prefilling requests, thereby having a finer-grained control for
+targeted at single-GPU inference and mimics vLLM imple-
+                                                                               CPU-GPU balancing. Chunked prefill would be especially
+mentation, it achieves comparable throughput with vLLM in
+                                                                               useful for NEO when context length gets very large while
+a single A10G + Llama-3-8B setting. However, SwiftLLM
+                                                                               GPU memory is limited.
+is slightly worse than vLLM (8.8% lower throughput) in
+the 2-GPU setting; this is due to our less optimized tensor                    Offloading other parts to CPU. N EO implicitly assumes
+parallelism implementation compared to production-grade                        putting all model weights on the GPU and only offload-
+vLLM. We leave as future work integrating N EO into vLLM                       ing attention computation to the CPU is the most efficient
+to measure our 4-GPU and 8-GPU performance gains.                              way to balance GPU and GPU loads. This is because of,
+                                                                               as mentioned in section 2, the huge gap between the CPU
+6    D ISCUSSION                                                               and GPU’s computing power. Meanwhile, according to
+Compare to chunked-prefill. N EO’s performance benefits                        profiling results of Table 2 in (Zhu et al., 2024), all non-
+are essentially two-fold: 1) larger GPU batch size, and 2)                     communication operations are compute-bounded except
+shifting some unbatchable decoding attention operations to                     decoding attention. However, in prior work like (Sheng
+CPU, thus making up room on GPU for other batchable                            et al., 2023) and (Song et al., 2024), people offload com-
+operations. The second benefit source shares a similar spirit                  ponents other than attention to the CPU. This is not only
+as the chunked-prefill technique in Sarathi-Serve (Agrawal                     useful when the GPU’s memory is too constrained to hold
+et al., 2024), which breaks a prompt into multiple chunks                      all model weights, but also potentially beneficial even if
+to launch more prefill-decode mixed batches and thus less                      the GPU could hold all the model weights. For example,
+decoding-only batches (that contain unbatchable decoding                       when requests in the workload have too few output tokens,
+attention operations).                                                         N EO would be bounded by GPU computation, while the
+                                                                               CPU is mostly idle. Therefore, offloading some of the dense
+However, chunked-prefill suffers from several drawbacks                        operations to the CPU could alleviate the GPU’s pressure
+that N EO does not have. First, chunked-prefill consumes sig-                  in these extreme workloads. Nevertheless, the actual gain
+nificantly more GPU memory bandwidth, because the KV                           needs to be validated by further exploration.
+cache of all previous chunks needs to be loaded repetitively
+                      N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+N EO usage scenarios. N EO works best in scenarios where        et al., 2024), and more (Patel et al., 2024; Strati et al., 2024;
+the GPU memory is constrained such that it limits the batch     Hu et al., 2024), and low-level GPU kernel optimizations
+size and underutilizes the GPU compute. These scenarios         from FlashDecoding (Dao et al.), FlashDecoding++ (Hong
+will likely hold for a long time, as the GPU compute capacity   et al., 2023), and FlashInfer (flashinfer ai/flashinfer). N EO
+continues growing while its memory size stays relatively        leverages several techniques from these work such as selec-
+stagnant, e.g., H100 triples the compute of A100 but with the   tive batching (Yu et al., 2022) and paged attention (Kwon
+same 80GB memory size (NVIDIA, 2022; 2024). N EO will           et al., 2023), and could be used in parallel with others, e.g.,
+degrade to non-offloading mode when the GPU has enough          leveraging N EO to optimize the decoding phase in Dist-
+memory to reach a batch size that can saturate the GPU.         Serve (Zhong et al., 2024). Another line of work lever-
+Another usage scenario of N EO is the economic serving          ages sparcification and quantization techniques to trade
+of LLM models by leveraging cheap and abundant CPU              accuracy for performance, including AWQ (Lin et al.,
+resources that already exist in current datacenters.            2024), SparseGPT (Frantar & Alistarh, 2023), AlphaTun-
+                                                                ing (Kwon et al., 2022), GPT3.int8() (Dettmers et al., 2022),
+Using remote CPUs. N EO focuses on improving inference
+                                                                GPTQ (Frantar et al., 2022), ZeroQuant (Yao et al., 2022),
+throughput by only using the host CPU. In order to gain
+                                                                SmoothQuant (Xiao et al., 2023a), StreamingLLM (Xiao
+more throughput, N EO could be extended to support remote
+                                                                et al., 2023b), and more (Beltagy et al., 2020; Shen et al.,
+CPU workers. However, CPU memory bandwidth in current
+                                                                2020; Hoefler et al., 2021). Different from them, N EO does
+commercial clouds is still expensive, and as (He & Zhai,
+                                                                not compromise accuracy.
+2024) shows, cross-machine transfer latency could be yet
+another bottleneck. We leave this for future work.              Offloading for LLM serving. Many existing work offloads
+                                                                LLM models, activations, KV cache, or computations to the
+Money and energy cost N EO targets the following sce-
+                                                                CPU for offline scenarios that trade latency for throughput,
+narios: typical public cloud like AWS, Azure, and GCP
+                                                                such as FlexGen (Sheng et al., 2023), HeteGen (Zhao et al.,
+allocates host CPU proportionally with the GPU capacity
+                                                                2024a), PowerInfer (Song et al., 2024), and TwinPilots (Yu
+and count, and such CPU resources have been calculated
+                                                                et al., 2024). InstInfer (Pan et al., 2024) further offloads
+into the VM price. In these scenarios, NEO tries to exploit
+                                                                to computational SSD to lower the inference cost. FastDe-
+these host CPU resources (that were not effectively used
+                                                                code (He & Zhai, 2024) targets similar online scenarios as
+and thus wasted) to accelerate LLM serving. We note that
+                                                                N EO, but lacks critical designs to address the load imbalance
+all our performance comparisons on A10G and T4 GPUs in
+                                                                between the GPU and CPU (see §1).
+the paper are done using the same standard AWS instances
+for both NEO and GPU-only; therefore, from the perspec-         8    C ONCLUSION
+tive of cloud users, NEO does not incur additional costs.
+But we do agree that for on-premises testbeds, NEO may          N EO is a CPU offloading system for online LLM infer-
+not achieve better perf-TCO.                                    ence to increase GPU batch sizes and improve inference
+                                                                throughput. It features asymmetric pipelining and load-
+N EO achieves performance gains mainly through utilizing
+                                                                aware scheduling to fully leverage both GPU and CPU re-
+the host CPU, which will increase energy usage compared
+                                                                sources without overloading them. N EO achieves up to
+to GPU-only baselines. However, from the perspective of
+                                                                14%-7.5× (depending on GPUs) higher throughput than
+cloud users, the energy cost of the host CPU has already
+                                                                GPU-only inference systems across a variety of workloads
+been calculated and added to the GPU VM price. From
+                                                                and model sizes, while maintaining the same latency. We
+the environmental perspective, the throughput-per-watt of
+                                                                will open source N EO codebase to encourage more research
+GPU-CPU offloading may not be superior to pure GPU in
+                                                                on cost-efficient LLM inference.
+all cases; but in the case of T4 GPU, given our 8x through-
+put improvement, GPU-CPU offload will achieve better
+                                                                ACKNOWLEDGMENTS
+throughput-per-watt. We intend to leave it as future work
+to study the broad topic of energy consumption in LLM           Xuanlin Jiang and Minlan Yu are supported in part by NSF
+serving.                                                        NeTS 2107078. Yang Zhou, Shiyi Cao, and Ion Stoica are
+                                                                supported in part by gifts from Accenture, AMD, Anyscale,
+7   R ELATED W ORK                                              Google, IBM, Intel, Microsoft, Mohamed Bin Zayed Uni-
+                                                                versity of Artificial Intelligence, Samsung SDS, Uber, and
+GPU-efficient LLM inference. There is a line of work
+                                                                VMware.
+on optimizing the efficiency of LLM inference on GPUs,
+including general inference systems from Orca (Yu et al.,
+2022), vLLM (Kwon et al., 2023), SGLang (Zheng et al.,
+2023), FastServe (Wu et al., 2023), Sarathi-Serve (Agrawal
+et al., 2024), NanoFlow (Zhu et al., 2024), DistServe (Zhong
+                     N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+R EFERENCES                                                    Hong, K., Dai, G., Xu, J., Mao, Q., Li, X., Liu, J., Chen, K.,
+                                                                 Dong, Y., and Wang, Y. FlashDecoding++: Faster Large
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,
+                                                                 Language Model Inference on GPUs. arXiv preprint
+  N., Gulavani, B., Tumanov, A., and Ramjee, R. Taming
+                                                                 arXiv:2311.01282, 2023.
+ Throughput-Latency Tradeoff in LLM Inference with
+  Sarathi-Serve. In Proceedings of USENIX OSDI, pp.            Hu, C., Huang, H., Xu, L., Chen, X., Xu, J., Chen, S.,
+ 117–134, 2024.                                                  Feng, H., Wang, C., Wang, S., Bao, Y., et al. In-
+Beltagy, I., Peters, M. E., and Cohan, A. Longformer:            ference without Interference: Disaggregate LLM Infer-
+  The Long-Document Transformer.        arXiv preprint           ence for Mixed Downstream Workloads. arXiv preprint
+  arXiv:2004.05150, 2020.                                        arXiv:2401.11181, 2024.
+
+CarperAI.    OpenAI summarize comparisons.                     interestingLSY/swiftLLM. SwiftLLM. https://
+  https://huggingface.co/datasets/                                github.com/interestingLSY/swiftLLM.
+  CarperAI/openai summarize comparisons.
+                                                               ispc/ispc. Intel Implicit SPMD Program Compiler. https:
+Chen, S., Lin, Y., Zhang, M., and Wu, Y. Efficient and Eco-       //github.com/ispc/ispc.
+  nomic Large Language Model Inference with Attention
+  Offloading. arXiv preprint arXiv:2405.01814, 2024.           Kwon, S. J., Kim, J., Bae, J., Yoo, K. M., Kim, J.-H., Park,
+                                                                B., Kim, B., Ha, J.-W., Sung, N., and Lee, D. AlphaTun-
+Dao, T., Haziza, D., Massa, F., and Sizov, G.                   ing: Quantization-Aware Parameter-Efficient Adaptation
+  Flash-Decoding for  Long-Context   Inference.                 of Large-Scale Pre-Trained Language Models. arXiv
+  https://crfm.stanford.edu/2023/10/                            preprint arXiv:2210.03858, 2022.
+  12/flashdecoding.html.
+                                                               Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.       C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  GPT3.int8(): 8-bit Matrix Multiplication for Transform-       Memory Management for Large Language Model Serv-
+  ers at Scale. Advances in Neural Information Processing       ing with PagedAttention. In Proceedings of ACM SOSP,
+  Systems, 35:30318–30332, 2022.                                pp. 611–626, 2023.
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,       Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang,
+ A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,        W.-C., Xiao, G., Dang, X., Gan, C., and Han, S. AWQ:
+ A., et al. The Llama 3 Herd of Models. arXiv preprint           Activation-aware Weight Quantization for On-Device
+  arXiv:2407.21783, 2024.                                        LLM Compression and Acceleration. Proceedings of
+                                                                 Machine Learning and Systems, 6:87–100, 2024.
+flashinfer ai/flashinfer. FlashInfer: Kernel Library for LLM
+   Serving.      https://github.com/flashinfer-                Microsoft.    Azure LLM inference trace
+   ai/flashinfer/.                                              2023.        https://github.com/Azure/
+Frantar, E. and Alistarh, D. SparseGPT: Massive Lan-            AzurePublicDataset/blob/master/
+  guage Models Can Be Accurately Pruned in One-Shot.            AzureLLMInferenceDataset2023.md.
+  In International Conference on Machine Learning, pp.
+                                                               Moritz, P., Nishihara, R., Wang, S., Tumanov, A., Liaw,
+  10323–10337. PMLR, 2023.
+                                                                R., Liang, E., Elibol, M., Yang, Z., Paul, W., Jordan,
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh,           M. I., et al. Ray: A distributed framework for emerging
+  D. GPTQ: Accurate Post-Training Quantization for              {AI} applications. In Proceedings of USENIX OSDI, pp.
+  Generative Pre-trained Transformers. arXiv preprint           561–577, 2018.
+  arXiv:2210.17323, 2022.
+                                                               NVIDIA.   NVIDIA A100 Tensor Core GPU.
+He, J. and Zhai, J. FastDecode: High-Throughput GPU-            https://www.nvidia.com/content/dam/
+  Efficient LLM Serving using Heterogeneous Pipelines.          en-zz/Solutions/Data-Center/a100/
+  arXiv preprint arXiv:2403.11421, 2024.                        pdf/nvidia-a100-datasheet-nvidia-us-
+                                                                2188504-web.pdf, 2022.
+Hoefler, T., Alistarh, D., Ben-Nun, T., Dryden, N., and
+  Peste, A. Sparsity in Deep Learning: Pruning and growth      NVIDIA.    NVIDIA H100 Tensor Core GPU.
+  for efficient inference and training in neural networks.      https://resources.nvidia.com/en-us-
+  Journal of Machine Learning Research, 22(241):1–124,          tensor-core/nvidia-tensor-core-gpu-
+  2021.                                                         datasheet, 2024.
+                      N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+Pan, X., Li, E., Li, Q., Liang, S., Shan, Y., Zhou, K., Luo,     Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J.,
+  Y., Wang, X., and Zhang, J. Instinfer: In-Storage Atten-         and Han, S. SmoothQuant: Accurate and Efficient
+  tion Offloading for Cost-Effective Long-Context LLM              Post-Training Quantization for Large Language Mod-
+  Inference. arXiv preprint arXiv:2409.04992, 2024.                els. In International Conference on Machine Learning,
+                                                                   pp. 38087–38099. PMLR, 2023a.
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í.,
+  Maleki, S., and Bianchini, R. Splitwise: Efficient             Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+  Generative LLM Inference Using Phase Splitting. In               cient Streaming Language Models with Attention Sinks.
+  2024 ACM/IEEE 51st Annual International Symposium                arXiv preprint arXiv:2309.17453, 2023b.
+  on Computer Architecture (ISCA), pp. 118–132. IEEE,
+  2024.                                                          Yao, Z., Yazdani Aminabadi, R., Zhang, M., Wu, X., Li,
+                                                                   C., and He, Y. ZeroQuant: Efficient and Affordable
+Shen, S., Dong, Z., Ye, J., Ma, L., Yao, Z., Gholami,              Post-Training Quantization for Large-Scale Transformers.
+  A., Mahoney, M. W., and Keutzer, K. Q-BERT: Hes-                 Advances in Neural Information Processing Systems, 35:
+  sian Based Ultra Low Precision Quantization of BERT.             27168–27183, 2022.
+  In Proceedings of the AAAI Conference on Artificial
+  Intelligence, volume 34, pp. 8815–8821, 2020.                  Yu, C., Wang, T., Shao, Z., Zhu, L., Zhou, X., and Jiang,
+                                                                   S. TwinPilots: A New Computing Paradigm for GPU-
+Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,        CPU Parallel LLM Inference. In Proceedings of the 17th
+  B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flex-          ACM International Systems and Storage Conference, pp.
+  Gen: High-Throughput Generative Inference of Large               91–103, 2024.
+  Language Models with a Single GPU. In International
+  Conference on Machine Learning, pp. 31094–31116.               Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  PMLR, 2023.                                                      G. Orca: A Distributed Serving System for Transformer-
+                                                                   Based Generative Models. In Proceedings of USENIX
+Song, Y., Mi, Z., Xie, H., and Chen, H. PowerInfer: Fast           OSDI, pp. 521–538, 2022.
+  Large Language Model Serving with a Consumer-Grade
+  GPU. 2024.                                                     Zhao, X., Jia, B., Zhou, H., Liu, Z., Cheng, S., and
+                                                                   You, Y. HeteGen: Heterogeneous Parallel Inference for
+Strati, F., Mcallister, S., Phanishayee, A., Tarnawski, J.,
+                                                                   Large Language Models on Resource-Constrained De-
+  and Klimovic, A. DejaVu: KV-cache Streaming for Fast,
+                                                                   vices. arXiv preprint arXiv:2403.01164, 2024a.
+  Fault-tolerant Generative LLM Serving. arXiv preprint
+  arXiv:2403.01876, 2024.                                        Zhao, Y., Lin, C.-Y., Zhu, K., Ye, Z., Chen, L., Zheng, S.,
+                                                                   Ceze, L., Krishnamurthy, A., Chen, T., and Kasikci, B.
+Tillet, P. Introducing Triton: Open-source GPU program-
+                                                                   Atom: Low-Bit Quantization for Efficient and Accurate
+  ming for neural networks. https://openai.com/
+                                                                   LLM Serving. Proceedings of Machine Learning and
+  index/triton/.
+                                                                   Systems, 6:196–209, 2024b.
+Tillet, P., Kung, H.-T., and Cox, D. Triton: An Inter-
+  mediate Language and Compiler for Tiled Neural Net-            Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  work Computations. In Proceedings of the 3rd ACM                 Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+  SIGPLAN International Workshop on Machine Learning               SGLang: Efficient Execution of Structured Language
+  and Programming Languages, pp. 10–19, 2019.                      Model Programs. arXiv preprint arXiv:2312.07104,
+                                                                   2023.
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi, A.,
+  Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P., Bhos-      Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin,
+  ale, S., et al. Llama 2: Open foundation and fine-tuned          X., and Zhang, H. DistServe: Disaggregating Prefill and
+  chat models. arXiv preprint arXiv:2307.09288, 2023.              Decoding for Goodput-optimized Large Language Model
+                                                                   Serving. In Proceedings of USENIX OSDI, pp. 193–210,
+Vaswani, A. Attention is All You Need. Advances in Neural          2024.
+  Information Processing Systems, 2017.
+                                                                 Zhu, K., Zhao, Y., Zhao, L., Zuo, G., Gu, Y., Xie, D., Gao,
+WikiChip. AWS Graviton4 - Annapurna Labs (Ama-                     Y., Xu, Q., Tang, T., Ye, Z., et al. NanoFlow: Towards Op-
+ zon).      https://en.wikichip.org/wiki/                          timal Large Language Model Serving Throughput. arXiv
+ annapurna labs/graviton/graviton4.                                preprint arXiv:2408.12757, 2024.
+Wu, B., Zhong, Y., Zhang, Z., Huang, G., Liu, X., and Jin,
+ X. Fast Distributed Inference Serving for Large Language
+ Models. arXiv preprint arXiv:2305.05920, 2023.
+                     N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+A    P SEUDO C ODE FOR L OAD -AWARE                           update_queues(
+     S CHEDULING                                                  batches,
+                                                                  waiting_q,
+Here we show the pseudo-code for the load-aware schedul-          gpu_decoding_q,
+ing algorithm mentioned in section 3.2. The code is written       cpu_decoding_q
+in Python-like syntax.                                        )
+
+# 1. Initialization                                           return batches
+batches = [EMPTY_BATCH] * 2
+                                                              B                       C OMPARISON WITH C HUNKED P REFILL
+# 2. Schedule GPU decoding requests
+while NEED_SWAP_OUT_LAST_GPU_DECODE_REQ:                      We further conduct more experiments to compare NEO with
+    req = gpu_decoding_q.pop()                                chunked prefill by leveraging the chunked prefill imple-
+    cpu_decoding_q.prepend(req)                               mentation in vLLM. As Figure 11 shows, chunked prefill
+    swap_out(req)                                             slightly reduces the latency, but achieves a similar maxi-
+                                                              mum throughput with vLLM which is lower than NEO. The
+while CAN_SWAP_IN_LAST_CPU_DECODE_REQ:                        reason why chunked prefill has little impact on perfomance
+    req = cpu_decoding_q.popfront()                           is that the GPU memory is so limited that the number of
+    gpu_decoding_q.append(req)                                piggybacked decoding requests with a chunked prefilling
+    swap_in(req)                                              request, the main source of gain, cannot be sufficiently large.
+
+for req in gpu_decoding_q:                                          Average per token latency (s)   2.00
+ batches[0].add_gpu_decode(req)
+                                                                                                                 Neo (ours)
+                                                                                                    1.60         vLLM
+                                                                                                                 vLLM-1024
+# 3. Schedule prefilling requests                                                                                vLLM-2048
+for req in waiting_q:                                                                               1.20         vLLM-4096
+ if CAN_PREFILL_TO_GPU(req):
+        gpu_decoding_q.append(req)                                                                  0.80
+     batches[0].add_gpu_prefill(req)
+    elif CAN_PREFILL_TO_CPU(req):                                                                   0.40
+      cpu_decoding_q.append(req)
+     batches[0].add_cpu_prefill(req)                                                                0.00
+    else:                                                                                               0.0       0.5    1.0       1.5     2.0
+     break                                                                                                         Ruquest rate (req/s)
+                                                                                                              (a) A10G + LLaMa-3.1-8B.
+# 4. Schedule CPU decoding requests
+                                                                                                    2.00
+                                                                  Average per token latency (s)
+
+
+
+
+for req in cpu_decoding_q:
+                                                                                                                              Neo (ours)
+    for i in [1, 0]:
+                                                                                                    1.60                      vLLM
+        batches[i].add_cpu_decoding(req)                                                                                      vLLM-256
+        if cpu_time_exceed_gpu(batches):                                                                                      vLLM-512
+            batches[i].pop_cpu_decoding()                                                           1.20
+        else:
+            break                                                                                   0.80
+# 5. Reduce prefilling requests                                                                     0.40
+gpu_only_batch =
+    batches[0].remove_all_cpu_decodings()                                                           0.00
+reduce_cpu_prefill(batches[0])                                                                          0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5
+reduce_cpu_prefill(gpu_only_batch)                                                                              Ruquest rate (req/s)
+                                                                                  (b) T4 + LLaMa-2-7B.
+# 6. Make decisions                                           Figure 11. Load-latency curve comparison between N EO and
+if token_rate([gpu_only_batch]) > \                           vLLM with chunked-prefilling functionality. The numbers after
+    token_rate(batches):                                      vLLM stand for the chunk size, e.g., vLLM-256 for vLLM under
+    batches = [gpu_only_batch]                                chunk size of 256.
+                       N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+C     A RTIFACT A PPENDIX                                            C.3.4    Data sets
+C.1     Abstract                                                     We use a subset of OpenAI summarization comparison (OSC)
+                                                                     (CarperAI) for Figure 6c and synthetic workloads for 10a. Please
+This appendix describes the complete workflow of running             refer to 5 for more details.
+NEO and generating some representative results used in               The size of the datasets can be reduced manually for a faster run
+this paper, including Figure 6c and Figure 10a                       at the price of accuracy. Please refer to the README in our
+                                                                     repository for more details.
+C.2     Artifact check-list (meta-information)
+                                                                     C.4     Installation
+• Algorithm: Continuous batching; paged attention; grid profiling
+• Compilation: Both GNU g++-11 and g++-13 compilers are              1. Launch a g4dn.4xlarge/g5.16xlarge instance with AWS commu-
+  required. CMake must be version 3.18 or higher. The Intel ISPC        nity AMI named neo-ae-g4-image/neo-ae-g5-image in us-east-1
+  compiler should be version 1.23. The Nvidia nvcc compiler             region. Then all you need to do is run mamba activate
+  must be version 12.2 or later.                                        neo and cd NEO in your login shell. The dependencies should
+• Data set: OpenAI summarization comparison (OSC)                       already be installed, and you can skip the steps below. However,
+  (CarperAI); synthetic workloads                                       it is still recommended to re-download the model weights for
+• Run-time environment: Ubuntu 22.04                                    faster evaluation. Please refer to the README document of
+• Hardware: AWS g4dn.4xlarge instance; AWS g5.16xlarge                  our code repository for details.
+  instance                                                           2. If you do not have access to the AMI. Please launch the same
+• Execution: Automatic scripts are included (Please refer to            instances using the “amazon/Deep Learning OSS Nvidia Driver
+  README.md of the repository for details).                             AMI GPU PyTorch 2.6.0 (Ubuntu 22.04)” AMI and run the
+• Metrics: Average per token latency; relative throughput to            following commands in your shell to install NEO and its depen-
+  baseline                                                              dencies:
+• Output: Plots in pdf files and evaluation traces including nu-
+                                                                        sudo add-apt-repository \
+  merical results under NEO/evaluation
+                                                                            ppa:ubuntu-toolchain-r/test
+• How much disk space required (approximately)?: 15-20GB
+                                                                        sudo apt update
+  (mainly model weights)
+                                                                        sudo apt install g++-13 libomp-dev numactl
+• How much time is needed to prepare workflow (approxi-
+                                                                        sudo snap install ispc --channel latest/edge
+  mately)?: less than 30 minues
+                                                                        git clone \
+• How much time is needed to complete experiments (approxi-
+                                                                            https://github.com/NEO-MLSys25/NEO.git
+  mately)?: 10-15h for full reproduction; less than 1h for reduced
+                                                                        cd NEO
+  reproduction
+                                                                        pip install -r requirements.txt
+• Publicly available?:           https://github.com/NEO-
+                                                                        pip install -e csrc
+  MLSys25/NEO
+                                                                        pip install -e .
+• Archived (provide DOI)?: https://doi.org/10.5281/
+                                                                        cd pacpu
+  zenodo.14964833
+                                                                        bash build.sh llama2_7b 1
+                                                                        cd ..
+C.3     Description
+                                                                        NOTE: Change the second last line to bash build.sh
+C.3.1    How delivered                                                  llama3 8b 1 on the g5.16xlarge instance.
+The code can be downloaded through a public Github repository.       3. Prepare LLaMa-2-7B/LLaMa-3-8B model weights. You
+                                                                        can download it from Huggingface or Meta’s official
+                                                                        repository. Note that the weights should be in .safeten-
+C.3.2    Hardware dependencies                                          sors format. Please also change the “model path” entry
+AWS g4dn.4xlarge and g5.16xlarge instances.                             in evaluation/configs/config-t4-7b.json on g4dn.4xlarge or
+                                                                        evaluation/configs/config-a10-8b.json on g5.16xlarge to the
+                                                                        actual path to the model weigths.
+C.3.3    Software dependencies                                       4. For reproducing Figure 6c, please also install vLLM by pip
+• Both g++-11 and g++-13                                                install vllm. Please note that our original results were
+• CMake 3.18 or later                                                   obtained with vLLM 0.6.3.post1. However, installing this ver-
+• Intel ISPC compiler 1.23                                              sion directly via pip may lead to an SQL-related bug. The
+• Nvidia CUDA toolkit 12.2 or later                                     latest vLLM (0.7.3 by March 2nd, 2025) does not exhibit
+• OpenMP library                                                        this issue and demonstrates comparable performance to vLLM
+• Python 3.10 or later                                                  0.6.3.post1 in our experiments.
+• Pytorch 2.4 or later
+• vLLM                                                               C.5     Experiment workflow
+• Other python dependencies described in requirement.txt of the
+  repository                                                         On g4dn.4xlarge instance:
+
+                                                                     cd NEO
+                                                                     python evaluation/reproduce-fig6c.py
+
+                                                                     On g5.16xlarge instance:
+                        N EO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
+
+cd NEO
+python evaluation/reproduce-fig10a.py
+
+C.6    Evaluation and expected result
+Reproducing Figure 6c Running the reproduce-fig6c.py script on
+g4dn.4xlarge instance with proper environment setup will repro-
+duce this figure. By default, the script only uses a small subset
+(100 requests) of the original input data (2000 requests) used in
+the original experiment. This is for the purpose of demonstration
+and quick verification of the results for faster evaluation. As a
+result, the latency would be lower than the original figure due to
+the lower average queuing latency. You can change the number in
+evaluation/benchmark.py, line 114 to use more requests
+for more accurate results.
+Reproducing Figure 10a Running the reproduce-fig10a.py script
+on g5.16xlarge instance with proper environment setup will repro-
+duce this figure. Only the “x16large” and the “baseline” lines in
+the original figure will be drawn. The default number of requests is
+2000, the same as in the original paper. You can reduce the number
+for faster evaluation. However, the result may not be as accurate
+as the original one because of warm-up and cool-down effects. It
+is not recommended to set this number below 800.
+
+C.7    Experiment customization
+Users can reduce or add custom data points through very straight-
+forward modifications of the scripts. Users can also modify the
+number of data used in experiments. See the code for more detailed
+instructions.
+
+C.8    Notes
+On the first run of NEO, the server process starts very slowly
+for two reasons. First, it needs to load the model weights from
+storage to the main memory. Secondly, it might (not if you use our
+provided AMI) need to do the initial performance profiling before
+starting the service. The whole process would take less than ten
+minutes. You can check the logs in NEO/evaluation for details if
+you find no output from the console.
+
+C.9    Methodology
+Submission, reviewing and badging methodology:
+• http://cTuning.org/ae/submission-
+  20190109.html
+• http://cTuning.org/ae/reviewing-
+  20190109.html
+• https://www.acm.org/publications/policies/
+  artifact-review-badging
+
