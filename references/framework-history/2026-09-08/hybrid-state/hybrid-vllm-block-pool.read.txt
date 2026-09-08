@@ -1,0 +1,123 @@
+    def cache_partial_block(
+        self,
+        request: Request,
+        block: KVCacheBlock,
+        num_tokens: int,
+        kv_cache_group_id: int,
+        block_size: int,
+        replace_existing_hashes: bool = False,
+    ) -> BlockHashWithGroupId | None:
+        """Register a partial prefix-cache entry for an existing block.
+
+        Prefix-cache keys normally identify full cache blocks. A partial entry
+        makes an existing cache block reachable from a fine-grained prefix
+        boundary inside that block without allocating or copying a new
+        ``KVCacheBlock``.
+
+        The partial entry is lookup metadata owned by ``block``. If ``block``
+        has no primary hash, the key becomes its primary hash. If the block
+        already has a primary hash, the partial entry is tracked in
+        ``cached_block_hashes_by_block`` so eviction, reset, and promotion can
+        remove every hash key that points to the block.
+
+        Args:
+            request: Request whose token IDs and block hashes define the
+                partial entry.
+            block: Existing cache block to make reachable from the partial
+                prefix boundary.
+            num_tokens: Prefix length represented by the partial entry. It
+                must be a positive multiple of ``self.hash_block_size`` and
+                cannot exceed the request's computed block hashes.
+            kv_cache_group_id: KV cache group that owns the partial entry.
+            block_size: Cache block size for the owning group. The partial
+                entry hash itself is always the prefix-chain hash at
+                ``num_tokens``; ``block_size`` is used to assert that the
+                entry is partial within the owning cache block.
+            replace_existing_hashes: Whether the block contents were replaced
+                and all existing cache entries must be removed before the new
+                entry is registered.
+
+        Returns:
+            The hash key with group ID if a partial entry can be registered;
+            otherwise ``None`` for null blocks.
+        """
+        if block.is_null:
+            return None
+
+        assert block_size % self.hash_block_size == 0
+        assert replace_existing_hashes or (
+            block_size > self.hash_block_size and num_tokens % block_size != 0
+        )
+        block_hash = self._get_partial_block_hash(request, num_tokens)
+        num_hash_blocks = num_tokens // self.hash_block_size
+        block_hash_with_group_id = make_block_hash_with_group_id(
+            block_hash, kv_cache_group_id
+        )
+        already_cached = block.block_hash == block_hash_with_group_id or (
+            self.cached_block_hash_to_block.contain(
+                block_hash_with_group_id, block.block_id
+            )
+        )
+        if replace_existing_hashes:
+            removed_hashes = self._remove_cached_block_hashes(block)
+            self._emit_block_removed_events(removed_hashes)
+            already_cached = False
+        elif (
+            not already_cached
+            and block.block_hash is not None
+            and block.block_hash_num_tokens is not None
+            and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+        ):
+            removed_hashes = self._remove_cached_block_hashes(block)
+            self._emit_block_removed_events(removed_hashes)
+        self._insert_block_hash(
+            block_hash_with_group_id,
+            block,
+            num_tokens=num_hash_blocks * self.hash_block_size,
+        )
+        if self.enable_kv_cache_events and not already_cached:
+            parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
+                request, num_tokens
+            )
+            parent_block_hash = (
+                maybe_convert_block_hash(parent_hash)
+                if parent_hash is not None
+                else None
+            )
+            block_end = num_tokens
+            curr_mm_idx = -1 if block_start > 0 else 0
+            extra_keys, _ = generate_block_hash_extra_keys(
+                request, block_start, block_end, curr_mm_idx
+            )
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[maybe_convert_block_hash(block_hash)],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=request.all_token_ids[block_start:block_end],
+                    block_size=block_end - block_start,
+                    lora_id=request.lora_request.adapter_id
+                    if request.lora_request
+                    else None,
+                    medium=MEDIUM_GPU,
+                    lora_name=request.lora_request.name
+                    if request.lora_request
+                    else None,
+                    extra_keys=[extra_keys],
+                    group_idx=kv_cache_group_id,
+                    session_id=request.session_id,
+                )
+            )
+        return block_hash_with_group_id
+
+    def _get_partial_block_hash(
+        self,
+        request: Request,
+        num_tokens: int,
+    ) -> BlockHash:
+        assert num_tokens % self.hash_block_size == 0
+        num_hash_blocks = num_tokens // self.hash_block_size
+        assert 0 < num_hash_blocks <= len(request.block_hashes)
+
+        # Each hash_block_size hash chains over its full prefix, so the partial
+        # entry for any group block size is the hash at that prefix boundary.
+        return request.block_hashes[num_hash_blocks - 1]

@@ -1,0 +1,196 @@
+def apply_shift_parallel_patches():
+    UlyssesModelConfig.apply_patch()
+    UlyssesParallelState.apply_patch()
+    UlyssesWorkerProc.apply_patch()
+    UlyssesMultiprocExecutor.apply_patch()
+    UlyssesAttention.apply_patch()
+    UlyssesCudagraphDispatcher.apply_patch()
+    UlyssesCompilationConfig.apply_patch()
+    UlyssesVllmConfig.apply_patch()
+    UlyssesEngineCore.apply_patch()
+
+
+class UlyssesModelConfig(ArcticPatch[ModelConfig]):
+
+    _orig_get_num_kv_heads = ModelConfig.get_num_kv_heads
+    _orig_get_num_attention_heads = ModelConfig.get_num_attention_heads
+
+    def get_num_kv_heads(self: ModelConfig,
+                         parallel_config: ParallelConfig) -> int:
+        num_kv_heads = self._orig_get_num_kv_heads(parallel_config)
+        sp_size = parallel_config.ulysses_sequence_parallel_size
+        return max(1, num_kv_heads // sp_size)
+
+    def get_num_attention_heads(self: ModelConfig,
+                                parallel_config: ParallelConfig) -> int:
+        num_heads = self._orig_get_num_attention_heads(parallel_config)
+        sp_size = parallel_config.ulysses_sequence_parallel_size
+        return max(1, num_heads // sp_size)
+
+    def get_layers_start_end_indices(
+            self, parallel_config: "ParallelConfig") -> tuple[int, int]:
+        from vllm.distributed.utils import get_pp_indices
+        if (self.hf_text_config.model_type == "deepseek_mtp"
+                or self.hf_config.model_type == "mimo_mtp"
+                or self.hf_config.model_type == "glm4_moe_mtp"):
+            total_num_hidden_layers = getattr(self.hf_text_config,
+                                              "num_nextn_predict_layers", 0)
+        else:
+            total_num_hidden_layers = getattr(self.hf_text_config,
+                                              "num_hidden_layers", 0)
+        # the layout order is: DP x PP x SP x TP
+        pp_rank = (parallel_config.rank //
+                   (parallel_config.tensor_parallel_size *
+                    parallel_config.ulysses_sequence_parallel_size)
+                   ) % parallel_config.pipeline_parallel_size
+        pp_size = parallel_config.pipeline_parallel_size
+        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        return start, end
+
+
+class UlyssesParallelState(ArcticPatch[parallel_state]):
+
+    _SP = None
+        world_size: int = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+
+        data_parallel_size = 1
+        from vllm.config import get_current_vllm_config
+        config = get_current_vllm_config()
+        if config is not None:
+            data_parallel_size = config.parallel_config.data_parallel_size
+
+        sequence_parallel_size = config.parallel_config.ulysses_sequence_parallel_size
+
+        # vLLM types allow None, but group building needs an int
+        if decode_context_model_parallel_size is None:
+            # treat "no DCP" as DCP==TP (common interpretation)
+            decode_context_model_parallel_size = tensor_model_parallel_size
+
+        # Layout order (extended from vLLM's): ExternalDP x DP x PP x PCP x SP x TP
+        all_ranks = torch.arange(world_size).reshape(
+            -1,
+            data_parallel_size,
+            pipeline_model_parallel_size,
+            prefill_context_model_parallel_size,
+            sequence_parallel_size,
+            tensor_model_parallel_size,
+        )
+
+        assert _TP is None, "tensor model parallel group is already initialized"
+        group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+        group_ranks = [x.tolist() for x in group_ranks]
+        TP_group_ranks = group_ranks
+        _TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        )
+
+        assert parallel_state._SP is None, "sequence parallel group is already initialized"
+        group_ranks = (
+            all_ranks.transpose(4, 5)
+            .reshape(-1, sequence_parallel_size)
+            .unbind(0)
+        )
+        group_ranks = [x.tolist() for x in group_ranks]
+        SP_group_ranks = group_ranks
+        _SP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="sp",
+        )
+
+        shift_parallel_size = tensor_model_parallel_size * sequence_parallel_size
+        assert parallel_state._SP_TP is None, "full-TP group is already initialized"
+        group_ranks = (
+            all_ranks.transpose(4, 5)  # head-order trick
+            .reshape(-1, shift_parallel_size)
+            .unbind(0)
+        )
+        group_ranks = [x.tolist() for x in group_ranks]
+        SP_TP_group_ranks = group_ranks
+        _SP_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="sp_tp",
+        )
+            f"_parallel_size ({pp_size}) x prefill_context"
+            f"_parallel_size ({pcp_size}) x ulysses_sequence_parallel"
+            f"_size ({sp_size})."
+        )
+        return tp_size * sp_size, pp_size, pcp_size
+
+
+class UlyssesAttention(ArcticPatch[Attention]):
+
+    _orig_init = Attention.__init__
+    _orig_forward = Attention.forward
+
+    def __init__(self, num_heads, *args, **kwargs):
+        from .model_runner import is_shift_parallel_mode
+        self.sp_size = parallel_state._SP.world_size
+        self.sp_device_group = parallel_state._SP.device_group
+        if not is_shift_parallel_mode():
+            num_heads //= self.sp_size
+            num_kv_heads = kwargs["num_kv_heads"]
+            self.is_kv_replicated = True if num_kv_heads < self.sp_size else False
+            if self.is_kv_replicated:
+                self.replication_factor = self.sp_size // num_kv_heads
+                num_kv_heads = 1
+            else:
+                num_kv_heads //= self.sp_size
+            kwargs["num_kv_heads"] = num_kv_heads
+        return self._orig_init(num_heads, *args, **kwargs)
+
+    def forward(self, query, key, value, **kwargs):
+        from .model_runner import is_shift_parallel_mode
+        if self.sp_size == 1 or is_shift_parallel_mode():
+            return self._orig_forward(query, key, value, **kwargs)
+
+        # prepare
+        q = query.view(-1, self.sp_size, self.num_heads * self.head_size)
+        if self.is_kv_replicated:
+            k = key.view(-1, self.sp_size // self.replication_factor, self.head_size).repeat_interleave(self.replication_factor, dim=1)
+            v = value.view(-1, self.sp_size // self.replication_factor, self.head_size).repeat_interleave(self.replication_factor, dim=1)
+        else:
+            k = key.view(-1, self.sp_size, self.num_kv_heads * self.head_size)
+            v = value.view(-1, self.sp_size, self.num_kv_heads * self.head_size)
+
+        # pack
+        qkv = torch.cat((q, k, v), dim=-1).transpose(0, 1).reshape(
+            -1, (self.num_heads + 2 * self.num_kv_heads) * self.head_size)
+        
+        # Ulysses all-to-all 1/2
+        qkv_ = torch.empty_like(qkv)
+        torch.distributed.all_to_all_single(qkv_, qkv, group=self.sp_device_group)
+
+        # unpack
+        q_, k_, v_ = qkv_.split([
+            self.num_heads * self.head_size, 
+            self.num_kv_heads * self.head_size, 
+            self.num_kv_heads * self.head_size
+        ], dim=-1)
+
+        # original attention
+        c_ = self._orig_forward(q_, k_, v_, **kwargs)
+
+        # Ulysses all-to-all 2/2
+        c = torch.empty_like(c_)
+        torch.distributed.all_to_all_single(c, c_, group=self.sp_device_group)
+        output = (c.view(self.sp_size, -1, self.num_heads * self.head_size)
+                  .transpose(0, 1)
+                  .reshape(-1, self.num_heads * self.sp_size * self.head_size))
+        
+        return output
+
+

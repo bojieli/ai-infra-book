@@ -1,0 +1,346 @@
+            accesses = tuple(access for access in accesses if access.phase == phase)
+        if not accesses:
+            return "none"
+        return "; ".join(
+            f"{access.phase.value}:{access.kind.value}:"
+            f"exact={sorted(access.backend_matcher.exact)}:"
+            f"tags={sorted(access.backend_matcher.tags)}"
+            for access in accesses
+        )
+
+    def needs_dequant_workspace(self) -> bool:
+        """Whether the pool should allocate dq_k_buffer / dq_v_buffer."""
+        return any(
+            access.kind == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+            for access in self.attention_accesses()
+        )
+
+    def needs_plain_kv_dequant_read(self) -> bool:
+        """Whether plain attention reads require dequantizing packed KV first."""
+        return any(
+            access.kind == KVCacheAttentionAccessKind.PLAIN
+            and access.storage_dtype is not None
+            for access in self.attention_accesses()
+        )
+
+    def dequant_workspace_dtype(self) -> Optional[torch.dtype]:
+        """Workspace dtype required by DEQUANT_WORKSPACE access rules."""
+        workspace_dtypes = set()
+        for access in self.attention_accesses():
+            if access.kind != KVCacheAttentionAccessKind.DEQUANT_WORKSPACE:
+                continue
+            if access.workspace_dtype is None:
+                raise ValueError(
+                    f"KV cache method {self.name!r} declares DEQUANT_WORKSPACE "
+                    "without workspace_dtype."
+                )
+            workspace_dtypes.add(access.workspace_dtype)
+
+        if not workspace_dtypes:
+            return None
+        if len(workspace_dtypes) != 1:
+            raise ValueError(
+                f"KV cache method {self.name!r} declares multiple dequant "
+                f"workspace dtypes: {sorted(str(dtype) for dtype in workspace_dtypes)}."
+            )
+        return next(iter(workspace_dtypes))
+
+    def kv_storage_dtype(self) -> torch.dtype:
+        """Packed KV storage dtype declared by attention access rules."""
+        storage_dtypes = {
+            access.storage_dtype
+            for access in self.attention_accesses()
+            if access.storage_dtype is not None
+        }
+        if not storage_dtypes:
+            return torch.uint8
+        if len(storage_dtypes) != 1:
+            raise ValueError(
+                f"KV cache method {self.name!r} declares multiple storage "
+                f"dtypes: {sorted(str(dtype) for dtype in storage_dtypes)}."
+            )
+        return next(iter(storage_dtypes))
+
+    def plain_attention_kv_dtype(self) -> Optional[torch.dtype]:
+class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
+    """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
+
+    Supported on SM100 and SM120.
+    """
+
+    name = "nvfp4"
+    SCALE_BLOCK_SIZE = 16
+
+    def __init__(self, num_layers: int, device: str):
+        self.num_layers = num_layers
+        self.device = device
+        # Per-layer global FP32 scales; filled by load_scales_from_model()
+        self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
+        self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
+        self.k_scales_float = [1.0] * num_layers
+        self.v_scales_float = [1.0] * num_layers
+
+    def needs_global_scale(self) -> bool:
+        return True
+
+    def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
+        return torch.float8_e4m3fn
+
+    def load_scales_from_model(self, model_runner) -> None:
+    def create_buffers(
+        self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
+    ) -> dict:
+        m = size
+        n = head_num
+        k = head_dim
+        store_dtype = self.kv_storage_dtype()
+        dq_dtype = self.dequant_workspace_dtype()
+
+        k_buffer = [
+            torch.zeros((m, n, k // 2), dtype=store_dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        v_buffer = [
+            torch.zeros((m, n, k // 2), dtype=store_dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        k_scale_buffer = [
+            torch.zeros(
+                (m, n, k // self.SCALE_BLOCK_SIZE), dtype=store_dtype, device=device
+            )
+            for _ in range(layer_num)
+        ]
+        v_scale_buffer = [
+            torch.zeros(
+                (m, n, k // self.SCALE_BLOCK_SIZE), dtype=store_dtype, device=device
+            )
+            for _ in range(layer_num)
+        ]
+        # Shared dequant workspace: one copy, reused per layer during prefill.
+        dq_k_buffer = (
+            torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+        dq_v_buffer = (
+            torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+
+        return {
+            "k_buffer": k_buffer,
+            "v_buffer": v_buffer,
+            "k_scale_buffer": k_scale_buffer,
+            "v_scale_buffer": v_scale_buffer,
+            "dq_k_buffer": dq_k_buffer,
+            "dq_v_buffer": dq_v_buffer,
+            "store_dtype": store_dtype,
+        }
+
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        # FP4 data: per-layer, K+V
+        fp4_size = head_num * (head_dim // 2) * num_layers * 2 * kv_size
+        # Block scales: per-layer, K+V (uint8)
+        scale_size = (
+            head_num * (head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
+        )
+        # Dequant workspace is shared across layers, not multiplied by num_layers.
+        dq_dtype = self.dequant_workspace_dtype()
+        dq_size = (
+            head_num
+            * head_dim
+            * 2
+            * kv_size
+            * torch.empty((), dtype=dq_dtype).element_size()
+            if dq_dtype is not None
+            else 0
+        )
+        return fp4_size + scale_size + dq_size
+
+
+class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
+    """Block-16 FP4 E2M1 single-level scaling.
+
+    This is intentionally not called MXFP4: standard MXFP4 uses a block size of
+    32, while this KV cache recipe stores one scale per 16 FP4 values.
+    """
+
+    name = "fp4_mx_block16"
+    SCALE_BLOCK_SIZE = 16
+
+    def __init__(
+        self,
+        num_layers: Optional[int] = None,
+        device: Optional[str] = None,
+    ):
+        pass
+
+    def create_buffers(
+        self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
+    ) -> dict:
+        m = size
+        store_dtype = self.kv_storage_dtype()
+        dq_dtype = self.dequant_workspace_dtype()
+
+        k_buffer = [
+            torch.zeros((m, head_num, head_dim // 2), dtype=store_dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        v_buffer = [
+            torch.zeros((m, head_num, head_dim // 2), dtype=store_dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        # Block-16 FP4 flattens head dimensions for scale storage
+        k_scale_buffer = [
+            torch.zeros(
+                (m, (head_num * head_dim) // self.SCALE_BLOCK_SIZE),
+                dtype=store_dtype,
+                device=device,
+            )
+            for _ in range(layer_num)
+        ]
+        v_scale_buffer = [
+            torch.zeros(
+                (m, (head_num * head_dim) // self.SCALE_BLOCK_SIZE),
+                dtype=store_dtype,
+                device=device,
+            )
+            for _ in range(layer_num)
+        ]
+        dq_k_buffer = (
+            torch.zeros((m, head_num, head_dim), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+        dq_v_buffer = (
+            torch.zeros((m, head_num, head_dim), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        fp4_size = head_num * (head_dim // 2) * num_layers * 2 * kv_size
+        scale_size = (
+            (head_num * head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
+        )
+        dq_dtype = self.dequant_workspace_dtype()
+        dq_size = (
+            head_num
+            * head_dim
+            * 2
+            * kv_size
+            * torch.empty((), dtype=dq_dtype).element_size()
+            if dq_dtype is not None
+            else 0
+        )
+        return fp4_size + scale_size + dq_size
+
+
+# Registry: method name -> attention access rules.
+_PREFILL = KVCacheAttentionPhase.PREFILL
+_DECODE = KVCacheAttentionPhase.DECODE
+_PLAIN_KIND = KVCacheAttentionAccessKind.PLAIN
+_DQ_WORKSPACE_KIND = KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+_NATIVE_FP4_KIND = KVCacheAttentionAccessKind.NATIVE_FP4
+_ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
+_NVFP4_SCALE = "nvfp4"
+_FP4_MX_SCALE = "fp4_mx_block16"
+_FP8_E4M3 = torch.float8_e4m3fn
+_TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
+_BF16 = torch.bfloat16
+_NVFP4_PREFILL_BACKENDS = frozenset({"flashinfer"})
+_NVFP4_DECODE_BACKENDS = frozenset({"trtllm_mha"})
+_FP4_MX_MHA_BACKENDS = frozenset(
+    {"triton", "torch_native", "flex_attention", "trtllm_mha"}
+)
+_FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
+_CPU_FP8_BACKENDS = frozenset({"intel_amx"})
+
+
+def _backend_matcher(backends) -> KVCacheBackendMatcher:
+    if isinstance(backends, KVCacheBackendMatcher):
+        return backends
+    return KVCacheBackendMatcher(exact=backends)
+
+
+def _plain(
+    phase: KVCacheAttentionPhase,
+    backends,
+    scale: Optional[str] = None,
+        attention_kv_dtype=attention_dtype,
+        scale_recipe=scale,
+    )
+
+
+KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
+    UnquantizedKVCacheMethod.name: (
+        _plain(_PREFILL, _ANY_BACKEND),
+        _plain(_DECODE, _ANY_BACKEND),
+    ),
+    CPUFP8KVCacheMethod.name: (
+        _plain(_PREFILL, _CPU_FP8_BACKENDS),
+        _plain(_DECODE, _CPU_FP8_BACKENDS),
+    ),
+    NVFP4KVCacheMethod.name: (
+        _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+    ),
+    FP4MXBlock16KVCacheMethod.name: (
+        _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
+        _plain(_DECODE, _FP4_MX_MHA_BACKENDS, _FP4_MX_SCALE, _BF16),
+    ),
+}
+
+
+# Registry: explicit --kv-cache-dtype value -> method class.
+KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
+    "cpu_fp8_e4m3": CPUFP8KVCacheMethod,
+    "nvfp4": NVFP4KVCacheMethod,
+    "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
+}
+
+
+def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
+    """Resolve the explicit FP4 KV cache recipe from ``--kv-cache-dtype``."""
+
+    if not isinstance(kv_cache_dtype, str):
+        if (
+            hasattr(torch, "float4_e2m1fn_x2")
+            and kv_cache_dtype == torch.float4_e2m1fn_x2
+        ):
+            raise ValueError(
+                "FP4 KV cache storage dtype does not identify the recipe. "
+                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'fp4_mx_block16'."
+            )
+        return None
+
+    if kv_cache_dtype == "fp4_e2m1":
+        raise ValueError(
+            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
+            "Use --kv-cache-dtype=fp4_mx_block16."
+        )
+    if kv_cache_dtype == "mxfp4":
+        raise ValueError(
+            "--kv-cache-dtype=mxfp4 is reserved for true MXFP4 block-size-32 "
+            "semantics. Use --kv-cache-dtype=fp4_mx_block16 for the current "
+            "block-size-16 FP4 KV recipe."
+        )
+    if kv_cache_dtype in KV_CACHE_QUANT_REGISTRY:
+        return kv_cache_dtype
+    return None
+
+
+def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethodBase:
+    """Instantiate a KVCacheQuantMethodBase by internal method name."""
+    if name not in KV_CACHE_QUANT_REGISTRY:
+        raise ValueError(
+            f"Unknown KV cache quantization method: '{name}'. "
+            f"Available: {list(KV_CACHE_QUANT_REGISTRY)}"
+        )
+    return KV_CACHE_QUANT_REGISTRY[name](**kwargs)

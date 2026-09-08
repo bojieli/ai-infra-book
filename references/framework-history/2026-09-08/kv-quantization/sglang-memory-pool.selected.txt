@@ -1,0 +1,203 @@
+                else _KV_COPY_NUM_WARPS_LARGE_TILE
+            ),
+            "num_locs_upper": chunk_upper,
+        }
+
+        dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
+        copy_all_layer_kv_cache_func(
+            self.data_ptrs,
+            self.data_strides,
+            dummy_loc,
+            dummy_loc,
+            1,
+            chunk_upper,
+            self._kv_copy_config,
+        )
+
+    @property
+    def is_quantized_kv_cache(self) -> bool:
+        return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
+
+    def _create_buffers(self):
+        if self.is_quantized_kv_cache:
+            if self.post_capture_active:
+                raise NotImplementedError(
+                    "Post-capture KV backing is not supported for quantized KV cache."
+                )
+            self._create_quantized_buffers()
+        else:
+            self.k_scale_buffer = None
+            self.v_scale_buffer = None
+            self.dq_k_buffer = None
+            self.dq_v_buffer = None
+            if self.post_capture_active:
+                self._alloc_post_capture_buffers()
+            else:
+                self._create_buffers_normal()
+        self._kv_buffer_descs = self._build_kv_buffer_descs()
+        self._init_data_ptrs_and_strides()
+
+    def _create_quantized_buffers(self):
+        # Quantized recipes own packed-data, scale, and workspace shapes.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                buf = self.quant_method.create_buffers(
+                    self.size + self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                    self.layer_num,
+                    self.device,
+                )
+        self.k_buffer = buf["k_buffer"]
+        self.v_buffer = buf["v_buffer"]
+        self.k_scale_buffer = buf.get("k_scale_buffer")
+        self.v_scale_buffer = buf.get("v_scale_buffer")
+        self.dq_k_buffer = buf.get("dq_k_buffer")
+        self.dq_v_buffer = buf.get("dq_v_buffer")
+        self.store_dtype = buf.get("store_dtype", torch.uint8)
+        self._check_quantized_buffer_access_requirements()
+
+    def _check_quantized_buffer_access_requirements(self):
+        expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
+        has_k_workspace = self.dq_k_buffer is not None
+            self.dq_k_buffer.dtype != expected_workspace_dtype
+            or self.dq_v_buffer.dtype != expected_workspace_dtype
+        ):
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} declares dequant "
+                f"workspace dtype {expected_workspace_dtype}, but created "
+                f"{self.dq_k_buffer.dtype}/{self.dq_v_buffer.dtype}."
+            )
+
+    def _slot_move_pointer_buffers(self):
+        """Buffers whose pointers/strides are used when KV slots are remapped.
+
+        FP4 KV cache stores data and per-block scales separately, so slot moves
+        must update both. This list feeds data_ptrs/data_strides; it does not
+        copy tensor contents by itself.
+        """
+        buffers = [*self.k_buffer, *self.v_buffer]
+        if getattr(self, "k_scale_buffer", None) is not None:
+            buffers.extend([*self.k_scale_buffer, *self.v_scale_buffer])
+        return buffers
+
+    def _init_data_ptrs_and_strides(self):
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        slot_move_pointer_buffers = self._slot_move_pointer_buffers()
+            del self.dq_v_buffer
+        if self._post_capture_owner is not None:
+            self._post_capture_owner.close()
+            self._post_capture_owner = None
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        k_size_bytes = get_tensor_size_bytes(self.k_buffer)
+        v_size_bytes = get_tensor_size_bytes(self.v_buffer)
+        if getattr(self, "k_scale_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
+        if getattr(self, "dq_k_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
+        return k_size_bytes, v_size_bytes
+
+    # for disagg
+        *,
+        prepare_workspace: bool,
+        use_ragged: bool,
+        k_cur: Optional[torch.Tensor] = None,
+        v_cur: Optional[torch.Tensor] = None,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the FlashInfer FP8 KV view for a quantized KV cache.
+
+        FlashInfer prefill consumes FP8 KV. Quantized pools store packed FP4 plus
+        per-block scales, so the pool owns the dequant workspace and returns the
+        view shape expected by FlashInfer.
+        """
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError(
+                "FlashInfer quantized KV buffer requested from a non-quantized KV pool."
+            )
+
+        if prepare_workspace:
+            transfer_cur_kv = not use_ragged
+            k_cur_fp8 = (
+                k_cur.to(torch.float8_e4m3fn)
+                if k_cur is not None and transfer_cur_kv
+                else None
+            )
+            v_cur_fp8 = (
+                v_cur.to(torch.float8_e4m3fn)
+                if v_cur is not None and transfer_cur_kv
+                else None
+            )
+            self._prepare_dequant_extend_workspace(
+                layer.layer_id if layer_id_override is None else layer_id_override,
+                layer.layer_id,
+                req_to_token,
+                req_pool_indices_cpu,
+                extend_prefix_lens_cpu,
+                extend_seq_lens_cpu,
+                page_size,
+                k_cur_fp8=k_cur_fp8,
+                v_cur_fp8=v_cur_fp8,
+            )
+
+        k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
+        return (
+            k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+        )
+
+    def get_flashinfer_decode_dequant_workspace_kv_buffer(
+        self,
+        layer: RadixAttention,
+        req_to_token: torch.Tensor,
+        req_pool_indices,
+        seq_lens,
+        *,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError(
+                "FlashInfer dequant workspace requested from a non-quantized KV pool."
+            )
+
+        self._prepare_dequant_decode_workspace(
+            layer.layer_id if layer_id_override is None else layer_id_override,
+            layer.layer_id,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+        )
+        k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
+        return (
+            k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+        )
+
+    @staticmethod
+    def _to_cpu_int_list(values) -> list[int]:
+        if isinstance(values, list):
+            return [int(value) for value in values]
+        if isinstance(values, torch.Tensor):
+            return [int(value) for value in values.cpu().tolist()]
+        return [int(value) for value in values]
+
+    def _prepare_dequant_extend_workspace(
+        self,

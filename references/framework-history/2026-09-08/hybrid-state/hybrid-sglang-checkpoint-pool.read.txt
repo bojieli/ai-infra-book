@@ -1,0 +1,73 @@
+def maybe_init_int8_mamba_checkpoint_pool(
+    *,
+    mamba_size: int,
+    cache_params,
+    mamba_layer_ids: List[int],
+    device: str,
+) -> Optional[MambaCheckpointPool]:
+    """Build the optional int8 ``MambaCheckpointPool`` when
+    ``--enable-int8-mamba-checkpoint`` is set (and a global server-args context
+    exists), else return ``None``. The radix caches states here (int8) instead of
+    in the active bf16 pool -> ~2x cached-prefix capacity at fixed memory.
+
+    Estimates the pool's HBM footprint and checks it against free memory BEFORE
+    allocating, so an oversized ``--int8-mamba-ckpt-size`` fails with an actionable
+    message instead of a cryptic mid-allocation CUDA OOM.
+    """
+
+    try:
+        mamba = get_exec().mamba
+    except ValueError:
+        # Some unit-test / mock runners construct HybridReqToTokenPool directly
+        # without a global server-args context. The int8 checkpoint pool is opt-in
+        # via a CLI flag, so an unset context unambiguously means it is off.
+        mamba = None
+    if mamba is None or not mamba.enable_int8_mamba_checkpoint:
+        return None
+
+    GB = 1 << 30
+    H, d_v, d_k = cache_params.shape.temporal
+    ckpt_size = mamba.int8_mamba_ckpt_size or (2 * mamba_size)
+    kwargs = dict(
+        num_layers=len(mamba_layer_ids),
+        num_slots=ckpt_size,
+        num_heads=H,
+        head_v_dim=d_v,
+        head_k_dim=d_k,
+        conv_shapes=list(cache_params.shape.conv),
+        conv_dtype=cache_params.dtype.conv,
+        temporal_dtype=cache_params.dtype.temporal,
+    )
+
+    est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs)
+    free_bytes = None
+    if isinstance(device, str) and device.startswith("cuda"):
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+        except Exception:
+            free_bytes = None
+    logger.info(
+        f"int8 mamba checkpoint pool: {ckpt_size} slots, "
+        f"{est['total'] / GB:.2f}GB (qdata {est['qdata'] / GB:.2f} + scale "
+        f"{est['scale'] / GB:.2f} + conv {est['conv'] / GB:.2f}); active mamba "
+        f"pool {mamba_size} slots"
+        + (f"; free HBM {free_bytes / GB:.2f}GB" if free_bytes is not None else "")
+    )
+    if free_bytes is not None and est["total"] >= free_bytes:
+        raise RuntimeError(
+            f"int8 mamba checkpoint pool needs ~{est['total'] / GB:.2f}GB but only "
+            f"{free_bytes / GB:.2f}GB HBM is free. Lower --int8-mamba-ckpt-size "
+            f"(currently {ckpt_size}) or --mem-fraction-static."
+        )
+
+    pool = MambaCheckpointPool(device=device, **kwargs)
+    # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
+    # (max_total_num_tokens); it is allocated from --mem-fraction-static headroom.
+    # The estimate check above guards against an oversized pool; accounting it in
+    # the KV budget is a follow-up.
+    logger.warning(
+        f"int8 mamba checkpoint pool ({est['total'] / GB:.2f}GB) is allocated from "
+        f"--mem-fraction-static headroom and is not reflected in "
+        f"max_total_num_tokens; ensure headroom covers it."
+    )
+    return pool

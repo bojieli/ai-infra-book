@@ -1,0 +1,124 @@
+
+        self.model.forward = ulysses_forward
+
+    def load_model(self: GPUModelRunner, *args, **kwargs):
+        load_shift_model = (
+            self.vllm_config.parallel_config.enable_shift_parallel)
+
+        if load_shift_model:
+            # Make a deep copy of the config before loading the model.
+            shift_config = copy.deepcopy(self.vllm_config)
+
+        self._orig_load_model(*args, **kwargs)
+
+        if self.parallel_config.ulysses_sequence_parallel_size > 1:
+            self.monkeypatch_forward()
+
+        if load_shift_model:
+            shift_config.parallel_config.tensor_parallel_size *= (
+                shift_config.parallel_config.ulysses_sequence_parallel_size)
+            shift_config.parallel_config.ulysses_sequence_parallel_size = 1
+            with set_shift_parallel_mode(True):
+                self.shift_model = get_model(vllm_config=shift_config)
+            self.shift_parallel_threshold = (
+                shift_config.parallel_config.shift_parallel_threshold)
+            if "SwiftKV" in self.model.__class__.__name__:
+                # HACK: Replace the decode-runner since it always runs in full
+                # TP, but the original model is captured using SP * BATCH_SIZE,
+                # which does not cover all its cuda graph sizes. The shift-mode
+                # model should have all its cuda graphs captured correctly.
+                self.model.model.decode_runner = (
+                    self.shift_model.model.decode_runner)
+        else:
+            self.shift_model = None
+            self.shift_parallel_threshold = 0
+
+    def initialize_kv_cache(self, kv_cache_config: "KVCacheConfig") -> None:
+        self._orig_initialize_kv_cache(kv_cache_config)
+
+        if self.shift_model is not None:
+            # Bind the KV caches to the shift parallel model.
+            forward_context = (
+                self.vllm_config.compilation_config.static_forward_context)
+            for mod in self.shift_model.modules():
+                if isinstance(mod, Attention):
+                    mod.kv_cache = forward_context[mod.layer_name].kv_cache
+
+    @torch.inference_mode()
+    def execute_model(
+        self: GPUModelRunner,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, torch.Tensor]:
+        self._update_states(scheduler_output)
+        if not scheduler_output.total_num_scheduled_tokens:
+            # Return empty ModelRunnerOutput if there's no work to do.
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        if self.is_multimodal_model:
+            # Run the multimodal encoder if any.
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+        else:
+            mm_embeds = []
+
+        # Prepare the decoder inputs.
+        attn_metadata, logits_indices, spec_decode_metadata = (
+            self._prepare_inputs(scheduler_output))
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        use_shift_model = num_scheduled_tokens <= self.shift_parallel_threshold
+        if use_shift_model:
+            if (self.use_cuda_graph and num_scheduled_tokens
+                    <= self.cudagraph_batch_sizes[-1]):
+                # Use piecewise CUDA graphs.
+                # Add padding to the batch size.
+                num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                    num_scheduled_tokens)
+            else:
+                # Eager mode.
+                num_input_tokens = num_scheduled_tokens
+        else:
+            # add padding to the batch size to make it a multiple of SP
+            SP = self.parallel_config.ulysses_sequence_parallel_size
+            num_input_tokens = (num_scheduled_tokens + SP - 1) // SP * SP
+    def capture_model(self) -> None:
+        if not self.use_cuda_graph:
+            logger.warning(
+                "Skipping CUDA graph capture. Please add "
+                "-O %s to use CUDA graphs.", CompilationLevel.PIECEWISE)
+            return
+
+        start_time = time.perf_counter()
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+        # Trigger CUDA graph capture for specific shapes.
+        # Capture the large shapes first so that the smaller shapes
+        # can reuse the memory pool allocated for the large shapes.
+        with parallel_state.graph_capture(device=self.device):
+            sp_size = self.parallel_config.ulysses_sequence_parallel_size
+            for num_tokens in reversed(self.cudagraph_batch_sizes):
+                if (num_tokens * sp_size > self.shift_parallel_threshold and
+                        num_tokens * sp_size <= self.max_num_tokens):
+                    for _ in range(self.vllm_config.compilation_config.
+                                   cudagraph_num_of_warmups):
+                        self._dummy_run(num_tokens * sp_size)
+                    self._dummy_run(num_tokens * sp_size)
+
+            if self.shift_model is not None:
+                orig_model, self.model = self.model, self.shift_model
+                for num_tokens in reversed(self.cudagraph_batch_sizes):
+                    with set_shift_parallel_mode(True):
+                        for _ in range(self.vllm_config.compilation_config.
+                                        cudagraph_num_of_warmups):
+                            self._dummy_run(num_tokens)
+                        self._dummy_run(num_tokens)
+                self.model = orig_model
+
+        end_time = time.perf_counter()
+        end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        elapsed_time = end_time - start_time
+        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # This usually takes 5~20 seconds.
+        logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
+                    elapsed_time, cuda_graph_size / (1 << 30))
+

@@ -1,0 +1,49 @@
+Reconciling partial block cache hits and KV cache offloading
+As described in the
+Kimi K3 preview
+, vLLM supports fine-grained prefix hits that may end inside a physical cache block. This introduces a subtle challenge for KV offloading: vLLM may first find a local GPU hit with a partial tail, then discover a longer prefix in an external store such as Mooncake. With full-block hits, remote reuse extends cleanly beyond the local prefix. A partial tail, however, can overlap with the remote result.
+The vLLM scheduler therefore compares the exact reusable token lengths from both tiers and selects the longer prefix. If the remote hit wins, it releases the block reserved for the shorter local tail and reconciles all cache groups to the new prefix length.
+Importantly, we built this mechanism entirely through the existing KV Connector APIs, which already provide all the required semantics. This allows
+MooncakeStoreConnector
+,
+SimpleCPUOffloadConnector
+, and other connectors to support multi-tier partial-prefix reuse without model-specific integration paths.
+The design is tracked in the
+RFC
+and implemented across
+PR #45939
+,
+PR #46384
+, and
+PR #49502
+.
+Agentic serving: smarter cache retention policies
+Kimi K3’s linear-attention layers require only a constant-size KDA state, making them memory-efficient at long context lengths. A single layer’s KDA state is roughly equivalent to the MLA cache for a few thousand tokens. Although large, this state does not grow with sequence length, unlike a conventional KV cache. That distinction becomes significant for agentic workloads spanning hundreds of thousands to one million tokens.
+The same design complicates prefix caching. KDA state is updated in place during decoding, so vLLM must copy the state at a selected prefix boundary before the next forward pass overwrites it. Caching at every token position would be prohibitively expensive: each KDA checkpoint is much larger than one token’s MLA cache and would quickly exhaust even a distributed cache pool.
+To improve cache-space efficiency while preserving useful prefixes, vLLM supports two complementary retention policies.
+Interval-based retention
+Caching every KDA state is wasteful, but caching too sparsely forces the next request to recompute a large suffix. Interval-based retention balances these costs by treating selected positions as checkpoints—for example, one every 32K tokens.
+Prompt boundaries are even better checkpoints. In agentic workloads, the next turn usually begins by replaying the previous turn’s prompt, so the state at the end of that prompt is especially likely to be reused. vLLM detects and retains these boundaries automatically.
+Users can control periodic checkpointing with
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+. Setting it to
+0
+disables periodic checkpoints and retains only prompt-end states, which is a good fit for workloads dominated by multi-turn conversations. Larger intervals trade some recomputation for lower cache usage.
+Interval-based retention was introduced for DeepSeek V4 and hybrid sliding-window-attention models in
+PR #43447
+, with day-0 support for Kimi K3 and hybrid linear-attention models added in
+PR #45845
+.
+Interval-based cache retention. MLA caches KV for every block, while a KDA state is kept only at checkpoints: prompt ends (green) are always retained, and fixed-interval checkpoints (orange) are configurable.
+Marconi-style selective retention
+Prompt-end retention works well for conversational state, but valuable shared prefixes can appear elsewhere. A system prompt, repository snapshot, or tool specification may be reused across many requests without aligning with a prompt boundary.
+Marconi-style retention (MLSys ‘25)
+handles these cases with a simple rule: cache on the second hit. The first observation provides evidence that the prefix exists; the second shows that it is actually shared. Only then does vLLM spend cache capacity on its KDA state.
+This turns retention into a demand-driven decision. One-off prefixes do not crowd the cache, while recurring prefixes are promoted automatically—without requiring users to predict which parts of their workload will become hot.
+Selective retention was introduced in
+PR #37898
+, with day-0 Kimi K3 support added in
+PR #47782
+.
+Selective cache retention. Request 1 keeps a KDA state only at its own prompt end, past the shared prefix, so request 2 gets a KV hit but a KDA miss. That second sighting is evidence the prefix is shared, so a state is cached at the prefix boundary, and request 3 reuses it.
+Together, the policies cover both predictable and emergent reuse: interval retention checkpoints structurally important boundaries, while Marconi-style retention learns which other prefixes are worth keeping.

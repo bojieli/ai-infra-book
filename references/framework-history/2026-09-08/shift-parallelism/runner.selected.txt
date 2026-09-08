@@ -1,0 +1,341 @@
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[
+        ModelRunnerOutput, AsyncGPUModelRunnerOutput, IntermediateTensors, None
+    ]:
+        num_scheduled_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+        if num_scheduled_tokens is None:
+            try:
+                num_scheduled_tokens = int(
+                    sum(scheduler_output.num_scheduled_tokens.values())
+                )
+            except Exception:
+                num_scheduled_tokens = 0
+
+        use_shift_model = (
+            getattr(self, "use_ulysses", False)
+            and getattr(self, "shift_model", None) is not None
+            and num_scheduled_tokens <= int(getattr(self, "shift_parallel_threshold", 0))
+        )
+
+        # Remember which model ran this step so sample_tokens -- where the final
+        # ModelRunnerOutput / CUDAGraphStat is actually built -- can tag it.
+        # (execute_model only returns an ExecuteModelState here.)
+        self._arctic_shift_enabled = (
+            getattr(self, "use_ulysses", False)
+            and getattr(self, "shift_model", None) is not None
+        )
+        self._arctic_used_shift_model = use_shift_model
+
+        if not use_shift_model:
+            return self._orig_execute_model(scheduler_output, intermediate_tensors)
+
+        orig_model = self.model
+        cc = self.vllm_config.compilation_config
+        base_ctx = cc.static_forward_context
+        shift_ctx = getattr(self, 'shift_forward_context', None)
+        try:
+            self.model = self.shift_model
+            if shift_ctx is not None:
+                cc.static_forward_context = shift_ctx
+            with set_shift_parallel_mode(True), \
+                 self._use_shift_cudagraph_tables():
+                result = self._orig_execute_model(scheduler_output, intermediate_tensors)
+        finally:
+            self.model = orig_model
+            cc.static_forward_context = base_ctx
+
+        self._fix_shift_logits_ordering()
+
+        return result
+
+    def _tag_cudagraph_stat_model(self, cudagraph_stats):
+        """Return a copy of ``cudagraph_stats`` whose ``runtime_mode`` is
+        annotated with which model (``base`` / ``shift``) executed this step,
+        so per-step cudagraph metrics show it (e.g. ``PIECEWISE shift``).
+
+        No-op (returns the input unchanged) when shift parallelism is disabled,
+        no stat was produced (cudagraph metrics off), or the per-step flag was
+        never stashed. ``CUDAGraphStat`` is frozen, hence the replaced copy.
+        """
+        if cudagraph_stats is None or not getattr(
+                self, "_arctic_shift_enabled", False):
+            return cudagraph_stats
+        tag = "shift" if getattr(self, "_arctic_used_shift_model",
+                                 False) else "base"
+        try:
+            return replace(
+                cudagraph_stats,
+                runtime_mode=f"{cudagraph_stats.runtime_mode} {tag}",
+            )
+        except Exception:
+            return cudagraph_stats
+
+    def _compute_shift_logits_perm(self):
+        """Compute permutation to fix logits after all-gather for the shift model.
+
+        NCCL all_gather_into_tensor outputs chunks in sorted global-rank order,
+        but vLLM's GroupCoordinator assigns rank_in_group (and thus weight shards)
+        based on the unsorted rank list.  When _SP_TP has non-trivial ordering
+        (e.g. [0,2,1,3]), the vocabulary shards in the gathered logits are
+        scrambled.  This method returns the permutation that restores correct
+        vocabulary order, or None if no reordering is needed.
+        """
+        sp_tp = parallel_state._SP_TP
+        if sp_tp is None:
+            return None
+        ranks = sp_tp.ranks
+        sorted_ranks = sorted(ranks)
+        if ranks == sorted_ranks:
+            return None
+        nccl_to_shard = [ranks.index(r) for r in sorted_ranks]
+        perm = sorted(range(len(nccl_to_shard)), key=lambda i: nccl_to_shard[i])
+        return perm
+
+    def _fix_shift_logits_ordering(self):
+        """Reorder logits vocabulary dimension to fix NCCL rank-sort mismatch."""
+        perm = getattr(self, '_shift_logits_perm', None)
+        if perm is None:
+            return
+        state = self.execute_model_state
+        if state is None or state.logits is None:
+            return
+        logits = state.logits
+        tp_size = len(perm)
+        vocab_size = logits.shape[-1]
+        if vocab_size % tp_size != 0:
+            return
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
+        with record_function_or_nullcontext(
+            "gpu_model_runner: set_async_sampled_token_ids"
+        ):
+            # Save ref of sampled_token_ids CPU tensor if the batch contains
+            # any requests with sampling params that require output ids.
+            self.input_batch.set_async_sampled_token_ids(
+                async_output.sampled_token_ids_cpu,
+                async_output.async_copy_ready_event,
+            )
+
+        return async_output
+
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        load_shift_model = (
+            self.vllm_config.parallel_config.enable_shift_parallel
+        )
+
+        if load_shift_model:
+            shift_config = copy.deepcopy(self.vllm_config)
+
+        self._orig_load_model(load_dummy_weights)
+
+        if self.parallel_config.ulysses_sequence_parallel_size > 1:
+            self.monkeypatch_forward()
+
+        if load_shift_model:
+            shift_config.parallel_config.tensor_parallel_size *= (
+                shift_config.parallel_config.ulysses_sequence_parallel_size
+            )
+            shift_config.parallel_config.ulysses_sequence_parallel_size = 1
+            shift_config.compilation_config.pass_config.fuse_allreduce_rms = False
+            with set_shift_parallel_mode(True):
+                self.shift_model = get_model(vllm_config=shift_config)
+            torch.cuda.set_device(self.device)
+            self.shift_parallel_threshold = (
+                shift_config.parallel_config.shift_parallel_threshold
+            )
+            self.shift_forward_context = (
+                shift_config.compilation_config.static_forward_context
+            )
+
+            from vllm.distributed.device_communicators.cuda_communicator import (
+                CudaCommunicator,
+            )
+            sp_tp = parallel_state._SP_TP
+            if (sp_tp is not None
+                    and sp_tp.device_communicator is not None
+                    and isinstance(sp_tp.device_communicator, CudaCommunicator)
+                    and sp_tp.device_communicator.ca_comm is not None):
+                sp_tp.device_communicator.ca_comm.disabled = True
+
+            self._shift_logits_perm = self._compute_shift_logits_perm()
+
+            if "SwiftKV" in self.model.__class__.__name__:
+                if hasattr(self.model, "model") and hasattr(self.model.model, "decode_runner"):
+                    self.model.model.decode_runner = self.shift_model.model.decode_runner
+                else:
+                    logger.warning("Could not apply SwiftKV HACK: "
+                                   "model.model.decode_runner not found.")
+
+            cudagraph_mode = self.compilation_config.cudagraph_mode
+            if (cudagraph_mode is not None
+                    and cudagraph_mode.has_full_cudagraphs()
+                    and not self.parallel_config.use_ubatching):
+                from vllm.compilation.cuda_graph import CUDAGraphWrapper
+                self.shift_model = CUDAGraphWrapper(
+                    self.shift_model, self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                )
+        else:
+            self.shift_model = None
+            self.shift_parallel_threshold = 0
+            self.shift_forward_context = None
+            self._shift_logits_perm = None
+
+    def reload_weights(self, *args, **kwargs) -> None:
+        self._orig_reload_weights(*args, **kwargs)
+
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None and getattr(drafter, "model", None) is not None:
+            logger.info("Reloading drafter (spec model) weights...")
+            drafter.load_model(self.model)
+
+    def initialize_kv_cache(
+        self, kv_cache_config, is_profiling: bool = False
+    ) -> None:
+        self._orig_initialize_kv_cache(kv_cache_config, is_profiling)
+        shift_ctx = getattr(self, 'shift_forward_context', None)
+        if shift_ctx is None:
+            return
+        base_ctx = self.compilation_config.static_forward_context
+        bound = 0
+        for name, shift_attn in shift_ctx.items():
+            base_attn = base_ctx.get(name)
+            if base_attn is not None and hasattr(base_attn, 'kv_cache'):
+                shift_attn.kv_cache = base_attn.kv_cache
+                bound += 1
+        if is_global_first_rank():
+            logger.info("Bound KV cache to %d shift model attention layers",
+                        bound)
+
+    from vllm.forward_context import BatchDescriptor
+    def _case_bs(self, case) -> int:
+        # vLLM can pass ints, tuples, or sometimes BatchDescriptor-like objects
+        if isinstance(case, int):
+            return case
+        if isinstance(case, BatchDescriptor):
+            return int(case.num_tokens)
+        if isinstance(case, tuple):
+            return int(case[0])
+        # last resort
+        return int(getattr(case, "num_tokens"))
+
+    def _with_bs(self, case, new_bs: int):
+        if isinstance(case, tuple):
+            return (new_bs, *case[1:])
+        if isinstance(case, BatchDescriptor):
+            # Best-effort reconstruction; adjust if your BatchDescriptor signature differs.
+            return BatchDescriptor(
+                num_tokens=new_bs,
+                num_reqs=case.num_reqs,
+                uniform=case.uniform,
+                has_lora=case.has_lora,
+            )
+        return new_bs
+
+    @contextlib.contextmanager
+    def _shift_graph_capture_context(self):
+        """Disable custom all-reduce on _TP and _SP_TP during shift model graph
+        capture so collectives fall back to pynccl (NCCL), which handles graph
+        capture natively.  Custom all-reduce communicators were not set up through
+        the normal vLLM graph_capture() path, so using them inside a CUDA graph
+        would crash."""
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        def _get_ca_comm(group):
+            if (group is not None
+                    and group.device_communicator is not None
+                    and isinstance(group.device_communicator, CudaCommunicator)):
+                return group.device_communicator.ca_comm
+            return None
+
+        tp_ca = _get_ca_comm(parallel_state._TP)
+        sp_tp_ca = _get_ca_comm(parallel_state._SP_TP)
+
+        saved_tp = tp_ca.disabled if tp_ca is not None else None
+        saved_sp_tp = sp_tp_ca.disabled if sp_tp_ca is not None else None
+        if tp_ca is not None:
+            tp_ca.disabled = True
+        if sp_tp_ca is not None:
+            sp_tp_ca.disabled = True
+        try:
+            yield
+        finally:
+            if tp_ca is not None and saved_tp is not None:
+                tp_ca.disabled = saved_tp
+            if sp_tp_ca is not None and saved_sp_tp is not None:
+                sp_tp_ca.disabled = saved_sp_tp
+
+    @contextlib.contextmanager
+    def _use_shift_cudagraph_tables(self):
+        """Temporarily swap compilation_config sizes and the cudagraph
+        dispatcher's padded-size lookup table to the shift (unscaled) values so
+        vLLM internals (dispatcher, pad_for_cudagraph, bounds checks) all see the
+        shift model's sizes."""
+        disp = getattr(self, 'cudagraph_dispatcher', None)
+        if disp is None or not hasattr(disp, '_bs_to_padded_graph_size'):
+            yield
+            return
+
+        cc = self.compilation_config
+        saved_sizes = cc.cudagraph_capture_sizes
+        saved_max = cc.max_cudagraph_capture_size
+
+        saved_table = disp._bs_to_padded_graph_size
+
+        shift_sizes = self.vllm_config._shift_cudagraph_capture_sizes
+        shift_max = self.vllm_config._shift_max_cudagraph_capture_size
+        shift_table = self.vllm_config._shift_bs_to_padded_graph_size
+
+        cc.cudagraph_capture_sizes = shift_sizes
+        cc.max_cudagraph_capture_size = shift_max
+        disp._bs_to_padded_graph_size = shift_table
+        try:
+            yield
+        finally:
+            cc.cudagraph_capture_sizes = saved_sizes
+            cc.max_cudagraph_capture_size = saved_max
+            disp._bs_to_padded_graph_size = saved_table
+
+    def _shift_capture_descriptors(self, cudagraph_runtime_mode):
+        """Build the shift model's cudagraph batch descriptors for a given
+        runtime mode, matching exactly what runtime ``dispatch()`` and key
+        registration produce.
+
+        Must be called inside ``_use_shift_cudagraph_tables()`` so that
+        ``_create_padded_batch_descriptor`` pads using the shift (unscaled)
+        size table.  Descriptors are returned largest-first for capture memory
+        efficiency (large shapes reuse the memory pool for smaller ones).
+
+        - PIECEWISE: relaxed keys (``num_reqs=None, uniform=False``) over all
+          shift capture sizes, mirroring the mixed-mode branch of base
+          ``CudagraphDispatcher.initialize_cudagraph_keys``.
+        - FULL: exact uniform-decode keys, restricted to the decode-eligible
+          size subset (``uniform_decode_query_len <= bs <=
+          uniform_decode_query_len * max_num_seqs``), mirroring base's
+          ``cudagraph_capture_sizes_for_decode``.
+        """
+        disp = getattr(self, 'cudagraph_dispatcher', None)
+        if disp is None or cudagraph_runtime_mode not in (
+                CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL):
+            return []
+
+        shift_sizes = self.vllm_config._shift_cudagraph_capture_sizes or []
+        sizes = sorted({int(bs) for bs in shift_sizes}, reverse=True)
+
+        if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            max_decode_tokens = (self.uniform_decode_query_len
+                                 * self.scheduler_config.max_num_seqs)
+            sizes = [bs for bs in sizes
+                     if self.uniform_decode_query_len <= bs <= max_decode_tokens]
+
+        lora_cases = disp._get_lora_cases()
+        descriptors = []
+        for bs in sizes:
