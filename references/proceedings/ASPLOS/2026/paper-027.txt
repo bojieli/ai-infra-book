@@ -1,0 +1,1239 @@
+                                         SwiftSpec: Ultra-Low Latency LLM Decoding by Scaling
+                                                 Asynchronous Speculative Decoding
+
+                                             Ziyi Zhang1,2 , Ziheng Jiang1† , Chengquan Jiang1 , Menghan Yu1 , Size Zheng1 ,
+                                                                 Haibin Lin1 , Henry Hoffmann2 , Xin Liu1,†
+                                                                        1
+                                                                            ByteDance Seed, 2 University of Chicago
+arXiv:2506.11309v1 [cs.DC] 12 Jun 2025
+
+
+
+
+                                                                                    †
+                                                                                        Corresponding authors
+
+
+
+                                                                                            Abstract
+                                              Low-latency decoding for large language models (LLMs) is crucial for applications like chatbots
+                                              and code assistants, yet generating long outputs remains slow in single-query settings. Prior work
+                                              on speculative decoding (which combines a small draft model with a larger target model) and
+                                              tensor parallelism has each accelerated decoding. However, conventional approaches fail to apply
+                                              both simultaneously due to imbalanced compute requirements (between draft and target models),
+                                              KV-cache inconsistencies, and communication overheads under small-batch tensor-parallelism.
+                                              This paper introduces SwiftSpec, a system that targets ultra-low latency for LLM decoding.
+                                              SwiftSpec redesigns the speculative decoding pipeline in an asynchronous and disaggregated
+                                              manner, so that each component can be scaled flexibly and remove draft overhead from the critical
+                                              path. To realize this design, SwiftSpec proposes parallel tree generation, tree-aware KV cache
+                                              management, and fused, latency-optimized kernels to overcome the challenges listed above. Across 5
+                                              model families and 6 datasets, SwiftSpec achieves an average of 1.75× speedup over state-of-the-art
+                                              speculative decoding systems and, as a highlight, serves Llama3-70B at 348 tokens/s on 8 Nvidia
+                                              Hopper GPUs, making it the fastest known system for low-latency LLM serving at this scale.
+
+                                               Date: June 16, 2025
+                                               Correspondence: Ziheng Jiang at ziheng.jiang@bytedance.com, Xin Liu at liuxin.ai@bytedance.com
+
+
+
+
+                                         1   Introduction                                             minutes to complete. Reducing decoding latency is,
+                                                                                                      therefore, critical.
+                                         The remarkable capacity of large language models
+                                         (LLMs) to learn from vast datasets has been instru-          In LLM-serving systems, there is an inherent trade-off
+                                         mental in enabling the rapid proliferation of emerg-         between throughput and latency under the same com-
+                                         ing applications across diverse domains, including           pute resources. This work investigates how to achieve
+                                         chatbots [13], search [4, 37], and personalized recom-       ultra-low latency decoding in single-request scenarios,
+                                         mendation systems [13, 39]. Real-time applications,          where existing serving frameworks—designed to max-
+                                         such as interactive code assistants [6, 11, 15] and          imize throughput under service-level-objective (SLO)
+                                         robotics [41, 46], impose stringent limits on models’        constraints—often fall short. For instance, a 4-bit
+                                         decoding latency. Recently, Chain-of-thought (CoT)           quantized LLama-70B model running on 8 NVIDIA
+                                         [9, 35] is also increasingly adopted to improve rea-         H800 GPUs can take approximately 30s to generate
+                                         soning quality. A single CoT inference can decode            a response of about 3000 tokens when deployed with
+                                         tens of thousands of tokens and take more than ten           the popular LLM serving frameworks.
+
+
+                                                                                                  1
+                                                                                                              GPU0             verify[tp0]                          verify[tp0]
+ GPU0 dft    dft    dft                  verify            dft   dft    dft           verify                                                                                                 fused                  fused
+                                                                                                                                                                                                         ...
+                                                                                                              GPU1             verify[tp1]                          verify[tp1]               attn                 gemm-ar
+                                              （a) Speculative decoding.
+                                                                                                                                                                                          latency-optimized kernels (section 3.3)
+
+
+
+
+                                                                                                              ...
+
+
+
+
+                                                                                                                                                      ...
+                                                                                                              GPU5             verify[tp5]                          verify[tp5]
+ GPU0 dft dft dft         verify [tp0]    dft dft dft   verify [tp0]                                                          verify iter n-1                      verify iter n
+                                                                                                                                                            sync
+ GPU1 dft dft dft                                                                                                                                                                                         update
+                          verify [tp1]    dft dft dft   verify [tp1]                                          GPU6      dft     dft    dft      dft          dft     dft   dft      dft
+                                                                              attn comm ... gemm   ar
+  ...
+
+
+
+
+                                                                                                              GPU7      dft     dft    dft      dft          dft     dft   dft      dft
+                                                                              bound by latency and comm                        draft iter n                        draft iter n+1           update draft tree and kv cache to
+ GPU7 dft dft dft         verify [tp7]    dft dft dft   verify [tp7]                                                                                                                        maintain consistency (section 3.2)
+                                                                                                                              parallel tree generation (section 3.1)
+
+                           （b) Naively scale speculative decoding with tensor parallelism.                          (c) SwiftSpec: redesigns speculative decoding in an asynchronous and disaggregated manner.
+
+
+
+Figure 1 Overview of speculative decoding variants. (a) Conventional speculative decoding with sequential draft/verify
+steps. (b) Tensor-parallel decoding with reduced latency but communication overhead and GPU under utilization. (c)
+SwiftSpec: Our approach, combining parallel tree generation (§3.1), KV cache consistency (§3.2), and latency-optimized
+kernels (§3.3).
+
+
+                          # gpus=1                # gpus=2             # gpus=4       # gpus=8                reaches the point of diminishing returns sooner: once
+ Llama3-1B                 1.58ms                   1.58ms               1.73ms        1.72ms
+ Llama3-3B                 2.77ms                   2.61ms               2.80ms        3.27ms                 its weights are already finely sharded, further increas-
+ Llama3-8B                 4.30ms                   3.46ms               3.50ms        3.78ms                 ing the tensor-parallelism no longer reduces latency,
+ Llama3-70B                24.78ms                 15.90ms              11.86ms        11.22ms                because other overheads—most notably inter-GPU
+                                                                                                              communication—dominate. As Table 1 shows, under
+Table 1 Time per inference for 4 different int4 AWQ mod-
+                                                                                                              a batch size of 8. extending from 2 GPUs to 4 GPUs,
+els under Llama3 family under different degrees (ngpus)
+of tensor parallelism under a batch size of 8
+                                                                                                              a lightweight Llama 3B draft model has even longer
+                                                                                                              inference time (increasing from 2.61ms to 2.80ms per
+                                                                                                              inference), while the Llama 70B target model still
+Speculative decoding [3, 5, 18, 25] accelerates LLM                                                           has good improvements (decreasing from 15.90ms to
+inference in single-request scenarios. Speculative de-                                                        11.86ms).
+coding consists of two distinct phases: a draft phase
+followed by a verification phase. During the draft                                                            To effectively combine speculative decoding with ten-
+phase, a relatively small draft model rapidly generates                                                       sor parallelism and achieve ultra-low decoding latency,
+a sequence of candidate tokens (and, in some vari-                                                            we redesign the speculative decoding process in an
+ants, a tree-structured set of candidates). During the                                                        asynchronous, disaggregated manner (Figure 1(c)).
+subsequent verification phase, a significantly larger                                                         We partition GPUs into two groups: verification and
+target model validates all candidates by performing                                                           draft. Rather than co-located on the same hardware,
+a batch inference, thereby emitting multiple tokens                                                           the target model runs on the verification group, and
+at once and reducing decoding latency. Prior work                                                             the draft model runs on the draft group. The verifi-
+typically treats the draft and verification phases as                                                         cation and draft phases proceed in parallel: while the
+strictly sequential operations because of their data de-                                                      verification group verifies iteration n − 1, the draft
+pendencies [3, 19, 25], as shown in Figure 1(a). This                                                         group concurrently produces candidates for iteration
+design places the draft phase on the critical path as an                                                      n. When a verification iteration is complete, the veri-
+additional overhead, preventing speculative decoding                                                          fication group synchronizes the validated tokens with
+from fully realizing its latency-reduction potential.                                                         the draft group and obtains the next set of candidate
+                                                                                                              tokens to be verified. Under this design, (1) the draft
+Tensor parallelism [30] is another technique to re-                                                           and target models can be flexibly scaled to different
+duce the decoding latency by scaling the computation                                                          degrees of parallelism, and (2) the dependencies be-
+resources. Tensor parallelism partitions the model                                                            tween the two phases are decoupled, removing the
+weights across multiple GPUs and then performs                                                                draft phase from the critical path.
+all-reduce operations to aggregate the partial results.
+However, a straightforward combination of tensor par-                                                         Realizing this design poses three system-level chal-
+allelism with speculative decoding, as shown in Figure                                                        lenges. First, while the verification group is still
+1(b), is ineffective. In speculative decoding, the draft                                                      performing parallel validation and has not yet ob-
+and target models are co-located on the same devices.                                                         tained a definitive answer for the current iteration,
+Because the two models differ greatly in size, applying                                                       the draft group must still generate the candidate set
+the same degree of tensor-parallelism to both cannot                                                          for the next iteration. Second, maintaining key-value
+yield optimal system latency. The smaller draft model                                                         cache consistency between complex drafting models
+
+
+                                                                                                          2
+(e.g., tree-structured draft models) and the target            baseline. As a highlight, SwiftSpec serves Llama3-
+model is non-trivial. When tree-based draft genera-            70B with an average decoding speed of 348 output
+tion runs in parallel, newly accepted tokens may force         tokens per second, currently the fastest solution we
+the draft model to discard invalid branches. It is im-         are aware of using Nvidia Hopper GPUs.
+portant (yet challenging) to keep a consistent view of
+the KV cache of accepted tokens and the draft tokens           Our contributions are:
+that might be useful in the future. Third, hiding
+communication latency during decoding is challeng-               • We identify the scalability challenges of specula-
+ing. For example, when draft and target models are                 tive decoding under tensor parallelism in existing
+under tensor parallelism, it is hard to overlap the                LLM serving systems.
+all-reduce operation with other operations since they
+                                                                 • We present SwiftSpec, which integrates tech-
+usually remain on the critical path. Furthermore, the
+                                                                   niques including parallel tree generation, con-
+GPU kernels, usually optimized for higher through-
+                                                                   sistent KV cache management, and latency-
+put, have suboptimal performance under low batch
+                                                                   optimized kernels to redesign speculative decod-
+sizes, spending most of the time on the latency of
+                                                                   ing in an asynchronous, disaggregated manner.
+data movement and kernel launch.
+                                                                 • We conduct a comprehensive evaluation of Swift-
+We present SwiftSpec, a novel system that achieves                 Spec across five model families and six bench-
+ultra-low decoding latency for LLMs (Figure 1(c)),                 mark datasets, in which SwiftSpec consistently
+significantly reducing the decoding latency in single-             outperforms the baselines.
+request scenarios. To address the above challenges,
+SwiftSpec introduces: (a) Parallel tree generation.
+We allocate the draft and target models onto dif-              2 Background and System-level Chal-
+ferent sets of GPUs, eliminating inter-dependencies              lenges
+and allowing each model to generate tokens or verify
+them independently. While the target model verifies            2.1   Parallelism for LLM Decoding
+one batch, the draft model simultaneously produces
+future candidate tokens, ensuring high GPU utiliza-            LLM inference (e.g., [28, 33, 34]) is typically accel-
+tion. This allows us to scale each model according             erated through model parallelism, which distributes
+to its own compute requirements. (b) Consistent                computation across multiple GPUs. The two most
+KV cache management. After each verification step,             common strategies are intra-operator parallelism
+we carefully reorganize the KV Cache of both the               (such as tensor parallelism, which splits matrix multi-
+draft and target models to maintain consistency. For           plications across GPUs) [30] and inter-operator paral-
+the draft model, we develop a scheme to keep the               lelism (such as pipeline parallelism, which distributes
+accepted and future tokens consistent with the draft           layers across devices) [10, 14].
+tree, even when some guesses are incorrect and some
+part of the draft tree is invalidated. This approach           In single-request serving, tensor parallelism (TP) is
+also maximizes the reuse of the previously computed            generally preferred. By splitting large matrix op-
+KV cache values. (c) Latency-optimized kernels. We             erations across GPUs and aggregating results via
+develop latency-optimized kernels that minimize syn-           all-reduce, TP reduces compute latency. Pipeline
+chronization barriers and unnecessary data transfers,          parallelism, while useful for high-throughput scenar-
+accelerating inference in low-batch scenarios. Using           ios, often adds per-token latency due to sequential
+the Nvidia Collective Communication Library’s Low              layer execution.
+Latency (NCCL LL) protocol, we develop a fused
+GEMM with all-reduce and an attention operator                 However, TP alone is insufficient to achieve low la-
+without any explicit synchronization barriers. Fur-            tency in speculative decoding. Draft models are typi-
+thermore, we fuse the multiple operations in the               cally small and gain relatively little from TP, while
+Switched Gated Linear Unit (SwiGLU) operator to                large target models benefit more from increased TP
+decrease latency.                                              degrees. These asymmetric scaling needs pose chal-
+                                                               lenges in resource allocation and utilization. Swift-
+We evaluate SwiftSpec using five different model fam-          Spec directly addresses these issues through parallel
+ilies and six different datasets. SwiftSpec consistently       tree generation (§3.1) and latency-optimized kernels
+outperforms the baselines, achieving an average of             (§3.3).
+1.75× decoding speed using 8 GPUs over the best
+
+
+                                                           3
+         System              Spec Type   Spec Parallel     Consistent KV-Cache Management                                          Latency-Optimized Kernels
+ SpecInfer, EAGLE [19, 25]     Tree          No                       easy to manage                                                    standard kernels
+        PEARL [21]           Sequence        Yes                      easy to manage                                                    standard kernels
+       PipeInfer [2]           Tree          Yes           no fine-grained re-use of draft cache                                standard kernels/CPU operations
+       AMUSD [24]            Sequence        Yes                      easy to manage                                                    standard kernels
+  SGLang, vLLM [17, 44]        Tree          No                       easy to manage                                                  limited optimization
+    SwiftSpec (Ours)           Tree          Yes         fined-grained reorganization, zero waste                                  fused latency-optimized ops
+
+
+                         Table 2 The comparison between SwiftSpec and other existing baselines
+
+2.2     GPU Constraints for Low Batch Size                                                                     coding/math tasks          natural language tasks
+                                                                                          8                                         8.0
+
+
+
+
+                                                                      compression ratio
+Modern GPUs feature high-bandwidth memory                                                 7                                         7.5
+(HBM) and fast interconnects (e.g., NVLink), and
+                                                                                          6                                         7.0
+they are typically optimized for large-batch through-
+                                                                                          5                                         6.5
+put workloads. In small-batch inference, common
+in interactive LLM serving, GPU performance suf-                                          4
+                                                                                              10     20   30   40    50    60
+                                                                                                                                    6.0
+                                                                                                                                            10    20     30        40   50   60
+fers due to underutilized kernels and communication                                                target model batch size                       draft model batch size
+overhead.                                                               Figure 2 Compression ratio (average number of correctly
+                                                                        guessed tokens per target model inference) while increas-
+In transformer layers executed with TP, three op-                       ing the batch size of the target model (left figure) and
+erators dominate runtime: GEMM, attention, and                          draft model (right figure)
+all-reduce. Under small batch sizes (≤ 8), these oper-
+ators exhibit poor bandwidth and compute utilization                    the draft model. Parallel sequence-based speculative
+due to short execution and frequent synchronization.                    decoding partially addresses this challenge by con-
+Some targeted optimizations, such as low-bit quanti-                    currently running the draft model to generate the
+zation [20, 36], reduce communication costs but fall                    next guesses (under the assumption that previous
+short of a holistic solution.                                           guesses are correct) while the target model verifies
+Similarly, state-of-the-art LLM serving frameworks                      those preceding guesses [21, 24].
+have reduced communication costs for small sizes by
+using the Nvidia collective communication library                       However, sequence-based methods typically exhibit
+all-reduce operator [17, 44]. Again, this falls short                   lower-quality guesses compared to tree-based ap-
+of a holistic solution. SwiftSpec instead introduces                    proaches. In tree-based speculative decoding, the
+latency-optimized kernels (§3.3) that fuse GEMM                         draft model proposes a tree of candidate token paths
+and all-reduce operators to greatly reduce overhead                     instead of a linear sequence. The target model veri-
+and enable fine-grained communication.                                  fies a path through this tree. This approach tends to
+                                                                        achieve higher compression ratios, i.e., tokens verified
+                                                                        per target inference. Compression ratio directly im-
+2.3     Tree-based Speculative Decoding                                 pacts the end-to-end latency, as higher ratios reduce
+2.3.1   Overview of Tree-based Approaches                               the number of target model invocations.
+
+Speculative decoding methods leverage a smaller                       So, while tree-based methods can improve compres-
+draft model to accelerate inference from a larger                     sion ratios, they also impose more complexity on the
+target model [3, 5, 18, 25]. These techniques typically               overall decoding system. First, while sequential ap-
+proceed in two stages: a drafting phase and a verifi-                 proaches often generate the single most probable next
+cation phase. In the drafting phase, the draft model                  token, it remains unclear how to optimally construct
+iteratively proposes a short sequence or a partial tree               tree nodes in parallel to maximize the compression
+[25] of potential next tokens. In the subsequent verifi-              ratio. Second, managing the KV cache to maintain
+cation phase, the target model verifies these proposed                a consistent view of accepted tokens and potentially
+tokens by performing a batched forward pass over the                  useful draft tree nodes introduces further complexity.
+drafted tokens and then sampling from the results.                    SwiftSpec supports tree-based parallel speculative
+The draft model then proceeds to predict the next                     decoding by addressing these two limitations through
+set of tokens, and this process is repeated until the                 two key innovations: parallel tree generation and
+target model concludes generation.                                    consistency management in asynchronous decoding
+Conventional speculative decoding approaches im-                      (§3.1–3.2).
+pose dependencies between the target model and
+
+
+                                                                  4
+2.3.2   Low Batch Sizes in Tree-based Specula-                 crease the degree of tensor parallelism for the Llama
+        tive Decoding                                          model family. It also shows that different models
+                                                               could have different compute requirements. For ex-
+Figure 2 shows the effects of increasing the batch size
+                                                               ample, the 70B model benefits from using 4 GPUs
+for the target and draft models when serving a single
+                                                               instead of 2, while there is no benefit from using
+request. We use Llama3 70B as the target model and
+                                                               more than 2 GPUs for the smaller models (1B, 3B,
+Llama3 3B as the draft model, and we generate 7 tree
+                                                               8B). Prior work using sequential speculative decoding
+layers (i.e., running the draft model 7 times) before
+                                                               (SpecInfer[25], EAGLE [19], etc) fails to address this
+running a batch (size 7) inference using the target
+                                                               lack of scalability, while our design of parallel tree
+model. In the first experiment (the left figure), we fix
+                                                               generation does (§3.1).
+the batch size of the draft model to be 16, and the
+average number of guesses only increases marginally            Lack of effective KV Cache management scheme
+after the batch size is larger than 16. In the second          for parallel tree-based speculative decoding. Tree-
+experiment (the right figure), we fix the batch size           based speculative decoding imposes a challenge
+of the target model to be 32, and when we increase             on consistent and effective KV cache management.
+the batch size of the draft model over 8, the average          While parallel sequence-based speculative decoding
+number of correct guesses of the target model almost           (PEARL[21], AMUSD[24]) has a concise way to man-
+stops increasing.                                              age the KV cache, only generating a chain of draft
+                                                               tokens yields a suboptimal compression ratio and thus
+As we can see, to minimize the latency of serving a
+                                                               low end-to-end performance. It is non-trivial to keep
+single request, it is usually sufficient to use a small
+                                                               the consistency between the KV cache of both models
+batch size (≤ 16) for both the target and draft mod-
+                                                               and the draft trees. PipeInfer [2] runs draft tree gen-
+els. Note that this characteristic is different from
+                                                               eration and target model verification in parallel and
+throughput-oriented systems [1, 40, 45], where larger
+                                                               generates multiple draft trees to fill up the bubbles
+batch sizes improve system throughput while satis-
+                                                               during execution. However, if some draft trees get
+fying SLOs, rather than minimizing the end-to-end
+                                                               invalidated, every draft tree generated after that will
+generation of a single request, which is the focus of
+                                                               be discarded, wasting the compute and yielding low
+our work.
+                                                               effective utilization. Therefore, to achieve a high per-
+                                                               formance, it is important—but challenging—to keep
+2.4     Key Limitations of Prior Work                          the KV cache consistent while maximizing the reuse
+This section describes how existing speculative decod-         of generated tokens. Our consistency management
+ing systems fall short in addressing the following key         scheme addresses this (§3.2).
+system challenges in single-request serving: (1) inde-
+                                                               Low utilization of the GPU kernels. While the compu-
+pendent scalability across draft and target models,
+                                                               tation and communication kernels are usually well-
+(2) KV cache consistency under speculative execu-
+                                                               optimized for large batch inference, with large com-
+tion, and (3) kernel under utilization under low batch
+                                                               putation and communication demands, they do not
+sizes.
+                                                               perform well under low batch size.
+Table 2 summarizes the differences between recent
+                                                               Table 3 shows the amount of bandwidth and compute
+work, and the following paragraphs provide a detailed
+                                                               utilization of the most time-consuming kernels in a
+analysis on why they fail to address those three chal-
+                                                               transformer layer of a LLama 70B model split across
+lenges.
+                                                               4 GPUs under a batch size of 8. The bandwidth
+Lack of scalability of the target and draft models             utilization shown for the all-reduce operation is the
+under low batch size. For sequential speculative de-           NVLink bandwidth, while for the other operators, it
+coding approaches, since there is a strict dependency          is the HBM to SRAM bandwidth utilization. Under
+between the target and draft models, tree-based spec-          this low batch size, all operators are communication-
+ulative decoding can only run one draft model and              intensive, yet the bandwidth utilization (both across
+the target model at the same time. Therefore, to use           GPUs and within a GPU) is low (< 10%) for both the
+parallelism for speculative decoding, we have to scale         all-reduce and attention operators. This is because
+both the draft and target models across all GPUs;              the amount of communication is small, and therefore,
+otherwise, some GPUs will be idle when running the             the time is mainly spent on synchronization and
+models. However, using more GPUs for TP does not               waiting for the first input to arrive in the GPU SRAM.
+necessarily decrease latency. Table 1 shows that the           Some frameworks (vLLM [17], SGLang [44], etc) use
+benefit of using more GPUs diminishes when we in-              the NCCL LL protocol to reduce the latency in the
+
+
+                                                           5
+      Operators    Time (in us)   Comp. Util. (%)   Band. Util. (%)                        Iteration 1                            Iteration 2                      Iteration 3
+ QKV projection            16.9              2.0%            18.7%                                           target worker                      target worker                   target worker
+                                                                                                            verified t1, t3, t6               verified t6, t9, t16          verified t16, t18, t21
+  mask attention           18.8          <0.01%               6.5%
+    O projection           10.8              2.5%            23.3%                                   t1                                  t6                           t16
+      all reduce           12.0          <0.01%               8.5%
+                                                                           Target            t2           t3                      t9      t10                  t17       t18            ...
+        SwiGLU             39.3              4.8%            44.6%         model                                             t11              t16                     t20      t21
+ down projection           18.1              5.2%            48.5%                                t5        t6
+
+      all reduce           15.3          <0.01%               6.6%
+
+                                                                                                                                         t6
+Table 3 The utilization of the most time-consuming                         Draft
+                                                                                                       t1                                                                t16
+
+                                                                                                t2          t3                     t9     t10                      t17      t18
+kernels in an int4 AWQ Llama 70B model when running                        model
+                                                                                           t4        t5          t6           t11       t12     t13            t19       t20      t21   ...
+TP on 4 GPUs.
+                                                                                      t7     t8           t9          t10   t14    t15               t24     t22   t27      t28 t29
+
+                                                                                                     t11 t12                                   t25    t26                t30 t31
+all reduce operator when communication volume is                                draft tree                         draft tree                         draft tree
+low. However, as shown in Table 2, there is still a                            roots at t1                       re-roots at t6                     re-roots at t16
+
+significant opportunity to improve kernels to reduce
+                                                                          Figure 3 Example of parallel tree generation. Each
+latency for small batch sizes. Our latency-optimized                      iteration re-roots the tree based on verified tokens, while
+kernels (in §3.3) fuse multiple optimizations to realize                  the KV-cache is reorganized to preserve useful state.
+this opportunity.
+
+3     SwiftSpec System Design and Ar-                                     model inference (and thus expand the leaves to get
+      chitecture                                                          potential children) each round (i.e., the batch size of
+                                                                          the draft model), d as the number of tree expansions
+SwiftSpec addresses the three key systems challenges                      in one round. Both target worker and draft worker
+identified in the prior section through a modular                         run in a loop until the end of the generation, and
+design built around: (1) parallel tree generation,                        synchronize when each finishes one iteration in the
+which enables asynchronous decoding and indepen-                          loop.
+dent GPU allocation (§3.1); (2) KV-cache consistency
+                                                                          In one iteration, the draft worker expands the draft
+management, which supports reuse and correctness
+                                                                          tree d times, by running inference on w unexpanded
+under speculative execution (§3.2); and (3) latency-
+                                                                          leaves (i.e., the leaves where the KV-cache and logits
+optimized fused kernels, which reduce communication
+                                                                          (probability distribution of the next token) are not yet
+and compute overhead under tensor parallelism (§3.3).
+                                                                          calculated) from the tree with the highest probability.
+We describe each component in turn.
+                                                                          After that, it synchronizes with the target worker to
+                                                                          get the verified tokens. Then it re-roots the draft tree
+3.1   Parallel Tree Generation                                            by walking down the tree using the path representing
+To enable independent scaling of draft and target                         the verified tokens and adjusts the KV cache to stay
+models, we introduce parallel tree generation, which                      consistent. After that, it grows the draft tree if there
+splits the decoding process across GPU groups sepa-                       are not enough nodes to send to the target, and then
+rately dedicated to drafting and verification. This al-                   it sends a sub-graph of the draft tree of size bs to the
+lows both models to operate concurrently and avoids                       target worker.
+placing the draft phase on the critical path. The two                     On the other hand, in one iteration, the target model
+groups communicate using NVLink/cross-network in-                         constantly gets the draft tokens from the draft tree
+terconnect. The draft tree GPUs manage the draft                          and runs batch inferences to calculate the logits. Af-
+tree and run draft inference to generate new tree                         ter that, it samples through the logits to generate the
+nodes, while the target GPUs run the target model.                        tokens one by one and then sends the verified tokens
+Both the draft and target models are split across                         back to the draft worker.
+their respective GPUs through tensor parallelism
+(TP). GPUs computing the same model are connected                         Figure 3 shows three decoding iterations. In each
+tightly using NVLink.                                                     iteration, the draft model grows the tree while the
+                                                                          target model verifies a subgraph. The tree is then
+Algorithm 1 details the interaction between draft and                     re-rooted, and verified tokens are promoted to the
+target models in each decoding iteration. Denote one                      KV cache. In this example, bs = 4, d = 3, w = 2.
+round (or one iteration) as the procedures of the draft
+and target model between two synchronization points.                      At the start, the draft tree is t1 , t2 , t3 , t4 , t5 , t6 , and
+Define bs as the batch size of the target model, w                        the draft workers select the top bs = 4 tokens
+as the number of leaves for which we run the draft                        (t1 , t2 , t3 , t5 ) to give as input1 to the target work-
+
+
+                                                                      6
+ers. During iteration 1, while the draft workers                  Input: Depth of tree to generate d, width of tree to
+continue growing the tree with 6 new nodes, the                          generate w, batch size of target model bs
+target workers run inference on input1 and sample 1 if Is_draft_worker then
+output1 = (t1 , t3 , t6 ). Then, the draft workers ver- 2            while True do
+                                                                         for i = 1 to d do
+ify that (t1 , t3 , t6 ) is a valid path in the tree and 3
+                                                                4             Expand the w most probable leaves from
+re-root at t6 . With enough nodes remaining, they
+                                                                              the tree;
+choose the next top 4 tokens (t6 , t9 , t10 , t11 ) as input2 .
+                                                                5        Get verified tokens from the target worker;
+During iteration 2, the draft workers grow 6 more 6                      if target worker signal to stop then
+nodes while the target workers process input2 and 7                           break;
+produce output2 = (t6 , t9 , t16 ). However, t16 is not 8                Update KV Cache and draft tree based on
+yet in the tree, so the draft workers re-root at t16                     verified tokens;
+and keep growing new nodes t17 , t18 , t19 , t20 , t21 , giv- 9          while Tree size < bs do
+ing (t16 , t17 , t18 , t20 ) as input3 . During iteration 3, a 10             Expand the w most probable leaves from
+similar process continues, with the draft and target                          the tree;
+workers running in parallel, growing and verifying 11                    Get the most probable subgraph of size bs
+tokens as they build out the tree.                                       from the draft tree;
+                                                        12        Send it to the target worker to verify;
+Maximum-likelihood tree expansion We use the log- 13 else if Is_target_worker then
+arithm of the softmax probability as the value of 14          while True do
+each node, and use the sum of values from the root 15             Get draft tokens from the draft tree worker;
+to each node as the weight. Thus, a higher weight 16              Verify the draft tokens by batch inference;
+means a higher probability that a token could be 17               if Reach the end of generation then
+                                                        18            Send the stop signal to the draft worker;
+generated (under the distribution of the draft model).
+                                                        19            Break;
+We keep the pair (value, node) in a priority queue to
+                                                        20        else
+efficiently get the most probable leaves in O(k log s),
+                                                         21           Send the verified tokens to the draft tree
+where s is the number of probable leaves to consider                  worker;
+and expand the tree.                                        Algorithm 1: Parallel tree generation algorithm
+GPU allocation for draft model and target model
+Given a GPU node of k GPUs, we will allocate x(1 ≤
+                                                                maximize parallelism.
+x ≤ k−1) GPUs to the target model and (k−x) GPUs
+to the draft model. To determine which x to use, we             Non-square mask support for efficient masked at-
+run a profile phase before serving the queries, where           tention kernel The attention operator in the target
+we try out different xs to find which configuration             model uses a square mask, since the target model
+yields the fastest average decoding speed. We found             takes a tree each time, and each token will only mask
+that if we fix the target model, the optimal x is               out the attention with those tokens that are not the
+smaller when we are using a more powerful draft                 ancestors within the current input. This is similar to
+model (more analysis is in 5.5)                                 prior work [25]. However, for the draft model, this
+                                                                is not the case. Consider the example in Figure 4
+Setting the batch size Larger bs, w will lead to higher         with a current tree of size 6, and we want to calculate
+acceptance ratio per iteration, but when bs, w get              the logits of 4 probable leaves, then regarding the
+larger and larger, the margin gain on the acceptance            tree cache, we only calculate the attention of each
+ratio will decrease, and total running time will in-            leave with its ancestor on the tree (and also all the
+crease. We set bs = 8 and w = 8 empirically to                  data that is in the prefix cache). In this case, we
+balance the acceptance ratio and running time, based            need a mask of at least size (4, 10) to contain all
+on our analysis in §5.5.                                        the necessary information. Therefore, we support a
+Setting the number of tree expansions d in one round.           non-square mask as input in our attention operator
+Before we start serving the requests, we first profile          for the draft model.
+the running time of both the draft model and the
+target model. Denote ttarget as one round of target             3.2   KV Cache Consistency Management
+model inference, and tdraf t as one round of draft tree         To maintain the consistency between the draft model
+                           t
+expansion. Define r = ⌊ ttarget
+                             draf t
+                                    ⌋. We set d = r or          and target model, we develop a consistency manage-
+d = r + 1 so that draft tree expansion and the target           ment scheme to reorganize the KV cache of the draft
+model verification finish nearly at the same time to            model so that it remains consistent with the target
+
+
+                                                            7
+        Draft Tree                                 New Tree Mask                                 Figure 5 shows an example of how the KV cache
+                        t1                              t1 t2 t3 t4 t5 t6 t7 t8 t9 t10           of the draft model is updated when there are new
+                  t2         t3                    t7 ✓ ✓   ✓     ✓                              verified tokens. Suppose the sequence (t1 , t3 , t7 , t10 )
+                                                   t8 ✓ ✓   ✓       ✓                            is already verified, and the prefix of the cache is
+             t4        t5         t6
+                                                   t9 ✓ ✓     ✓       ✓
+        t7        t8        t9         t10        t10 ✓   ✓     ✓       ✓                        the KV states of those tokens, and the KV states
+                                                                                                 of the draft tree tokens are organized contiguously
+Figure 4 Example of a non-square tree mask during draft                                          after the prefix. When we update the verified tokens
+tree expansion: yellow nodes are the leaves to expand,                                           to be (t1 , t3 , t7 , t10 , t12 , t15 ), we walk down the draft
+and the blue nodes are the existing tree nodes                                                   tree using the newly verified tokens (t12 , t15 ). Then
+                                                                                                 we reach the node t15 , which means the nodes in
+          Verfied sequence:                                                                      the subtree, t17 , t18 , are still useful in the future.
+            t1, t3, t7, t10                               Prefix           Tree
+                        t10
+                                                          cache           cache                  Therefore, we move t12 , t15 to the prefix cache so
+                   t11 t12
+                                                                                                 that it stores the information of the same verified
+verify tokens t13 t14 t15
+                                             t1 t3 t7 t10 t11 t12 t13 t14 t15 t16 t17 t18
+                                                                                                 tokens as the target model. Then it reorganizes the
+  (t12, t15)
+                 t16 t17 t18                       put verified tokens the remaining nodes       remaining sub-tree of t15 (i.e. t17 , t18 ) into the next
+          Verfied sequence:
+                                                     into the prefix      to tree cache          positions available, discarding the KV states that are
+        t1, t3, t7, t10, t12, t15
+                        t15
+                                                                                                 no longer useful (e.g. t11 , t12 , etc).
+                                             t1 t3 t7 t10 t12 t15 t17 t18 ..   ..   ..
+                       t17 t18
+                                                                                                 In the case where the draft tree does not have enough
+Figure 5 KV cache management of the draft model: each                                            nodes to send back to the target worker, it expands
+time after the new verified tokens get updated, the KV                                           bs nodes immediately using one draft model inference.
+states of the verified tokens will be in the prefix of the                                       In either case, the draft tree will have enough nodes
+KV cache (green part), and the KV states of the draft                                            to pass to target workers, therefore entering the next
+tree tokens will be right after the prefix (yellow part).                                        iteration, with the KV states synchronized across the
+                                                                                                 draft model, the target model, and the draft tree.
+
+model and the draft tree and maximizes the re-use                                                3.3    Latency-Optimized Kernels Design
+of previously computed KV states.
+                                                                                                 To reduce the inference time of both draft and tar-
+Throughout the execution, we organize the KV Cache                                               get under low batch size, we design and implement
+of the draft model as follows and keep it as an invari-                                          latency-optimized operators for the LLama and Qwen
+ant throughout the execution: the KV states of the                                               model family. While our design could be applied to
+verified tokens are stored continuously in the prefix                                            any precision, we implement it for the int4 AWQ
+of the KV cache (which we call prefix cache), and the                                            quantized model. The operators we optimize include
+KV states of the tree are stored right after the prefix                                          all-reduce, masked attention, and SwiGLU. We first
+(which we call tree cache).                                                                      introduce the Nvidia Collective Communication Li-
+                                                                                                 brary’s Low Latency (NCCL LL) protocol, which our
+While the target worker is doing batch inference and
+                                                                                                 work leverages heavily.
+sampling on the tokens from the draft workers, the
+draft worker keeps generating new tree leaves in the                                             NCCL LL protocol.          This is a communication
+draft tree, appending the tree cache after the existing                                          scheme to reduce the latency of GPU-to-GPU send
+entries.                                                                                         and receive operations. Algorithm 2 shows the
+                                                                                                 store and load function of the LL protocol. The
+Re-organization of KV cache for verified tokens After                                            functions AtomicStore and AtomicLoad are NVidia
+the target worker samples the tokens, it sends the                                               GPU PTX instructions ld.volatile.global.v4.u32 and
+verified tokens to the draft worker. The draft worker                                            st.volatile.global.v4.u32, which load and store 16
+then walks through the tree using the verified tokens                                            bytes of data from and to the global memory in
+and reroots at the last verified token. Then, if the                                             the same or different GPUs. Each 8-byte (2 32-bit
+last verified token exists in the current draft tree,                                            unsigned integers) load/store is atomic.
+then we will reorganize the tree cache so that only
+the KV states of the nodes in the new subtree remain                                             The storeLL function takes a 64-bit integer val and a
+in the tree cache. In this way, even when some of the                                            32-bit integer flag, splits val into two 32-bit integers,
+predicted tokens we send to the target worker are                                                and stores them each with f lag to a memory location.
+wrong, we can still reuse all the computed KV states                                             The loadLL function takes a memory location and a
+in the subtree, avoiding any recomputation.                                                      flag. It keeps polling until the flag at the memory lo-
+
+
+                                                                                             8
+ 1   Function                                               ure 6 shows the computation and data flow within
+  storeLL(dst: address, val: 64-bit int, flag: 32-bit int): one thread block when we run GEMM fused with
+2    val_low ← lower 32 bits of val;                        all reduce. Each thread block has three steps during
+3    val_high ← upper 32 bits of val;                       execution:
+4    AtomicStore(dst, val_low, f lag, val_high,
+                                                               • The threadblock calculates a contiguous set of
+     f lag);
+                                                                  columns in the final result matrix.
+5    Function
+     readLL(src: address, flag: 32-bit integer):                         • The threadblock starts sending the result to each
+6       data1, f lag1, data2, f lag2 ← 0;                                  GPU using the NCCL LL protocol.
+ 7      repeat
+                                                                         • The threadblock on each GPU waits until the
+ 8          f lag1, data1, f lag2, data2 =
+                                                                           results are available, aggregates them to get the
+           AtomicLoad(src) ;
+                                                                           final results, and stores them back to the global
+9       until;
+                                                                           memory on the current GPU.
+10      flag1 = flag and flag2 = flag;
+        val64 ← data1 + (uint64_t)data2 ≪ 32 ;                       The synchronization between steps 2 and 3 is imple-
+                                              
+11
+12      return val64;                                                mented using just the NCCL LL protocol described
+       Algorithm 2: storeLL and readLL Function                      above and no additional, expensive mechanisms.
+                                                                     Masked attention. For the mask-attention operators,
+        Stream multi-proccessors                                     we fuse the position embedding with the attention
+           One thread block                                          calculation. Then, within one GPU, we first split
+                                                                     the computation of the single attention head between
+          1) Compute a tile 2) send results to 3) read and sum       different thread blocks. After the calculation, the
+              of matrix     each GPU using       results from
+            multiplication     LL protocol     global memory         threadblocks aggregate the sum using the NCCL LL
+                                                                     protocol within a single GPU. Similar to our Fused
+                                                                     GEMM with all-reduce operators, we add up the
+                              shared memory                          results within one attention head without explicit
+                                                                     synchronization across thread blocks or extra kernel
+                              global memory                          launches.
+                              remote memory                          Fused   SwiGLU. This operator is of the form
+                                                                     SwiGLU (x, W, V, b, c) = σ(xW + b) ⊕ (xV + c). We
+     Figure 6    Execution flow of fused GEMM all-reduce             implement tile-based matrix multiplication, where
+     operator                                                        each threadblock calculates the same tile of the two
+                                                                     matrix multiplications. This avoids loading the input
+                                                                     twice from the GPU HBM. Right after we get the
+     cation matches the expected one, and then combines              output of the tiles, we calculate the sigmoid and dot
+     the 2 32-bit integers into a 64-bit integer to return.          product before putting the results back to the GPU
+                                                                     memory, avoiding unnecessary data movement.
+     Using those two functions, we can implement a com-
+     munication scheme without any explicit synchroniza-
+     tion. Assume that last time we store some value x               4     Implementation
+     as a flag, and this time we use x + 1. The other
+                                                                     We implement our latency-optimized kernels using
+     compute unit (another stream multi-processor in the
+                                                                     ∼ 3000 lines of CUDA and C++, and our tree-based
+     same GPU or on another GPU) will know the data
+                                                                     parallel speculative decoding using ∼ 4000 lines of
+     is ready when it sees x + 1 as the flag, without any
+                                                                     C++ and Python. We use the CUTLASS library [32]
+     additional synchronization. In our latency-optimized
+                                                                     to implement the fused, latency-optimized kernels.
+     kernels, we heavily rely on this powerful primitive
+     to reduce synchronization overhead both within and              Aside from the optimized, fused all-reduce operators
+     across GPUs.                                                    within the decoder layers in the transformer mod-
+                                                                     els, we use the NCCL library to communicate and
+     Fused GEMM with all reduce. To further reduce
+                                                                     synchronize states between different workers.
+     the data movement overhead and save the number
+     of synchronization barriers, we fuse each all-reduce            We wrap our optimized CUDA kernels in Python
+     operation with the preceding GEMM operation. Fig-               and capture all the kernels in a forward pass into
+
+
+                                                                 9
+         Target model                      Draft model
+     Llama-3-70b-Instruct          Llama-3.2-3B, EAGLE-0.99B
+                                                                         non-padded model.
+  deepseek-coder-33b-instruct       deepseek-coder-1.3b-instruct
+      Qwen2-72B-Instruct         Qwen2-1.5B-Instruct, EAGLE-1.05B
+ DeepSeek-R1-Distill-Qwen-32B     DeepSeek-R1-Distill-Qwen-1.5B          5     Evaluation
+ DeepSeek-R1-Distill-Llama-70B     DeepSeek-R1-Distill-Llama-8B
+                                                                         In our evaluation, we want to answer and analyze the
+Table 4 The set of models we use in our evaluation of
+                                                                         following questions:
+our approach and baselines
+                                                                             • What is the end-to-end improvement of Swift-
+                                                                               Spec compared to other speculative decoding
+a CUDAGraph for both our draft model and target                                baseline systems? (in §5.2)
+model to reduce kernel launch overhead.
+                                                                             • How much does parallel tree generation (with kv-
+Saving the number of CUDAGraphs for variable-sized                             cache synchronization in asynchronous decoding)
+masks. A CUDAGraph only supports a fixed-shape                                 improve the end-to-end performance? (in §5.3)
+input. To reduce the number of CUDAGraphs that
+we need to capture, we perform a small optimization.                         • How much does latency-optimized kernels im-
+We pad all tree masks to a fixed-size shape of (w,                             prove the end-to-end performance? (in §5.3)
+maxseqlen), where w is the number of leaves to ex-                           • What is the improvement of single operators
+pand, and we copy the tree mask of size (w, w + T ),                           using our latency-optimized kernels? (in §5.4)
+where T is the size of the tree, into the suffix of this
+larger structure and mask the prefix to be all 1’s.                          • What are the design choices we make to achieve
+This allows us to reuse CUDAGraphs with variable-                              good performance using our framework? (in
+sized inputs. Specifically, we only need to capture                            §5.5)
+O(wmax ) (which is less than 20) CUDAGraphs, while
+supporting tree masks of more than one thousand                          5.1    Experiments setup
+different shapes.
+                                                                         Cluster setup We evaluate SwiftSpec and the base-
+Enabling arbitrary tensor parallelism for transformer                    lines on one node with 8 NVIDIA 80GB H800 SXM
+models. Llama models (and transformer models from                        GPUs connected by NVLink, which is the most com-
+other families) usually need to satisfy two constraints                  mon setup of a Nvidia Hopper compute node. We use
+before running tensor parallelism across x GPUs: (1)                     all 8 GPUs to minimize the decoding latency for all
+the dimension of the matrix multiplication (after split                  of our experiments, except that, in §5.4, we show the
+across x GPUs) is divisible by the GEMM kernel’s                         performance improvement of our latency-optimized
+block size (usually 128 or 256); and (2) the number                      kernels under a subset of these GPUs.
+of attention heads must be divisible by x so that
+each attention head can be distributed to a single                       Models and model configurations We evaluate our
+GPU. When we split the LLama 70B model across a                          system under five different pairs of models (as shown
+power-of-two number of GPUs (i.e, 1/2/4/8), those                        in 4) from different families, including LLama3
+two requirements are naturally satisfied since the                       [33], Deepseek-Coder [12], Qwen2 [38], Deepseek R1-
+number of attention heads and the dimension of the                       Distilled Qwen, and Deepseek R1-Distilled Llama
+70B model are divisible by a large power of 2.                           [9]. Deepseek-Coder is a series of models that focus
+                                                                         on coding, while the rest of the model families have
+However, when we want to enable a more fine-grained                      general abilities. From each model family, we pick
+allocation of the draft model and the target model                       a large model as the target model (generally having
+(e.g., using 6 GPUs for the target model and 2 GPUs                      > 30B parameters) and a small model as the draft
+for the draft model), those two requirements may                         model (< 10B). For Llama3 and Qwen2 family, there
+not be satisfied. To resolve this, we increase the                       are also trained EAGLE2 models, so we used those
+dimension of the matrix operation so that they are                       in the baselines, which supports EAGLE-based [19]
+divisible by the number of GPUs x and zero-pad. For                      speculative decoding. We apply 4-bit AWQ quantiza-
+the attention calculation, we increase the number                        tion with a group size of 128 [20] to all the weights of
+of attention heads so that it is divisible by x, and                     the transformer layers models in each family except
+we also pad the projection matrix before and after                       the EAGLE models. We keep the BF16 precision
+the multi-head attention so that the calculation of                      for the embedding layers and the LM head operator.
+padded attention heads does not contribute to the                        Each model uses BF16 to compute the attention and
+final result and the model output is equivalent of the                   the linear operators (after weight de-quantization).
+
+
+                                                                    10
+                 EAGLE   smaller draft   draft TP   tree spec        performance
+    vLLM           ✓          ✓             ×           ×            not optimal
+   SGLang          ✓          ×             ✓           ✓         optimal (EAGLE)                                      End-to-end decoding performance across different baselines
+  TRT-LLM          ✓          ✓             ✓           ×            not optimal                                                   SwiftSpec-full       vllm           trtllm
+SwiftSpec-base                                                  optimal (smaller draft)
+                   ×          ✓             ✓           ✓
+                                                                                                                                   SwiftSpec-base       sglang
+Table 5 The support matrix for different baselines in the                                                        400
+
+
+
+
+                                                                                               tokens / second
+evaluation under int4 AWQ                                                                                        300
+                                                                                                                 200
+We apply the same quantization to both the base-                                                                 100
+line and our system, and therefore, even with the                                                                 0
+latency-optimized kernels, the computation of each                                                                         Llama     DS-Coder      Qwen      R1-Qwen     R1-Llama
+                                                                                                                            70B        33B          72B        32B         70B
+single model in our system is equivalent to that of                                                                                             Model Family
+each baseline model.                                                                           Figure 7 End-to-end decoding speed comparison between
+                                                                                               baselines.
+Datasets We evaluated our system in six different
+datasets across different domains: MT-bench [43],                                                                  GPUs.
+HumanEval [7], GSM8K [8], Alpaca [31], CNN/Daily                                               Table 5 shows the configuration of speculative de-
+Mail [26], and Natural Questions [16]. The datasets                                            coding that each baseline supports. As shown in
+consist of tasks including summarization, math ques-                                           later benchmarks, the most competitive baselines
+tions, coding questions, etc.                                                                  are SGLang and SwiftSpec-base since they support
+Baseline systems We compare our solution against                                               serial tree-based speculative decoding for EAGLE
+three major LLM serving frameworks:                                          vLLM,             and a smaller draft, respectively. For each baseline
+SGLang, and TensorRT-LLM.                                                                      implementation of each model, we run them in an
+                                                                                               extensive set of configurations and choose the configu-
+  • vLLM [17]: vLLM supports both EAGLE and                                                    ration that maximizes the average tokens per second
+    a smaller model from the same model family                                                 across all the datasets.
+    as the draft model. However, it only supports
+    sequence-based speculative decoding for both                                               5.2                     End-to-end results
+    cases.
+                                                                                               Figure 7 shows the end-to-end benchmark on the
+  • SGLang [44]: SGLang supports using the EA-                                                 decoding speed of SwiftSpec along with the four base-
+    GLE model as the draft model, with tree-based                                              lines, vLLM, SGLang, TRT-LLM, and SwiftSpec-
+    generation. Out of the five model families we                                              base. Due to the limitation that vLLM and TRT-
+    benchmark on, only two pairs (Llama 70B and                                                LLM only support sequence-based speculative decod-
+    Qwen 72B) have the corresponding EAGLE draft                                               ing, their performance is not comparable with SGlang
+    model, and therefore, we benchmark the speed                                               and SwiftSpec-base. For the Llama 70B model and
+    of the normal auto-regressive generation for the                                           the Qwen 72B model, EAGLE speculative decoding
+    other three model families.                                                                is supported in SGLang, and thus SGLang has a
+                                                                                               comparable performance with SwiftSpec-based; for
+  • TRT-LLM [27]: Under int4-awq precision, TRT-
+                                                                                               the other models (Deepseek-Coder, R1-Qwen, and
+    LLM only supports sequence-based speculative
+                                                                                               R1-Llama), we benchmark SGLang with autoregres-
+    decoding with a smaller draft model.
+                                                                                               sive decoding since EAGLE and other speculative
+Since the normal tree-based speculative decoding                                               decoding methods are not supported. Therefore, for
+with tensor parallelism is not supported on vLLM                                               those models, SwiftSpec-base serves as a baseline
+and TRT-LLM, to make a fair comparison with the                                                that we can compare more fairly. As shown in Fig-
+existing techniques, we also implement:                                                        ure 7, our SwiftSpec system consistently outperforms
+                                                                                               SwiftSpec-base (by an average of 1.75×) and SGLang
+  • SwiftSpec-base: This is an implementation with
+                                                                                               (on average 2.23×), the two most competitive base-
+    only our optimized custom attention kernels. It
+                                                                                               lines in the benchmark.
+    uses the one-shot all-reduce implementation in
+    the PyTorch Distributed library, and a SwiGLU
+                                                                                               5.3                     Ablation studies
+    implementation using normal AWQ multiplica-
+    tion kernel and PyTorch implementation of silu                                             In this paper, we propose three techniques, which help
+    activation and dot product. It also performs                                               two classes of optimizations: Parallel tree generation
+    sequential speculative decoding with the draft                                             and consistency management together support effi-
+    model and the target model both running on all                                             cient parallel tree-based speculative decoding, while
+
+
+                                                                                          11
+                                                                                                                            model time       compression ratio for different datasets
+                            End-to-end decoding performance across                                      Decoding speed    target    draft   ALP GSM HE MT QA SUM
+                              different configurations of SwiftSpec                          parallel    275 tokens/s    10.48ms 3.25ms     2.92   3.78 3.92 3.11 2.74 3.56
+                         SwiftSpec-full                    SwiftSpec-only-kernel-opt          serial     200 tokens/s    10.34ms 3.73ms     3.28    4.2    4.04 3.42 3.12 3.72
+                         SwiftSpec-only-parallel-tree      SwiftSpec-base
+                  400                                                                       Table 6 The comparison of compression ratio, model
+tokens / second
+
+
+
+
+                  300                                                                       inference time, and decoding speed under parallel and
+                                                                                            serial tree generation for model Qwen2-72B and draft
+                  200
+                                                                                            model Qwen2-1.5B. ALP, GSM, etc are the abbreviations
+                  100                                                                       of the six datasets we use in the benchmark.
+                   0
+                        Llama      DS-Coder       Qwen      R1-Qwen     R1-Llama            8 GPUs for both models, the parallel version uses 2
+                         70B         33B           72B        32B         70B
+                                               Model Family                                 GPUs for the draft model and 6 GPUs for the target
+Figure 8 End-to-end decoding speed comparison across                                        model.
+different configurations of SwiftSpec
+                                                                                            Table 6 shows the compression ratio (average number
+                                                                                            of successful guesses per target model verification)
+latency-optimized kernels support more efficient ker-
+                                                                                            and the target and draft model inference time un-
+nel execution. We study the effect of each of those
+                                                                                            der parallel/serial speculative decoding ( 1 and 3 ).
+two classes of optimizations to reason about where
+                                                                                            When we are running parallel tree generation instead
+our performance gain comes from.
+                                                                                            of serial speculative decoding, the draft model does
+As shown in Figure 8, we benchmark our frame-                                               not know the result of the concurrent target model
+work under four different configurations of our                                             verification, and thus it generates some nodes that
+framework: 1 SwiftSpec, 2 SwiftSpec-only-parallel-                                          are not useful after the verification. Therefore, the
+tree, 3 SwiftSpec-only-kernel-opt, 4 SwiftSpec-base.                                        compression ratio is smaller when we use parallel tree
+SwiftSpec and SwiftSpec-base are introduced earlier;                                        generation. However, due to our maximum-likelihood
+SwiftSpec-only-parallel-tree is a version of SwiftSpec                                      expansion of the draft tree and the maximized reuse
+with only the parallel tree generation mechanism                                            of the KV cache, the compression ratio is only 9% less
+and the optimized attention kernels, while SwiftSpec-                                       than the serial version on average. Furthermore, our
+only-kernel-opt is a version of SwiftSpec with only                                         draft model inference time decreases from 3.72ms to
+the latency-optimized kernels (and serial speculative                                       3.25ms using only 2 GPUS instead of 8 GPUs saving
+decoding). Note that all four configurations contain                                        79% of the GPU cycles during one round of draft-
+our customized attention kernels since a non-square                                         ing, and our target model has nearly no slow down
+mask is needed to support our tree expansion algo-                                          using 6 GPUs instead of 8 GPUs (from 10.34ms to
+rithm, which is not supported by other works. We                                            10.48ms), still saving 25% of the GPUs cycles during
+reason about the improvement of our attention kernel                                        one round of target verification. As a result, the
+optimization alone later in this section and also in                                        end-to-end tokens-per-second of Qwen2-72B model
+the kernel micro-benchmark section (§5.4).                                                  increases from 200 to 275 (by 37%) by applying our
+                                                                                            parallel tree generation and KV cache management
+Effect of parallel tree generation (with KV synchro-                                        scheme.
+nization) To show the effect of our parallel tree gen-
+eration with KV cache consistency management, we                                            Effect of latency-optimized kernels To illustrate ef-
+compare 1 with 3 (using vs not using parallel tree                                          fect of our latency-optimized fused GEMM-all-reduce
+generation under latency-optimized kernels) and 2                                           kernel and SwiGLU operators, we compare 1 with 2
+with 4 (using vs not using parallel tree generation                                         (using vs not using those kernels under parallel tree
+without latency-optimized kernels). As shown in Fig-                                        generation) and 3 with 4 (using vs not using those
+ure 8, 1 outperforms 3 by an average speedup of                                             kernels under serial tree generation. ). As shown in
+1.43×, and 2 outperforms 4 by an average speed of                                           Figure 8, 1 outperforms 2 by an average speedup of
+1.50×.                                                                                      1.16×, and 3 outperforms 4 by an average of 1.21×.
+                                                                                            Therefore, those two kernel optimizations give the
+To look deeper into how our parallel tree generation                                        end-to-end improvement of at least 16% for both
+mechanism brings an improvement of an average                                               parallel and serial tree generation.
+of 43% (from 3 to 1 ), we look specifically into
+the Qwen2 model family as an example, where the                                             To illustrate the improvement of our optimized at-
+optimal configurations (including tree depth d, tree                                        tention kernel, we benchmark the Llama 3B model
+width w, etc) are the same for using and not using                                          under TP=4 as an example. Under an input token
+parallel tree generation. While the serial version uses                                     length of 8 and a context length of 500, an inference
+
+
+                                                                                       12
+                    End-to-end performance across different resource configurations         tion libraries: FlashAttention (FA) and FlashInfer
+                                                                       Target TP = 2        (FI). To make a fair comparison to FA and FI, which
+                  400                                                  Target TP = 4
+                                                                       Target TP = 6        only support square kernels, during the benchmark,
+tokens / second
+
+
+
+                  300                                                                       we only feed square masks to our tree attention kernel,
+                  200                                                                       even though it supports a more general non-square
+                  100                                                                       mask. We use BatchPrefillWithPagedKVCacheWrap-
+                                                                                            per in FlashInfer, which supports a square custom
+                   0
+                          Llama
+                           70B
+                                    DS-Coder
+                                      33B
+                                                  Qwen
+                                                   72B
+                                                            R1-Qwen
+                                                              32B
+                                                                      R1-Llama
+                                                                        70B
+                                                                                            mask. However, the kernel is not optimized for small
+                                               Model Family                                 numbers of attention heads, and, therefore, performs
+Figure 9 End-to-end decoding speed comparison using                                         much worse than the other baseline, FA. FA uses ker-
+different resource configurations for draft model and tar-
+                                                                                            nel flash_fwd_splitkv_kernel to split each kv head
+get model
+                                                                                            across different threadblocks to compute the attention
+of the 3B model with all the latency-optimized ker-                                         score and sum faster, and then it launches another
+nel optimizations takes 3.25 ms to finish, while an                                         kernel flash_fwd_splitkv_combine_kernel to aggre-
+inference with a FlashAttention kernel takes 3.54 ms.                                       gate the results across different threadblocks. On
+This shows an 8.2% reduction in the inference time                                          the other hand, our kernel fuses those two kernels
+of the Llama 3B model using our optimized attention                                         into one, using the NCCL LL protocol to perform an
+kernel.                                                                                     implicit barrier, saving time for the overhead of syn-
+                                                                                            chronization and an extra kernel launch. As shown
+Refer to §5.4 for the inference time of individual op-                                      in Table 7, our optimization kernel constantly saves
+erators to understand our per-operator improvement.                                         30% to 56% of the running time compared to FA
+                                                                                            under two representative context lengths, 500 and
+5.4                     Latency-optimized                  operator              mi-        1000, across different model configurations.
+                        crobenchmark                                                        SwiGLU operator In each layer of the Llama3 model,
+In Table 7, we show the individual kernel times of                                          we fuse the four operations in the SwiGLU opera-
+our latency-optimized kernels and kernels in other                                          tor (SwiGLU (x, W, V, b, c) = σ(xW + b) ⊕ (xV + c))
+baselines. We focus on the Llama3 model family as                                           into one, reducing data movement and extra kernel
+a specific example, while our optimizations are also                                        launches. Both vllm and TRTLLM fuse the dot prod-
+applied to other model families in our benchmark,                                           uct operator with the σ activation operator. Further-
+achieving similar speedup.                                                                  more, vllm fuses the first two matrix multiplications
+                                                                                            into one operator. As shown in Table 7, our SwiGLU
+Fused GEMM with all reduce In each layer of the                                             optimization outperforms other baselines (with a time
+Llama3 model under tensor parallelism, there are                                            reduction of 39%-50%) when the model is small (1B,
+two all-reduce operations, one in the attention block,                                      3B), where latency dominates the whole execution
+and the other in the MLP block. We fuse each all-                                           time. When the model is larger and the amount of
+reduce operation with the previous GEMM. In the                                             computation is more (for the 70B model), TRTLLM
+implementation of both vllm and TRTLLM, they use                                            and vllm outperform our kernel since they have more
+their implementation of one-shot all-reduce, and they                                       optimized kernels (including AWQ marlin, where a
+perform the all-reduce operations after the GEMM                                            more intricate layout of weight matrices is used to
+operations as separate kernels. We sum up the time                                          improve performance), while our kernel is based on
+spent on two kernels as their total time. In our                                            simple tile-based GEMM and uniform layout.
+solution, we fuse the GEMM operation with our im-
+plementation of one-shot all-reduce. As shown in                                            5.5   Design choices
+Table 7, our fused GEMM-all-reduce kernel consis-
+                                                                                            Choice about target batch size, draft batch size,
+tently outperforms vllm and TRTLLM on all five
+                                                                                            depth In section 2.3, Figure 2 shows that increasing
+model configurations. Our improvement is larger
+when the amount of compute is less: this happens for                                        the draft model batch size over 8 only increases the
+the fused GEMM in attention block for all models                                            compression ratio marginally. For the target model,
+(with a time reduction of 23%-43%) and that in MLP                                          there is still an average increase of 24.5% when we
+block for the smaller models, 1B, 3B, and 8B (with                                          increase the batch size from 8 to 16. However, for
+a time reduction of 16%-25%).                                                               example, if we increase the batch size of the Llama3-
+                                                                                            70B model from 8 to 16 under TP=4, the inference
+Attention operator For the attention operator, we                                           time will increase from 10.39 ms to 13.25 ms (by
+compare our implementation with two popular atten-                                          29%). Thus, the increase in compression ratio does
+
+
+                                                                                       13
+                 Fused GEMM (attn)       Fused GEMM (mlp)             SwiGLU           Attn, len(context)=500    Attn, len(context)=1000
+                Ours    vllm   TRT      Ours    vllm   TRT     Ours     vllm   TRT     Ours     FI       FA       Ours      FI      FA
+ 1B, tp = 4     5.9us  12.9us 10.2us    8.3us  18.8us 11.0us    5.8us  12.3us 11.5us   6.3us 13.6us     13.8us    6.2us   22.8us 13.8us
+ 3B, tp = 4     6.4us  12.3us 10.0us    8.7us  17.0us 10.3us    7.2us  12.5us 11.8us   6.2us 19.1us     17.2us   8.0us    33.4us 18.3us
+ 8B, tp = 4     7.7us  14.6us 10.3us   10.5us 16.5us 11.9us    15.0us 16.3us   15us    6.4us 19.4us 17.75us       8.1us   33.4us 18.13us
+ 70B, tp = 4   11.72us 16.9us 15.5us   24.3us 25.4us 26.1us     49us   36.7us 31.9us   9.6us 19.2us     19.0us   13.4us 33.2us     19.1us
+ 70B, tp = 8   13.3us  25.7us 17.2us   19.9us 29.5us 20.7us    23.6us 22.5us   22us    6.4us 18.6us     17.8us    8.1us   32.7us 18.2us
+
+Table 7 Time per kernel of our optimized operator under batch size 8 across different TP configurations in the Llama
+family.
+
+not cover the increase in inference time. Furthermore,                 draft model and target model that is hard to break.
+reducing the batch size to under 8 does not reduce                     Therefore, our approach is more suitable when an "in-
+the inference time (e.g. It takes 10.32ms under batch                  dependent" draft model, preferably a smaller model
+size 4) since the smallest first input dimension of the                from the same model family, is available. How to
+matrix multiplication tensor core operation is 8. As                   integrate our method with EAGLE is left as future
+a result, we use batch size = 8 for both our target                    work.
+model and draft model.
+                                                                       High-throughput serving Our use of int4 quantized
+To choose d, the number of tree expansions each                        model and its latency-optimized kernels are naturally
+round, as reasoned in §3.1, we choose one of the                       not suitable for high-throughput serving scenarios
+two integers that are closest to the time ratio of a                   where the batch size is larger (e.g. ≥ 64). However,
+target model inference and one round of draft tree                     we believe our parallel tree generation algorithm could
+expansion. In the benchmark, for each model pair,                      still be useful for larger batch sizes (especially when
+we run SwiftSpec using those two different ds based                    the GPU interconnect is slow) since it effectively de-
+on the draft and target model execution time and                       creases the amount of communication across different
+choose the configuration with the higher decoding                      GPUs. However, as speculative decoding is generally
+speed.                                                                 useful when the workload of the system is relatively
+                                                                       light [22], when the system workload is high and it is
+Draft model and target model resource allocation.
+                                                                       more cost-efficient to run autogressive decoding, our
+Figure 9 illustrates how flexible allocation of GPU                    approach, based on speculative decoding, becomes
+resources between draft and target models affects                      less effective as well.
+overall decoding performance. Specifically, it shows
+the performance of each model family when we al-                       Disaggregated execution LLM serving systems such
+locate different numbers of GPUs to the target and                     as [29, 45] use the idea of disaggregating the prefill
+draft models. We only consider TP=2,4,6 for the                        phase and the decoding phase. SwiftSpec’s parallel
+target model since even degree of tensor parallelism                   tree generation idea is similar in spirit to those ap-
+is more aligned to the attention operators and ma-                     proaches, allowing different types of computation to
+trix multiplications and thus requires less padding.                   scale independently. On the other hand, SwiftSpec
+For Deepseek-Coder 33B and Qwen2-72B, we find it                       focuses on disaggregating different components in
+optimal to use TP=6 for the target model and TP=2                      the decoding phase and is thus orthogonal to those
+for the draft model, and for other models, it is the                   approaches. Therefore, approaches that accelerate
+best to use TP=4 for both models since for those                       the prefill phase [23, 42] are complementary to our
+model pairs, giving more compute to a more capable                     system.
+draft model can increase the number of tree layers
+and thus increase the number of accepted tokens per                    7   Conclusion
+round.
+                                                                       Increasing the decoding speed of large language mod-
+6    Discussion and Limitations                                        els by scaling speculative decoding is important yet
+                                                                       challenging for reducing end-to-end request latency.
+EAGLE speculative decoding vs smaller-draft spec-                      This paper proposes SwiftSpec, which includes three
+ulative decoding While SwiftSpec could make nor-                       key innovations: parallel tree generation, consistent
+mal speculative decoding with a smaller draft model                    KV cache management, and latency-optimized ker-
+faster, it is non-trivial to apply them into EAGLE                     nels. Combining those three techniques, we are able
+speculative decoding, since the EAGLE model takes                      to serve five different models in different model fam-
+the target model output of the verified tokens as in-                  ilies with an average decoding speed 1.75× faster
+put, imposing a even stricter dependency between                       than the most competitive baselines. Particularly,
+
+
+                                                                  14
+SwiftSpec can serve the Llama3 70B model on an
+average of 348 tokens per second, which is currently
+the fastest system using Nvidia Hopper GPUs. We
+believe the parallel tree generation with KV cache
+consistency and fused operator strategies are general
+and independent of the particular model families we
+test, so we expect these key techniques SwiftSpec
+to generalize to future speculative decoding architec-
+tures.
+
+
+
+
+                                                         15
+References                                                           Krueger, Michael Petrov, Heidy Khlaaf, Girish Sas-
+                                                                     try, Pamela Mishkin, Brooke Chan, Scott Gray,
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar,                        Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz
+    Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani,                 Kaiser, Mohammad Bavarian, Clemens Winter,
+    Alexey Tumanov, and Ramachandran Ramjee. Tam-                    Philippe Tillet, Felipe Petroski Such, Dave Cum-
+    ing Throughput-Latency tradeoff in LLM inference                 mings, Matthias Plappert, Fotios Chantzis, Eliza-
+    with Sarathi-Serve. In 18th USENIX Symposium                     beth Barnes, Ariel Herbert-Voss, William Hebgen
+    on Operating Systems Design and Implementation                   Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie
+    (OSDI 24), pages 117–134, Santa Clara, CA, July                  Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain,
+    2024. USENIX Association. ISBN 978-1-939133-                     William Saunders, Christopher Hesse, Andrew N.
+    40-3. URL https://www.usenix.org/conference/                     Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan
+    osdi24/presentation/agrawal.                                     Morikawa, Alec Radford, Matthew Knight, Miles
+                                                                     Brundage, Mira Murati, Katie Mayer, Peter Welin-
+[2] Branden Butler, Sixing Yu, Arya Mazaheri, and
+                                                                     der, Bob McGrew, Dario Amodei, Sam McCandlish,
+    Ali Jannesari. Pipeinfer: Accelerating llm inference
+                                                                     Ilya Sutskever, and Wojciech Zaremba. Evaluating
+    using asynchronous pipelined speculation, 2024. URL
+                                                                     large language models trained on code, 2021. URL
+    https://arxiv.org/abs/2407.11798.
+                                                                     https://arxiv.org/abs/2107.03374.
+[3] Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu
+    Peng, Jason D. Lee, Deming Chen, and Tri Dao.                 [8] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+    Medusa: Simple llm inference acceleration framework               Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+    with multiple decoding heads, 2024. URL https:                    Plappert, Jerry Tworek, Jacob Hilton, Reiichiro
+    //arxiv.org/abs/2401.10774.                                       Nakano, Christopher Hesse, and John Schulman.
+                                                                      Training verifiers to solve math word problems, 2021.
+[4] Kevin Matthe Caramancion. Large language models                   URL https://arxiv.org/abs/2110.14168.
+    vs. search engines: Evaluating user preferences across
+    varied information retrieval scenarios, 2024. URL             [9] DeepSeek-AI, Daya Guo, Dejian Yang, Haowei
+    https://arxiv.org/abs/2401.05761.                                 Zhang, Junxiao Song, Ruoyu Zhang, Runxin Xu,
+                                                                      Qihao Zhu, Shirong Ma, Peiyi Wang, Xiao Bi, Xi-
+[5] Charlie Chen, Sebastian Borgeaud, Geoffrey Irv-                   aokang Zhang, Xingkai Yu, Yu Wu, Z. F. Wu, Zhibin
+    ing, Jean-Baptiste Lespiau, Laurent Sifre, and John               Gou, Zhihong Shao, Zhuoshu Li, Ziyi Gao, Aixin
+    Jumper. Accelerating large language model decod-                  Liu, Bing Xue, Bingxuan Wang, Bochao Wu, Bei
+    ing with speculative sampling, 2023. URL https:                   Feng, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+    //arxiv.org/abs/2302.01318.                                       Chenyu Zhang, Chong Ruan, Damai Dai, Deli Chen,
+[6] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming                       Dongjie Ji, Erhang Li, Fangyun Lin, Fucong Dai,
+    Yuan, Henrique Ponde de Oliveira Pinto, Jared Ka-                 Fuli Luo, Guangbo Hao, Guanting Chen, Guowei
+    plan, Harri Edwards, Yuri Burda, Nicholas Joseph,                 Li, H. Zhang, Han Bao, Hanwei Xu, Haocheng
+    Greg Brockman, Alex Ray, Raul Puri, Gretchen                      Wang, Honghui Ding, Huajian Xin, Huazuo Gao,
+    Krueger, Michael Petrov, Heidy Khlaaf, Girish Sas-                Hui Qu, Hui Li, Jianzhong Guo, Jiashi Li, Jiawei
+    try, Pamela Mishkin, Brooke Chan, Scott Gray,                     Wang, Jingchang Chen, Jingyang Yuan, Junjie Qiu,
+    Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz                 Junlong Li, J. L. Cai, Jiaqi Ni, Jian Liang, Jin
+    Kaiser, Mohammad Bavarian, Clemens Winter,                        Chen, Kai Dong, Kai Hu, Kaige Gao, Kang Guan,
+    Philippe Tillet, Felipe Petroski Such, Dave Cum-                  Kexin Huang, Kuai Yu, Lean Wang, Lecong Zhang,
+    mings, Matthias Plappert, Fotios Chantzis, Eliza-                 Liang Zhao, Litong Wang, Liyue Zhang, Lei Xu, Leyi
+    beth Barnes, Ariel Herbert-Voss, William Hebgen                   Xia, Mingchuan Zhang, Minghua Zhang, Minghui
+    Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie                 Tang, Meng Li, Miaojun Wang, Mingming Li, Ning
+    Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain,              Tian, Panpan Huang, Peng Zhang, Qiancheng Wang,
+    William Saunders, Christopher Hesse, Andrew N.                    Qinyu Chen, Qiushi Du, Ruiqi Ge, Ruisong Zhang,
+    Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan                  Ruizhe Pan, Runji Wang, R. J. Chen, R. L. Jin,
+    Morikawa, Alec Radford, Matthew Knight, Miles                     Ruyi Chen, Shanghao Lu, Shangyan Zhou, Shan-
+    Brundage, Mira Murati, Katie Mayer, Peter Welin-                  huang Chen, Shengfeng Ye, Shiyu Wang, Shuiping
+    der, Bob McGrew, Dario Amodei, Sam McCandlish,                    Yu, Shunfeng Zhou, Shuting Pan, S. S. Li, Shuang
+    Ilya Sutskever, and Wojciech Zaremba. Evaluating                  Zhou, Shaoqing Wu, Shengfeng Ye, Tao Yun, Tian
+    large language models trained on code, 2021. URL                  Pei, Tianyu Sun, T. Wang, Wangding Zeng, Wan-
+    https://arxiv.org/abs/2107.03374.                                 jia Zhao, Wen Liu, Wenfeng Liang, Wenjun Gao,
+                                                                      Wenqin Yu, Wentao Zhang, W. L. Xiao, Wei An,
+[7] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming                       Xiaodong Liu, Xiaohan Wang, Xiaokang Chen, Xi-
+    Yuan, Henrique Ponde de Oliveira Pinto, Jared Ka-                 aotao Nie, Xin Cheng, Xin Liu, Xin Xie, Xingchao
+    plan, Harri Edwards, Yuri Burda, Nicholas Joseph,                 Liu, Xinyu Yang, Xinyuan Li, Xuecheng Su, Xuheng
+    Greg Brockman, Alex Ray, Raul Puri, Gretchen                      Lin, X. Q. Li, Xiangyue Jin, Xiaojin Shen, Xiaosha
+
+
+                                                             16
+    Chen, Xiaowen Sun, Xiaoxiang Wang, Xinnan Song,                  Redfield, Michael Collins, Ankur Parikh, Chris Al-
+    Xinyi Zhou, Xianzu Wang, Xinxia Shan, Y. K. Li,                  berti, Danielle Epstein, Illia Polosukhin, Jacob De-
+    Y. Q. Wang, Y. X. Wei, Yang Zhang, Yanhong                       vlin, Kenton Lee, Kristina Toutanova, Llion Jones,
+    Xu, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Wang,                  Matthew Kelcey, Ming-Wei Chang, Andrew M. Dai,
+    Yi Yu, Yichao Zhang, Yifan Shi, Yiliang Xiong, Ying              Jakob Uszkoreit, Quoc Le, and Slav Petrov. Nat-
+    He, Yishi Piao, Yisong Wang, Yixuan Tan, Yiyang                  ural questions: A benchmark for question answer-
+    Ma, Yiyuan Liu, Yongqiang Guo, Yuan Ou, Yud-                     ing research. Transactions of the Association for
+    uan Wang, Yue Gong, Yuheng Zou, Yujia He, Yun-                   Computational Linguistics, 7:452–466, 2019. doi: 10.
+    fan Xiong, Yuxiang Luo, Yuxiang You, Yuxuan Liu,                 1162/tacl_a_00276. URL https://aclanthology.
+    Yuyang Zhou, Y. X. Zhu, Yanhong Xu, Yanping                      org/Q19-1026/.
+    Huang, Yaohui Li, Yi Zheng, Yuchen Zhu, Yunxian
+    Ma, Ying Tang, Yukun Zha, Yuting Yan, Z. Z. Ren,             [17] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+    Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhenda                  Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+    Xie, Zhengyan Zhang, Zhewen Hao, Zhicheng Ma,                     Gonzalez, Hao Zhang, and Ion Stoica. Efficient mem-
+    Zhigang Yan, Zhiyu Wu, Zihui Gu, Zijia Zhu, Zi-                   ory management for large language model serving
+    jun Liu, Zilin Li, Ziwei Xie, Ziyang Song, Zizheng                with pagedattention, 2023. URL https://arxiv.
+    Pan, Zhen Huang, Zhipeng Xu, Zhongyu Zhang, and                   org/abs/2309.06180.
+    Zhen Zhang. Deepseek-r1: Incentivizing reasoning             [18] Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+    capability in llms via reinforcement learning, 2025.              Fast inference from transformers via speculative de-
+    URL https://arxiv.org/abs/2501.12948.                             coding, 2023. URL https://arxiv.org/abs/2211.
+[10] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao,                    17192.
+     Siyu Wang, Zhen Zheng, Chuan Wu, Guoping Long,              [19] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang
+     Jun Yang, Lixue Xia, Lansong Diao, Xiaoyong Liu,                 Zhang. Eagle-2: Faster inference of language models
+     and Wei Lin. Dapple: A pipelined data parallel                   with dynamic draft trees, 2024. URL https://arxiv.
+     approach for training large models, 2020. URL                    org/abs/2406.16858.
+     https://arxiv.org/abs/2007.01045.
+                                                                 [20] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang,
+[11] Daya Guo, Canwen Xu, Nan Duan, Jian Yin, and Ju-                 Wei-Ming Chen, Wei-Chen Wang, Guangxuan Xiao,
+     lian McAuley. Longcoder: A long-range pre-trained                Xingyu Dang, Chuang Gan, and Song Han. Awq:
+     language model for code completion, 2023. URL                    Activation-aware weight quantization for llm com-
+     https://arxiv.org/abs/2306.14893.                                pression and acceleration, 2024. URL https://
+                                                                      arxiv.org/abs/2306.00978.
+[12] Daya Guo, Qihao Zhu, Dejian Yang, Zhenda Xie,
+     Kai Dong, Wentao Zhang, Guanting Chen, Xiao                 [21] Tianyu Liu, Yun Li, Qitan Lv, Kai Liu, Jianchen
+     Bi, Y. Wu, Y. K. Li, Fuli Luo, Yingfei Xiong, and                Zhu, and Winston Hu. Parallel speculative decoding
+     Wenfeng Liang. Deepseek-coder: When the large                    with adaptive draft length, 2024. URL https://
+     language model meets programming – the rise of                   arxiv.org/abs/2408.11850.
+     code intelligence, 2024. URL https://arxiv.org/
+     abs/2401.14196.                                             [22] Xiaoxuan Liu, Cade Daniel, Langxiang Hu, Woosuk
+                                                                      Kwon, Zhuohan Li, Xiangxi Mo, Alvin Cheung,
+[13] Walid Hariri. Unlocking the potential of chat-                   Zhijie Deng, Ion Stoica, and Hao Zhang. Opti-
+     gpt: A comprehensive exploration of its applica-                 mizing speculative decoding for serving large lan-
+     tions, advantages, limitations, and future direc-                guage models using goodput, 2024. URL https:
+     tions in natural language processing, 2025. URL                  //arxiv.org/abs/2406.14066.
+     https://arxiv.org/abs/2304.02017.
+                                                                 [23] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray,
+[14] Yanping Huang, Youlong Cheng, Ankur Bapna,                       Yuyang Huang, Qizheng Zhang, Kuntai Du, Jiayi
+     Orhan Firat, Mia Xu Chen, Dehao Chen, Hy-                        Yao, Shan Lu, Ganesh Ananthanarayanan, Michael
+     oukJoong Lee, Jiquan Ngiam, Quoc V. Le, Yonghui                  Maire, Henry Hoffmann, Ari Holtzman, and Junchen
+     Wu, and Zhifeng Chen. Gpipe: Efficient training                  Jiang. Cachegen: Kv cache compression and stream-
+     of giant neural networks using pipeline parallelism,             ing for fast large language model serving, 2024. URL
+     2019. URL https://arxiv.org/abs/1811.06965.                      https://arxiv.org/abs/2310.07240.
+[15] Maliheh Izadi, Jonathan Katzy, Tim van Dam, Marc            [24] Bradley McDanel. Amusd: Asynchronous multi-
+     Otten, Razvan Mihai Popescu, and Arie van Deursen.               device speculative decoding for llm acceleration, 2024.
+     Language models for code completion: A practical                 URL https://arxiv.org/abs/2410.17375.
+     evaluation, 2024. URL https://arxiv.org/abs/
+     2402.16197.                                                 [25] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang,
+                                                                      Xinhao Cheng, Zeyu Wang, Zhengxin Zhang,
+[16] Tom Kwiatkowski, Jennimaria Palomaki, Olivia                     Rae Ying Yee Wong, Alan Zhu, Lijie Yang,
+
+
+                                                            17
+    Xiaoxiang Shi, Chunan Shi, Zhuoming Chen,                        need, 2023.    URL https://arxiv.org/abs/1706.
+    Daiyaan Arfeen, Reyna Abhyankar, and Zhi-                        03762.
+    hao Jia. Specinfer: Accelerating large language
+    model serving with tree-based speculative infer-            [35] Jason Wei, Xuezhi Wang, Dale Schuurmans,
+    ence and verification. In Proceedings of the 29th                Maarten Bosma, Brian Ichter, Fei Xia, Ed Chi, Quoc
+    ACM International Conference on Architectural                    Le, and Denny Zhou. Chain-of-thought prompting
+    Support for Programming Languages and Operating                  elicits reasoning in large language models, 2023. URL
+    Systems, Volume 3, ASPLOS ’24. ACM, April 2024.                  https://arxiv.org/abs/2201.11903.
+    doi: 10.1145/3620666.3651335. URL http://dx.doi.
+    org/10.1145/3620666.3651335.                                [36] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+                                                                     Julien Demouth, and Song Han. Smoothquant: Ac-
+[26] Ramesh Nallapati, Bowen Zhou, Cicero Nogueira dos               curate and efficient post-training quantization for
+     santos, Caglar Gulcehre, and Bing Xiang. Abstrac-               large language models, 2024. URL https://arxiv.
+     tive text summarization using sequence-to-sequence              org/abs/2211.10438.
+     rnns and beyond, 2016. URL https://arxiv.org/
+     abs/1602.06023.                                            [37] Haoyi Xiong, Jiang Bian, Yuchen Li, Xuhong Li,
+                                                                     Mengnan Du, Shuaiqiang Wang, Dawei Yin, and
+[27] Nvidia. Nvidia/tensorrt-llm: A tensorrt toolbox for             Sumi Helal. When search engine services meet large
+     optimized large language model inference. https:                language models: Visions and challenges, 2024. URL
+     //github.com/NVIDIA/TensorRT-LLM.                               https://arxiv.org/abs/2407.00128.
+
+[28] OpenAI. Gpt-4 technical report, 2024. URL https:           [38] An Yang, Baosong Yang, Binyuan Hui, Bo Zheng,
+     //arxiv.org/abs/2303.08774.                                     Bowen Yu, Chang Zhou, Chengpeng Li, Chengyuan
+                                                                     Li, Dayiheng Liu, Fei Huang, Guanting Dong, Hao-
+[29] Pratyush Patel, Esha Choukse, Chaojie Zhang,                    ran Wei, Huan Lin, Jialong Tang, Jialin Wang,
+     Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ri-                Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin
+     cardo Bianchini. Splitwise: Efficient generative                Ma, Jianxin Yang, Jin Xu, Jingren Zhou, Jinze
+     llm inference using phase splitting, 2024. URL                  Bai, Jinzheng He, Junyang Lin, Kai Dang, Kem-
+     https://arxiv.org/abs/2311.18677.                               ing Lu, Keqin Chen, Kexin Yang, Mei Li, Mingfeng
+                                                                     Xue, Na Ni, Pei Zhang, Peng Wang, Ru Peng, Rui
+[30] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,
+                                                                     Men, Ruize Gao, Runji Lin, Shijie Wang, Shuai
+     Patrick LeGresley, Jared Casper, and Bryan Catan-
+                                                                     Bai, Sinan Tan, Tianhang Zhu, Tianhao Li, Tianyu
+     zaro. Megatron-lm: Training multi-billion parameter
+                                                                     Liu, Wenbin Ge, Xiaodong Deng, Xiaohuan Zhou,
+     language models using model parallelism, 2020. URL
+                                                                     Xingzhang Ren, Xinyu Zhang, Xipin Wei, Xu-
+     https://arxiv.org/abs/1909.08053.
+                                                                     ancheng Ren, Xuejing Liu, Yang Fan, Yang Yao,
+[31] Tatsu-Lab. Tatsu-lab/stanford-alpaca: Code and                  Yichang Zhang, Yu Wan, Yunfei Chu, Yuqiong Liu,
+     documentation to train stanford’s alpaca mod-                   Zeyu Cui, Zhenru Zhang, Zhifang Guo, and Zhi-
+     els, and generate the data. https://github.com/                 hao Fan. Qwen2 technical report, 2024. URL
+     tatsu-lab/stanford_alpaca.                                      https://arxiv.org/abs/2407.10671.
+
+[32] Vijay Thakkar, Pradeep Ramani, Cris Cecka, Aniket          [39] Fan Yang, Zheng Chen, Ziyan Jiang, Eunah Cho,
+     Shivam, Honghao Lu, Ethan Yan, Jack Kosaian,                    Xiaojiang Huang, and Yanbin Lu. Palr: Personal-
+     Mark Hoemmen, Haicheng Wu, Andrew Kerr, Matt                    ization aware llms for recommendation, 2023. URL
+     Nicely, Duane Merrill, Dustyn Blasig, Fengqi Qiao,              https://arxiv.org/abs/2305.07622.
+     Piotr Majcher, Paul Springer, Markus Hohnerbach,
+     Jin Wang, and Manish Gupta. CUTLASS, January               [40] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim,
+     2023. URL https://github.com/NVIDIA/cutlass.                    Soojeong Kim, and Byung-Gon Chun. Orca: A
+                                                                     distributed serving system for Transformer-Based
+[33] Hugo Touvron, Thibaut Lavril, Gautier Izacard,                  generative models. In 16th USENIX Symposium
+     Xavier Martinet, Marie-Anne Lachaux, Timothée                   on Operating Systems Design and Implementation
+     Lacroix, Baptiste Rozière, Naman Goyal, Eric Ham-               (OSDI 22), pages 521–538, Carlsbad, CA, July
+     bro, Faisal Azhar, Aurelien Rodriguez, Armand                   2022. USENIX Association. ISBN 978-1-939133-
+     Joulin, Edouard Grave, and Guillaume Lample.                    28-1. URL https://www.usenix.org/conference/
+     Llama: Open and efficient foundation language                   osdi22/presentation/yu.
+     models, 2023. URL https://arxiv.org/abs/2302.
+     13971.                                                     [41] Jiatao Zhang, Lanling Tang, Yufan Song, Qiwei
+                                                                     Meng, Haofu Qian, Jun Shao, Wei Song, Shiqiang
+[34] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob                Zhu, and Jason Gu. Fltrnn: Faithful long-horizon
+     Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz                  task planning for robotics with large language models.
+     Kaiser, and Illia Polosukhin. Attention is all you              In 2024 IEEE International Conference on Robotics
+
+
+                                                           18
+    and Automation (ICRA), pages 6680–6686, 2024.
+    doi: 10.1109/ICRA57147.2024.10611663.
+[42] Siyan Zhao, Daniel Israel, Guy Van den Broeck, and
+     Aditya Grover. Prepacking: A simple method for fast
+     prefilling and increased throughput in large language
+     models, 2024. URL https://arxiv.org/abs/2404.
+     09529.
+[43] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan
+     Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin,
+     Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang,
+     Joseph E. Gonzalez, and Ion Stoica. Judging llm-
+     as-a-judge with mt-bench and chatbot arena, 2023.
+     URL https://arxiv.org/abs/2306.05685.
+[44] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie,
+     Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao,
+     Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez,
+     Clark Barrett, and Ying Sheng. Sglang: Efficient
+     execution of structured language model programs,
+     2024. URL https://arxiv.org/abs/2312.07104.
+[45] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo
+     Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao
+     Zhang.   DistServe: Disaggregating prefill and
+     decoding for goodput-optimized large language
+     model serving.    In 18th USENIX Symposium
+     on Operating Systems Design and Implementation
+     (OSDI 24), pages 193–210, Santa Clara, CA, July
+     2024. USENIX Association. ISBN 978-1-939133-
+     40-3. URL https://www.usenix.org/conference/
+     osdi24/presentation/zhong-yinmin.
+[46] Enshen Zhou, Qi Su, Cheng Chi, Zhizheng Zhang,
+     Zhongyuan Wang, Tiejun Huang, Lu Sheng, and
+     He Wang. Code-as-monitor: Constraint-aware vi-
+     sual programming for reactive and proactive robotic
+     failure detection, 2025. URL https://arxiv.org/
+     abs/2412.04455.
+
+
+
+
+                                                             19
+

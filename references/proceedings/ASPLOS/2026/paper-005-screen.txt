@@ -1,0 +1,249 @@
+Tackling the Dynamicity in a Production LLM Serving System with SOTA
+Optimizations via Hybrid Prefill/Decode/Verify Scheduling on Efficient
+Meta-kernels
+Mingcong Song∗
+Huawei
+Xinru Tang∗
+Tsinghua University
+Fengfan Hou
+Huawei
+Jing Li
+Huawei
+Wei Wei
+Huawei
+Yipeng Ma
+Huawei
+Runqiu Xiao
+Huawei
+Hongjie Si
+Huawei
+Dingcheng Jiang
+Tsinghua University
+Shouyi Yin
+Tsinghua University/Shanghai AI Lab
+Yang Hu
+Tsinghua University
+Guoping Long
+Huawei
+Abstract
+Meeting growing demands for low latency and cost efficiency
+in production-grade large language model (LLM) serving sys-
+tems requires integrating advanced optimization techniques.
+However, dynamic and unpredictable input-output lengths of
+LLM, compounded by these optimizations, exacerbate the
+issues of workload variability, making it difficult to maintain
+high efficiency on AI accelerators, especially DSAs with tile-
+based programming models. To address this challenge, we
+introduce XY-Serve, a versatile, Ascend native, end-to-end
+production LLM-serving system. The core idea is an abstrac-
+tion mechanism that smooths out the workload variability by
+decomposing computations into unified, hardware-friendly,
+fine-grained meta primitives. For attention, we propose a meta-
+kernel that computes the basic pattern of matmul-softmax-
+matmul with architectural-aware tile sizes. For GEMM, we
+introduce a virtual padding scheme that adapts to dynamic
+shape changes while using highly efficient GEMM primitives
+with assorted fixed tile sizes. XY-Serve sits harmoniously
+with vLLM. Experimental results show up to 89% end-to-
+end throughput improvement compared with current publicly
+available baselines on Ascend NPUs. Additionally, our ap-
+proach outperforms existing GEMM (average 14.6% faster)
+and attention (average 21.5% faster) kernels relative to exist-
+ing libraries. While the work is Ascend native, we believe the
+approach can be readily applicable to SIMT architectures as
+well.
+1 Introduction
+Large language models (LLMs) [41, 42] have achieved im-
+pressive accuracy and are widely applied in fields like natural
+language processing [19] and computer vision [21, 25]. As
+shown in Fig. 1(a), LLM inference typically consists of two
+stages: prefill and decode. During the prefill stage, LLMs
+process the user’s input to generate an initial token, while
+concurrently caching the key/value (K/V) data for future use.
+∗These authors contributed equally to this work.
+Varying input and output lengths
+Input Prompts
+to Prefill
+Output Answers
+from Decode
+The input length variability is
+amplified
+Varying speculative
+length of tokens
+Matched prefixes
+Square-shaped
+Attention with a
+triangular mask
+Rectangular
+Attention with a
+trapezoidal mask
+Added with a
+part of random
+structure
+Input\Output
+Mask
+Raw Inference Automatic Prefix Caching (APC) Speculative Decoding (SD)
+SplitFuse
+(SF) 1/3
+Newly Arrived
+Time
+Prefill and Decode stages are batched togater
+long-sequence prefill Chunk
+Chunk Chunk
+Chunk Chunk
+Chunk
+Time
+TBT TBT
+1/3 1/3
+(b) Optimization Techniques for LLM Inference
+Verify
+Users’
+Request
+Prefill
+Prefill Decode Decode ...
+K/V Cache
+Prompt
+Auto-
+regressively
+(a) Overview
+of LLM
+Inference
+Figure 1: Dynamics of LLM Inference.
+In the decode stage, tokens are generated sequentially in an
+auto-regressive manner. Despite their impressive performance,
+LLMs come with significant computational costs and latency.
+As the model size increases and input sequences become
+longer, the computational demands grow substantially, mak-
+ing online inference increasingly challenging [30].
+To address these challenges, a number of optimization tech-
+niques have emerged to reduce inference costs and latency,
+such as Automatic Prefix Caching (APC) [8, 47], Specula-
+tive Decoding (SD) [20, 22, 32, 33, 38, 46], and SplitFuse
+[17,18,26]. APC enables new queries with matching prefixes
+to reuse cached K/V data and skip computations for shared
+segments, thereby improving prefill performance. The adop-
+tion of draft model in SD provides a chance for target model to
+generate multiple tokens per step, enhancing key/value cache
+and model weight reuse, which helps mitigate the memory-
+bound bottleneck of decode in draft model. SplitFuse splits
+long-sequence prefill tokens into smaller chunks and sched-
+ules them alongside decode tokens, reducing interruptions to
+the decode stage.
+While these optimizations promise to improve inference
+efficiency, they also introduce new complexities. For LLM
+1
+arXiv:2412.18106v1
+[cs.AI]
+24
+Dec
+2024
+serving of a production system, the key challenge is how to
+integrate all these optimizations efficiently on AI accelerators
+given that a friendly SIMT programming model is lacked. We
+illustrate this issue in Fig. 1(b). Performance already struggles
+with unpredictable and varying input/output token lengths,
+these optimizations can further exacerbate the issue.
+For example, APC increases the variability in input prompt
+lengths, as the number of cached prefixes depends on both
+query history and real-time memory availability. With SD, the
+decode stage no longer processes one token at a time. Instead,
+it handles a dynamically varying speculative length of tokens
+[37]. This new stage is referred to as the Verify stage [4,45].
+SD also transforms the attention mask from a standard causal
+mask into a more complex, dynamically generated version.
+Additionally, SplitFuse combines the prefill and decode stages
+into a single batch, further complicating the management of
+multiple stages within one batch.
+These dynamicities pose significant challenges for LLM
+computations, particularly in Linear and Attention modules.
+First, the uncertainty of input lengths leads to arbitrary ma-
+trix shapes in Linear ops, complicating optimization efforts
+aimed at achieving peak computational efficiency. Second, the
+adoption of technologies like APC, SD, and SplitFuse intro-
+duces greater diversity in attention shapes and mask structures,
+weakening the effectiveness of existing attention kernels.
+Furthermore, in practical systems, the Prefill (P), Decode
+(D), and Verify (V) stages may operate independently or in
+combination. Even in disaggregated deployments, the D node
+may run both D and V stages simultaneously. If disaggre-
+gated deployment [27, 28, 39, 48] nodes support dynamic
+role switching, the hybrid P/D/V combinations issue may
+also arise during role transitions. Since these stages present
+varying computational loads during the attention phase, at-
+tempting to enumerate and optimize for every possible stage
+combination becomes a labor-intensive and impractical task.
+To tackle the challenges posed by dynamicities, we present
+XY-Serve, a versatile, Ascend native, and end-to-end pro-
+duction LLM-serving system. The main idea is to intro-
+duce an abstraction to bridge the gap between varying
+high level workloads and fixed hardware-friendly low level
+meta-primitives. Specifically, XY-Serve features a token-wise
+scheduling mechanism that batches tokens in chunks. Tokens
+could be from either prefill, verify, and decode stages. Then
+the token chunks will be processed by three core components:
+workload decomposition, computation task reordering, and
+meta kernels.
+Workload decomposition is a mechanism to decompose
+and map dynamic workloads onto hardware-friendly meta-
+primitives. For attention computations, it unifies the P/D/V
+stages through dynamic tiling, generating hardware-friendly
+tile-based computational tasks. Each task computes a basic
+matmul-softmax-matmul pattern. For GEMM, it decomposes
+dynamic-shaped matmul ops into a small set of basic matmul
+primitives with fixed tile sizes. This transformation seems
+deceptively straightforward but is surprisingly hard to imple-
+ment without any actual padding overhead. We introduce a
+novel virtual padding mechanism to address this issue with-
+out introducing any extra overhead on AI accelerators with
+tile-based programming models.
+After decomposition, computation task reordering reorga-
+nizes decomposed tasks and schedules them for hardware
+processing cores. The goal of reordering is to smooth out
+varying task sizes at fine-grained level, balancing workload
+on different cores for high execution efficiency. For atten-
+tion, P/D/V tasks have drastically different granularity; thus,
+reordering of decomposed tasks is essential to achieve load
+balance. The case for GEMM is different; task reordering
+is an effective approach to improve L2 cache locality and
+mitigate bank conflicts.
+With workload decomposition and task reordering, it is pos-
+sible to construct efficient kernels for attention and GEMM.
+For attention, we propose meta kernels to efficiently paral-
+lelize computations of matmul-softmax-matmul patterns with
+different tile sizes, without needing to differentiate which
+P/D/V stage they originate from. With this decoupling ap-
+proach, it is feasible to integrate a range of optimizations
+seamlessly and efficiently, including APC, PageAttention [31],
+SplitFuse, SD, and FlashAttention [24]. These optimizations
+work synergistically within our meta kernels, achieving supe-
+rior performance.
+Moreover, our attention meta kernels come with aggres-
+sive on-chip Cube Core-Vector Core orchestration pipelines,
+together with novel schemes to handle various kinds of atten-
+tion masks dynamically. These low level techniques minimize
+off-chip memory accesses and maximize on-chip workload
+balance and execution efficiency. For GEMM ops, we first
+design and implement a set of highly efficient meta kernels
+with fixed tile sizes. To handle arbitrary input shapes dynami-
+cally, we employ virtual padding at the on-chip memory level,
+coupled with selective HBM reads and writes, and do not
+introduce any actual padding overhead. In other words, our
+approach allows matrix computations to seamlessly handle
+dynamic shapes while preserving the performance benefits of
+fixed-shape optimizations.
+Experimental evaluation shows that our attention kernels
+achieve higher efficiency in production workloads, outper-
+forming existing implementations(torch-npu PFA [12] and
+IFA [11]) by on average of 21.5%. Our GEMM kernels not
+only support arbitrary matrix shapes but also improve perfor-
+mance by on average of 14.6% over existing baselines. In end-
+to-end evaluation, XY-Serve achieves improvement up to 89%
+over Ascend-vLLM [14] on publicly available datasets [13].
+While currently implemented on Ascend NPUs [34,35], these
+techniques can be applied to other AI platforms as well. Fi-
+nally, we conduct a comparative evaluation against GPU-
+based inference systems. In terms of end-to-end MFU and
+MBU, XY-Serve performs on par with the best GPU imple-
+mentations.
+2
+

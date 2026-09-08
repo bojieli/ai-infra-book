@@ -1,0 +1,1224 @@
+  Toasty: Speeding Up Network I/O with Cache-Warm
+                       Buffers
+                                 Preeti                                                          Nitish Bhat
+              Indian Institute of Technology, Bombay                              Indian Institute of Technology, Bombay
+                           Mumbai, India                                                       Mumbai, India
+                        preeti@cse.iitb.ac.in                                            nitishbhat@cse.iitb.ac.in
+
+                           Ashwin Kumar                                                      Mythili Vutukuru
+              Indian Institute of Technology, Bombay                              Indian Institute of Technology, Bombay
+                           Mumbai, India                                                       Mumbai, India
+                      ashkumar@cse.iitb.ac.in                                              mythili@cse.iitb.ac.in
+
+Abstract                                                                  CCS Concepts: • Networks → Cloud computing; Data
+Modern NICs DMA packets directly to the LLC using tech-                   center networks; • Software and its engineering → Op-
+nologies like DDIO, reducing access latencies for networking              erating systems.
+applications. Prior work has observed several performance
+                                                                          Keywords: Host Network; Network I/O; Cache Efficiency;
+issues with DDIO when the working set of packet buffers
+                                                                          AF_XDP; DDIO
+does not fit into LLC. For example, the leaky DMA problem
+arises when incoming packets evict older packets that have                ACM Reference Format:
+not yet been processed by the application from LLC, causing               Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru. 2026.
+them to be fetched again from main memory. While using a                  Toasty: Speeding Up Network I/O with Cache-Warm Buffers. In
+smaller pool of packet buffers that fits in cache is an obvious           Proceedings of the 31st ACM International Conference on Architectural
+solution, this may result in the NIC running out of buffers               Support for Programming Languages and Operating Systems, Volume
+to DMA packets into when a burst of packets arrives. This                 2 (ASPLOS ’26), March 22-26, 2026, Pittsburgh, PA, USA. ACM, New
+paper proposes Toasty, a system that mitigates this tradeoff              York, NY, USA, 15 pages. https://doi.org/10.1145/3779212.3790235
+between high throughput and resilience to packet loss that
+arises when sizing the network packet buffer pool. While
+prior work has proposed hardware-based solutions to this                  1    Introduction
+problem, Toasty is a software-only solution that can be de-               Innovation in chip manufacturing has led to an explosion
+ployed on commodity NIC hardware. Toasty manages the                      in the speeds at which computer networking is possible to-
+packet buffer pool as a LIFO stack instead of a FIFO queue,               day. However, CPU frequencies have not progressed at the
+and adapts the number of buffers populated into the NIC                   same pace, forcing networking software to play catch-up
+hardware RX ring based on incoming packet load and ap-                    in the ability to process packets over high-bandwidth links
+plication processing rate. Together, these changes enable                 efficiently [1, 5, 6, 17, 22–24, 29, 31]. Recently, kernel bypass
+Toasty to recirculate a small working set of cache-warm                   frameworks like DPDK [10] and AF_XDP [3, 15] deliver sig-
+buffers in steady state, while falling back to a larger pool              nificant improvements in software packet processing rates
+of buffers during traffic bursts. We implement Toasty over                by removing the kernel bottleneck from the network I/O data
+the AF_XDP kernel bypass framework, and our evaluation                    path. To avoid dynamic buffer allocation and packet copy
+shows that Toasty improves network throughput for a vari-                 overheads, these frameworks pre-allocate a large pool of
+ety of network functions by up to 78% over the default buffer             packet buffers in userspace memory, and the Network Inter-
+pool implementation of AF_XDP. We also show that Toasty                   face Card (NIC) receives pointers to these free buffers from
+matches the performance of a small buffer pool that fits in               the device driver. When packets arrive over the network, the
+cache, while being more resilient to traffic bursts.                      NIC DMAs incoming packets into the free buffers, which are
+                                                                          directly processed by the application in a zero-copy manner,
+                                                                          and then recycled back into the free pool.
+                                                                             In addition to software frameworks, Direct Cache Access
+                                                                          (DCA) is a hardware technology to help applications process
+This work is licensed under a Creative Commons Attribution 4.0 Interna-   packets faster, with Intel’s DDIO [11] leading the charge.
+tional License.
+ASPLOS ’26, Pittsburgh, PA, USA
+                                                                          With the limited time budget available to process packets
+© 2026 Copyright held by the owner/author(s).                             with high-speed NICs, fetching every packet from memory
+ACM ISBN 979-8-4007-2359-9/2026/03                                        is no longer viable [7, 14, 18]. For this reason, DDIO enables
+https://doi.org/10.1145/3779212.3790235                                   the NICs to DMA packets directly into the last-level cache
+ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                             Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+(LLC). This reduces the access latencies of packets and mem-         The goal of our work is to mitigate this tradeoff between
+ory bandwidth usage for applications, and hence improves          high network I/O throughput and resilience to packet loss
+network I/O performance. DDIO uses a limited number of            that one encounters when sizing the packet buffer pool. Prior
+LLC ways (10% of LLC ways), to prevent network I/O traffic        work has proposed solutions that either redesign the NIC-
+from interfering with co-located applications.                    CPU interface, or leverage advanced hardware features avail-
+   Previous work [1, 5, 17, 23, 24, 30, 33, 35] has identified    able in modern smart NICs, to better utilize the LLC space
+several shortcomings with DDIO. If the size of the packet         available for network packets [17, 22–24, 28]. Our work seeks
+buffer pool is larger than what can fit into the DDIO ways of     to explore a solution that works on today’s commodity NICs,
+LLC, then network buffers contend for the limited available       for immediate deployment and impact.
+space, and several problems result from this cache contention.       To this end, this paper introduces Toasty, a software frame-
+For example, if packets arrive faster than the application can    work that enables the reuse of a small working set of cache-
+process them, newer packets may evict older packets from          warm packet buffers in steady traffic conditions, while au-
+the LLC even before the application has processed them.           tomatically adapting to a larger buffer pool to avoid packet
+This phenomenon is popularly known as the leaky DMA               drops due to traffic bursts. Our work consists of two key
+problem [30], and causes the application to fetch most of         ideas. First, Toasty manages the pool of free packet buffers
+the packets from memory even with DDIO in place. A more           as a Last-In-First-Out (LIFO) stack, rather than a First-In-
+subtle problem arises in the case of packet buffers that have     First-Out (FIFO) queue as is commonly done. This ensures
+been processed by the application and added back to the free      that network packet buffers that have been recently pro-
+buffer pool. These free buffers continue to stay in various       cessed and freed up by an application, and hence likely to
+levels of caches, with the data never being accessed again        be warm (and toasty!) in caches, are reused for the DMA of
+(because the application is “done” with the packet), until they   new packets immediately. However, using a LIFO stack for
+are either evicted due to cache contention, or the NIC reuses     the memory pool alone is not enough, because the hardware
+the buffers to DMA new packets. If free network buffers are       RX ring (in which the NIC stores pointers to the free buffers)
+evicted from the cache before reuse by the NIC, their contents    still works as a queue, and changing its behavior from FIFO
+will be written back to memory, because the cachelines would      to LIFO requires hardware changes. Therefore, the second
+be dirty. However, such writebacks are wasteful because the       key idea of our work is to adaptively control the number of
+packet content will be overwritten when the packet buffer is      packet descriptors that are filled in the hardware RX ring.
+reused for DMA in the future. This is called the unnecessary      Under steady incoming load, the device driver refills the RX
+writebacks problem [1, 32], and there is no way for hardware      ring with a small number of packet descriptors from the head
+to identify and avoid these writebacks.                           of the free pool, which, given our LIFO buffer pool design,
+   The above problems seem to indicate that one must use a        are likely to be warm in the cache. However, when the device
+small pool of free packet buffers, which fits snugly into LLC     driver detects a high traffic rate that causes a rapid deple-
+DDIO ways, as proposed in prior work [17, 23, 24, 30]. A          tion of free buffers available in the RX ring, it populates the
+small pool of buffers will significantly ameliorate the leaky     NIC RX ring with a larger number of buffers, temporarily
+DMA problem, because packet buffers will not have to con-         pulling in cold packet buffers from beyond the warm region
+tend for LLC space and evict other packet buffers, thereby im-    at the head of the buffer pool. This adaptive filling of the
+proving cache hit rates and application throughputs. A small      hardware RX ring by the device driver ensures that we reuse
+pool of packet buffers also ensures that processed buffers        only cache-warm buffers in steady state, while effectively
+that are added back to the free pool are reused quickly again     handling traffic volatility. Toasty implements these ideas on
+for DMA before being evicted from the cache. Such reuse of        top of the AF_XDP kernel bypass framework, though our
+cache-warm buffers for packet DMA avoids wasteful write-          ideas can be applied to other packet I/O frameworks as well.
+back traffic to memory, because when the NIC tries to DMA a          Our evaluation of Toasty with a variety of network func-
+packet into a buffer that is already present in the CPU cache,    tions shows that Toasty improves network function through-
+the buffer is updated in place without accessing memory.          put by up to 78% over the default AF_XDP implementation,
+Our experiments with different types of network functions         when both systems use a larger buffer pool that is resilient
+over the AF_XDP kernel bypass framework (§2) show that            to varying traffic conditions. Our gains are even more com-
+most network functions achieve optimal application (and           pelling at up to 86% when there is increased contention in the
+cache) performance with a small pool of buffers that fit in the   LLC from co-located applications. Further, the performance
+DDIO LLC ways. However, under highly variable or bursty           of Toasty with a larger buffer pool matches the performance
+traffic conditions, we also see that a small buffer pool leads    of the default AF_XDP with an ideal throughput-maximizing
+to packet drops due to the exhaustion of packet buffers avail-    small buffer pool, while being a lot more resilient to bursty
+able to the NIC for DMA, a phenomenon observed in prior           traffic conditions. We show that our performance gains come
+research as well [1, 6, 17, 23, 24].                              from improved CPU cache hit rates (due to better reuse of
+Toasty                                                                                              ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+cache-warm buffers) and reduced writeback traffic to mem-              App adds all           1                                                         Packet access
+                                                                     buffer desc to FQ                                                                  Packet descriptor access
+ory. Our evaluation also demonstrates the synergy between                                                          Application
+                                                                                                                                                                      App
+the two key components of Toasty—the performance gains of             App
+                                                                                                                                                                    dequeues
+                                                                                                App                                                                  DMA’d
+Toasty are higher than what can be achieved with userspace-           adds
+                                                                            5b                  frees 5a             4b
+                                                                                                                            App processes                        4a packet
+                                                                      free                                                  DMA’d packets
+only changes (i.e., LIFO memory pool without adaptive sizing         buffer
+                                                                                               buffers                                                             buffer desc
+
+of the RX ring) that have been proposed for frameworks like           desc
+
+DPDK [25], or from adaptive RX ring resizing alone.                                 FQ                                                                          RXQ
+
+
+   The rest of the paper is organized as follows. We begin                                                                       UMEM/Buffer Pool                     Driver
+with some background and motivation (§2), then discuss the              Driver                           NIC DMA 3a                                                 also adds
+                                                                        allocates 2                  packets into buffers                                        3b DMA’d
+design and implementation of Toasty (§3), followed by our               free buffer                                                                                   packet
+evaluation (§4), related work (§5), and conclusions (§6).               desc to                                             NIC                                    buffer desc
+                                                                        the RX                                                                                       to RXQ
+                                                                                                                                 RX Ring
+                                                                        ring
+                                                                                         Network
+                                                                                          packets
+2     Background and Motivation                                                                                          NIC
+
+2.1      Packet Buffer Lifecycle                                                 Received                  Recycled                        Rx                     Recycled
+                                                                                 packets                   warm buffer                     descriptor             cold buffer
+We first review the lifecycle of a packet buffer in popular high-
+                                                                                         Figure 1. Lifecycle of a packet buffer
+performance kernel bypass frameworks like AF_XDP [3, 15]
+and DPDK [10]. While DPDK uses a userspace poll-mode
+device driver, AF_XDP redirects packets from a hook in the          and the free buffer descriptors are recycled into the FQ for
+kernel device driver. This minimal kernel involvement adds          reuse immediately 5b . If a packet needs to be forwarded
+a small overhead in AF_XDP as compared to DPDK, but also            back into the network, its buffer can only be marked as “free”
+provides several advantages, e.g., interrupt-based processing       after the network device completes the transmission via the
+for lower idle CPU usage and the ability to easily share the        transmit path. Note that only buffer pointers move between
+NIC across applications. For these reasons, Toasty builds           these various queues; there is no data copying.
+upon the AF_XDP framework, although our ideas can also                 AF_XDP supports two main operating modes: interrupt
+easily extend to other frameworks.                                  mode and busy poll mode. In the interrupt mode, the device
+   To avoid dynamic memory allocation and packet copy               driver is scheduled to run on a core upon an NIC interrupt on
+overheads, applications built over such frameworks use a            that core, and it performs two critical tasks when it executes.
+contiguous memory region of pre-allocated packet buffers            First, it cleans DMA’d packets from the NIC RX ring and
+to store network packet data. For example, an AF_XDP ap-            moves them to the AF_XDP RXQ for application processing
+plication initializes a userspace buffer pool called UMEM,          (step 3b in Figure 1). Second, it "consumes" free buffers from
+where each packet buffer is typically 4KB in size. The appli-       the AF_XDP FQ, placing them in the NIC RX ring for them
+cation and the device driver exchange packet "descriptors",         to be used for DMA of future incoming packets (step 2 in
+i.e., pointers to buffers in this region, using several queues.     Figure 1). The execution of the kernel driver and applica-
+In AF_XDP, every UMEM is linked with four queues called             tion threads is interleaved via context switches. In contrast,
+the Fill Queue (FQ), RX Queue (RXQ), TX Queue (TXQ), and            with the busy poll mode of AF_XDP, the kernel driver logic
+Completion Queue (CQ), as described in [3, 19]. Further, the        executes when the application invokes system calls to poll
+device driver and the NIC hardware share one or more RX             and read data from the NIC itself, and there are no context
+and TX rings filled with packet descriptors, that the hardware      switches between application and driver threads. While the
+accesses when receiving or transmitting packets.                    interrupt mode achieves low idle CPU usage, the busy poll
+   Figure 1 illustrates the lifecycle of a packet buffer in the     mode is more effective at high loads as it avoids context
+AF_XDP framework, focusing on the RX path (see [3, 19] for          switch overheads [19, 20]. For this reason, we implement
+a detailed description). Initially, 1 the application populates     and evaluate all applications in the busy poll mode in this
+the FQ with "free" buffers. 2 The kernel driver then moves          paper, though our ideas extend to other modes as well.
+some of these descriptors to the NIC’s RX ring. When a
+network packet arrives, 3a the NIC dequeues a descriptor            2.2     Challenges in Sizing Packet Buffer Pool
+from the RX ring, and performs a DMA of the packet into             The working set of packet buffers of an application depends
+the free buffer. If DDIO is enabled, the corresponding cache        on several factors (the size of the packet buffer pool, the RX
+lines are allocated (or updated) in the DDIO LLC ways. The          ring size, the rate at which the application can process and
+driver moves these buffer pointers into the RXQ 3b , and            recycle buffers, and so on), and is at most the size of the
+notifies the AF_XDP application to start processing these           packet buffer pool. We now show some empirical results to
+packets. The application dequeues 4a and processes the              highlight the difficulties in sizing the pool of packet buffers,
+packets from the RXQ 4b . If the packet is consumed locally,        especially when DDIO is turned on. While one line of thought
+the application marks the buffer containing it as "free" 5a ,       is to limit the pool of buffers to fit within the LLC for optimal
+ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                                                                             Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+                              NAT                         IDS                      Decryption                          L2FWD                       MICA                    MAGLEV
+Throughput (Gbps)
+
+
+                                                                          10                                                            40                         40
+                    40                                                                                         50
+                                                50
+                    20                                                     5                                                            20                         20
+                     0                           0                         0                                    0                        0                          0
+                       56
+                      1012
+                      2024
+                      4048
+                      8 96
+                     16192
+                          4
+
+
+
+                                                  56
+                                                 1012
+                                                 2024
+                                                 4048
+                                                 8 96
+                                                16192
+                                                     4
+
+
+
+                                                                            56
+                                                                           1012
+                                                                           2024
+                                                                           4048
+                                                                           8 96
+                                                                          16192
+                                                                               4
+
+
+
+                                                                                                                 56
+                                                                                                                1012
+                                                                                                                2024
+                                                                                                                4048
+                                                                                                                8 96
+                                                                                                               16192
+                                                                                                                    4
+
+
+
+                                                                                                                                           56
+                                                                                                                                          1012
+                                                                                                                                          2024
+                                                                                                                                          4048
+                                                                                                                                          8 96
+                                                                                                                                         16192
+                                                                                                                                              4
+
+
+
+                                                                                                                                                                     56
+                                                                                                                                                                    1012
+                                                                                                                                                                    2024
+                                                                                                                                                                    4048
+                                                                                                                                                                    8 96
+                                                                                                                                                                   16192
+                                                                                                                                                                        4
+                       25
+
+
+
+
+                       38
+
+
+
+                                                  25
+
+
+
+
+                                                  38
+
+
+
+                                                                            25
+
+
+
+
+                                                                            38
+
+
+
+                                                                                                                 25
+
+
+
+
+                                                                                                                 38
+
+
+
+                                                                                                                                           25
+
+
+
+
+                                                                                                                                           38
+
+
+
+                                                                                                                                                                     25
+
+
+
+
+                                                                                                                                                                     38
+                                                     Figure 2. Application throughput vs. size of the packet buffer pool
+
+                                                L2 Miss % (LLC Miss %)                                         from 256 (extremely low) to 16384 (moderately high) packet
+      Modes
+                              NAT         IDS       Dec.     L2Fwd MICA              Mag.                      buffers. The L3 cache on the system is 45 MB in size and
+     Default                                                                                                   is 15-way set associative, with DDIO utilizing the last two
+                              37.3        64.77      61         39.9      39.5       37.8
+     AF_XDP                                                                                                    ways. The packet size in these experiments was 512 bytes,
+                              (0.85)      (8.61)     (8.88)     (0.58)    (4.21)     (0.94)
+     Ideal                                                                                                     while the packet buffer was 4KB. Hence, the L3 cache (DDIO
+                              15.4        55.08      52.7       15.4      26.2       15.4
+     AF_XDP
+                              (0.004)     (0.018)    (0.023)    (0.003)   (0.075)    (0.045)
+                                                                                                               ways) are capable of holding a minimum1 of 1536 network
+                                                                                                               packet buffers simultaneously.
+     Table 1. L2 and LLC cache miss rates for all applications
+                                                                                                                  Figure 2 shows single-core saturation throughput for all
+                                                                                                               applications described above, as we vary the number of
+                     150                                                        100                            buffers in the packet buffer pool. The results are averaged
+                                                                                           Memory B/W (Gbps)
+                               Default PCIeWrHit                  Default MemBW
+PCIe Write Hit (%)
+
+
+
+
+                                                                                80                             over 5 runs of the experiment, each of which lasted for 300
+                               Ideal PCIeWrHit                    Ideal MemBW
+                     100                                                        60
+                                                                                                               seconds. We see from the figure that applications do not
+                                                                                                               perform well in the extreme cases of using a very low num-
+                                                                                      40                       ber of buffers (256) or a moderately high number of buffers
+                      50
+                                                                                      20                       (16384). The decryption workload is the only exception to
+                                                                                                               this rule, as it is compute-bound and is able to saturate a
+                         0                                                            0
+                             NAT        IDS Decryption L2Fwd       MICA    Maglev                              core at very low packet rates. For each application, we pick
+Figure 3. PCIe write hit rate and memory bandwidth usage                                                       the best configuration of the buffer pool size and RX ring
+                                                                                                               size that gives the highest throughput, and call it the “ideal”
+                                                                                                               AF_XDP configuration (for that application) in the rest of
+LLC usage [30], the counterpoint is that the NIC may run                                                       the paper. We will refer to the common configuration of
+out of empty buffers in case a burst of packets arrives [6, 17,                                                AF_XDP with a comfortably large buffer pool (16384 buffers)
+23, 24]. We will now explore this tradeoff empirically.                                                        and RX ring (4096) as the “default” AF_XDP configuration.
+   For this exploration, and for experiments in the rest of the                                                   Table 1 shows the L2 and LLC miss percentages, computed
+paper, we use six popular applications/network functions                                                       using the perf tool [8], for the various applications, using the
+that we implement (or port) over AF_XDP: (i) NAT looks                                                         “default” and “ideal” buffer pool size configurations described
+up and rewrites IP address bytes in the packet headers after                                                   above. We see that applications have significantly higher L2
+reading them. (ii) IDS is an application that reads and com-                                                   and LLC miss rates for the default configuration with a larger
+pares bytes in the payload with a pre-defined pattern. (iii)                                                   packet buffer pool, as compared to the ideal configuration
+Decryption is a proxy server in which the application reads                                                    where the packet buffers fit in LLC. 2
+the entire payload, decrypts it, and rewrites the contents                                                        Figure 3 shows the PCIe hit rates and memory bandwidth
+of the packet. (iv) L2Fwd is a swap-and-forward applica-                                                       usage for the same experiments. The former signifies how
+tion which reads and updates the MAC address, and then                                                         often the NIC found the buffer already in the LLC during
+forwards the packets back into the network. (v) MICA is                                                        DMA, avoiding write allocation in DDIO ways, while the
+an optimized key-value server that handles get/put requests                                                    latter represents writeback traffic to main memory, e.g., for
+in the packet, retrieves/updates key-value pairs in memory,                                                    PCIe write miss. These results show lower PCIe hit rates
+then sends back the packet to the client [16]. (vi) Maglev is                                                  and higher memory bandwidth usage, respectively, for the
+a hashing-based L4 load balancer [4].                                                                          1We use the term "minimum" because DMA can also happen in other LLC
+   We run all of these applications on an Intel(R) Xeon(R)                                                     ways as well if the packet buffer is already present in LLC in some other
+Gold 5418Y CPU, receiving packets over an Intel 100G E810                                                      way, which is referred to as DMA bloating [1].
+                                                                                                               2 The reader may wonder why we measure L2 performance if DDIO only
+NIC, generated by the PktGen [34] load generator running on
+a different machine. We run each application on a single core,                                                 works at the LLC. We find that due to hardware prefetching (that is on by de-
+                                                                                                               fault), DDIO also improves L2 performance, because packets are prefetched
+with a single RX ring capable of holding 4096 descriptors in                                                   into L2 before access. We find L2 miss rates to be significantly higher and
+the NIC bound to the application core. We measure saturation                                                   not impacted by DDIO when prefetching is turned off, and we see a larger
+throughput (in Gbps) for varying buffer pool sizes, ranging                                                    impact at LLC itself in such cases.
+Toasty                                                                                     ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+                                 Microburst Packet Drop %                increase in processing delay in the application can cause a
+  Modes
+                   NAT     IDS    Decrypt L2Fwd MICA           Maglev    smaller packet buffer pool to run dry, leading to packet loss.
+  Ideal            7.843   0      14.835    0.002    1.571     11.884       The experiments above illustrate the tradeoff between the
+  Default          0.001   0      0.002     0.001    1.628     0.001     requirements of high throughput and resilience to packet
+               Table 2. Packet drops (in %) with microbursts             loss under traffic bursts. This problem is exacerbated for
+                                                                         multi-core applications that receive packets from multiple
+                              Poisson Traffic Packet Drop %              NIC RX rings, where every core must have enough buffers
+  Modes
+                   NAT     IDS    Decrypt L2Fwd MICA            Maglev   in its RX ring to avoid packet loss, leading to an even higher
+  Ideal            3.382   1.831 5.756        0.054    4.126    6.066    working set size [23]. While solutions have been proposed
+  Default          1.22    0.877 1.475        0.032    2.76     1.367
+                                                                         to this problem in prior work [17, 23, 24, 28], they either
+             Table 3. Packet drops (in %) with Poisson traffic           redesign the hardware NIC-CPU interface, or leverage ad-
+                                                                         vanced features of modern smart NICs, while our goal is
+default AF_XDP configuration, in comparison to the ideal                 to come up with a solution that works on commodity NIC
+configuration, and are consistent with the leaky DMA and                 hardware. A simple strawman approach to this problem is to
+unnecessary writeback problems of a larger buffer pool.                  dynamically resize the packet buffer pool or RX ring size in
+   So, why then do real-life applications need to use larger             response to incoming traffic patterns or application process-
+buffer pools? The answer lies in the ability to handle diverse           ing rates. However, this is not feasible at run time, as these
+traffic conditions. In all experiments so far, we generated              operations require a restart of the device and/or application.
+uniform traffic at a specified rate, which was varied across                The key contribution of our work is to come up with a
+experiments to saturate the application. We now change the               practical solution that allows us to reuse a small set of cache-
+load generator to generate bursty traffic in two different               warm packet buffers under suitable traffic conditions, thereby
+ways. First, we generate traffic with "microbursts", where we            avoiding issues like leaky DMA, while also being able to tran-
+send a pulse of 2048 512-byte packets every 1ms, with no                 sition to a larger pool of buffers dynamically when packet
+other traffic for the remainder of the 1ms period, such that             losses are imminent. Figure 4 shows the frequency of use of
+the overall average rate is below the application’s processing           the 16384 buffers in the buffer pool for DMA, when running
+capacity. Note that this burst size is still well below the total        the NAT application with Toasty as well as with AF_XDP
+RX ring size in the NIC (4096 buffers in our case), and is sim-          configured with the default and ideal buffer pool sizes. We
+ilar to traffic patterns that can occur in real-life situations,         see that the ideal and default AF_XDP configurations use all
+e.g., during TCP’s bandwidth probing. Next, we generate                  buffers uniformly, while Toasty reuses the first thousand or
+variable traffic following the Poisson distribution, where the           so buffers more frequently under low load, but pulls in the
+rate of the incoming traffic varies every 5ms according to               other buffers to handle traffic bursts, thereby achieving both
+a Poisson distribution, whose mean is equal to the packet                high cache reuse and negligible packet drops.
+processing capacity of the application. Tables 2 and 3 show
+the packet drop percentage (dropped at the NIC) for all net-             3     Toasty Design and Implementation
+work functions under these variable traffic conditions. We
+                                                                         This section describes the design and implementation of
+see from these results that the “ideal” configuration, which
+                                                                         Toasty. Our system consists of two components built over
+resulted in the highest throughput for applications under a
+                                                                         the AF_XDP packet I/O framework. First, we modify the
+steady packet arrival rate, suffers from a non-trivial packet
+                                                                         userspace packet buffer pool management in AF_XDP to
+loss when traffic arrives in bursts, because the NIC temporar-
+                                                                         work as a LIFO stack rather than a FIFO queue, so that re-
+ily runs out of packet buffers to DMA packets into. On the
+                                                                         cently recycled warm buffers are reused for future packets
+other hand, the default configuration with a lower satura-
+                                                                         immediately (§3.1). Next, we modify the kernel device dri-
+tion throughput is quite resilient to bursty traffic conditions.
+                                                                         ver that populates the NIC RX ring to adapt the number of
+Note that the source of variability that leads to such packet
+                                                                         buffers in circulation based on incoming load and application
+loss can also come from the application, e.g., a temporary
+                                                                         processing rate, in a way that improves cache locality while
+                                                                         being resilient to packet loss (§3.2).
+                                      Ideal        Toasty      Default
+Frequency
+
+
+
+
+            200k
+                                                                         3.1   LIFO Buffer Pool in Userspace
+            100k                                                         The fill queue (FQ) holds pointers to the free packet buffers
+              0k                                                         from the userspace packet buffer pool in AF_XDP, and the
+                                                                         size of the FQ is typically the number of buffers in the buffer
+                    10 0
+                    20 0
+                    30 0
+                    40 0
+                    50 0
+                    60 0
+                    70 0
+                    80 0
+                    90 0
+                   10 00
+                   11 00
+                   12 00
+                   13 00
+                   14 00
+                   15 00
+                   16 00
+                        0
+                      0
+                      0
+                      0
+                      0
+                      0
+                      0
+                      0
+                      0
+
+
+
+
+                     00
+                     0
+                     0
+                     0
+                     0
+                     0
+                     0
+
+
+
+
+                                       Buffer Id                         pool. To implement the userspace component of Toasty, we
+                                                                         change the FQ implementation in the AF_XDP userspace
+            Figure 4. Frequency of buffer use for packet DMA             library to add newly replenished packet buffers to the head
+     ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                                                                 Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+             Recycled cold buffer                   Received packets                Recycled warm buffer
+                                                                                                           moves the buffers that were just recycled by the applica-
+        Producer
+                                       Fill Queue
+                                                              Producer
+                                                                                             Fill Queue    tion to the front of the queue, while moving the buffers that
+                                                                                                           were originally present at the front to the back of the queue.
+                                                                                                           The produce function in Listing 1 shows the pseudocode of
+            Consumer                                                   Consumer                            the logic implemented in the AF_XDP userspace library in
+            Producer
+                                                                 Atomic Swap
+                                                                                                           Toasty. Note that we do not make any changes to the con-
+                                                                                                           sumer logic shown in the consume function. Now, with this
+                                                                                                           change in place, the most recently processed buffers will
+                             Consumer
+                                                                   Producer
+                                                                                  Consumer                 be quickly reused for DMA of incoming packets. Because
+                                                                                      Consumed recently
+                                                                                                           these buffers are likely to be cache-warm (present in LLC
+             Producer                                              Producer
+                                                                                       recycled buffers    or even in the lower-level caches), a DDIO-capable NIC will
+                                                                                                           most probably encounter a PCI write hit during DMA of a
+                                                                                                           packet into the LLC and will update the buffer in place. This
+                                    Consumer                                          Consumer
+                                                                                                           will lead to fewer evictions from LLC, mitigating issues like
+          (a) Default AF_XDP Implementation                      (b) Toasty AF_XDP Implementation          the leaky DMA problem or the wasted writeback problem.
+            Figure 5. Toasty userspace changes in AF_XDP                                                   It is important to note here that Toasty only swaps buffer
+                                                                                                           pointers inside the FQ, and not the actual buffer contents
+                                                                                                           themselves. For the atomic exchange of buffer pointers, we
+     of the FQ instead of at the tail, thereby allowing for quicker                                        use GCC’s atomic built-in function __atomic_exchange_n() to
+     reuse of the cache-warm free buffers.                                                                 swap the packet descriptors present at the producer pointer.
+        The FQ is a single-producer single-consumer circular queue,                                        We quantify the overheads of this swap in §4.
+     where the AF_XDP application is the producer (enqueues                                                   An astute reader may notice the possibility of race condi-
+     buffer pointers in the FQ), and the AF_XDP kernel driver is                                           tions between the producer and consumer functions shown
+     the consumer (dequeues buffer pointers from the FQ). The                                              above. What if the consumer runs concurrently with the
+     synchronization between the AF_XDP application and the                                                producer? Is it possible that the kernel driver may consume
+     driver is managed via two pointers, the producer pointer and                                          and move a buffer from the head of the FQ to the hardware
+     the consumer pointer. As shown in Figure 5(a), the default                                            RX ring, while the producer is swapping this buffer with a
+     implementation of the AF_XDP userspace library places re-                                             newly recycled warm buffer? This may result in the buffer
+     cycled free buffers at the producer pointer in the FQ, and the                                        being incorrectly handled, e.g., the NIC may DMA a packet
+     driver dequeues buffers from the consumer pointer to allocate                                         into this buffer, and the application may never process it
+     to the NIC RX ring. Because the FQ follows FIFO semantics                                             (believing it to be a free buffer). We would like to clarify
+     by default, the free buffers being enqueued by the AF_XDP                                             that such race conditions do not occur in the busy poll mode
+     application at the producer pointer will be consumed by the                                           of AF_XDP that is used in Toasty, because the kernel dri-
+     AF_XDP driver only after it has cycled through all the other                                          ver’s consumer code runs in the context of the userspace
+     free buffers present in the buffer pool, by which time these                                          application itself, when the application invokes a system call
+     recently recycled (and likely cache-warm) buffers may even                                            to poll and read from the device. Therefore, the producer
+     be evicted from the LLC.                                                                              and consumer functions cannot run concurrently, and hence
+                                                                                                           there is no scope for such race conditions in Toasty.
+1 def produce ( buf [] , * producer , * consumer ) :
+2   for i , buffer in enumerate ( buf ) :                                                                     However, the above described race conditions are possible
+3     # fill buffer into FQ                                                                                in the interrupt mode of AF_XDP, if the application and ker-
+4        *( producer + i ) = buffer                                                                        nel driver threads execute concurrently, either in parallel on
+5        # critical addition in Toasty
+6        ATOMIC_EXCHANGE (*( consumer + i ) , *( producer + i ) )                                          different cores, or interleaved via context switching on the
+7      producer += len ( buf )                                                                             same core. In such cases, we will need to set up more syn-
+8
+                                                                                                           chronization between the producer and consumer functions
+ 9 def consume ( buf [] , * consumer ) :
+10   for i , buffer in enumerate ( buf ) :                                                                 shown above. For example, we can remember the ring entry
+11     allocate_in_rx_ring (*( consumer + i ) )                                                            at the head of the queue, and abort the swap if we notice that
+12     consumer += len ( buf )                                                                             this entry has changed, say, using the compare-and-swap
+                            Listing 1. Toasty atomic swap                                                  atomic operation. Such synchronization involves a higher
+                                                                                                           overhead, but may be acceptable in low-load scenarios that
+        Figure 5(b) shows the modification we make to this logic                                           are typically suitable for the interrupt mode of AF_XDP.
+     in Toasty to improve cache reuse. After the application pro-
+     cesses and recycles a batch of packets at the producer pointer,                                       3.2   Adaptive RX Refill in Kernel Driver
+     we atomically swap these packet descriptors with those                                                The default behavior of NIC device drivers is to keep the
+     present at the consumer pointer. This exchange essentially                                            RX ring fully stocked with packet buffers, so that the NIC
+Toasty                                                                                    ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+Pseudocode 1 Adaptive Refill of NIC RX Ring                             the RX ring, but populate it only with as many buffers as
+ 1: 𝑁 FQ ← Number of packets recycled by app. in previous iteration     required to comfortably handle the current traffic load.
+ 2: 𝑁 RXQ ← Number of packets DMA’d by the NIC in current iteration        The algorithm used by the kernel driver in Toasty to esti-
+ 3: 𝑁 avail ← Number of buffers available in RX ring for DMA            mate the number of buffers to fill in the RX ring is shown
+ 4: 𝑘 ← Tunable threshold to maintain a reserve of buffers in RX ring   in pseudocode 1. The inputs on which the algorithm bases
+ 5:
+                                                                        its decision are shown in lines 1–3. At the start of every iter-
+ 6: if 𝑁 avail < 𝑘 ∗ 𝑁 RXQ then
+ 7:    if 𝑁 RXQ < 50% of link capacity then                             ation, the algorithm computes 𝑁 FQ (the number of buffers
+ 8:        Fill 𝑚𝑖𝑛 (𝑘 ∗ 𝑁 RXQ , 𝑁 FQ ) buffers                         recycled into the FQ by the application since the previous it-
+ 9:    else                                                             eration), 𝑁 RXQ (the number of packets that have been DMA’d
+10:        Fill 𝑘 ∗ 𝑁 RXQ − 𝑁 avail buffers                             by the NIC since the last iteration, and moved to the RXQ of
+11: if 𝑁 avail >= 𝑘 ∗ 𝑁 RXQ then
+                                                                        the AF_XDP application), and 𝑁 avail (the total number of free
+12:    if 𝑁 RXQ < 50% of link capacity then
+13:        Pass                                                         buffers available in the NIC RX ring for use for DMA in the
+14:    else                                                             future). Note that these metrics are readily available from
+15:        Fill 𝑚𝑖𝑛 (𝑘 ∗ 𝑁 RXQ , 𝑁 FQ ) buffers                         the state maintained by the driver, and from the values of the
+                                                                        various head and tail pointers of the software queues. The
+                                                                        algorithm then refills the RX ring with cache-warm buffers
+never needs to drop incoming packets due to the unavailabil-            as far as possible, while trying to ensure that the number of
+ity of free buffers to DMA packets into. Now, note that the             buffers available for DMA in this iteration is at least 𝑘 times
+hardware RX ring is still a FIFO queue and cannot become a              the number of buffers used up for DMA in the last iteration
+LIFO stack barring hardware changes. Therefore, the cache-              (𝑁 RXQ ), where 𝑘 is a configurable parameter (line 4). Our
+warm buffers pulled from the head of the packet buffer pool             current implementation uses 𝑘 = 10, and we evaluate our
+(after Toasty userspace modifications) will be used to DMA              sensitivity to this parameter choice in §4.
+incoming packets only after all the other buffers in the ring              If the number of available buffers is below this threshold
+ahead of them have been used up. Therefore, the userspace               (lines 6–10), the driver tries to place more buffers into the
+changes of Toasty (and similar ideas proposed in the context            RX ring to mitigate this shortfall. However, if the number
+of userspace kernel bypass drivers, like DPDK [25]) alone               of packets received in the previous iteration indicates that
+may not be fully effective in improving cache reuse of warm             the link bandwidth utilization is under 50% (any reasonable
+buffers, unless we limit the RX ring size to small values [27].         threshold will work here, as we show in §4), then we surmise
+However, limiting the size of the NIC RX ring may result in             that there is no imminent danger of the NIC running out
+the driver being unable to replenish the ring quickly enough            of free buffers for DMA, so we refill the ring with only the
+during traffic bursts, which can lead to packet loss. There-            recently recycled 𝑁 FQ warm buffers, subject to the maximum
+fore, the kernel device driver in the AF_XDP framework                  limit of 𝑘 ∗ 𝑁 RXQ . That is, when the rate of packet arrival is
+is modified in Toasty, to dynamically adapt the number of               low enough that there is no danger of packet drops, we fill
+packet descriptors being refilled into the NIC RX ring from             the NIC ring mostly with cache-warm buffers that have been
+the userspace packet buffer pool (FQ), in order to maximize             recently recycled by the application. However, if the rate
+the reuse of cache-warm buffers, while also avoiding packet             of packet arrival indicates that the link utilization is high,
+drops due to the NIC ring running dry.                                  then we refill the ring to bring the number of buffers to our
+   A simple method to estimate the optimal number of buffers            desired value of 𝑘 ∗ 𝑁 RXQ , pulling in cache-warm as well as
+in the ring could be to read NIC registers that keep track              cache-cold buffers from the packet buffer pool. This ensures
+of packet drops and increase the number of buffers to the               that we are able to adapt the number of buffers in the ring
+point where there are no packet drops. However, reading                 to effectively handle a burst.
+NIC registers frequently incurs a high performance overhead;               Next, if the number of free buffers 𝑁 avail is above the de-
+also, the NIC registers are not updated in real time. Instead,          sired limit 𝑘 ∗ 𝑁 RXQ (lines 11–15), and the rate of arrival of
+Toasty uses driver-level metrics that are readily available in          packets is also below 50% utilization, then we assume that
+software to estimate the optimal number of buffers to fill in           there is no danger of the NIC running out of buffers any time
+the RX ring. This estimate is made in every iteration when              soon, and hence do not refill any new buffers into the ring
+the driver code is invoked to replenish the RX ring, e.g., every        in this iteration. This helps us drain out the excess buffers in
+time a batch of packets is processed by the kernel’s bottom-            the ring that were possibly brought into circulation to handle
+half interrupt handler, typically every few milliseconds. Note          a previous burst, thereby allowing the working set size to
+that we do not reconfigure the size of the NIC RX ring itself           settle to a lower value after a traffic burst ends. However, if
+to this estimated value in every iteration, because doing so            we find the link utilization to be high, we still bring in the
+would require a restart of the device and application, and              recently recycled 𝑁 FQ buffers, subject to the maximum limit
+cannot be done fast enough to react to changes in incoming              of 𝑘 ∗ 𝑁 RXQ , into the RX ring. This prepares us to handle the
+packet rate. Instead, we configure a reasonably large size for          ongoing high traffic load, but the high enough reserve of
+ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                                                                   Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+
+              100       Throughput (Gbps)                            N_avail                                  100                        Default        Toasty      Ideal
+
+
+
+
+                                                                                          Throughput (Gbps)
+                                                                               3k
+Rate (Gbps)
+
+                        Traffic Rate (Gbps)
+                                                                                                               80
+
+
+
+
+                                                                                N_avail
+                                                                               2k
+               50
+                                                                               1k                              60
+                0                                                              0k                              40
+                                                                                                               20
+                      0
+                     15
+                     20
+                     25
+                     46
+                     52
+                     58
+                     65
+                     71
+                     93
+                    113
+                    122
+                    152
+                    196
+                    247
+                    244
+                    259
+                    265
+                    261
+                    279
+                    295
+                    306
+                       2
+                    10
+                                         Time (milliseconds)
+                                                                                                                0
+Figure 6. Toasty buffer adjustment with different traffic rates                                                     NAT        IDS    Decrypt L2Fwd       MICA   Maglev
+                                                                                                     Figure 7. Single core throughput: Toasty vs. baselines
+
+buffers already present in the ring means that we can afford                                                                                   IPC
+to refill only cache-warm buffers into the ring. Note that in                                  Modes
+                                                                                                                    NAT    IDS       Decrypt    L2Fwd    MICA    Maglev
+all of the above cases, we always restrict the total number of                                 Default              2.90   2.04      2.36       2.67     2.15    2.96
+buffers to the maximum of the RX ring capacity.                                                Ideal                3.68   2.65      2.36       2.98     2.69    3.89
+   Figure 6 illustrates how the Toasty driver dynamically                                      Toasty               3.70   2.58      2.49       2.75     2.32    3.86
+allocates RX ring buffers. We run the L2Fwd application on                                                            Table 5. IPC: Toasty vs. baselines
+AF_XDP under varying input traffic rates (20 to 100 Gbps),
+and the figure shows the incoming traffic rate, the appli-                                                                           Latency (in microseconds)
+cation throughput with Toasty, and the number of buffers                                       Modes
+                                                                                                                       Mean             99 Percentile     99.99 Percentile
+available in the NIC RX ring as a function of time. Note that                                  Default                 22.03            37.31             93.49
+the maximum application throughput in this case is around                                      Ideal                   15.88            25.17             38.8
+78 Gbps, limited by CPU processing of the application. We                                      Toasty                  12.51            27.31             34.98
+can see from the figure that Toasty adapts the number of                                                       Table 6. Latency of L2Fwd: Toasty vs. baselines
+available buffers in the NIC to match the incoming load.
+After an initial calibration period, Toasty maintains a low
+number of buffers in the NIC, and all of these would likely                               see in §4 that the benefits of our change outweigh the costs,
+be cache-warm due to the small working set size. However,                                 leading to overall improved performance.
+as the traffic increases over a few iterations, Toasty increases
+the number of buffers as well, to adapt to the increasing rates                           4                   Evaluation
+of depletion of buffers in the RX ring. This avoids packet                                We now evaluate the effectiveness of Toasty through exten-
+losses while potentially using a larger set of cache-warm and                             sive experimentation. We first compare the performance of
+cache-cold buffers. Finally, after the traffic burst ends, Toasty                         Toasty with several baseline AF_XDP configurations (§4.1),
+adapts back to a low buffer level within a few tens of millisec-                          e.g., the “default” AF_XDP configuration (large buffer pool)
+onds again. In contrast, a static configuration of the number                             and the “ideal” configuration (smaller buffer pool size that
+of buffers in the RX ring, either to a high value (in the default                         maximizes throughput, similar to prior work like ResQ [30]).
+configuration) or to a low value (in the ideal configuration                              Next, we evaluate Toasty under varying traffic conditions
+with the best throughput) attains a lower throughput, either                              (§4.2), co-located workloads (§4.3), and with a varying num-
+due to the leaky DMA problem (caused by a large working                                   ber of application cores and packet sizes (§4.4). In addition
+set size) or from packet drops (caused by insufficient buffers                            to the default AF_XDP baseline, we also compare Toasty
+in the RX ring), as we show in §4.                                                        to several systems in related work, i.e., ShRing [23], LIFO
+   Finally, in addition to changing the RX ring refill logic,                             memory pool in DPDK [25], and software prefetching (§4.5).
+Toasty also modifies the transmit path of the kernel to proac-                            Finally, we report several microbenchmarks, ablation, and
+tively transmit packets in the TXQ. This change expedites                                 parameter sensitivity studies on Toasty (§4.6).
+the return of transmitted packet descriptors back into the                                   Experimental Setup. The experimental setup is similar
+free buffer pool and ensures that cache-warm buffers get                                  to the one described for the experiments done in §2. The
+recycled quickly. This change may hurt performance due to                                 server machine running the NFs built over AF_XDP has
+reduced TX batch size during transmissions. However, we                                   Ubuntu 22.04.5 LTS with the 6.10.9v of the Linux kernel. We
+                                                                                          modify the AF_XDP device driver and the AF_XDP user
+                                                                                          space library of the kernel as described in Section 3 to im-
+                                               L2 and LLC Miss %                          plement Toasty. We use Linux’s perf tool [8] and Intel’s
+    Toasty
+                      NAT       IDS           Decrypt L2Fwd MICA         Maglev           PCM [13] to measure cache miss rates, PCIe writes hit rates,
+    L2                15.98     24.44         33.02     14.66    26.20   16.50            and memory bandwidth usage. To measure throughput and
+    LLC               0.008     0.045         0.335     0.007    0.075   0.010
+                                                                                          packet loss, the number of packets received by the AF_XDP
+                    Table 4. Toasty L2 and LLC cache miss rates                           application is counted within the application itself and then
+Toasty                                                                                                ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+
+
+                                                                 Throughput (Gbps)
+subtracted from the transmitted packet count by the load
+                                                                                     80                 Baseline_RX_1k            Baseline_RX_2k
+generator, respectively. We operate AF_XDP in zero-copy                                                 Toasty_RX_1k              Toasty_RX_2k
+and busy poll mode for all AF_XDP configurations described                           60
+in the paper (Default, Ideal, and Toasty). It is important to                        40
+note that we co-locate both the AF_XDP application process-                          20
+ing packets and the AF_XDP driver responsible for moving                              0
+                                                                                              2048              4096           8192            16384
+packet buffers between the NIC and the application on the                                                        Buffer Pool Size
+same CPU core. We evaluate ShRing on the same server, us-        Figure 8. Toasty vs. baseline AF_XDP with varying UMEM
+ing shring-DPDK [21] over an NVIDIA ConnectX-6 100Gbps
+NIC, with load generated by PktGen running on the client
+
+
+
+
+                                                                 Throughput (Gbps)
+machine. For experiments involving multicore applications,                           80              Baseline_UMEM_4k          Baseline_UMEM_16k
+                                                                                                     Toasty_UMEM_4k            Toasty_UMEM_16k
+we use 64B packets, as the 100 Gbps network link saturates                           60
+for larger packet sizes. For all single core experiments, we                         40
+use 512B packets unless mentioned otherwise.                                         20
+                                                                                      0
+4.1      Toasty vs. Baseline AF_XDP                                                           256         512           1024        2048           4096
+                                                                                                                   RX Ring Size
+In this section, we compare the performance of several appli-
+cations running over Toasty with that of different baseline      Figure 9. Toasty vs. baseline AF_XDP with varying RX ring
+configurations of AF_XDP.
+   Figure 7 shows the single-core saturation throughput for      as compared to the baselines. We clearly see that Toasty does
+all applications. For the Toasty and AF_XDP baseline config-     a lot better in terms of tail latencies (36.2% gain for 99 per-
+urations, we refer to them as default and ideal, respectively,   centile and 2.6× gain for 99.99 percentile) when compared
+as described in §2. We see from the figure Toasty achieves       with the L2Fwd application running over the default con-
+up to 78% higher throughput (for the IDS application) than       figuration, in spite of Toasty delivering modest throughput
+the default AF_XDP configuration, and almost matches the         gains. These results show that Toasty provides performance
+maximum throughput achieved by the ideal configuration.          benefits to the different types of applications, along different
+These performance gains come from better reuse of packet         dimensions of performance.
+I/O buffers in the CPU caches, as seen from the reduced L2          Next, we compare Toasty with a more extensive set of
+and LLC miss rates of applications with Toasty shown in          baseline AF_XDP configurations, besides the “default” and
+Table 4 (see Table 1 for corresponding results of default and    “ideal” ones. Figures 8 and 9 show the throughput of the NAT
+ideal configurations). We clearly see that the applications      application, with Toasty and baseline AF_XDP, where we
+experience near-zero LLC misses with Toasty, much like           vary the packet buffer pool (UMEM) size and RX ring size
+with the optimally chosen static buffer pool size of the ideal   in many different ways. We see that Toasty outperforms
+configuration, because Toasty adaptively converges to the        the baseline across various configurations. The performance
+optimal buffer pool size. Improved cache performance over        gains of Toasty over the baseline are smaller at very low val-
+the default AF_XDP configuration eventually translates to        ues of the buffer pool and RX ring sizes, because the limited
+the application fetching packet data from the cache instead      availability of buffers in these configurations leaves little to
+of the main memory, leading to fewer memory stalls and           no room for Toasty to improve throughput. However, Toasty
+improved Instruction Per Cycle (IPC), as seen in Table 5.        outperforms the baseline AF_XDP at all reasonable configu-
+   We would like to point out that throughput gains with         rations, e.g., RX ring size 1K to 4K, and UMEM size of 4K to
+Toasty vary across applications, due to the specific charac-     16K. Furthermore, the performance of Toasty is less sensi-
+teristics of the application. For example, the L2Fwd appli-      tive to these configuration parameters themselves because
+cation has a more modest throughput gain because there is        Toasty dynamically adapts the buffer pool size. This implies
+a longer delay to recycle packets when transmission is in-       that Toasty eliminates the need for fine-tuning various pa-
+volved. Although the kernel changes in Toasty expedite the       rameters, such as UMEM size or RX ring size. One can simply
+recycling of transmitted buffers, this change also imposes       set these parameters to some reasonable defaults and trust
+an overhead due to the reduced TX batch size, resulting          Toasty to converge to the optimal values.
+in an overall lower throughput gain. Similarly, the decryp-
+tion NF is highly compute-intensive and does not stress the      4.2                      Variable Traffic Conditions
+network I/O enough to create cache pressure, which again         We now compare the performance of Toasty with the base-
+translates to lower throughput gains. However, even for ap-      line AF_XDP under different types of bursty traffic patterns.
+plications showing modest throughput gains, we still see a       First, we consider the microburst and Poisson traffic work-
+significant improvement in tail latency of the applications.     loads described in §2. Figure 10 shows the throughput of
+Table 6 shows latency for the L2Fwd application with Toasty      the NAT application when processing Poisson distributed
+ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                                                   Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+
+
+                                                                    Throughput (Gbps)
+                                 Toasty Packet Drop %
+    Traffic
+                NAT      IDS       Dec. L2Fwd MICA        Maglev                        60           Toasty
+                                                                                                     Ideal
+ Microburst     0.01     0.02      0      0.02     1.68   0.02                          40           Default
+  Poisson       0.482    0.156     1.17 0.029      1.16   0.303
+                                                                                        20
+ Table 7. Packet drop (%) with varying traffic conditions
+                                                                                         0
+                                                                                              10      20       30    40   50    60    70       80    90    100
+                                        Packet Drop %                                                           Average Rate (lambda) Gbps
+ Burst Size     Mode
+                          Freq 2      Freq 5    Freq 10   Freq 20                             Figure 10. Throughput with Poisson traffic
+               Default    0.00        0.00      0.030     0.035
+    1024        Ideal     0.080       0.080     0.088     0.087
+               Toasty     0.010       0.010     0.040     0.050
+
+
+
+
+                                                                    Throughput (Gbps)
+                                                                                        80               Default AF_XDP        Ideal AF_XDP           Toasty
+               Default    0.00        0.00      0.050     0.073
+    2048        Ideal     11.854      26.472    27.039    31.167                        60
+               Toasty     0.010       0.020     0.030     0.640                         40
+               Default    0.00        0.00      0.070     0.082
+                                                                                        20
+    4096        Ideal     20.546      34.867    35.562    41.681
+               Toasty     1.43        2.31      3.31      5.752                          0
+                                                                                                NAT            IDS   Decrypt L2FWD         MICA      Maglev
+Table 8. Packet drop % with varying burst size and frequency
+                                                                                              Figure 11. No-drop rate: Toasty vs. baselines
+
+traffic, as we vary the average of the Poisson distribution
+
+                                                                    Throughput (Gbps)
+from 10 to 100 Gbps. We see that the application throughput                             80                                                     Default AF_XDP
+flattens at different levels for Toasty and the baselines, and                          60                                                     Toasty
+the maximum throughput achieved by Toasty exceeds that                                  40
+of the baselines. The results with the other applications were
+                                                                                        20
+similar. Note that the throughput of Toasty is higher than
+even the “ideal” configuration, because while the ideal con-                             0
+                                                                                                   NAT         IDS    Decrypt L2Fwd           MICA    Maglev
+figuration uses a smaller size of packet buffer pool that gives
+the highest throughput under steady traffic, it can suffer             Figure 12. Toasty vs. baseline with co-located workloads
+from packet losses under bursty traffic. On the other hand,
+Toasty can adapt the buffer pool size to traffic bursts better,
+leading to lower packet drops and overall higher throughput.        packet drop percentage of Toasty with that of the default and
+To verify this claim, Table 7 shows the packet drop percent-        ideal AF_XDP baselines, for the NAT application. The results
+age with Toasty for all applications, with the microburst and       show that packet drop rates increase with both larger burst
+Poisson traffic patterns (the corresponding ideal and default       sizes and higher burst frequencies across all configurations.
+AF_XDP packet drop % are shown in Tables 2 and 3 of §2).            Toasty exhibits packet drop behavior comparable to default
+We see from these results that Toasty handles bursts bet-           AF_XDP, while the “ideal” configuration with a small packet
+ter than ideal AF_XDP, and behaves almost similar to the            buffer pool and RX ring size sees significant packet drops.
+default configuration of AF_XDP that uses a large packet
+buffer pool.                                                        4.3                      Co-located Workloads
+   Our throughput measurements so far allowed for a very            We now evaluate the performance of Toasty when running
+small packet drop rate of 0.1%, that transport protocols can        under the realistic scenario of memory pressure from co-
+recover from. Now, we compute the No-Drop Rate (NDR),               located memory-intensive applications. We simulate mem-
+i.e., maximum throughput that can be sustained without any          ory pressure using Intel’s MLC tool [12] running on 8 cores
+packet loss [26]. Figure 11 shows the NDR for all applications,     and generating memory read/write requests. Figure 12 shows
+with Toasty and the baseline AF_XDP configurations. We see          the single-core saturation throughput of all applications, for
+from the figure that while the throughput values themselves         Toasty and the default AF_XDP baseline. We see from the
+are slightly lower, the relative trends between Toasty and          figure that Toasty is able to adjust to this memory pressure
+the baselines remain the same.                                      much better than the baseline by reusing a smaller set of
+   Finally, we evaluate Toasty by varying the microburst            memory buffers in cache, leading to 30-86% performance
+size and frequency. Recall that our experiments in §2 con-          gains over the default baseline.
+sidered one microburst of 2048 512B packets every 1ms. We
+now vary the burst size from 1024 to 4096 packets of 512B           4.4                      Varying Packet Size and Application Cores
+each. We vary the burst frequency by sending 𝐾 bursts ev-           We now evaluate the scalability of Toasty with varying num-
+ery 5ms, where 𝐾 varies from 2 to 20. Table 8 compares the          ber of application cores and for different packet sizes. Our
+Toasty                                                                                                      ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+setup consists of a replicated application running on multi-                                                       Default AF_XDP                          Toasty
+
+
+
+
+                                                                  Throughput (Gbps)
+ple cores, each of which is associated with a separate NIC                            40                                      100
+RX ring. The NIC distributes the packets to these RX rings                            30                                       80
+                                                                                      20                                       60
+using Receive Side Scaling (RSS) [9]. We also tag separate                                                                     40
+buffer pools to every RX ring, and hence the Toasty driver                            10                                       20
+still moves a particular buffer between only one FQ and one                            0                                        0
+                                                                                             1      2       4       8                     64         128 256 512 1024 1518
+NIC RX ring. We observe that the performance of Toasty                                       Number of Cores                                         Packet Size (Bytes)
+scales almost linearly for all applications as the number of      Figure 13. Toasty with varying packet size and CPU cores
+cores increases, until the network saturates. Figure 13 shows
+saturation throughput of the NAT application on both Toasty
+
+
+
+
+                                                                  Throughput Gain (%)
+and default AF_XDP, as we vary the number of cores from                                 80                  78.8                    Toasty
+1 to 8 (for 64B packets), and the packet size from 64B to                                                                           User-only Toasty
+1518B (for single core). We did not use larger packet sizes                             60   53.6                                   DPDK LIFO                                     52.2
+                                                                                                                                                               42.5
+for the multicore experiments, as the application was able                              40                                   35.0
+                                                                                                 28.1                                                                                        27.0
+to saturate the 100 Gbps link using just 2 cores for Toasty,
+                                                                                        20           16.5
+                                                                                                                10.0             10.0                                       9.0
+                                                                                                                                                                                     14.0
+and using 4 cores for default AF_XDP with 512B packets.                                                                3.9                     7.9                    4.4
+                                                                                                                                        2.2          0.6 0.2
+The figure shows that the throughput of Toasty scales nearly                             0
+                                                                                                 NAT            IDS          Decrypt            L2Fwd            MICA              Maglev
+linearly with the increasing number of cores for 64B packets,
+and Toasty is able to scale better to higher packet rates as      Figure 14. Toasty vs. User Toasty vs. DPDK LIFO mempool
+compared to the default AF_XDP.
+
+4.5      Comparison with Related Work                             Throughput (Gbps)                 ShRing_1k                    Toasty
+                                                                                      30            ShRing_4k
+In this section, we compare Toasty with several state-of-the-                         20
+art systems designed to solve similar problems.
+DPDK LIFO Mempool [25] is a buffer pool configuration                                 10
+in DPDK, in which the packet buffer pool is maintained as a                            0
+                                                                                                    1                        2                           4                               8
+LIFO stack instead of a FIFO queue. We now compare Toasty                                                                    Number of Cores
+with this LIFO-based packet buffer pool implementation in                                               Figure 15. Toasty vs. ShRing
+DPDK, and also with the user-space only LIFO buffer pool im-
+plementation of Toasty (termed User Toasty in this section).
+All experiments in this section have been configured to run       an RX ring of size 4096 that is adaptively refilled. We can
+with the same buffer pool size (16384 buffers) and the same       see that Toasty performs better than ShRing, especially at
+NIC RX ring size (4096 buffers). Figure 14 shows throughput       a higher number of cores, while also working on simpler
+gains for Toasty, User Toasty, and DPDK LIFO over their           commodity NIC hardware. In our experimental setup, ShRing
+corresponding default configurations (the default AF_XDP          achieves its best performance with 4 cores, contrary to the
+configuration or the default DPDK FIFO-based mempool              8-core scalability mentioned in the original paper [23]. We
+configuration, as the case may be). We see that the gains         further observe that ShRing requires 1 GB hugepages to
+obtained with User Toasty over the default configuration are      achieve good performance, whereas Toasty does not impose
+comparable to what the DPDK LIFO system is able to get            such constraints. Next, we measure the packet drop rates of
+over the default DPDK baseline, albeit with slightly higher       ShRing and Toasty with bursty traffic (Poisson distributed
+cache miss rates in DPDK as compared to Toasty due to             with average rate 30 Gbps, as described in §2). We find that
+a more complicated LIFO stack implementation in DPDK.             the packet drop rates of ShRing (1024 ring size), ShRing (4096
+These results confirm the need for the adaptive RX ring refill    ring size), and Toasty are 0.53%, 1.18%, and 0.01% respectively.
+logic employed by the kernel driver in Toasty in realizing        These results show that the adaptively refilled RX rings in
+the full benefits of the system.                                  Toasty are more resilient to traffic bursts than the shared RX
+ShRing [23] ShRing uses primitives available on state-of-         ring in ShRing, even while delivering comparable or better
+the-art smart NICs to efficiently share a single RX ring across   throughput due to better cache utilization.
+multiple cores, effectively reducing the working set size of      Software Prefetching [2] improves memory access perfor-
+a multi-core network application, resulting in better cache       mance by loading data into the processor’s cache before it is
+hit rates. Figure 15 shows the saturation throughput when         actually needed, using nonblocking prefetch instructions. It
+the network application (NAT in this case) runs on different      can be used to bring packet buffers into the cache before the
+numbers of cores (from 1 to 8). The throughput of ShRing is       application goes on to process them, partly hiding the leaky
+shown for two RX ring sizes (1024 and 4096 buffers), which        DMA problem that occurs due to large packet buffer pools.
+are shared among all cores, while each core of Toasty has         In this section, we investigate whether software prefetching
+ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                                                                      Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+                                                                                                           of throughput), in order to proactively fetch packet buffers
+Throughput (Gbps)
+
+                    100        Default AF_XDP          Default+SPF AF_XDP       Toasty
+                                                                                                           evicted from LLC. This shows that applications running with
+                     80                                                                                    SPF essentially use extra resources (memory bandwidth) to
+                     60
+                                                                                                           increase their LLC hit rates and improve throughput when
+                     40
+                     20                                                                                    compared to Toasty, which delivers more throughput using
+                      0                                                                                    a fraction of the resources.
+                              NAT            IDS       L2Fwd       MICA       Maglev
+                           Figure 16. Toasty vs. software prefetching
+                                                                                                           4.6   Microbenchmarks
+                                                                                                           Swap Overheads. Toasty requires one swap operation per
+                                                                                 100                       processed packet while replenishing the FQ buffer. Here, we
+
+
+
+
+                                                                                       Memory B/W (Gbps)
+                     150       Default PCIeWrHit               Default MemBW
+PCIe Write Hit (%)
+
+
+
+
+                               Default+SPF PCIeWrHit           Default+SPF MemBW 80                        quantify the computational overhead of swap operations
+                               Toasty PCIeWrHit                Toasty MemBW
+                     100                                                         60                        introduced by Toasty. To isolate the cost, we executed 1M
+                                                                                 40                        swap operations and measured a cumulative execution time
+                      50                                                                                   of 4.9ms. For comparison, our NAT implementation achieves
+                                                                                 20                        a throughput of 52.9 Gbps, which implies a packet processing
+                       0                                                         0                         time of approximately 72ms for 1M packets (512B). Hence,
+                              NAT        IDS        L2Fwd       MICA Maglev
+                                                                                                           the swap overheads account for 4.9ms of the total processing
+    Figure 17. PCIe write hit rate and memory BW with SPF                                                  time of 72ms, which results in an overhead of 6.8% that is
+                                                                                                           more than offset by the performance gains of Toasty.
+                     120                                                                                   Ablation Study. We now quantify the performance gains of
+Throughput (Gbps)
+
+
+
+
+                                                        User-only Toasty         Toasty
+                     100                                Kernel-only Toasty
+                                                                                                           the individual components of Toasty, namely, the user-space
+                      80                                                                                   LIFO buffer pool, and the adaptive RX ring refill in the ker-
+                      60                                                                                   nel driver. Figure 18 shows the throughput of three different
+                      40                                                                                   variants of Toasty, one with only the userspace LIFO buffer
+                      20                                                                                   pool, one with only the adaptive RX refill in the kernel driver,
+                       0
+                             NAT        IDS        Decrypt L2Fwd       MICA    Maglev                      and the final complete system with both components. We
+Figure 18. User-space only and kernel-space only variants                                                  see from the figure that the components of Toasty do not
+                                                                                                           realize full performance gains in isolation, but work syner-
+                                                                                                           gistically to improve performance in the complete system.
+                                                 L2 Miss % (LLC Miss %)
+                     Modes                                                                                 With the user-space LIFO buffer pool enabled in isolation,
+                                   NAT       IDS     Dec.     L2Fwd MICA          Mag.
+                                                                                                           warm buffers are reused at the application level; however,
+           User only               17.85     54.26 50.25 20.41 28.96              18.00
+                                   (0.085)   (0.05) (0.49) (0.49) (0.50)          (0.14)                   the NIC RX ring still behaves as a FIFO queue, allowing cold
+      Kernel only                  33.24     63.23 65.45 35.27 35.18              32.09                    buffers to accumulate at the head of the ring and limiting the
+                                   (1.44)    (9.10) (19.06) (1.23) (5.15)         (1.48)                   cache locality benefits. With the kernel-space adaptive RX
+Table 9. L2 and LLC cache miss rates for user-space only                                                   ring enabled in isolation, the RX ring dynamically adjusts
+and kernel-space only Toasty variants                                                                      to traffic load, but cannot recycle warm buffers, resulting in
+                                                                                                           continued cache misses. These observations are further veri-
+                                                                                                           fied in the Table 9, where we see that the L2 and LLC cache
+(SPF) can do as well as Toasty in mitigating the leaky DMA                                                 misses are higher in the case of kernel-space only Toasty as
+problem. For our SPF baseline, the applications use SPF to                                                 compared to the user-space only Toasty. However, the cache
+prefetch packets in the RXQ.                                                                               miss rate of the kernel-only Toasty is still slightly lower than
+   Figure 16 shows the throughput of the default AF_XDP                                                    that of default AF_XDP (shown in Table 1), which shows the
+configuration with and without SPF, and the throughput                                                     effectiveness of our adaptive RX refill mechanism.
+with Toasty. The results show that SPF does move the nee-                                                  Sensitivity to the Threshold Parameter 𝑘. Now, we test
+dle a bit and improves the throughput of some applications                                                 the sensitivity of Toasty to the choice of the threshold param-
+running over the default AF_XDP configuration to a value                                                   eter 𝑘 in our design, which is the multiplier factor relative to
+much closer to Toasty, e.g., for NAT and Maglev. However,                                                  the incoming packet rate that is used to compute the number
+this gain in performance comes at a cost. Figure 17 shows                                                  of free buffers the kernel driver fills in the hardware RX ring.
+the PCIe write hit rate and DRAM bandwidth used in these                                                   First, Figure 19 shows how the number of available buffers
+experiments. The results clearly show that applications run-                                               in the RX ring varies for different values of 𝑘, for the IDS
+ning over SPF consume a higher memory bandwidth when                                                       application. We see from the figure that higher values of 𝑘
+compared with Toasty (as much as 35× for Maglev and 25×                                                    lead to the driver maintaining a larger number of free buffers
+for NAT, the two apps which are closest to Toasty in terms                                                 in the RX ring, which increases resilience to packet drops
+Toasty                                                                                                                 ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+                                                                                                     response to bursty or high-rate traffic. A threshold of 75%
+                    4.0k                             Threshold 5             Threshold 20
+                                                     Threshold 10            N_RXQ                   tends to delay the system’s reaction to some traffic bursts,
+                    3.0k                                                                             but is not too much worse than the threshold of 50% that is
+N_avail
+
+
+
+                    2.0k                                                                             currently used in our design. We conclude that our system
+                    1.0k                                                                             is fairly stable for a range of threshold values around the
+                                                                                                     chosen threshold value.
+                    0.0k
+                                0         200    400      600       800 1000 1200 1400 1600
+                                                             Iterations
+                           Figure 19. Number of available buffers vs. 𝑘
+                                                                                                     5   Related Work
+                                                                                                     We now summarize related work that has identified DDIO
+                                                                                                     performance issues and proposed solutions for the same.
+                    80               PktDrop_50                 PktDrop_70            PktDrop_90     Leaky DMA Problem. ResQ [30] was one of the first works
+Packet Drop (%)
+
+
+
+
+                    60               PktDrop_60                 PktDrop_80            PktDrop_100    that discussed the leaky DMA problem and proposed that
+                    40                                                                               the RX ring should be sized to fit within the LLC to avoid this
+                                                                                                     problem. Our experiments clearly demonstrate the pitfalls
+                    20
+                                                                                                     of this approach. ShRing [23] questions the wisdom of using
+                     0                                                                               a separate NIC RX ring for every CPU core, and argues that
+                            1                    5                10             15             20   using multiple RX rings increases the I/O working set size,
+                                                            Threshold
+                                                                                                     leading to the leaky DMA problem.
+ Figure 20. Performance of Toasty for different values of 𝑘                                          Unnecessary Writebacks. IDIO [1] and Sweeper [32] sug-
+                                                                                                     gest microarchitectural changes to reduce unnecessary write-
+                                                                                                     back traffic between L2 and L3, and between L3 and memory
+Throughput (Gbps)
+
+
+
+
+                    100                         25% LU              50% LU            75% LU         respectively, caused by network I/O workloads in the context
+                     80                                                                              of DDIO. Both solutions identify that packet buffers, once
+                     60                                                                              used up by the application, hold no value until new data is
+                     40
+                                                                                                     DMA’d into them by the NIC, and hence, propose hardware
+                     20
+                                                                                                     solutions (e.g., invalidating processed I/O buffers automati-
+                      0
+                                    NAT         IDS      Decrypt L2Fwd           MICA       Maglev   cally, or via explicit hardware instructions), to avoid writing
+                     Figure 21. Sensitivity to link util (LU) threshold                              them back from a mid-level cache to LLC or memory. Toasty
+                                                                                                     proposes a software-only solution to this problem.
+                                                                                                     Fine-tuning DDIO. Farshin et al. [6] were able to identify
+but also increases the I/O working set size and hurts perfor-                                        that Intel’s DDIO DMA’d packets into the last two LLC ways,
+mance. On the other side, with a lower value of 𝑘, Toasty                                            and hence is only limited to using a small portion of the LLC.
+maintains a very small number of buffers, leading to more                                            They further found ways to tune DDIO by controlling the
+packet drops. Next, Figure 20 shows the packet drop rates                                            LLC ways used by DDIO, increasing network I/O capacity.
+of the NAT application under varying average rates of Pois-                                          CacheDirector [5] optimized DDIO by DMA’ing incoming
+son traffic. We see from the figure that a value of 𝑘 = 10                                           packets into the LLC slice closest to the core, which would
+leads to the sweet spot in performance, striking a balance                                           eventually process that particular packet. Wang et.al. [33]
+between throughput and packet drops. At this value of 𝑘,                                             reverse-engineered DDIO and found that when a packet
+Toasty is able to maintain a low working set size that fits                                          buffer resident in L2 was forwarded back to the NIC, it was
+in LLC DDIO ways under steady traffic conditions, while                                              first moved to two separate ways in LLC (other than the
+being able to quickly adapt to bursty traffic without dropping                                       DDIO ways), before the NIC could read these buffers, show-
+packets, justifying the choice of the threshold parameter in                                         ing that network I/O could be using more cache space in
+our system. Of course, slightly different threshold values                                           LLC than anticipated in the case of DDIO. IAT [35] builds an
+also give comparable performance, and our design is not too                                          LLC management mechanism that dynamically adjusts the
+sensitive to the choice of the threshold.                                                            number of LLC ways for DDIO, for the tenants that demand
+Sensitivity to the Link Utilization Threshold. Our design                                            more LLC capacity. In addition, IAT dynamically chooses the
+uses a threshold of 50% to decide if a link is reasonably                                            tenants that share LLC resources with DDIO to minimize the
+utilized or not. Figure 21 shows the throughput of Toasty for                                        performance interference. Toasty is orthogonal to research
+different values of this threshold. We see that a threshold                                          that fine-tunes DDIO.
+of 25% is too low to classify a link as heavily utilized and                                         Redesigning the NIC-CPU Interface. Enso [28] argues
+start filling the RX ring aggressively. The threshold of 50%                                         that a high percentage of the PCIe interface is wasted in
+strikes a good balance; it is high enough to filter out normal                                       transferring metadata in the current NIC-CPU interface, and
+traffic fluctuations while still enabling timely detection and                                       advocates for a simpler interface that places all incoming
+ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA                                 Preeti, Nitish Bhat, Ashwin Kumar, and Mythili Vutukuru
+
+
+packets contiguously in a single large buffer. This also results   Acknowledgments
+in a better fit in cache as a side effect, in the context of       We thank the anonymous reviewers of ASPLOS ’26 for their
+DDIO. Pismenny et al. [22] identify that most networking           insightful feedback. We also thank Debojeet Das for contri-
+applications only work on the header of the network packet.        butions to the ShRing experiments and Shubham Roy for
+Hence, they advocate using the available on-NIC memory to          valuable discussions. This work was partially supported by
+store payloads, and only DMA packet headers to be processed        the Asha Navani Fellowship, IIT Bombay (DO/2024-JANF001-
+by the application. ShRing [23] leverages features available       008), and the Microsoft Research India PhD Award (IIT-
+in modern smart NICs, and proposes sharing a common RX             BRSP242000100).
+ring across multiple cores to reduce the I/O working set
+size. To avoid the problem of this common ring being shared        References
+unfairly across cores due to load imbalance, RxBisect[24]           [1] Mohammad Alian, Siddharth Agarwal, Jongmin Shin, Neel Patel, Yi-
+proposes dividing the RX ring into two separate rings, an               fan Yuan, Daehoon Kim, Ren Wang, and Nam Sung Kim. 2023. IDIO:
+allocation ring and a bisected reception ring corresponding             Network-Driven, Inbound Network Data Orchestration on Server Pro-
+to each producer-consumer (core-NIC) pair. CEIO [17] is                 cessors. In Proceedings of the 55th Annual IEEE/ACM International
+                                                                        Symposium on Microarchitecture. IEEE Press.
+a cache-efficient hardware architecture for the NIC-CPU             [2] David Callahan, Ken Kennedy, and Allan Porterfield. 1991. Software
+datapath, which utilizes a proactive credit-based I/O rate              prefetching. In Proceedings of the Fourth International Conference on Ar-
+manager in the NIC to minimize LLC contention. The above                chitectural Support for Programming Languages and Operating Systems.
+solutions either require a redesigned hardware NIC-CPU                  Association for Computing Machinery.
+interface or exploit certain capabilities made available in         [3] Cilium. 2024. AF XDP. https://docs.ebpf.io/linux/concepts/af_xdp/.
+                                                                        (Accessed March , 2025).
+some state-of-the-art smart NICs. In contrast, Toasty does          [4] Danielle E. Eisenbud, Cheng Yi, Carlo Contavalli, Cody Smith, Ro-
+not depend on any new hardware capabilities and works                   man Kononov, Eric Mann-Hielscher, Ardas Cilingiroglu, Bin Cheyney,
+with commodity NICs.                                                    Wentao Shang, and Jinnah Dylan Hosein. 2016. Maglev: a fast and
+DPDK Stack Mempool. DPDK has the option of structuring                  reliable software network load balancer. In Proceedings of the 13th
+the buffer pool as a stack [25], as an alternative to the tradi-        Usenix Conference on Networked Systems Design and Implementation.
+                                                                        USENIX Association.
+tional FIFO ring-based mempool. The LIFO stack mempool              [5] Alireza Farshin, Amir Roozbeh, Gerald Q. Maguire, and Dejan Kostić.
+was introduced to improve cache locality, allowing appli-               2019. Make the Most out of Last Level Cache in Intel Processors. In
+cations to reuse recently freed, cache-warm buffers more                Proceedings of the Fourteenth EuroSys Conference 2019. Association for
+efficiently. However, this paper argues that such changes               Computing Machinery.
+alone are not enough to mitigate the leaky DMA problem,             [6] Alireza Farshin, Amir Roozbeh, Gerald Q. Maguire, and Dejan Kostić.
+                                                                        2020. Reexamining direct cache access to optimize I/O intensive appli-
+and also shows results (§4.5) supporting this claim.                    cations for multi-hundred-gigabit networks. In Proceedings of the 2020
+                                                                        USENIX Conference on Usenix Annual Technical Conference. USENIX
+6    Conclusion                                                         Association.
+This paper presents Toasty, a software framework built atop         [7] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.
+                                                                        2020. Caladan: mitigating interference at microsecond timescales. In
+the AF_XDP kernel bypass framework, that avoids the trade-              Proceedings of the 14th USENIX Conference on Operating Systems Design
+off between high network I/O performance and resilience                 and Implementation. USENIX Association.
+to packet drops that arises when sizing the network packet          [8] Brendan Gregg. 2024. perf Examples. https://www.brendangregg.com/
+buffer pool. Toasty structures the packet buffer pool as a LIFO         perf.html. (Accessed March , 2025).
+stack instead of a FIFO queue, and adapts the number of free        [9] Tom Herbert and Willem de Bruijn. 2024. Scaling in the Linux Network-
+                                                                        ing Stack. https://www.kernel.org/doc/Documentation/networking/
+buffers populated into the hardware RX ring based on traffic            scaling.txt. (Accessed March , 2025).
+conditions. Together, these changes ensure that Toasty reuses      [10] Intel. 2024. Data Plane Development Kit. https://www.dpdk.org/.
+a small working set of cache-warm buffers in steady traffic             (Accessed March , 2025).
+conditions, while also pulling in a larger number of packet        [11] Intel. 2024. Intel® Data Direct I/O Technology. https://www.intel.com/
+buffers during traffic bursts to avoid packet drops. Toasty             content/www/us/en/io/data-direct-i-o-technology.html. (Accessed
+                                                                        March , 2025).
+can be deployed on commodity NIC hardware and delivers
+                                                                   [12] Intel. 2024.        Intel® Memory Latency Checker.                 https:
+impressive performance gains over the default AF_XDP con-               //www.intel.com/content/www/us/en/developer/articles/tool/intelr-
+figuration across various network applications and traffic              memory-latency-checker.html. (Accessed March , 2025).
+conditions. While recent research has leveraged new features       [13] Intel. 2024. Intel® Performance Counter Monitor. https://github.com/
+in modern smart NICs or explored ways to redesign the NIC-              intel/pcm. (Accessed March , 2025).
+                                                                   [14] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries, Adam Belay,
+CPU interface to optimize network I/O, Toasty explores a
+                                                                        David Mazières, and Christos Kozyrakis. 2019. Shinjuku: preemptive
+different point in the design space and shows that one can              scheduling for µsecond-scale tail latency. In Proceedings of the 16th
+reap significant performance gains with software changes                USENIX Conference on Networked Systems Design and Implementation.
+on existing hardware. The source code of Toasty is available            USENIX Association.
+at https://github.com/networkedsystemsIITB/toasty.                 [15] Magnus Karlsson and Bjorn Topel. 2018. The Path to DPDK Speeds
+                                                                        for AF XDP. In Linux Plumbers Conference, Vancouver.
+Toasty                                                                                             ASPLOS ’26, March 22-26, 2026, Pittsburgh, PA, USA
+
+
+[16] Hyeontaek Lim, Dongsu Han, David G. Andersen, and Michael Kamin-         [26] RFC2544. [n. d.]. Benchmarking Methodology for Network Intercon-
+     sky. 2014. MICA: a holistic approach to fast in-memory key-value              nect Devices. https://www.rfc-editor.org/rfc/rfc2544.txt. (Accessed
+     storage. In Proceedings of the 11th USENIX Conference on Networked            March , 2025).
+     Systems Design and Implementation. USENIX Association.                   [27] Luigi Rizzo. 2012. Netmap: a novel framework for fast packet I/O.
+[17] Bowen Liu, Xinyang Huang, Qijing Li, Zhuobin Huang, Yijun Sun,                In Proceedings of the 2012 USENIX Conference on Annual Technical
+     Wenxue Li, Junxue Zhang, Ping Yin, and Kai Chen. 2025. CEIO: A                Conference. USENIX Association.
+     Cache-Efficient Network I/O Architecture for NIC-CPU Data Paths.         [28] Hugo Sadok, Nirav Atre, Zhipeng Zhao, Daniel S. Berger, James C. Hoe,
+     In Proceedings of the ACM SIGCOMM 2025 Conference. Association for            Aurojit Panda, Justine Sherry, and Ren Wang. 2023. Enso: A Stream-
+     Computing Machinery.                                                          ing Interface for NIC-Application Communication. In 17th USENIX
+[18] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and               Symposium on Operating Systems Design and Implementation (OSDI
+     Hari Balakrishnan. 2019. Shenango: achieving high CPU efficiency              23). USENIX Association.
+     for latency-sensitive datacenter workloads. In Proceedings of the 16th   [29] Dan Tang, Yungang Bao, Weiwu Hu, and Mingyu Chen. 2010. DMA
+     USENIX Conference on Networked Systems Design and Implementation.             cache: Using on-chip storage to architecturally separate I/O data from
+     USENIX Association.                                                           CPU data for improving I/O performance. In HPCA - 16 2010 The
+[19] Federico Parola, Roberto Procopio, Roberto Querio, and Fulvio Risso.          Sixteenth International Symposium on High-Performance Computer Ar-
+     2023. Comparing User Space and In-Kernel Packet Processing for Edge           chitecture.
+     Data Centers. SIGCOMM Comput. Commun. Rev. (2023).                       [30] Amin Tootoonchian, Aurojit Panda, Chang Lan, Melvin Walls, Katerina
+[20] Federico Parola, Shixiong Qi, Anvaya B. Narappa, K. K. Ramakrishnan,          Argyraki, Sylvia Ratnasamy, and Scott Shenker. 2018. ResQ: enabling
+     and Fulvio Risso. 2024. SURE: Secure Unikernels Make Serverless Com-          SLOs in network function virtualization. In Proceedings of the 15th
+     puting Rapid and Efficient. In Proceedings of the 2024 ACM Symposium          USENIX Conference on Networked Systems Design and Implementation.
+     on Cloud Computing. Association for Computing Machinery.                      USENIX Association.
+[21] Boris Pismenny. 2024. ShRing-DPDK. https://github.com/BorisPis/          [31] Rich Tull. 2023. Explore the Evolution of 400G Ethernet: How it Came
+     shRing-dpdk. (Accessed March , 2025).                                         and Where it’s going? https://www.versitron.com/blogs/post/explore-
+[22] Boris Pismenny, Liran Liss, Adam Morrison, and Dan Tsafrir. 2022. The         the-evolution-of-400g-ethernet-how-it-came-and-where-its-going.
+     benefits of general-purpose on-NIC memory. In Proceedings of the 27th         (Accessed March , 2025).
+     ACM International Conference on Architectural Support for Program-       [32] Marina Vemmou, Albert Cho, and Alexandros Daglis. 2023. Patching
+     ming Languages and Operating Systems. Association for Computing               up Network Data Leaks with Sweeper. In Proceedings of the 55th Annual
+     Machinery.                                                                    IEEE/ACM International Symposium on Microarchitecture. IEEE Press.
+[23] Boris Pismenny, Adam Morrison, and Dan Tsafrir. 2023. ShRing: Net-       [33] Minhu Wang, Mingwei Xu, and Jianping Wu. 2022. Understanding
+     working with Shared Receive Rings. In 17th USENIX Symposium on                I/O Direct Cache Access Performance for End Host Networking. Proc.
+     Operating Systems Design and Implementation (OSDI 23). USENIX As-             ACM Meas. Anal. Comput. Syst. (2022).
+     sociation.                                                               [34] Keith Wiles. 2024. DPDK PktGen. https://github.com/pktgen/Pktgen-
+[24] Boris Pismenny, Adam Morrison, and Dan Tsafrir. 2025. Disentangling           DPDK. (Accessed March , 2025).
+     the dual role of NIC receive rings. In Proceedings of the 19th USENIX    [35] Yifan Yuan, Mohammad Alian, Yipeng Wang, Ren Wang, Ilia Kurakin,
+     Conference on Operating Systems Design and Implementation. USENIX             Charlie Tai, and Nam Sung Kim. 2021. Don’t forget the I/O when
+     Association.                                                                  allocating your LLC. In Proceedings of the 48th Annual International
+[25] DPDK Project. [n. d.]. Stack Mempool Driver. https://doc.dpdk.org/            Symposium on Computer Architecture. IEEE Press.
+     guides/mempool/stack.html. (Accessed March , 2025).
+

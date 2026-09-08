@@ -1,0 +1,1271 @@
+Cxlalloc: Safe and Efficient Memory Allocation for a
+                     CXL Pod
+                               Newton Ni                                                            Yan Sun
+                       nwtnni@cs.utexas.edu                                                  yans3@illinois.edu
+                  The University of Texas at Austin                               University of Illinois Urbana-Champaign
+                        Austin, Texas, USA                                               Champaign, Illinois, USA
+
+                             Zhiting Zhu∗                                                     Emmett Witchel
+                       zhitingz@nvidia.com                                                 witchel@cs.utexas.edu
+                  The University of Texas at Austin                                   The University of Texas at Austin
+                        Austin, Texas, USA                                                  Austin, Texas, USA
+                              NVIDIA
+                    Santa Clara, California, USA
+Abstract                                                                  ACM Reference Format:
+A Compute Express Link (CXL) pod is a group of hosts that                 Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel. 2026.
+                                                                          Cxlalloc: Safe and Efficient Memory Allocation for a CXL Pod. In
+share CXL-attached memory. A memory allocator for a CXL
+                                                                          Proceedings of the 31st ACM International Conference on Architectural
+pod faces novel challenges: (1) CXL devices may not fully
+                                                                          Support for Programming Languages and Operating Systems, Volume
+support inter-host hardware cache coherence (HWcc), (2)                   2 (ASPLOS ’26), March 22–26, 2026, Pittsburgh, PA, USA. ACM, New
+the allocator may be concurrently accessed from different                 York, NY, USA, 18 pages. https://doi.org/10.1145/3779212.3790149
+processes, and (3) with more hosts, failures become more
+likely.
+   We present cxlalloc, a user-space memory allocator that                1    Introduction
+addresses these challenges through careful metadata layout                Compute Express Link (CXL) memory provides a load/store
+and new protocols to maintain cache coherence in software,                interface that allows processors to access memory across
+coordinate memory mappings across processes, and recover                  a CXL link, most commonly transported over PCIe. CXL
+from crashes. Cxlalloc uses compare-and-swap (CAS) for                    is maturing into a practical substrate for lower-cost, disag-
+efficient synchronization; to support CXL devices with no                 gregated memory in data centers, where system software
+HWcc, we present a memory-based CAS (mCAS) primitive                      manages tiering between fast local memory and slower CXL-
+implemented in an FPGA.                                                   attached memory [45, 46, 50, 61, 65, 69]. Initial prototypes
+   Experiments with in-memory key-value store workloads                   for hardware that allow multiple machines to share a sin-
+demonstrate that cxlalloc retains competitive performance                 gle CXL memory device are now available, with plans for
+while enabling new use-cases. Experiments with a commer-                  broader commercialization [5, 12]. A small number of hosts
+cial CXL device show that cxlalloc can achieve 80% of its                 (e.g., 8–16) connected directly to a single multi-headed CXL
+maximum allocation throughput using mCAS.                                 memory module and sharing memory at cacheline granular-
+                                                                          ity is called a CXL pod [12, 33, 71]. Applications that want
+CCS Concepts: • Software and its engineering → Mem-                       to dynamically allocate and share memory in a CXL pod
+ory management; • Computer systems organization →                         require a memory allocator.
+Processors and memory architectures.                                         CXL pods present some novel challenges that make it
+Keywords: Memory allocation; CXL; shared memory; mCAS;                    difficult to use existing memory allocators: limited inter-
+cache coherence                                                           host hardware cache coherence (HWcc), cross-process
+                                                                          sharing, and partial failure. We contribute a new memory
+∗ Work done while at The University of Texas at Austin.
+                                                                          allocator, cxlalloc, that address these challenges.
+                                                                           Limited HWcc. Version 3 of the CXL specification [2] de-
+                                                                          fines an inter-host cache coherence protocol, but given im-
+                                                                          plementation cost and complexity, it is unclear if HWcc will
+                                                                          become widely supported in practice. HWcc is important
+This work is licensed under a Creative Commons Attribution 4.0 Interna-   for software, as it enables threads on different hosts to syn-
+tional License.
+ASPLOS ’26, Pittsburgh, PA, USA
+                                                                          chronize with atomic operations like compare-and-swap
+© 2026 Copyright held by the owner/author(s).                             (CAS). Recent work assumes a range of HWcc models: full
+ACM ISBN 979-8-4007-2359-9/2026/03                                        HWcc [9], HWcc in a limited memory region [33, 35], and
+https://doi.org/10.1145/3779212.3790149                                   no HWcc [56, 70].
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                  Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+   Cxlalloc is compatible with all three of these HWcc mod-             Prior work [68] achieves partial failure tolerant memory
+els. Cxlalloc’s algorithms reduce the amount of HWcc meta-           allocation using lock-free data structures to ensure metadata
+data while efficiently maintaining cache coherence in soft-          shared between threads is always consistent, and reference
+ware for the remaining metadata. Cxlalloc’s memory layout            counting to recover memory from dead threads. Reference
+separates HWcc metadata into its own contiguous region.              counting works well for message passing workloads like
+If there is full HWcc, cxlalloc remains correct. If HWcc             RPC, which involve relatively few and uncontended refer-
+is limited to a small region (Figure 1(A)), cxlalloc mini-           ence count updates, but less so for shared memory data
+mizes its HWcc usage. If there is no HWcc (Figure 1(B)), we          structures, where reference counts updates can cause high
+demonstrate how to implement a memory-based compare-                 contention even under read-heavy access patterns. More-
+and-swap (mCAS) operation in near-memory processing                  over, reference counts (which require HWcc) are embedded
+logic, using hardware available today. Cxlalloc can use              in each allocation, making them non-trivial to adapt to other
+mCAS instead of CAS.                                                 HWcc models.
+ Cross-process sharing. Memory allocators typically as-                 cxlalloc also uses lock-free data structures, but intro-
+sume that their metadata will be accessed within a single            duces a new recovery protocol to reduce overhead. Each allo-
+process, but shared CXL memory may be accessed concur-               cator operation starts by updating 8 bytes of state atomically,
+rently from different processes on different hosts. To discuss       in place, like a single-element redo log. This state provides
+correctness, it is useful to define two properties:                  enough information to idempotently redo an interrupted
+Definition 1.1 (Spatial pointer consistency (PC-S)). A pointer       operation on recovery.
+refers to the same physical memory in each sharing process.           Contributions. We identify and explain the constraints of
+                                                                     shared CXL memory allocation: limited HWcc, cross-process
+Definition 1.2 (Temporal pointer consistency (PC-T)). A              sharing, and partial failure. We present the design of cxlal-
+pointer to memory allocated in one process can immediately           loc, the first memory allocator to satisfy all of these con-
+be dereferenced in any sharing process.                              straints, and an FPGA implementation of mCAS that can be
+   Together, we refer to these properties as pointer consis-         used for inter-host synchronization for CXL devices that do
+tency (PC). PC must be maintained when memory allocators             not support HWcc.
+manipulate memory mappings—for example, to increase the                 We evaluate cxlalloc against shared memory allocators,
+size of the heap, or to back a new 1GiB allocation. In a single-     persistent memory allocators, and CXL memory allocators
+process setting, PC is guaranteed by the OS: concurrent mmap         (§5). Using YCSB [20] and real-world traces of memcached
+calls return memory mappings that do not overlap and are im-         requests [66], we establish that cxlalloc has best-in-class
+mediately visible to all threads. With cross-process sharing,        performance for time and space. Using a commercial CXL
+the OS can no longer provide these guarantees. For exam-             device, we demonstrate that cxlalloc can achieve up to
+ple, concurrent mmap calls in different processes may return         80% of its maximum allocation throughput with no HWcc
+memory mappings with the same virtual address, and each              (using mCAS). Our allocator is open source and available
+memory mapping is initially invisible to other processes.            here: https://github.com/nwtnni/cxlalloc.
+   Cxlalloc is the first memory allocator to provide PC for
+cross-process shared memory, without trade-offs like fixed           2     Background and motivation
+heap size [1, 72] or maximum allocation size [68]. Cxlalloc
+provides PC-S by using offset pointers (§2.3) and placing            We will discuss CXL hardware and memory allocation.
+heap metadata and data at consistent offsets in every pro-
+cess. Cxlalloc provides PC-T by using a signal handler to            2.1   Compute Express Link (CXL)
+asynchronously install memory mappings in each process,              CXL is a communication protocol that defines semantics for
+and introduces a hazard pointer [51] based protocol to safely        accessing memory across a serial link. CXL can run over PCIe
+reclaim memory mappings.                                             links, allowing processors that support the CXL protocol (e.g.,
+ Partial failure. Compared to a single-process application,          Intel’s Sapphire Rapids) to access memory across the PCIe
+a multi-process application in a CXL pod faces a higher prob-        bus. The CXL memory device contains commodity DDR
+ability of partial failure [28, 68], where a single thread or pro-   DRAM modules. CXL memory has evolved from a single
+cess may crash (e.g., due to the OS’s out-of-memory killer).         device (1.0), to a switched pool (2.0), to fine-grained sharing
+Tolerating partial failures is useful for high-availability ap-      (3.0, and in the current 3.2 specification [2]).
+plications [71] like transactional databases [33], machine            Cache coherence. The CXL standard supports inter-host
+learning training [48], and file systems [7], to ensure that         hardware cache coherence (HWcc) via back-invalidation [2].
+a single software bug or other problem cannot bring down             HWcc is important for shared memory programs because it
+the whole system. Memory allocators should not cause live            allows threads to efficiently synchronize across hosts using
+application threads to block, even if a thread crashes inside        standard atomic operations like compare-and-swap (CAS).
+an allocator function.                                               Unfortunately, full HWcc seems unlikely due the cost of
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                       ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+                                                                  in false cache line sharing or even unbounded memory us-
+                                                                  age [13].
+                                                                   Limitations. It is non-trivial to adapt traditional memory
+                                                                  allocators to limited HWcc because their layouts intersperse
+                                                                  thread-local and global metadata. Leaving the global meta-
+                                                                  data in place wastes HWcc memory, but moving it out creates
+                                                                  other problems, like correlating the thread-local and global
+                                                                  metadata.
+Figure 1. (A) shows shared CXL memory split into a section           Cross-process sharing also makes managing memory map-
+that is kept coherent by hardware (HWcc) and a much larger        pings more challenging. Traditional memory allocators use
+region that must rely on software for cache coherence (SWcc).     absolute virtual addresses as pointers and assume a single-
+(B) shows shared CXL memory connected to a host via a PCIe        process address space. They rely on the OS to guarantee that
+bus. One region of CXL memory is device biased, meaning           new memory mappings do not overlap, so that a pointer
+its contents cannot be cached by a CPU. This region is fully      refers to the same physical memory (PC-S). But new mem-
+managed by near memory processing logic (NMP), which              ory mappings in different processes may have overlapping
+handles load, store, and mCAS operations sent from the CPU        virtual addresses, violating PC-S. They also rely on the OS to
+to an address region marked uncachable. Host-biased CXL           guarantee that memory mapping updates are immediately
+memory can be cached by the host.                                 visible to all threads, so that pointers can be safely derefer-
+                                                                  enced (PC-T). But a new memory mapping in one process
+                                                                  is invisible to other processes, so a pointer passed between
+                                                                  processes may fault when dereferenced, violating PC-T.
+snoop filters [35]. Two current hardware prototypes that             Finally, traditional memory allocators do not provide fail-
+support inter-host memory sharing do not support HWcc             ure tolerance. Many use locks for synchronization [27], which
+at all [5, 12]. Other work proposes limiting HWcc to a small      can block live threads if a thread crashes in a critical section,
+memory region [35].                                               and none provide APIs to allow the application to recover
+   These two HWcc models are illustrated in Figure 1. Fig-        the in-memory state of a crashed thread.
+ure 1(A) shows a CXL device that supports HWcc in a small
+contiguous region (HWcc). Figure 1(B) shows a CXL de-
+vice with no HWcc: we implement a custom memory-based             2.3   Persistent memory (PM) allocation
+compare-and-swap (mCAS) primitive using near memory               We again start with background, and then discuss why PM
+processing (NMP) logic (§4). The NMP intercepts operations        allocators fail to support CXL shared memory. PM is byte-
+to a small contiguous region (device biased) to ensure that       addressable, like DRAM, but preserves its contents upon
+mCAS operations are serialized.                                   power loss. CXL memory is not persistent by default (though
+   A critical difference between these HWcc models is that        it can be made persistent using a backing SSD [22]), but data
+the HWcc region in Figure 1(A) can be cached by CPUs,             in shared CXL memory can survive application and even OS
+but the device biased region in Figure 1(B) must be marked        restarts, if shared by different hosts.
+uncachable (via /proc/mtrr, for example), as the NMP has           Recoverability. PM allocators can restore their internal
+no way of tracking or invalidating CPU caches.                    metadata to a consistent state after a crash. There are broadly
+ Failure model. Like related work [68, 71], we assume our         two approaches to recoverability: garbage collection [14, 16]
+CXL device is reliable. It keeps its state while processes can    scans the heap for memory leaks on recovery, while redo
+crash and operating systems can reboot. Such reliability can      logging [23] replays log entries on recovery.
+be achieved using an independent power supply or batteries.        Offset pointers. Offset pointers [17] are a ubiquitous [1,
+                                                                  19, 23, 31, 52] alternative to traditional pointers (absolute
+2.2   Traditional memory allocation                               virtual addresses) that allow in-memory data structures con-
+We will start with some background, and then discuss why          taining pointers to be mapped at different virtual addresses.
+traditional memory allocators fail to support CXL shared          Traditional pointers require memory mappings to always be
+memory.                                                           placed at stable addresses, which can conflict with OS and ap-
+ Slab allocation. Slab allocation [41] is a common [16, 27, 43]   plication memory mappings. Offset pointers instead require
+design where memory is statically split into coarse-grained,      stable offsets between memory mappings. Other alternatives,
+fixed size slabs, which are then dynamically split into fine-     like indirection [15] and relocation [49], are possible, but re-
+grained, equally sized blocks. This balances fragmentation        quire complex runtime support.
+and performance.                                                   Limitations. Like traditional memory allocators (§2.2), PM
+ Remote free. A remote free [43, 47] is when memory allo-         allocators are difficult to adapt to limited HWcc: their layouts
+cated by one thread is freed by another, which can result         also intersperse thread-local and global metadata.
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+                                                                  struct SmallHeap {
+                                                                      hwcc: (SmallGlobal, [HWccDesc]),
+                                                                      swcc: ([SmallLocal; NUM_THREAD], [SWccDesc]),
+                                                                      data: [u8] }
+                                                                  struct SmallGlobal { len: u32, free: u32 }
+                                                                  struct SmallLocal {
+                                                                      unsized: u32, sized: [u32; NUM_SIZE_CLASS] }
+                                                                  struct HWccDesc { remote: u16 }
+                                                                  struct SWccDesc {
+                                                                      next: u32, owner: ThreadId,
+                                                                      class: u8, free: BitSet }
+
+                                                                  Figure 3. Pseudocode type definitions for the small heap.
+Figure 2. A sketch of cxlalloc’s memory layout. Heap
+metadata is partitioned into HWcc and SWcc metadata to
+                                                                  and 512KiB+, respectively. Figure 2 sketches how these heaps
+support limited HWcc (§3.2), and separated from applica-
+                                                                  are arranged in memory. We note two immediate differences
+tion data, which can reside in either HWcc or SWcc memory.
+                                                                  in how cxlalloc lays out metadata compared to a traditional
+Grey shaded regions indicate virtual address space reserva-
+                                                                  memory allocator: (1) cxlalloc partitions heap metadata
+tions (§3.3), used to maintain pointer consistency (§1) across
+                                                                  into HWcc and SWcc (§3.2), and (2) data regions are contigu-
+processes. S0 and L0 indicate slab metadata and data for a
+                                                                  ous in virtual address space to support offset pointers (§3.3).
+small or large slab, respectively, with index 0. H0 indicates a
+                                                                  We next describe each heap in more detail.
+virtual address region in the huge heap (§3.1.2). Ta indicates
+thread-local metadata for thread a.                               3.1.1 Small and large heap. The small and large heaps
+                                                                  share the same slab allocation design (§2.2), so we omit a
+                                                                  separate discussion of the large heap. Figure 3 lists the core
+   PM allocators assume sequential access from one process        data structures in the small heap.
+at a time, but cross-process sharing implies concurrent access.      At a high level, the data region is divided into fixed-size
+Even though PM allocators use offset pointers, they still rely    slabs. The heap length (SmallGlobal.len) indicates the cur-
+on the OS to guarantee that concurrent memory mapping             rent number of slabs in the heap, and can be increased (§3.3.1).
+updates do not have overlapping offset ranges (PC-S). And         Slabs are organized into free lists, and each slab is linked to
+even though PM allocators can replay memory mappings on           at most one free list (we will explain how a slab may be un-
+recovery, they still rely on the OS to make mapping updates       linked during allocation). There are three kinds of free lists:
+visible to all threads during normal execution (PC-T).            the global free list (SmallGlobal.free) and thread-local un-
+   Partial failure also breaks some common design choices         sized free lists (SmallLocal.unsized) contain inactive slabs,
+in PM allocators. PM allocators assume a total failure model,     which have no size class and all memory available for allo-
+where all sharing threads crash at once, and there is a qui-      cation; the thread-local sized free lists (SmallLocal.sized)
+escent period during recovery where no thread is accessing        contain non-full slabs, which have a size class and at least
+the heap. As a result, many PM allocators synchronize their       one block available for allocation.
+data structures using locks [23, 52], which can block live           Each slab has some associated metadata, which is split
+threads if a thread crashes in an allocator critical section.     across two descriptors: SWccDesc and HWccDesc. A slab has
+And many PM allocators recover their metadata by using            an owning thread (SWccDesc.owner) that has exclusive write
+non-concurrent garbage collection [14, 16], which blocks          access to the slab’s SWccDesc, which includes the size class
+live threads from accessing the heap during recovery. Any         (SWccDesc.class), a bitset of available blocks
+blocking is undesirable for highly available applications.        (SWccDesc.free), and a slab index (SWccDesc.next) to link
+                                                                  into free lists (implemented as intrusive linked lists). The
+3     Design                                                      owner of a slab is the only thread that can allocate blocks
+We begin by describing cxlalloc ’s core data layout and           from that slab. To handle when a thread frees to a slab it does
+algorithms, and then explain how this core is extended to         not own (remote free), each slab also has a counter of remote
+address limited HWcc, cross-process sharing, and partial          frees (HWccDesc.remote). This counter counts down from
+failure.                                                          the total number of blocks due to our SWcc protocol (§3.2.2).
+                                                                  Figure 4 shows the various state transitions that a slab un-
+3.1   Architecture                                                dergoes during the (de)allocation algorithms described next.
+Cxlalloc comprises three heaps: the small, large, and huge         Allocation. To allocate, a thread first checks its thread-
+heaps, which manage allocations of size 8B-1KiB, 1KiB-512KiB,     local sized free list. If it is empty, the thread tries to transfer
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                           ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+                                                                      struct HugeHeap {
+                                                                          hwcc: HugeGlobal,
+                                                                          swcc: [HugeLocal; NUM_THREAD],
+                                                                          data: [u8] }
+                                                                      struct HugeGlobal {
+                                                                          reservations: [ThreadId; NUM_RESERVATION] }
+                                                                      struct HugeLocal {
+Figure 4. The state transition diagram of a slab in the small             free: IntervalTree,
+heap. Green and red indicate when a slab does or does not                 descs: u64,
+have an owner, respectively, and a dashed outline indicates               hazards: [u64; NUM_HAZARD] }
+that a slab is unlinked from all free lists. A global, thread-        struct HugeDesc {
+local (TL) unsized, or thread-local (TL) sized slab is linked            next: u64, offset: u64, size: u64, free: bool }
+to the corresponding free list. An unmapped slab is past the
+heap length. A detached slab is full, has an owner, and is             Figure 5. Pseudocode type definitions for the huge heap.
+unlinked, while a disowned slab is full, has no owner, and is
+unlinked (also see §3.2.1). The more complex transitions are          or disowned, so the thread steals ownership of the slab, trans-
+labelled with conditions.                                             ferring it to its own thread-local unsized free list. Stealing
+                                                                      is safe here because (1) a detached or disowned slab is not
+                                                                      linked to any free list, and (2) if the counter is 0, then every
+over a slab from the following sources, in order: the thread-
+                                                                      block has been remotely freed, and there can be no more
+local unsized free list, global free list, and heap length (i.e.,
+                                                                      allocation from or deallocation to this slab. This code path is
+extending the heap). After transferring a slab, the thread
+                                                                      the only way that remotely freed memory can be reclaimed;
+initializes the slab by setting SWccDesc.owner to its own ID,
+                                                                      we discuss tradeoffs in §3.2.1.
+SWccDesc.class to the requested size class, SWccDesc.free
+                                                                         In either case, if the thread-local unsized free list reaches
+to the full set of blocks, and HWccDesc.remote to the total
+                                                                      a configurable threshold length, the thread transfers some
+number of blocks.
+                                                                      slabs to the global free list.
+   At this point, the thread-local sized free list must contain
+at least one slab, so the thread allocates a block from SWc-          3.1.2 Huge heap. Allocations in the huge heap are backed
+cDesc.free. If the slab is still not full, allocation is done. Oth-   by individual memory mappings, necessitating a different
+erwise, the thread must maintain our invariant that thread-           design than the small heap. The main data structures are
+local sized free lists only contain non-full slabs (which allows      listed in Figure 5. At a high level, the reservation array
+future allocations to avoid traversing full slabs, and remote         (HugeGlobal.reservations) tracks ownership of coarse-
+frees to avoid coordination).                                         grained virtual address regions; an entry grants a thread
+   In the common case with no remote frees (i.e.,                     exclusive permission to install new mappings in the corre-
+HWccDesc.remote is equal to the total number of blocks), the          sponding region. Each thread tracks its owned regions using
+thread keeps ownership of the slab, but still unlinks it from         an interval tree (HugeLocal.free). We note that any deter-
+the thread-local sized free list, transitioning the slab to the       ministic data structure will work here. Whenever a thread
+detached state in Figure 4. Otherwise, at least one remote free       creates a memory mapping to back an allocation, it also allo-
+has occurred, and the thread clears SWccDesc.owner before             cates a new descriptor (HugeDesc) and links the descriptor
+unlinking, transitioning the slab to the disowned state in            to an intrusive linked list (HugeLocal.descs). Descriptors
+Figure 4. We discuss the reasoning behind these two states            record the allocation’s offset (relative to HugeHeap.data)
+in more detail (§3.2.1).                                              and size. The free bit (HugeDesc.free) is used in tandem
+ Deallocation. To deallocate, a thread identifies the slab            with hazard offsets (HugeLocal.hazards) to safely reclaim
+containing the freed pointer (by dividing the pointer’s offset        memory in a cross-process setting.
+within the data region by the slab size) and then checks the           Allocation. To allocate, a thread finds a contiguous region of
+owner. If the deallocating thread is the owner, it takes the          the requested size using HugeLocal.free (requesting more
+local free path and updates SWccDesc.free in place. If this           virtual address space from the reservation array if neces-
+slab was previously full, it must have been in the detached           sary). The thread then allocates a descriptor, initializes the
+state, and the thread pushes it onto the thread-local sized           descriptor’s size and offset with free bit unset, and links the
+free list. If this slab is now empty, the thread transfers it to      descriptor to its descriptor list. Finally, the thread installs the
+the thread-local unsized free list.                                   mapping and returns the resulting pointer to the application.
+   Otherwise, the thread is not the owner, and it takes the re-        Deallocation. To deallocate, a thread computes the virtual
+mote free path and uses CAS to decrement HWccDesc.remote.             address region containing the freed pointer (by subtract-
+If this counter reaches 0, this slab must have been detached          ing HugeHeap.data from the pointer and dividing by the
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                 Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+region size), and then looks up the owner in the reserva-           also assumes that any application written for SWcc memory
+tion array. The thread then traverses the owner’s descriptor        will pin threads to cores, to avoid inconsistent cache contents
+list to find the descriptor with the same offset, and sets the      due to the OS scheduling a thread on different core. Cxlalloc
+HugeDesc.free bit. Setting the free bit does not require CAS        manually controls cache state by flushing and fencing.
+because huge descriptors are never updated concurrently.               We begin with the small heap. The two sources of SWcc
+Finally, the thread unmaps this memory mapping.                     data are thread-local free lists (SmallLocal) and SWccDesc.
+                                                                    Thread-local free lists are only read and written by a single
+3.2   Limited HWcc                                                  thread, and trivially do not require any flushing or fencing.
+Cxlalloc supports limited HWcc by minimizing and separat-           SWccDescs require more care: while they are only written
+ing metadata that requires HWcc (SmallHeap.hwcc in Fig-             by their owner, ownership can change, and SWccDescs can
+ure 3 and HugeHeap.hwcc in Figure 5). For the small and large       also be read by many threads.
+heaps, cxlalloc uses only 2B of HWcc memory (HWccDesc)                 For SWccDesc writers, we observe that flushing and fenc-
+per slab—a small slab is 32KiB and a large slab is 512KiB—          ing is necessary only when ownership may change (see Fig-
+with 8B constant overhead (SmallGlobal). The huge heap              ure 4); the owner may otherwise keep SWccDesc in cache.
+uses a constant amount of HWcc memory (HugeGlobal),                 For example, a thread must flush and fence a SWccDesc be-
+which is 8KiB in our prototype. We will first discuss cxlal-        fore transferring the slab from the thread-local unsized free
+loc’s small heap remote free protocol, as metadata to manage        list to the global free list. More subtly, a flush and fence is
+remote frees is the only HWcc metadata that scales with the         required before a slab transitions to detached or disowned
+size of the heap, and then explain cxlalloc’s SWcc protocol.        states, since ownership may change due to remote frees.
+                                                                       For SWccDesc readers, there are two locations where a
+3.2.1 Remote free. Cxlalloc’s slab allocation design is
+                                                                    non-owning thread can read a SWccDesc. The first is push-
+similar to mimalloc [43] in that (1) each slab has its own free
+                                                                    ing and popping from the global free list, which reads SWc-
+bitset to decrease contention and improve spatial locality,
+                                                                    cDesc.next. Since global free list operations are rare, read-
+and (2) each slab has separate local and remote free metadata,
+                                                                    ers simply flush and fence before each load. The value of
+allowing local frees to take a fast unsychronized path, while
+                                                                    SWccDesc.next cannot change without popping the slab
+only remote frees need to synchronize via CAS for platforms
+                                                                    from the global free list, so a stale load will be detected by a
+with HWcc, mCAS otherwise.
+                                                                    CAS (or mCAS) conflict on SmallGlobal.free. The second
+   Cxlalloc introduces two major changes for remote frees.
+                                                                    location is freeing, which starts by loading SWccDesc.owner.
+The first change is the detached state (Figure 4), which al-
+                                                                    Crucially for performance, it is safe for a thread to cache SWc-
+lows a slab that is entirely remotely freed (e.g., in a producer-
+                                                                    cDesc.owner; no flush or fence is required. To understand
+consumer workload) to be stolen by a thread without coor-
+                                                                    why, we do case analysis on the value of SWccDesc.owner
+dinating with the slab’s previous owner. The second change
+                                                                    in thread 𝑡’s cache and in memory.
+is using a counter to track remote frees, which minimizes
+                                                                        1. Owner is 𝑡 in cache and memory. This is the common
+HWcc memory overhead compared to, say, a bitset or intru-
+                                                                           case of a thread freeing to a slab it owns, which is safe.
+sive free list. However, a counter loses information about
+                                                                        2. Owner is 𝑡 in memory, but not in cache. Same as (1).
+which specific blocks have been freed, which prevents re-
+                                                                        3. Owner is 𝑡 in cache, but not in memory. This is impos-
+motely freed blocks from being reused until the entire slab
+                                                                           sible, since it implies 𝑡 gave up ownership of this slab
+has been remotely freed. To ensure that slabs with a mix of
+                                                                           without flushing and fencing its SWccDesc.
+local and remote frees are eventually reclaimed, cxlalloc
+                                                                        4. Owner is not 𝑡 in cache or memory. In this case, the
+introduces the disowned state (Figure 4); any slab that has
+                                                                           thread performs a remote free by CASing (or mCAS-
+at least one remote free and is being actively allocated from
+                                                                           ing) to decrement HWccDesc.remote. Importantly, this
+will be disowned instead of detached, forcing all subsequent
+                                                                           decrement is correct even if the cached owner is in-
+frees to take the remote free path (§3.1.1.Deallocation) and
+                                                                           consistent with memory (e.g., if the SWccDesc is trans-
+allowing the whole slab to be reclaimed.
+                                                                           ferred between two other threads while this thread
+   There are pathological cases for our remote free proto-
+                                                                           holds a cached copy of SWccDesc.owner). This is pos-
+col, but these cases require a thread to allocate many slabs,
+                                                                           sible because HWccDesc.remote counts down to 0 in-
+locally free a few blocks in each slab (while the rest are
+                                                                           stead of up to the block count, so remote free logic
+freed remotely), and then stop allocating from those size
+                                                                           does not depend on the potentially inconsistent value
+classes. We do not expect this pattern to be common in nor-
+                                                                           of SWccDesc.class (which is in the same cache line
+mal workloads, and our evaluation does not show excessive
+                                                                           as SWccDesc.owner).
+fragmentation.
+                                                                       For the huge heap, performance is less critical, so we sim-
+3.2.2 SWcc protocol. Cxlalloc assumes that SWcc CXL                 ply treat all SWcc data (HugeLocal and HugeDesc) as un-
+memory does not have hardware inter-host cache coherence,           cachable, and flush and fence after every write and before
+but does let hosts keep state in their CPU caches. Cxlalloc
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                      ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+every read. This does not cause any data races, because Huge-     ensuring they have room to extend, and then places new
+Local and HugeDesc are never concurrently updated.                memory mappings linearly within the reservations (Figure 2).
+                                                                  There can be no overlapping memory mappings because the
+3.3   Cross-process sharing                                       heap length is changed atomically. To provide PC-T, cxlal-
+Cxlalloc provides pointer consistency (PC, §1) across pro-        loc’s signal handler checks the heap length to see if a pointer
+cesses by coordinating the location, installation, and removal    is within the heap.
+of memory mappings. We first introduce two basic mecha-              We simplify heap extension by having it be monotonic—
+nisms that are used by both the small and huge heap, and          cxlalloc never unmaps small heap memory mappings. The
+then explain how each heap maintains PC.                          underlying memory can be returned to the OS by calling
+ Virtual address space reservation. In order to provide           MADV_REMOVE (or any equivalent mechanism) when transfer-
+PC-S for offset pointers, cxlalloc must create memory map-        ring a slab to the global free list.
+pings at exactly the same offset in each process, which re-
+quires calling mmap with the MAP_FIXED flag. To avoid over-       3.3.2 Huge heap. The huge heap must create new mem-
+writing existing memory mappings, cxlalloc reserves large         ory mappings to back allocations. To provide PC-S, the reser-
+contiguous regions of virtual address space during heap ini-      vation array ensures that each thread creates memory map-
+tialization, in each process, by calling mmap with the PROT_-     pings in disjoint regions. To provide PC-T, cxlalloc’s signal
+NONE flag. The absolute address of a reservation does not         handler walks huge descriptor lists to see if a pointer is
+matter, and the OS may choose different addresses for each        within a huge allocation. However, unlike the small heap,
+process. What matters is that a reservation gives cxlalloc        memory mappings can be unmapped when a huge alloca-
+a contiguous range of offsets where it can its manage its         tion is freed. Frees are challenging in a cross-process setting
+own memory mappings. Reservations are visible as the gray         because memory must be unmapped in all processes when
+regions in Figure 2.                                              a huge allocation is freed in any process; only then are its
+ Signal handler. In order to provide PC-T, cxlalloc must          resources (physical memory, huge descriptor, virtual address
+ensure that new memory mappings in one process are made           region) safe to reclaim and reuse. Cxlalloc introduces a
+visible to sharing processes. For example, if a thread in one     hazard offset protocol to determine when reclamation is
+process requests a huge allocation (backed by a new memory        safe.
+mapping), and writes a pointer to this new memory mapping          Hazard offsets. Hazard offsets are a variant of hazard point-
+into a shared data structure, a thread in a different process     ers [51], which are used for safe memory reclamation in
+should be able to dereference the pointer without crashing.       lock-free data structures. Hazard pointers work roughly as
+   Cxlalloc updates memory mappings asynchronously by             follows: before dereferencing a pointer, a thread publishes
+installing a signal handler in each process that intercepts       the pointer to a globally readable list, which prevents this
+SIGSEGV signals when a thread dereferences an unmapped            pointer from being reclaimed while the thread is accessing
+pointer. A SIGSEGV might be a program bug or it might be          the memory. In cxlalloc, before installing a memory map-
+a thread trying to access a region that has been mapped by        ping, a thread publishes the offset to a globally readable list,
+cxlalloc in some processes, but not in the current one. The       which prevents the memory mapping from being reclaimed
+signal handler inspects heap metadata to determine if the         while a process has the memory mapped. Our protocol fol-
+pointer is within the heap and if it should be backed by a        lows three simple rules:
+valid memory mapping. If so, the signal handler installs the         • Publish hazard offset before mapping a huge allocation.
+memory mapping for the current process and reissues the              • Remove hazard offset after unmapping a huge alloca-
+faulting instruction; if not, the signal is forwarded to the      tion.
+default signal handler.                                              • Reclaim huge allocation if HugeDesc.free is set and
+   We considered and rejected a synchronous design, where         HugeDesc.offset is not published in any hazard offset list.
+processes participate in a barrier when updating memory              Together, these imply that a huge allocation will be re-
+mappings. A barrier would (a) introduce global overhead for       claimed if it has been freed and no process has this allocation
+memory mappings that are only accessed by a subset of pro-        mapped. To implement these rules, we update allocation and
+cesses, (b) prevent concurrent updates of memory mappings,        cxlalloc’s signal handler to publish hazard offsets, and
+and (c) block live threads under partial failure.                 deallocation to remove hazard offsets. We do not expect the
+                                                                  length of the huge allocation hazard list to pose a perfor-
+3.3.1 Small heap. Cxlalloc extends the small heap by              mance issue because huge allocations are relatively rare and
+atomically increasing the heap length (SmallGlobal.len),          long-lived.
+which requires creating three new memory mappings: one               Cxlalloc must clean up unused memory mappings and
+for each of the HWccDesc, SWccDesc, and SmallHeap.data            huge descriptors: a memory mapping can be unmapped and
+regions. To provide PC-S, the small heap reserves virtual         its hazard offset removed if the corresponding huge descrip-
+address space for each of these regions at initialization time,   tor’s free bit is set. A huge descriptor can be reclaimed if its
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                     Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+free bit is set and its offset is not published in any hazard           allows a thread to attach a version to a CAS operation; upon
+offset list. Cxlalloc cleans up asynchronously by having                recovery, the thread can query a global help array to see
+each thread occasionally walk its hazard offset list and huge           if its operation succeeded, i.e., became visible to another
+descriptor list.                                                        thread. For example, before popping from the global free list,
+   Finally, we point out one subtlety: hazard pointers require          a thread records the operation ID (4 bits), the slab index (32
+a validation step after publishing a hazard pointer, to make            bits) to pop, and a version (16 bits). On recovery, the thread
+sure the pointer wasn’t freed in between loading the pointer            checks if its CAS succeeded. If the CAS did not succeed, the
+and publishing it as a hazard. The equivalent race condition            thread retries the CAS; otherwise, the thread ensures that
+for hazard offsets would require one thread to dereference              the popped slab index has been pushed to the thread-local
+a huge allocation (to publish a hazard offset) while another            unsized free list.
+thread frees the huge allocation, which is a use after free vio-           Detectable CAS requires embedding a thread ID and logi-
+lation and can be ruled out for correct programs. Accordingly,          cal version in each CAS target: our CAS targets are at most
+hazard offsets do not require this validation step.                     32 bits, so we use a 16-bit thread ID and version to support
+                                                                        systems with only 8-byte CAS. This strategy increases our
+3.4   Partial failure                                                   HWcc (or mCAS) overhead for remote free metadata from
+Cxlalloc avoids blocking live threads during crashes by us-             2B to 6B (8B aligned) per slab (§3.2)
+ing lock-free data structures, and recovers without blocking             Huge heap. For the huge heap, on recovery, a thread can
+using a combination of detectable CAS [10] and atomic state             deterministically reconstruct its thread-local allocation state
+changes.                                                                (HugeLocal.free) from the reservation array and its huge
+                                                                        descriptor list. Since the huge heap is much simpler than the
+3.4.1 Non-blocking crashes. Single-writer, single-reader
+                                                                        small heap, and its data structures almost all have a single
+data structures, like thread-local sized free lists, may be in-
+                                                                        writer, recording the huge descriptor offset (the offset of the
+consistent after a crash. These transient inconsistencies are
+                                                                        huge descriptor itself, not the offset of its memory mapping)
+not a problem, because these data structures are not visible to
+                                                                        is sufficient to recover its operations.
+other threads. They can be repaired by the recovered thread
+and will not block other live threads. Single-writer, multiple-
+reader data structures, like hazard offsets or huge descriptors,        4   Implementation
+are updated through atomic writes and are always consistent.
+                                                                         Prototyping mCAS. We design customized near-memory
+Multiple-writer, multiple-reader data structures, of which
+                                                                        processing (NMP) logic in the FPGA of Intel’s Agilex 7 board [21]
+there are four—heap length, global free list, HwccDesc, and
+                                                                        to provide an mCAS operation for architectures that do not
+reservation array—are lock-free; furthermore, every opera-
+                                                                        support inter-host HWcc (Figure 1(B)).
+tion on these data structures requires only a single CAS, mak-
+                                                                           We partition the CXL physical address space into two
+ing them much easier to reason about. Since lock-free data
+                                                                        regions: device-biased and host-biased [2]. The NMP unit
+structures transition atomically between consistent states,
+                                                                        is positioned between the CXL interface (IP) and the CXL
+cxlalloc remains available even in the presence of thread
+                                                                        memory controller, and it manages the device-biased memory.
+crashes.
+                                                                        All load, store, and mCAS requests for the device-biased
+3.4.2 Non-blocking recovery. To recover without having                  memory go through the NMP unit (see Figure 1(B)). Only
+to scan the heap for memory leaks [14, 16], each thread                 memory within this device-biased region can be mCASed
+atomically updates 8 bytes of state in place, which records             and because the memory is device-biased, it must never
+which operation the thread is currently performing, and                 be cached by a CPU [2]. These mCAS restrictions create
+contains enough information to recover the operation in an              barriers to porting software to make use of mCAS. Any
+idempotent manner.                                                      memory location that might be used in an mCAS should
+ Small heap. For the small heap, each operation roughly                 be sequestered from other data structures, to minimize the
+corresponds to a state transition in Figure 4. For example,             amount of memory that needs to be marked uncachable.
+before transferring a slab from the thread-local unsized free              Our mCAS interface avoids MMIO to reduce latency. In-
+list to the thread-local sized free list, a thread records the          stead, we reserve two address ranges for threads to interact
+operation ID (4 bits), slab index (32 bits), and size class (8 bits).   with the NMP: the special write (spwr) region and special
+On recovery, the thread ensures this slab has been popped               read (sprd) region. Each thread accesses different cache lines
+from the thread-local unsized free list and pushed onto the             within these regions according to its thread ID.
+correct thread-local sized free list.                                      To initiate an mCAS, a thread writes 64B containing the
+   For operations involving lock-free data structures, like             expected value, swap value, and target address to the spwr
+transferring a slab from the global free list to the thread-local       region. To retrieve the response, a thread reads 16B from
+unsized free list, we use detectable CAS [10] as a primitive            the sprd region, which returns a success or failure bit and
+to help implement idempotence. In short, detectable CAS                 the previous value at the target address. To ensure these
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                           ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+        CPU                     Y                        N             Allocator        Mem.       XP     mmap      Fail   Rec.    Str.
+                                                                       mimalloc [43]    M          ×       ✓        NB      ×       ×
+                                                                       boost [1]        XP         ✓       ×         B      ×       ×
+        NMP                 CMP-Y                   CMP-N              lightning [72]   XP         ✓       ×         B      B      GC
+                                                                       cxl-shm [68]     CXL        ✓       ×        NB     NB      GC
+        Mem                                                            ralloc [16]      PM         ×       ×        NB      B      App
+                                Y
+                                                                       Cxlalloc         XP, CXL    ✓       ✓        NB     NB      App
+(a) mCAS returning success (Y) upon a matching value (CMP-Y)          Table 1. Properties of memory allocators in our evaluation.
+on the left and failure (N) upon a mismatch (CMP-N) on the right.     Mem. shows what kind of memory the allocator was de-
+The dashed line indicates the spwr while the solid line indicates     signed to manage (M is “normal”, volatile, in-process mem-
+the sprd.                                                             ory, XP is cross-process memory, CXL is compute express
+        CPU      T1        T2                T1-Y       T2-N          link memory, and PM is persistent memory). XP means
+                                                                      supports cross-process allocations by using pointer alter-
+                                                                      natives (§2.3). mmap means allocator can use mmap for large
+        NMP                          CMP-Y          CMP-N
+                                                                      allocations or to extend the heap. Fail means behavior on
+                                                                      failure (blocking (B), non-blocking (NB)) Rec. means be-
+        Mem
+                                             T1-Y                     havior on recovery (blocking (B), non-blocking (NB), or not
+                                                                      recoverable(×)) Str. is the recovery strategy (garbage collect
+(b) Thread 1 (T1) issues spwr-sprd pair before thread 2 (T2) to the   allocations from dead threads (GC), allow application to re-
+same target address. T1 succeeds (T1-Y) in the comparison and         cover (App), or not recoverable (×)).
+blocks T2’s operation (CMP-N), resulting in T2 failing its mCAS
+operation (T2-N).
+
+               Figure 6. mCAS timing diagram                            • How does cxlalloc affect performance of end-to-end
+                                                                      key-value store workloads (§5.2.1)?
+writes and reads reach the NMP, we mark the spwr and sprd               • How does cxlalloc perform on low contention and
+regions uncachable.                                                   high contention microbenchmarks (§5.2.2)?
+   On the NMP side, upon receiving a spwr, the NMP unit                 • How scalable are huge allocations (§5.3)?
+stores the operands in its internal register array and waits for        • How is performance affected by HWcc support (§5.4)?
+a sprd to trigger the mCAS operation. When the NMP unit                 We evaluate on two machines: a Chameleon [39] instance
+receives a sprd, it reads the target address and compares the         that does not have a CXL device, but does have 80 cores to
+value with the expected value. At the end of each sprd, the           better compare scalability, and another machine with a CXL
+NMP unit checks its register array to see if any other spwr           Type-2 device, 32 cores, and our mCAS prototype to measure
+or sprd is in progress and has a matching target address.             the effect of HWcc.
+If there is a match, the NMP unit will return mCAS failure
+for the competing spwr or sprd. On an mCAS success, all                  Baselines. We choose our baselines (summarized in Ta-
+subsequent sprd and spwr operations are stalled until the             ble 1) for the following reasons: mimalloc [43] is a state-of-
+swap value is written to the memory. These checks ensure              the-art traditional memory allocator that provides the best
+that for a given address, only one spwr-sprd pair can be in           performance for most allocation benchmarks [4]. Boost [1]
+progress at a time. Figure 6 shows the timing diagram of the          is an industry C++ library and one of the only explicit cross-
+mCAS operation.                                                       process shared memory allocators we found. Lightning [72]
+ Heap initialization. Most allocators require some single-            is a shared-memory key-value store, one of our motivating
+thread initialization of the heap [1, 16, 43, 68] which creates a     use-cases. We extract its internal, cross-process memory al-
+bootstrapping problem for cross-process applications. Some            locator. Ralloc [16] is a lock-free recoverable allocator for
+external coordination becomes necessary to allow one pro-             PM. Finally, cxl-shm [68] is the state-of-the-art partial fault
+cess to initialize the heap before any other processes can            tolerant memory management system for CXL shared mem-
+access it.                                                            ory.
+   Cxlalloc is carefully constructed so that zeroed memory               None of our baselines optimize for limited HWcc. All al-
+constitutes a valid and initialized heap. Processes do not need       locators (except mimalloc) support pointer consistency for
+to coordinate to initialize a shared heap.                            cross-process shared memory, but only trivially, because
+                                                                      they do not allow heap extension or huge allocation, and do
+5    Evaluation                                                       not update memory mappings. Mimalloc does not support
+Our design seeks to answer the following questions:                   cross-process sharing at all, but serves as an indicator of
+  • Is cxlalloc correct (§5.1)?                                       maximum allocator performance.
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                 Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+   Experimental setup. All benchmarks are run for 10 trials,          Workload      Ins. % Key Distr. Key Size Value Size
+and include error bars for standard deviation (these are often        YCSB-Load 100          Uniform     8B         960B
+too close to be visible because of low performance variability).      YCSB-A        25       Skew        8B         960B
+All CPU performance governors are set to performance, and             YCSB-D        5        Skew        8B         960B
+the NMI watchdog, NUMA balancing, KSM, turbo boost, and               MC-12         79.7     Uniform     44 B       0-307 KiB
+hyperthreading disabled. Threads are always pinned to a               MC-15         99.9     Uniform     14-19 B 0-144 B
+core. We configure all benchmarks to perform fixed amounts            MC-31         93.0     Uniform     40-46 B 0-15 B
+of work as the thread count varies; we choose amounts that            MC-37         38.8     Skew        68-82 B 0-325 KiB
+(a) can be divided evenly across all thread counts and (b)          Table 2. Summary statistics for in-memory key-value store
+run long enough for throughput to be stable across trials.          workloads. Ins. % is the percentage of operations that insert
+Each memory allocator is backed by a 64 GiB shared memory           data (causing an allocation). We configure YCSB with the
+file. We configure ralloc and cxl-shm to remove flushing and        default Zipfian constant of 0.99, and modify YCSB-A from
+fencing.                                                            50% update to 25% insert and 25% delete operations to stress
+                                                                    the memory allocator. All other workloads consist entirely
+5.1   Correctness                                                   of read and insert operations.
+We compile cxlalloc with a host of runtime invariant checks,
+for example: SWccDesc.owner is null when popping a slab
+from the global free list, all slabs in thread-local sized free
+lists are non-full, all free lists are acyclic. We run all of our   Figure 8. For our index data structure, we adapt cxl-shm’s
+benchmarks with these checks enabled and observe no er-             non-resizable lock-free hash table to support all allocators,
+rors. We evaluate the correctness of recovery using a mix of        configuring it with 32M buckets. In order to support dele-
+black-box tests with random thread crashes, and white-box           tion, we also adapt it to use token-passing epoch-based recla-
+tests with defined thread crash points, again with invariant        mation [40]. Because we are comparing the impact of the
+checks enabled.                                                     underlying allocator, and not the index data structure, we
+                                                                    omit workloads that do not involve allocation (e.g., most
+5.2   Performance                                                   read-biased YCSB workload mixes).
+We run our first set of benchmarks on a Chameleon [39]                 We configure YCSB with the default Zipfian constant of
+compute_icelake_r650 instance running Ubuntu 22.04.5 LTS            0.99, 8 byte keys, and 960 byte values, with an initial in-
+and Linux kernel version 5.15. It has two Intel Xeon Plat-          dex size of 8.4M key-value pairs for YCSB-A and YCSB-D
+inum 8380 CPUs running at 2.30GHz, with 40 cores, 120 MiB           (0 for YCSB-Load), and run each workload for 8.4M total
+LLC, and 128GiB DDR4 3200 DRAM per socket. We bind                  operations.
+all memory to NUMA node 0 because NUMA-awareness is                    For memcached, we use the original paper’s representa-
+not a stated goal of any of the benchmarked systems, and to         tive clusters for write-heavy workloads, and execute 8.4M
+avoid introducing bias from NUMA interleaving correlating           operations from each trace (840K for MC-37, which requires
+with allocator data structure layout.                               more memory). Each trace consists solely of read and insert
+   Cxlalloc is a multi-process allocator, and we want to test       operations.
+cross-process allocation. (All allocators are cross-process            General analysis. Figure 8 shows that Boost and Light-
+except mimalloc.) Our understanding is that most multi-             ning are fundamentally unscalable, as they both acquire a
+process applications are also multi-threaded, but how many          global mutex. Lightning’s PSS usage is not included in the
+threads should run per process? We experimentally verified          figure, because it uses a large array to track each individual
+that performance of the allocators generally decreases with         allocation for garbage collection, and requires an order of
+increasing process counts, though there was no universal            magnitude more memory.
+trend. We choose to run cross-process allocators in 10 pro-            Cxl-shm’s performance suffers on skewed workloads like
+cesses because it provides good performance (relative to, say       YCSB-A and YCSB-D because its reference counting creates
+2 processes or 80), and it allows us to vary the number of          additional contention on hot items, even though YCSB-D is
+threads per process from 1 to 8. We report the total propor-        read-heavy. Cxl-shm also requires 24B of inline header meta-
+tional set size (PSS) across all processes to directly compare      data for each allocation, which causes noticeable overhead
+the cross-process allocators with mimalloc.                         in workloads with small allocations like MC-15 and MC-31.
+                                                                       Mimalloc, ralloc, and cxlalloc generally perform similarly.
+5.2.1 YCSB and memcached traces. We benchmark a                     Across all workloads and thread counts, cxlalloc achieves
+key-value store by port YCSB [20] and running production            93.9% of mimalloc’s performance on average, while ralloc
+traces from Twitter memcached clusters [66], which are sum-         achieves 90.9%.
+marized in Table 2. The throughput and sum of the pro-                 HWcc memory. Besides cxlalloc, ralloc is the only base-
+portional set size (PSS) for each workload are reported in          line that separates heap metadata from data. It can naively
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                                                                                                                   ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+                                      queue                                                                hashmap
+                                                                                                                                                               while ralloc achieves 41%. Xmalloc shows that mimalloc,
+                                                                                         200
+                        120                                                                                                                                    ralloc, and cxlalloc’s designs are effective at reducing con-
+                                                                                                                                                               tention for remote free operations. Cxlalloc achieves 81%
+                        100
+                                                                                                                                                               of mimalloc’s throughput, while ralloc achieves 106%. Ralloc
+Execution Time (secs)
+
+
+
+
+                                                                                         150
+
+
+
+
+                                                               Leak 29.6 KiB
+                                      Leak 13.6 KiB
+
+                        80
+                                                                                                                                                               falls off at higher thread counts because it returns partially
+                                                                                                                                                               full slabs to the global free list, which introduces contention.
+
+
+
+
+                                                                                                                                                      GC 89%
+                                                                                         100
+                        60                                                                                                                                        HWcc memory. Overall memory usage is low for these
+
+
+
+
+                                                                                                             Leak 17.3 KiB
+
+
+
+
+                                                                                                                                      Leak 34.6 KiB
+                                                                                                                             GC 89%
+                                                                               GC 59%                                                                          benchmarks, so cxlalloc’s HWcc optimizations are less
+                        40
+                                                                                          50
+                                                                                                                                                               effective. Cxlalloc still only requires 2.5% and 0.09% HWcc
+                                                      GC 37%
+
+
+
+
+                        20
+                                                                                                                                                               memory relative to total memory usage for thread-test and
+                                                                                                                                                               xmalloc, respectively, which is 9.4% and 9.5% of ralloc’s HWcc
+                         0                                                                 0                                                                   memory usage. Xmalloc shows how Cxlalloc’s split HWcc
+                              0                  1                        2                        0                    1                        2
+
+                              Crash Count (#threads)                                    cxlalloc       ralloc-leak                    ralloc-gc                and SWcc metadata design reduces HWcc usage, but can
+                                                                                                                                                               cause increased total memory usage.
+Figure 7. Execution time of inserting and removing 1M                                                                                                             Partial failure. Cxlalloc achieves 94.7% of cxlalloc-
+objects from Memento [18] recoverable data structures under                                                                                                    nonrecoverable’s throughput for thread-test, which shows
+0, 1, or 2 thread crashes. This experiment demonstrates how                                                                                                    the low overhead of cxlalloc’s recovery logic in the fast
+PM allocators that recover using garbage collection, like                                                                                                      path. And cxlalloc achieves 88.4% of
+ralloc, must choose to block heap access to run GC (ralloc-                                                                                                    cxlalloc-nonrecoverable’s throughput for xmalloc, which
+gc) or leak memory (ralloc-leak). Cxlalloc recovers without                                                                                                    shows the cost of using detectable CAS to perform remote
+leaking or blocking.                                                                                                                                           frees.
+
+
+                                                                                                                                                               5.3   Huge allocations
+support limited HWcc by placing only its metadata in the
+HWcc region, rather than the entire heap, so we will use it                                                                                                    Cxlalloc’s support for cross-process huge allocations (§3.3.2)
+as a reference point for our HWcc optimizations. Across all                                                                                                    is a novel feature. We evaluate its performance by config-
+workloads and thread counts, cxlalloc uses only 0.02% of                                                                                                       uring both threadtest and xmalloc with a fixed object size
+HWcc memory relative to total memory usage on average,                                                                                                         of 1GiB, and run them for 9.6M total operations, with re-
+and 7.1% relative to ralloc’s HWcc memory usage.                                                                                                               sults shown in Figure 10. There are no baselines because
+   Partial failure. We evaluate the overhead of cxlalloc’s                                                                                                     every other allocator crashes or does not complete within
+partial failure tolerance by comparing a variant of cxlalloc                                                                                                   30 minutes.
+(cxlalloc-nonrecoverable) that disables recovery state up-                                                                                                        Threadtest performance is pretty flat with increasing thread
+dates and uses a normal CAS instead of a detectable CAS.                                                                                                       count within one NUMA node indicating that the scala-
+Across all workloads and thread counts, cxlalloc is only                                                                                                       bility limit is from the OS memory mapping work, which
+0.3% slower than cxlalloc-nonrecoverable.                                                                                                                      shows greater throughput as work is split across more pro-
+   We also show some simple experiments with a recover-                                                                                                        cesses. Xmalloc stresses remote frees, and for larger process
+able queue and hash table from Memento [18]. We insert                                                                                                         counts, as we increase the number of threads, performance
+1M objects with sizes chosen uniformly randomly between                                                                                                        increases, because there is enough OS level parallelism. For
+8B-1KiB into each data structure, and then remove them,                                                                                                        low process counts, increasing the number of threads slightly
+crashing 0, 1, or 2 threads during the insertion phase. Af-                                                                                                    decreases performance as the workload bottlenecks on OS
+ter a crash, ralloc has to block heap access to run recovery                                                                                                   maintainance of a small number of process address spaces.
+garbage collection, or else leak memory; cxlalloc recovers                                                                                                     Going to multiple NUMA nodes (80 threads) decreases per-
+without leaking or blocking.                                                                                                                                   formance as threads access remote memory.
+                                                                                                                                                                  Memory consumption in all cases is modest because these
+5.2.2 Allocator microbenchmarks. We next evaluate                                                                                                              are allocator microbenchmarks and they do not access all
+two microbenchmarks in Figure 9: thread-test and xmalloc.                                                                                                      of the allocated data. Therefore memory consumption is
+Thread-test estimates the highest possible allocator through-                                                                                                  proportional to the size of allocator metadata.
+put using a fixed allocation size and entirely thread-local                                                                                                       While thread-test does not cause cross-process faults, xmal-
+operations. Xmalloc is a producer-consumer workload that                                                                                                       loc does exercise both Cxlalloc’s cross-process faults and
+stresses the remote free code path, which requires synchro-                                                                                                    hazard offset operations, and demonstrates its efficient reuse
+nization.                                                                                                                                                      of huge descriptors and address space. Overall, these results
+   General analysis. Threadtest reveals mimalloc’s highly                                                                                                      validate our huge allocation design (§3.3.2) by showing sta-
+optimized fast path, which uses an intrusive linked list. Cxlal-                                                                                               ble performance even for a punishingly unrealistic workload
+loc achieves only 47% of mimalloc’s throughput on average,                                                                                                     that unnaturally stresses huge allocations.
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                                                                                                                                 Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+                                     YCSB-Load                          YCSB-A                             YCSB-D                               MC-12                                               MC-15                                MC-31                                  MC-37
+                         10M                                                                                                        10M                                                   5
+                                                                                                   2                                  9
+                                                                                                                                      8                                                                                     5
+                                                            10M                                                                       7
+                                                                                                                                      6
+                            5                                                                 10M
+                                                               5                                                                      5                                                   2                                                                        1M
+Throughput (ops/sec)
+
+
+
+
+                                                                                                                                      4                                                                                     2                                          9
+                                                                                                   5                                  3                                                 10M                                                                            8
+                                                               2
+                            2                                                                                                                                                                                         10M                                              7
+                                                             1M                                                                       2                                                   5                                                                            6
+                                                                                                   2                                                                                                                        5
+                         1M                                    5                                                                                                                                                                                                       5
+
+                                                                                               1M                                   1M                                                    2                                                                            4
+                            5                                                                                                         9                                                                                     2
+                                                               2                                                                      8
+                                                                                                                                      7
+                                                                                                   5                                  6                                                 1M                                1M                                           3
+                                                            100k                                                                      5
+                            2                                  5                                                                      4                                                   5
+                                                                                                   2                                                                                                                        5
+                                                                                                                                      3                                                                                                                                2
+                       100k                                    2
+                                                                                              100k                                    2                                                   2                                 2
+                                                             10k
+                                                                                                   5
+                                                             10                                                                                                                           2
+             PSS (GiB)
+
+
+
+
+                           8                                                                       8                                  8
+                           6                                                                                                          6                                                 1.5                                1                                           4
+                                                                                                   6
+                           4                                  5                                    4                                  4                                                   1
+                                                                                                                                                                                                                          0.5                                          2
+                           2                                                                       2                                  2                                                 0.5
+                           0                                  0                                    0                                  0                                                   0                                0                                           0
+                                 0    20   40     60   80          0    20   40     60   80            0   20    40      60    80          0   20   40                      60     80         0   20   40   60   80             0     20     40    60       80             0   20    40    60    80
+
+                                     Thread Count                                                                cxlalloc            cxlalloc-nonrecoverable                                      mimalloc            ralloc                 cxl-shm                  boost              lightning
+
+
+Figure 8. Throughput (logarithmic Y-axis) and memory consumption for different memory allocators running in-memory
+key-value store workloads from YCSB and Twitter memcached traces [66]. Experiments up to and including 40 threads run on
+a single socket in a single NUMA node. Experiments with more than 40 threads (shaded in gray) run on two sockets using two
+NUMA nodes. Cxl-shm crashes for workloads MC-12 and MC-37 because it does not support allocations larger than 1KiB.
+
+                                                threadtest-small                                       xmalloc-small                                                                              threadtest-huge                                                xmalloc-huge
+                                                                                                                                                                             350k
+                                                                                     2
+Throughput (ops/sec)
+
+
+
+
+                                                                                                                                                                             300k                                                    800k
+                                                                                                                                                     Throughput (ops/sec)
+
+                          1B                                                  100M
+                                                                                     5
+                                                                                                                                                                             250k
+                       100M                                                                                                                                                                                                          600k
+                                                                                     2
+                                                                                                                                                                             200k
+                                                                                  10M
+                         10M                                                         5
+                                                                                                                                                                             150k                                                    400k
+                                                                                     2
+                          1M                                                                                                                                                 100k
+                                                                                   1M                                                                                                                                                200k
+
+                                                                                                                                                                                 50k
+PSS (GiB)
+
+
+
+
+                         0.08                                                     0.08
+                         0.06
+                                                                                                                                                     PSS (GiB)
+
+
+
+
+                                                                                  0.06                                                                                      0.003
+                         0.04
+                                                                                                                                                                                                  Thread Count                       0.008                       Thread Count
+                                                                                  0.04                                                                                                                                               0.006
+                         0.02                                                     0.02                                                                                      0.002                                                    0.004
+                            0                                                        0                                                                                                                                               0.002
+                                 0         20          40          60        80               20           40             60          80                                    0.001
+                                                                                                                                                                                                                                         0
+                                                                                                                                                                                          20           40        60             80                     20             40            60          80
+                                                 Thread Count                                          Thread Count
+                                cxlalloc           cxlalloc-nonrecoverable               mimalloc               ralloc          cxl-shm                                                           Thread Count                                                   Thread Count
+                                boost           lightning                                                                                                                    Process Count                  1         2             10            40             80
+
+
+
+Figure 9. Throughput (logarithmic Y-axis) and memory con-                                                                                            Figure 10. Throughput and memory consumption for huge
+sumption for small heap allocation microbenchmarks across                                                                                            allocation microbenchmarks as the number of threads are
+all allocators with increasing numbers of threads distributed                                                                                        increased for different numbers of processes, run on the
+among 10 processes, run on the Intel ICX machine. Cxlal-                                                                                             Intel ICX machine. Performance (and memory consumption)
+loc, mimalloc, and ralloc are the highest performing options.                                                                                        improves monotonically for increasing process counts. Note
+                                                                                                                                                     that there is only a single data point for 80 threads in 80
+                                                                                                                                                     processes.
+5.4                             CXL memory hardware
+Our test machine runs Ubuntu 24.04.2 LTS, Linux kernel ver-
+sion 6.8. It has an Intel Xeon 8568 CPU running at 2.0GHz,                                                                                           Checker (MLC) [34] with a 3:1 read-write ratio. CXL read
+with 48 cores and 300MB LLC. The machine is equipped with                                                                                            latency is 357ns, compared with 112ns for local memory.
+8-channel DDR5 4800 DRAM. We use a commercially avail-                                                                                               Its bandwidth is 19.9 GB/s (using two channels), compared
+able CXL Type-2 device, the Intel Agilex 7 [21], connected to                                                                                        with 114 GB/s for local memory (using four channels). The
+the CPU via a PCIe 5.0 x16 link. It integrates an FPGA with                                                                                          CXL memory access latency and bandwidth are in line with
+ASIC-based CXL IPs. The memory controller is an ASIC, the                                                                                            the latest study on characterizing commercial CXL memory
+FPGA is only for implementing near memory processing                                                                                                 devices [37]. We disable hyper-threading and turbo boost
+logic (NMP). While the device supports CXL 2.0, our Intel                                                                                            and set the CPU frequency governor to performance.
+Emerald Rapids CPU only supports 1.1 [37, 58].
+   We measure the latency and bandwidth values of local                                                                                              5.4.1 CXL: mCAS prototyping. Figure 11 shows the la-
+DRAM and CXL memory using Intel’s Memory Latency                                                                                                     tency of a compare-and-swap (CAS) operation on a CXL
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                                                             ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+                          sw_cas       sw_flush_cas        hw_cas                                                    threadtest-small                            xmalloc-small
+
+
+
+
+                                                                        Throughput (ops/sec)
+                                                                                                  5                                                100M
+                                                                                                                                                      5
+                      Percentile                                                                  2
+                                                                                               100M                                                   2
+
+
+               105         p99.9                                                                  5                                                 10M
+                                                                                                                                                      5
+                           p99                                                                 10M
+                                                                                                  2
+                                                                                                                                                      2
+
+                           p90                                                                    5                                                  1M
+
+                           p50
+Latency (ns)
+
+
+
+
+                                                                                                                                                      5
+               104                                                                                2
+
+                                                                                                      0                 10               20                       10             20
+
+                                                                                                          cxlalloc       cxlalloc-hwcc           cxlalloc-mcas   Thread Count
+               103
+                                                                                                          ralloc       ralloc-hwcc            ralloc-mcas
+
+               102
+                                                                        Figure 12. Throughput of small heap allocator microbench-
+                                                                        marks for different CXL HWcc architectural assumptions and
+                     1 4 7 10 13 16   1 4 7 10 13 16   1 4 7 10 13 16
+                                        Thread count                    increasing thread counts. Experiments are run on a machine
+                                                                        with physical CXL memory (§5.4). Cxlalloc and ralloc use
+Figure 11. The latency of CAS operation with GCC CAS                    local DRAM; -hwcc variants use CXL memory and assume
+(sw_cas), cacheline flush and CAS (sw_flush_cas), and hard-             HWcc; -mcas variants use our NMP mCAS prototype (§4).
+ware NMP enabled CAS (hw_cas).
+                                                                           Overall performance is similar for local DRAM and HWcc
+                                                                        CXL memory. For threadtest, cxlalloc-mcas achieves 80%
+memory location for various implementations. For the soft-
+                                                                        of cxlalloc-hwcc’s throughput, and 10-99x of ralloc-mcas’s
+ware CAS (sw_cas), the CAS instruction is issued by the
+                                                                        throughput: our SWcc protocol allows local operations to
+CPU to CXL memory. Its performance benefits from the low-
+                                                                        keep metadata cached, while ralloc must read a size class
+latency CPU cache, and its atomicity is guaranteed by the
+                                                                        from uncachable memory on every free. For xmalloc, cxlal-
+cache-coherence protocol. The sw_flush_cas configuration
+                                                                        loc-mcas drops to 1% of cxlalloc-hwcc’s throughput, as
+models an mCAS by having the CPU first flush the target
+                                                                        every remote free requires an mCAS. Below 8 threads, ralloc-
+from the cache, then issue the CAS. For systems without
+                                                                        mcas has higher throughput because it shares partial slabs be-
+NMP, this is a software emulation for a system that does not
+                                                                        tween threads, allowing remote frees to go into thread-local
+have HWcc.
+                                                                        caches. However, slab sharing increases mCAS contention
+   It is important to remember that neither sw_cas nor sw_-
+                                                                        on slab metadata, causing ralloc-mcas to scale poorly; cxlal-
+flush_cas would be safe in a CXL pod without inter-host
+                                                                        loc-mcas attains 9.9x higher throughput at 24 threads.
+hardware cache coherence. CAS safety comes from coher-
+ence. Two hosts could CAS the same location and both suc-               6                        Related Work
+ceed because each would have exclusive access to the line
+relative to all other caches in its coherence domain.                   Cxlalloc takes inspiration from previous allocators for dif-
+   The hw_cas measures our NMP mCAS implementation,                     ferent types of memory: volatile, persistent, cross-process,
+which works without HWcc. At 16 threads (the maximum in                 and CXL, but contributes novel huge allocation management
+our experiments) hw_cas achieves 17.4% lower p50 latency,               and combines previous techniques in a new way that pro-
+and 20% lower p99 latency than sw_flush_cas. However, for               vides strong performance across a variety of use cases.
+1 thread, hw_cas is slower than sw_flush_cas, with a p50                 Persistent memory allocation. Ralloc [16] and zalloca-
+latency of 2.3𝜇s and a p99 of 2.8𝜇s. We believe an ASIC ver-            tor [64] are lock-free allocators, while libpmem [6], makalu [14],
+sion of the NMP will further reduce this latency gap when               nvm_malloc [54], and nvalloc [23] use locks. All of them do
+the contention is low. However, many projects have used                 garbage collection during a blocking recovery period after a
+sw_flush_cas to model mCAS [33, 68], and our measure-                   failure. Offline GC is attractive because it allows optimizing
+ments show that the latencies of these two primitives are               the common case of avoiding cache flushes and fences for
+comparable.                                                             allocator metadata during allocation.
+                                                                         Cxl-shm [68]. Cxl-shm is another memory management
+5.4.2 CXL: allocator microbenchmarks. Figure 12 shows                   system for CXL that tolerates partial failures. Cxl-shm makes
+throughput for small heap allocations on CXL memory. We                 several design choices that are incompatible with our con-
+compare against ralloc as a baseline since its heap metadata            straints. First, it embeds a 24B header into each allocation to
+is separate from application data—though it does not sepa-              support reference counting, 8B of which requires HWcc. This
+rate HWcc and SWcc metadata—so it can somewhat reduce                   metadata is scattered throughout the heap, inflating HWcc
+HWcc usage by placing only its metadata in the HWcc re-                 usage. Second, it provides only basic pointer consistency:
+gion. We do not compare against cxl-shm because it embeds               the heap is created with a fixed size and cannot be extended,
+a HWcc reference count in each allocation; with our mCAS                and it does not support allocation sizes larger than 1KiB,
+implementation, this would require the whole heap to be                 so it never modifies memory mappings. Thirdly, it requires
+marked uncachable, making a fair comparison impossible.                 reference counting, which is suitable for message passing
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                  Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+applications that rarely modify reference counts, but not for     processes with pointer consistency, and it supports the lim-
+applications with shared data structures, for which reference     ited inter-host hardware cache coherence of CXL. Cxlalloc
+count modifications artificially increase contention, even for    also tolerates partial failures [28], which makes it resilient
+read-only workloads.                                              to thread or process failures. Our evaluation demonstrates
+ Tigon [33]. Tigon is an in-memory transactional database         cxlalloc’s performance.
+that uses explicit allocation of CXL memory to share and
+synchronize data used in cross-partition transactions. The        8    Acknowledgements
+authors of Tigon used an early version of cxlalloc in their       We thank the anonymous reviewers, Vijay Chidambaram,
+system. Tigon assumes inter-host hardware cache coher-            Hayley Leblanc, and Arthur Peters for their insightful com-
+ent memory and does not tolerate partial failures. Adapting       ments. Results presented in this paper were obtained using
+Tigon to mCAS is interesting future work.                         the Chameleon testbed [39] supported by the National Sci-
+   Memory protection. There is recent work on memory              ence Foundation. This work was supported in part by the
+allocators [24, 53] that protect the heap from buggy or mali-     Center for Processing with Intelligent Storage and Memories
+cious programs using hardware memory protection mecha-            (PRISM), one of seven centers in JUMP 2.0, a Semiconductor
+nisms like Intel’s memory protection keys (MPK) [3]. Cxlal-       Research Corporation (SRC) program sponsored by DARPA.
+loc does not currently implement these mechanisms because
+we assume processes sharing memory are correct and trusted.       References
+That being said, our design does separate heap metadata and        [1] [n. d.]. Boost.Interprocess. https://www.boost.org/doc/libs/1_77_0/
+heap data, and can therefore be extended with protection               doc/html/interprocess.html. (Accessed: April 2025).
+mechanisms in the future.                                          [2] [n. d.]. Compute Express Link (CXL) Specification, Revision 3.2. https:
+ CXL tiered memory management. Recent work explores                    //computeexpresslink.org/cxl-specification/. (Accessed: April 2025).
+                                                                   [3] [n. d.]. Memory Protection Keys. https://docs.kernel.org/core-api/
+using CXL to enable memory disaggregation and pooling                  protection-keys.html (Accessed: August 2025).
+for improved utilization and reduced costs in datacenter           [4] [n. d.]. mimalloc-bench. https://github.com/daanx/mimalloc-bench
+servers [11, 26, 44, 45]. Key research directions include opti-        (Accessed: 2024).
+mizing CXL memory pool configurations for performance              [5] [n. d.]. SK hynix Presents CXL Memory Solutions Set to Power the
+and cost savings [50], developing resilient memory man-                AI Era at CXL DevCon 2024. https://news.skhynix.com/sk-hynix-
+                                                                       presents-ai-memory-solutions-at-cxl-devcon-2024/. (Accessed May
+agers and intelligent page placement policies to mitigate              2025).
+CXL’s higher access latency [37, 42, 57, 58, 61, 68], reducing     [6] [n. d.]. The libpmem library. https://pmem.io/pmdk/libpmem. (Ac-
+process and container startup time [8, 32] and leveraging              cessed: April 2025).
+CXL’s expanded memory capacity and bandwidth for large-            [7] Marcos K. Aguilera, Emmanuel Amaro, Nadav Amit, Erika Hunhoff,
+scale applications [30, 36, 62]. These approaches treat CXL            Anil Yelam, and Gerd Zellweger. 2023. Memory disaggregation: why
+                                                                       now and what are the challenges. SIGOPS Oper. Syst. Rev. 57, 1 (June
+as a memory tier that is not directly visible to user software,        2023), 38–46. doi:10.1145/3606557.3606563
+though some recent work has looked at how to provide an            [8] Chloe Alverti, Stratos Psomadakis, Burak Ocalan, Shashwat Jaiswal,
+extensible interface [59, 60]. Comparisons on genuine CXL              Tianyin Xu, and Josep Torrellas. 2025. CXLfork: Fast Remote Fork over
+hardware reveal differences from emulated CXL that compel              CXL Fabrics. In Proceedings of the 30th ACM International Conference
+                                                                       on Architectural Support for Programming Languages and Operating
+revisiting prior assumptions [58].
+                                                                       Systems, Volume 2 (Rotterdam, Netherlands) (ASPLOS ’25). Association
+ CXL and partial failures. Other recent work [55, 63,                  for Computing Machinery, New York, NY, USA, 210–226. doi:10.1145/
+68, 71] makes the same observation as this work that CXL               3676641.3715988
+systems can observe partial failures, with FUSEE [55] and          [9] Gal Assa, Michal Friedman, and Ori Lahav. 2024. A Programming
+rTX [63] focusing on RDMA and remote memory nodes.                     Model for Disaggregated Memory over CXL. arXiv:2407.16300 (July
+ RDMA. Systems built using RDMA [25, 38, 67] have a dis-               2024). doi:10.48550/arXiv.2407.16300 arXiv:2407.16300 [cs].
+                                                                  [10] Hagit Attiya, Ohad Ben-Baruch, and Danny Hendler. 2018. Nesting-
+aggregated view of memory, but remote allocation is not                Safe Recoverable Linearizability: Modular Constructions for Non-
+controlled directly by a malloc/free interface used by the ap-         Volatile Memory. In Proceedings of the 2018 ACM Symposium on Princi-
+plication. These systems use message passing to coordinate             ples of Distributed Computing. ACM, Egham United Kingdom, 7–16.
+state, not explicit memory allocation. Also, the latency for           doi:10.1145/3212734.3212753
+memory access through RDMA networks is still one to two           [11] Daniel S. Berger, Daniel Ernst, Huaicheng Li, Pantea Zardoshti, Monish
+                                                                       Shah, Samir Rajadnya, Scott Lee, Lisa Hsu, Ishwar Agarwal, Mark D.
+orders of magnitude higher than local memory [29], while it            Hill, and Ricardo Bianchini. 2023. Design Tradeoffs in CXL-Based
+is 2.3× higher latency in our experimental testbed (§5.4).             Memory Pools for Public Cloud Platforms. IEEE Micro 43, 2 (2023),
+                                                                       30–38. doi:10.1109/MM.2023.3241586
+                                                                  [12] Daniel S. Berger, Yuhong Zhong, Pantea Zardoshti, Shuwei Teng, Fio-
+                                                                       dar Kazhamiaka, and Rodrigo Fonseca. 2025. Octopus: Scalable Low-
+7    Conclusion                                                        Cost CXL Memory Pooling. https://arxiv.org/abs/2501.09020. (Ac-
+                                                                       cessed: April 2025).
+Cxlalloc is the first memory allocator appropriate for a          [13] Emery D. Berger, Kathryn S. McKinley, Robert D. Blumofe, and Paul R.
+CXL pod. It is efficient, it supports memory sharing among             Wilson. 2000. Hoard: a scalable memory allocator for multithreaded
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                                      ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+     applications. SIGPLAN Not. 35, 11 (Nov. 2000), 117–128. doi:10.1145/      [26] Padmapriya Duraisamy, Wei Xu, Scott Hare, Ravi Rajwar, David Culler,
+     356989.357000                                                                  Zhiyi Xu, Jianing Fan, Christopher Kennelly, Bill McCloskey, Danijela
+[14] Kumud Bhandari, Dhruva R. Chakrabarti, and Hans-J. Boehm. 2016.                Mijailovic, Brian Morris, Chiranjit Mukherjee, Jingliang Ren, Greg
+     Makalu: Fast Recoverable Allocation of Non-Volatile Memory. In Pro-            Thelen, Paul Turner, Carlos Villavieja, Parthasarathy Ranganathan, and
+     ceedings of the 2016 ACM SIGPLAN International Conference on Object-           Amin Vahdat. 2023. Towards an Adaptable Systems Architecture for
+     Oriented Programming, Systems, Languages, and Applications (Amster-            Memory Tiering at Warehouse-Scale. In Proceedings of the 28th ACM
+     dam, Netherlands) (OOPSLA 2016). Association for Computing Ma-                 International Conference on Architectural Support for Programming
+     chinery, New York, NY, USA, 677–694. doi:10.1145/2983990.2984019               Languages and Operating Systems, Volume 3 (Vancouver, BC, Canada)
+[15] Daniel Bittman, Peter Alvaro, Pankaj Mehra, Darrell D. E. Long, and            (ASPLOS 2023). Association for Computing Machinery, New York, NY,
+     Ethan L. Miller. 2021. Twizzler: A Data-centric OS for Non-volatile            USA, 727–741. doi:10.1145/3582016.3582031
+     Memory. ACM Trans. Storage 17, 2 (June 2021), 11:1–11:31. doi:10.         [27] Jason Evans. 2006. A Scalable Concurrent malloc(3) Implementation
+     1145/3454129                                                                   for FreeBSD. (2006). https://people.freebsd.org/~jasone/jemalloc/
+[16] Wentao Cai, Haosen Wen, H. Alan Beadle, Chris Kjellqvist, Mohammad             bsdcan2006/jemalloc.pdf
+     Hedayati, and Michael L. Scott. 2020. Understanding and optimizing        [28] Michal Friedman, Maurice Herlihy, Virendra Marathe, and Erez Pe-
+     persistent memory allocation. In Proceedings of the 2020 ACM SIGPLAN           trank. 2018. A Persistent Lock-Free Queue for Non-Volatile Memory.
+     International Symposium on Memory Management (London, UK) (ISMM                SIGPLAN Not. 53, 1 (feb 2018), 28–40. doi:10.1145/3200691.3178490
+     2020). Association for Computing Machinery, New York, NY, USA,            [29] Peter X. Gao, Akshay Narayan, Sagar Karandikar, Joao Carreira,
+     60–73. doi:10.1145/3381898.3397212                                             Sangjin Han, Rachit Agarwal, Sylvia Ratnasamy, and Scott Shenker.
+[17] Guoyang Chen, Lei Zhang, Richa Budhiraja, Xipeng Shen, and Youfeng             2016. Network requirements for resource disaggregation. In Proceed-
+     Wu. 2017. Efficient Support of Position Independence on Non-Volatile           ings of the 12th USENIX conference on Operating Systems Design and
+     Memory. In Proceedings of the 50th Annual IEEE/ACM International               Implementation (OSDI’16). USENIX Association, USA, 249–264.
+     Symposium on Microarchitecture (Cambridge, Massachusetts) (MICRO-         [30] Yufeng Gu, Alireza Khadem, Sumanth Umesh, Ning Liang, Xavier
+     50 ’17). Association for Computing Machinery, New York, NY, USA,               Servot, Onur Mutlu, Ravi Iyer, and Reetuparna Das. 2025. PIM Is All
+     191–203. doi:10.1145/3123939.3124543                                           You Need: A CXL-Enabled GPU-Free System for Large Language Model
+[18] Kyeongmin Cho, Seungmin Jeon, Azalea Raad, and Jeehoon Kang. 2023.             Inference. In Proceedings of the 30th ACM International Conference
+     Memento: A Framework for Detectable Recoverability in Persistent               on Architectural Support for Programming Languages and Operating
+     Memory. Proc. ACM Program. Lang. 7, PLDI, Article 118 (jun 2023),              Systems, Volume 2 (Rotterdam, Netherlands) (ASPLOS ’25). Association
+     26 pages. doi:10.1145/3591232                                                  for Computing Machinery, New York, NY, USA, 862–881. doi:10.1145/
+[19] Joel Coburn, Adrian M. Caulfield, Ameen Akel, Laura M. Grupp, Ra-              3676641.3716267
+     jesh K. Gupta, Ranjit Jhala, and Steven Swanson. 2011. NV-Heaps:          [31] Morteza Hoseinzadeh and Steven Swanson. 2021. Corundum: statically-
+     making persistent objects fast and safe with next-generation, non-             enforced persistent memory safety. In Proceedings of the 26th ACM
+     volatile memories. SIGARCH Comput. Archit. News 39, 1 (March 2011),            International Conference on Architectural Support for Programming
+     105–118. doi:10.1145/1961295.1950380                                           Languages and Operating Systems. ACM, Virtual USA, 429–442. doi:10.
+[20] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu Ramakrishnan,              1145/3445814.3446710
+     and Russell Sears. 2010. Benchmarking cloud serving systems with          [32] Jialiang Huang, MingXing Zhang, Teng Ma, Zheng Liu, Sixing Lin,
+     YCSB. In Proceedings of the 1st ACM symposium on Cloud comput-                 Kang Chen, Jinlei Jiang, Xia Liao, Yingdi Shan, Ning Zhang, Mengting
+     ing. ACM, Indianapolis Indiana USA, 143–154. doi:10.1145/1807128.              Lu, Tao Ma, Haifeng Gong, and YongWei Wu. 2024. TrEnv: Trans-
+     1807152                                                                        parently Share Serverless Execution Environments Across Different
+[21] Intel Corporation. [n. d.]. AgilexTM 7 FPGA I-Series Development               Functions and Nodes. In Proceedings of the ACM SIGOPS 30th Sym-
+     Kit. https://www.intel.com/content/www/us/en/products/details/                 posium on Operating Systems Principles (Austin, TX, USA) (SOSP ’24).
+     fpga/development-kits/agilex/agi027.html. (Accessed: April 2025).              Association for Computing Machinery, New York, NY, USA, 421–437.
+[22] Samsung corporation. 2024. Samsung CXL Solutions – CMM-H.                      doi:10.1145/3694715.3695967
+     (2024). https://semiconductor.samsung.com/news-events/tech-blog/          [33] Yibo Huang, Haowei Chen, Newton Ni, Yan Sun, Vijay Chidambaram,
+     samsung-cxl-solutions-cmm-h                                                    Dixin Tang, and Emmett Witchel. 2025. Tigon: A Distributed Database
+[23] Zheng Dang, Shuibing He, Peiyi Hong, Zhenxin Li, Xuechen Zhang,                for a CXL Pod. In 19th USENIX Symposium on Operating Systems Design
+     Xian-He Sun, and Gang Chen. 2022. NVAlloc: Rethinking Heap Meta-               and Implementation, OSDI 2025, Boston, MA, USA, July 7-9, 2025, Lidong
+     data Management in Persistent Memory Allocators. In Proceedings of             Zhou and Yuanyuan Zhou (Eds.). USENIX Association, 109–128. https:
+     the 27th ACM International Conference on Architectural Support for Pro-        //www.usenix.org/conference/osdi25/presentation/huang-yibo
+     gramming Languages and Operating Systems (Lausanne, Switzerland)          [34] Intel Corporation. accessed in 2024. Intel® Memory Latency Checker
+     (ASPLOS ’22). Association for Computing Machinery, New York, NY,               v3.10. https://www.intel.com/content/www/us/en/developer/articles/
+     USA, 115–127. doi:10.1145/3503222.3507743                                      tool/intelr-memory-latency-checker.html.
+[24] Anthony Demeri, Wook-Hee Kim, R. Madhava Krishnan, Jaeho Kim,             [35] Sunita Jain, Nagaradhesh Yeleswarapu, Hasan Al Maruf, and Rita
+     Mohannad Ismail, and Changwoo Min. 2020. Poseidon: Safe, Fast                  Gupta. 2024. Memory Sharing with CXL: Hardware and Software
+     and Scalable Persistent Memory Allocator. In Proceedings of the 21st           Design Approaches. arXiv:2404.03245 (April 2024). http://arxiv.org/
+     International Middleware Conference. ACM, Delft Netherlands, 207–220.          abs/2404.03245 arXiv:2404.03245 [cs].
+     doi:10.1145/3423211.3425671                                               [36] Junhyeok Jang, Hanjin Choi, Hanyeoreum Bae, Seungjun Lee,
+[25] Aleksandar Dragojevic, Dushyanth Narayanan, Edmund B. Nightin-                 Miryeong Kwon, and Myoungsoo Jung. 2023. CXL-ANNS: Software-
+     gale, Matthew Renzelmann, Alex Shamis, Anirudh Badam, and Miguel               Hardware Collaborative Memory Disaggregation and Computation for
+     Castro. 2015. No compromises: distributed transactions with consis-            Billion-Scale Approximate Nearest Neighbor Search. In 2023 USENIX
+     tency, availability, and performance. In Proceedings of the 25th Sympo-        Annual Technical Conference (USENIX ATC 23). USENIX Association,
+     sium on Operating Systems Principles, SOSP 2015, Monterey, CA, USA,            Boston, MA, 585–600. https://www.usenix.org/conference/atc23/
+     October 4-7, 2015, Ethan L. Miller and Steven Hand (Eds.). ACM, 54–70.         presentation/jang
+     doi:10.1145/2815400.2815425                                               [37] Houxiang Ji, Srikar Vanavasam, Yang Zhou, Qirong Xia, Jinghan
+                                                                                    Huang, Yifan Yuan, Ren Wang, Pekon Gupta, Bhushan Chitlur, Ipoom
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                                Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+     Jeong, and Nam Sung Kim. 2024. Demystifying a CXL Type-2 Device: A              f0f9e98bc2e2f0abc3e315eaa0d808fc-Paper.pdf
+     Heterogeneous Cooperative Computing Perspective. In 57th IEEE/ACM          [49] Suyash Mahar, Mingyao Shen, Tj Smith, Joseph Izraelevitz, and Steven
+     International Symposium on Microarchitecture (MICRO). 1504–1517.                Swanson. 2024. Puddles: Application-Independent Recovery and
+     doi:10.1109/MICRO61859.2024.00110                                               Location-Independent Data for Persistent Memory. In Proceedings
+[38] Anuj Kalia, Michael Kaminsky, and David G. Andersen. 2016. FaSST:               of the Nineteenth European Conference on Computer Systems. ACM,
+     Fast, Scalable and Simple Distributed Transactions with Two-Sided               Athens Greece, 575–589. doi:10.1145/3627703.3629555
+     (RDMA) Datagram RPCs. In 12th USENIX Symposium on Operating                [50] Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Johannes Weiner,
+     Systems Design and Implementation (OSDI 16). USENIX Association,                Niket Agarwal, Pallab Bhattacharya, Chris Petersen, Mosharaf Chowd-
+     Savannah, GA, 185–201. https://www.usenix.org/conference/osdi16/                hury, Shobhit Kanaujia, and Prakash Chauhan. 2023. TPP: Transparent
+     technical-sessions/presentation/kalia                                           Page Placement for CXL-Enabled Tiered-Memory. In Proceedings of
+[39] Kate Keahey, Jason Anderson, Zhuo Zhen, Pierre Riteau, Paul Ruth,               the 28th ACM International Conference on Architectural Support for
+     Dan Stanzione, Mert Cevik, Jacob Colleran, Haryadi S. Gunawi, Cody              Programming Languages and Operating Systems, Volume 3 (Vancouver,
+     Hammock, Joe Mambretti, Alexander Barnes, François Halbach, Alex                BC, Canada) (ASPLOS 2023). Association for Computing Machinery,
+     Rocha, and Joe Stubbs. 2020. Lessons Learned from the Chameleon                 New York, NY, USA, 742–755. doi:10.1145/3582016.3582063
+     Testbed. In Proceedings of the 2020 USENIX Annual Technical Conference     [51] M.M. Michael. 2004. Hazard pointers: safe memory reclamation for
+     (USENIX ATC ’20). USENIX Association.                                           lock-free objects. IEEE Transactions on Parallel and Distributed Systems
+[40] Daewoo Kim, Trevor Brown, and Ajay Singh. 2024. Are Your Epochs                 15, 6 (June 2004), 491–504. doi:10.1109/TPDS.2004.8
+     Too Epic? Batch Free Can Be Harmful. In Proceedings of the 29th ACM        [52] PMem.io. [n. d.]. Persistent memory development kit (PMDK). https:
+     SIGPLAN Annual Symposium on Principles and Practice of Parallel Pro-            //pmem.io/pmdk/
+     gramming (PPoPP ’24). Association for Computing Machinery, New             [53] Antonin Reitz, Aymeric Fromherz, and Jonathan Protzenko. 2024.
+     York, NY, USA, 30–41. doi:10.1145/3627535.3638491                               StarMalloc: Verifying a Modern, Hardened Memory Allocator. Proc.
+[41] Christoph Lameter. 2007. SLUB: The unqueued slab allocator V6.                  ACM Program. Lang. 8, OOPSLA2, Article 333 (Oct. 2024), 30 pages.
+     https://lwn.net/Articles/229096/                                                doi:10.1145/3689773
+[42] Taehyung Lee, Sumit Kumar Monga, Changwoo Min, and Young Ik                [54] David Schwalb, Tim Berning, Martin Faust, Markus Dreseler, and
+     Eom. 2023. MEMTIS: Efficient Memory Tiering with Dynamic Page                   Hasso Plattner. 2015. nvm_malloc: Memory Allocation for NVRAM.
+     Classification and Page Size Determination. In Proceedings of the 29th          ADMS@VLDB 15 (2015), 61–72.
+     Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP         [55] Jiacheng Shen, Pengfei Zuo, Xuchuan Luo, Tianyi Yang, Yuxin Su,
+     ’23). Association for Computing Machinery, New York, NY, USA, 17–34.            Yangfan Zhou, and Michael R. Lyu. 2023. FUSEE: A Fully Memory-
+     doi:10.1145/3600006.3613167                                                     Disaggregated Key-Value Store. In 21st USENIX Conference on File and
+[43] Daan Leijen, Benjamin Zorn, and Leonardo De Moura. 2019. Mi-                    Storage Technologies (FAST 23). USENIX Association, Santa Clara, CA,
+     malloc: Free List Sharding in Action. Lecture Notes in Computer Sci-            81–98. https://www.usenix.org/conference/fast23/presentation/shen
+     ence, Vol. 11893. Springer International Publishing, Cham, 244–265.        [56] Joshua Suetterlein, Joseph Manzano, and Andres Marquez. 2024. Syn-
+     doi:10.1007/978-3-030-34175-6_13                                                chronization for CXL Based Memory. In Proceedings of the International
+[44] Philip Levis, Kun Lin, and Amy Tai. 2023. A Case Against CXL Mem-               Symposium on Memory Systems (MEMSYS ’24). Association for Com-
+     ory Pooling. In Proceedings of the 22nd ACM Workshop on Hot Topics in           puting Machinery, New York, NY, USA, 178–185. doi:10.1145/3695794.
+     Networks (, Cambridge, MA, USA,) (HotNets ’23). Association for Com-            3695810
+     puting Machinery, New York, NY, USA, 18–24. doi:10.1145/3626111.           [57] Yan Sun, Jongyul Kim, Zeduo Yu, Jiyuan Zhang, Siyuan Chai,
+     3628195                                                                         Michael Jaemin Kim, Hwayong Nam, Jaehyun Park, Eojin Na, Yi-
+[45] Huaicheng Li, Daniel S. Berger, Lisa Hsu, Daniel Ernst, Pantea Zar-             fan Yuan, Ren Wang, Jung Ho Ahn, Tianyin Xu, and Nam Sung Kim.
+     doshti, Stanko Novakovic, Monish Shah, Samir Rajadnya, Scott Lee,               2025. M5: Mastering Page Migration and Memory Management for
+     Ishwar Agarwal, Mark D. Hill, Marcus Fontoura, and Ricardo Bianchini.           CXL-based Tiered Memory Systems. In Proceedings of the 30th ACM
+     2023. Pond: CXL-Based Memory Pooling Systems for Cloud Platforms.               International Conference on Architectural Support for Programming
+     In Proceedings of the 28th ACM International Conference on Architectural        Languages and Operating Systems, Volume 2 (Rotterdam, Netherlands)
+     Support for Programming Languages and Operating Systems, Volume 2               (ASPLOS ’25). Association for Computing Machinery, New York, NY,
+     (Vancouver, BC, Canada) (ASPLOS 2023). Association for Computing                USA, 604–621. doi:10.1145/3676641.3711999
+     Machinery, New York, NY, USA, 574–587. doi:10.1145/3575693.3578835         [58] Yan Sun, Yifan Yuan, Zeduo Yu, Reese Kuper, Chihun Song, Jinghan
+[46] Jinshu Liu, Hamid Hadian, Hanchen Xu, and Huaicheng Li. 2025.                   Huang, Houxiang Ji, Siddharth Agarwal, Jiaqi Lou, Ipoom Jeong, Ren
+     Tiered Memory Management Beyond Hotness. In 19th USENIX Sym-                    Wang, Jung Ho Ahn, Tianyin Xu, and Nam Sung Kim. 2023. De-
+     posium on Operating Systems Design and Implementation (OSDI 25).                mystifying CXL Memory with Genuine CXL-Ready Systems and De-
+     USENIX Association. https://www.usenix.org/system/files/osdi25-                 vices. In Proceedings of the 56th Annual IEEE/ACM International Sym-
+     liu.pdf                                                                         posium on Microarchitecture (Toronto, ON, Canada) (MICRO ’23). As-
+[47] Paul Liétar, Theodore Butler, Sylvan Clebsch, Sophia Drossopoulou,              sociation for Computing Machinery, New York, NY, USA, 105–121.
+     Juliana Franco, Matthew J. Parkinson, Alex Shamis, Christoph M. Win-            doi:10.1145/3613424.3614256
+     tersteiger, and David Chisnall. 2019. snmalloc: a message passing          [59] Bijan Tabatabai, Mark Mansi, and Michael M. Swift. 2023. FBMM:
+     allocator. In Proceedings of the 2019 ACM SIGPLAN International Sym-            Using the VFS for Extensibility in Kernel Memory Management. In
+     posium on Memory Management. ACM, Phoenix AZ USA, 122–135.                      Proceedings of the 19th Workshop on Hot Topics in Operating Systems,
+     doi:10.1145/3315573.3329980                                                     HOTOS 2023, Providence, RI, USA, June 22-24, 2023, Malte Schwarzkopf,
+[48] Kiwan Maeng, Shivam Bharuka, Isabel Gao, Mark Jeffrey, Vikram                   Andrew Baumann, and Natacha Crooks (Eds.). ACM, 181–187. doi:10.
+     Saraph, Bor-Yiing Su, Caroline Trippel, Jiyan Yang, Mike Rabbat,                1145/3593856.3595908
+     Brandon Lucia, and Carole-Jean Wu. 2021. Understanding and Im-             [60] Bijan Tabatabai, James Sorenson, and Michael M. Swift. 2024. FBMM:
+     proving Failure Tolerant Training for Deep Learning Recommen-                   Making Memory Management Extensible With Filesystems. In 2024
+     dation with Partial Recovery. In Proceedings of Machine Learning                USENIX Annual Technical Conference (USENIX ATC 24). USENIX Associ-
+     and Systems, A. Smola, A. Dimakis, and I. Stoica (Eds.), Vol. 3.                ation, Santa Clara, CA, 785–798. https://www.usenix.org/conference/
+     637–651. https://proceedings.mlsys.org/paper_files/paper/2021/file/             atc24/presentation/tabatabai
+Cxlalloc : Safe and Efficient Memory Allocation for a CXL Pod                                     ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+[61] Midhul Vuppalapati and Rachit Agarwal. 2024. Tiered Memory Man-           A      Artifact Appendix
+     agement: Access Latency is the Key!. In Proceedings of the ACM SIGOPS
+     30th Symposium on Operating Systems Principles (Austin, TX, USA)
+                                                                               A.1     Abstract
+     (SOSP ’24). Association for Computing Machinery, New York, NY, USA,       The main benchmark harness is the cxlalloc-bench crate,
+     79–94. doi:10.1145/3694715.3695968                                        which reads workload configuration files in the
+[62] Zhao Wang, Yiqi Chen, Cong Li, Yijin Guan, Dimin Niu, Tianchan            cxlalloc-bench/workloads directory and runs the YCSB
+     Guan, Zhaoyang Du, Xingda Wei, and Guangyu Sun. 2025. CTXNL:
+     A Software-Hardware Co-designed Solution for Efficient CXL-Based          and memcached macrobenchmarks and thread-test and xmal-
+     Transaction Processing. In Proceedings of the 30th ACM International      loc microbenchmarks in our evaluation. We use one external
+     Conference on Architectural Support for Programming Languages and         data set for the memcached traces [66].
+     Operating Systems, Volume 2 (Rotterdam, Netherlands) (ASPLOS ’25).
+     Association for Computing Machinery, New York, NY, USA, 192–209.          A.2     Artifact check-list (meta-information)
+     doi:10.1145/3676641.3716244
+[63] Xingda Wei, Haotian Wang, Tianxia Wang, Rong Chen, Jinyu Gu,
+                                                                                     • Program: YCSB, included
+     Pengfei Zuo, and Haibo Chen. 2023. Transactional Indexes on (RDMA               • Compilation: rustc 1.88.0, included by installation
+     or CXL-based) Disaggregated Memory with Repairable Transaction.                 • Data set: Memcached traces, 6.7GiB
+     arXiv:2308.02501 [cs.DB]                                                        • Run-time environment: Linux, dependencies managed
+[64] You Wu and Lin Li. 2022. Zallocator: A High Throughput Write-                     by Nix
+     Optimized Persistent Allocator for Non-Volatile Memory. J. Emerg.               • Execution: Hardware settings set during installation
+     Technol. Comput. Syst. 18, 4, Article 80 (oct 2022), 20 pages. doi:10.          • Metrics: Throughput, peak memory usage
+     1145/3549528                                                                    • Output: NDJSON files containing throughput and memory
+[65] Lingfeng Xiang, Zhen Lin, Weishu Deng, Hui Lu, Jia Rao, Yifan Yuan,               usage, pdf plots
+     and Ren Wang. 2024. NOMAD: non-exclusive memory tiering via
+                                                                                     • How much disk space required (approximately)?: 10GiB
+     transactional page migration. In Proceedings of the 18th USENIX Con-
+     ference on Operating Systems Design and Implementation (Santa Clara,
+                                                                                     • How much time is needed to prepare workflow (ap-
+     CA, USA) (OSDI’24). USENIX Association, USA, Article 2, 17 pages.                 proximately)?: 10min
+[66] Juncheng Yang, Yao Yue, and K. V. Rashmi. 2021. A Large-scale Analysis          • How much time is needed to complete experiments
+     of Hundreds of In-memory Key-value Cache Clusters at Twitter. ACM                 (approximately)?: 11h per iteration
+     Trans. Storage 17, 3 (Aug. 2021), 17:1–17:35. doi:10.1145/3468521               • Publicly available?: https://github.com/nwtnni/cxlalloc
+[67] Ming Zhang, Yu Hua, Pengfei Zuo, and Lurong Liu. 2022. FORD: Fast               • Code licenses (if publicly available)?: MIT
+     One-sided RDMA-based Distributed Transactions for Disaggregated                 • Data licenses (if publicly available)?: SNIA Trace Data
+     Persistent Memory. In 20th USENIX Conference on File and Storage                  Files Download License
+     Technologies (FAST 22). USENIX Association, Santa Clara, CA, 51–68.             • Archived (provide DOI)?: https://doi.org/10.5281/zenodo.
+     https://www.usenix.org/conference/fast22/presentation/zhang-ming
+                                                                                       18234672
+[68] Mingxing Zhang, Teng Ma, Jinqi Hua, Zheng Liu, Kang Chen, Ning
+     Ding, Fan Du, Jinlei Jiang, Tao Ma, and Yongwei Wu. 2023. Par-
+     tial Failure Resilient Memory Management System for (CXL -based)          A.3     Description
+     Distributed Shared Memory. In Proceedings of the 29th Symposium           A.3.1 How to access.
+     on Operating Systems Principles (Koblenz, Germany) (SOSP ’23). As-
+     sociation for Computing Machinery, New York, NY, USA, 658–674.
+                                                                               git clone https://github.com/nwtnni/cxlalloc.git
+     doi:10.1145/3600006.3613135
+                                                                               A.3.2 Hardware dependencies. Our figures 4, 5, and 6
+[69] Yuhong Zhong, Daniel S. Berger, Carl Waldspurger, Ryan Wee, Ishwar
+     Agarwal, Rajat Agarwal, Frank Hady, Karthik Kumar, Mark D. Hill,          (main macrobenchmarks and microbenchmarks) are evalu-
+     Mosharaf Chowdhury, and Asaf Cidon. 2024. Managing Memory Tiers           ated on a machine with 80 physical cores (no hyper-threading).
+     with CXL in Virtualized Environments. In 18th USENIX Symposium on         The workload configurations can be freely adjusted to use
+     Operating Systems Design and Implementation (OSDI 24). USENIX Asso-       fewer threads and processes, but the figures won’t match
+     ciation, Santa Clara, CA, 37–56. https://www.usenix.org/conference/
+                                                                               exactly. The default heap size is 64GiB; it can be reduced
+     osdi24/presentation/zhong-yuhong
+[70] Yuhong Zhong, Daniel S. Berger, Pantea Zardoshti, Enrique Saurez,         based on the hardware, but some baselines may crash.
+     Jacob Nelson, Antonis Psistakis, Joshua Fried, and Asaf Cidon. 2025. My      Our figure 9 is evaluated with a 32-core Intel SPR machine
+     CXL Pool Obviates Your PCIe Switch. In Proceedings of the Workshop        with CXL FPGA. We can provide the FPGA RTL and bit-
+     on Hot Topics in Operating Systems. ACM, Banff AB Canada, 58–66.          stream, but the current bitstream only works with Altera
+     doi:10.1145/3713082.3730393
+                                                                               Agilex 7 I-series FPGA, version R1BES.
+[71] Zhiting Zhu, Newton Ni, Yibo Huang, Yan Sun, Zhipeng Jia, Nam Sung
+     Kim, and Emmett Witchel. 2024. Lupin: Tolerating Partial Failures in      A.3.3 Software dependencies. Managed by Nix during
+     a CXL Pod. In Proceedings of the 2nd Workshop on Disruptive Memory
+                                                                               installation process.
+     Systems (Austin, TX, USA) (DIMES ’24). Association for Computing
+     Machinery, New York, NY, USA, 41–50. doi:10.1145/3698783.3699377          A.3.4 Data sets. We use the first subtrace of clusters 12,
+[72] Danyang Zhuo, Kaiyuan Zhang, Zhuohan Li, Siyuan Zhuang,
+     Stephanie Wang, Ang Chen, and Ion Stoica. 2021. Rearchitecting
+                                                                               15, 31, and 37 from [66]. The trace data can be downloaded
+     in-memory object stores for low latency. Proceedings of the VLDB          via this SNIA link. We convert each CSV trace to Parquet.
+     Endowment 15, 3 (Nov. 2021), 555–568. doi:10.14778/3494124.3494138        After installation (§A.4), run the following to convert:
+                                                                                   mv cluster{12,15,31,37}.000.zst cxlalloc/twitter/
+                                                                                    ./cxlalloc/twitter/convert.sh 12
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                            Newton Ni, Yan Sun, Zhiting Zhu, and Emmett Witchel
+
+
+      ./cxlalloc/twitter/convert.sh 15                          A.6   Evaluation and expected results
+      ./cxlalloc/twitter/convert.sh 31                          To reproduce the main figures (8,9, and 10) in our paper, run
+      ./cxlalloc/twitter/convert.sh 37                          the following commands:
+  The resulting parquet files occupy about 6.7 GiB.             ./script/run.sh ./cxlalloc-bench/workloads/main.toml
+                                                                ./script/run.sh ./cxlalloc-bench/workloads/huge.toml
+A.4    Installation                                             python3 ./plot/macro.py main.ndjson # macro.pdf
+                                                                python3 ./plot/micro.py main.ndjson # micro.pdf
+Run cxlalloc/script/setup.sh to install nix and direnv
+                                                                python3 ./plot/huge.py huge.ndjson # huge.pdf
+(which we use for dependency management), clone submod-
+ules, and set up the hardware for reproducibility (e.g., dis-     To reproduce the MCAS results (Figure 12), assuming ap-
+abling CPU frequency scaling). Make sure the                    propriate hardware, run:
+cluster{12,15,31,37}.000.parquet files (§A.3.4) are moved       ./script/ablation.sh
+into the cxlalloc/twitter/ directory.                           python3 ./plot/ablation.py ablation.ndjson
+   Basic test. From the root of the cxlalloc repository, run
+                                                                A.7   Experiment customization
+./script/run.sh cxlalloc-bench/workloads/mini.toml,
+which compiles and runs a small subset of the macro- and        The fields of the configuration files should be mostly self-
+micro-benchmarks. The results will be in mini.ndjson, which     explanatory, but we note that our benchmark harness iterates
+contains throughput and memory usage information for each       over the cartesian product of the fields within each experi-
+benchmark.                                                      ment. The reviewer can vary these fields according to their
+                                                                hardware (e.g., thread count). Note that mimalloc can only
+A.5 Experiment workflow                                         be run in a single process, which is why the configuration
+                                                                files are essentially duplicated (once for mimalloc, once for
+Relative paths assume we are at the root of the cxlalloc
+                                                                all other allocators).
+repository. The run script ./script/run.sh takes a path to
+a workload configuration file as an argument, and appends
+results to an ndjson file. The workloads from our paper are
+defined in ./cxlalloc-bench/workloads/.
+

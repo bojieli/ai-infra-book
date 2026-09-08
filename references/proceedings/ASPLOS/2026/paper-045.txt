@@ -1,0 +1,1324 @@
+TPLA: TENSOR PARALLEL LATENT ATTENTION FOR EFFICIENT
+DISAGGREGATED PREFILL & DECODE INFERENCE
+Xiaojuan Tang1,3∗
+, Fanxu Meng 1,3∗
+, Pingzhi Tang1
+, Yuxuan Wang1
+, Di Yin3
+, Xing Sun3
+, Muhan Zhang1,2†
+1
+Institute for Artificial Intelligence, Peking University
+2
+State Key Laboratory of General Artificial Intelligence, BIGAI
+3
+Tencent Youtu Lab, Shanghai, China
+https://github.com/fxmeng/TransMLA
+ABSTRACT
+Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, compresses key–value states into
+a low-rank latent vector cKV
+, caching only this vector to reduce memory. In tensor parallelism
+(TP), however, attention heads are computed across multiple devices, and each device must load
+the full cKV
+, eroding the advantage of MLA over Grouped Query Attention (GQA). We propose
+Tensor-Parallel Latent Attention (TPLA): a scheme that partitions both the latent representation
+and each head’s input dimension across devices, performs attention independently per shard, and
+then combines results with an all-reduce. TPLA preserves the benefits of a compressed KV cache
+while unlocking TP efficiency. Unlike Grouped Latent Attention (GLA), every head in TPLA still
+leverages the full latent representation, maintaining stronger representational capacity. TPLA is
+drop-in compatible with models pre-trained using MLA: it supports MLA-style prefilling and enables
+efficient tensor-parallel decoding without retraining. Applying simple orthogonal transforms—e.g.,
+the Hadamard transform or PCA—before TP slicing further mitigates cross-shard interference,
+yielding minimal accuracy degradation. By reducing the per-device KV cache for DeepSeek-V3 and
+Kimi-K2, we achieve 1.79× and 1.93× speedups, respectively, at a 32K-token context length while
+maintaining performance on commonsense and LongBench benchmarks. TPLA can be implemented
+with FlashAttention-3, enabling practical end-to-end acceleration.
+1 Introduction
+Currently, large language models (LLMs) [1, 2, 3, 4, 5] are typically memory-bound (limited by memory bandwidth)
+rather than compute-bound (limited by floating-point operations per second, FLOPs) during inference. To address this,
+KV cache compression [6, 7, 8, 9] and tensor parallelism [10, 11, 12, 13, 14] have emerged as two critical techniques
+for enabling efficient auto-regressive decoding in LLMs. KV cache compression methods prune/merge/share/quantize
+intermediate key–value pairs to reduce memory overhead. Tensor parallelism addresses memory and compute lim-
+itations by splitting large tensors—such as weight matrices—across multiple devices, enabling intra-layer parallel
+computation for models that cannot fit on a single GPU. GQA [15] inherently supports both KV cache compression
+and tensor parallelism by grouping query heads so that all heads within a group share a common set of key and value
+representations, which facilitates efficient distribution across multiple devices. Both theoretical analyses and empirical
+results demonstrate that the representational capacity of GQA is inferior to that of MLA [16, 17]. MLA introduces a
+pre-trained KV cache compression strategy that achieves an excellent trade-off between computational efficiency and
+model performance. However, when multiple attention heads are computed in parallel across multiple devices using
+tensor parallelism, MLA encounters a critical limitation: each device must load the full latent vector cKV , undermining
+the memory savings that MLA offers over GQA. For example, in LLaMA-3-70B [18], the dimension of the KV cache
+per token is 2 × 8 × 128 = 2048, and under tensor parallelism with TP = 4, each device holds a partitioned KV cache
+of size 512. In contrast, Deepseek-V3 [19] has a fixed KV cache dimension of 64 + 512 = 576, which must be fully
+∗
+Equal contribution.
+†
+Corresponding author: muhan@pku.edu.cn
+arXiv:2508.15881v2
+[cs.LG]
+25
+Aug
+2025
+Tensor Parallel Latent Attention
+Device 0
+Device 1
+a) MLA b) GLA
+AllReduce
+c) TPLA
+Prefill AllReduce
+Decode
+Figure 1: Comparison of MLA, GLA, and TPLA. In MLA, each device must load the entire KV cache. In GLA, each
+attention head only accesses the portion of the KV cache stored on its own device. In TPLA, the prefilling phase follows
+MLA for efficiency and accuracy, while during the decoding phase, attention heads are distributed across devices, each
+relying on the KV cache stored locally on its assigned device.
+replicated on each device regardless of the parallelism degree. This results in a higher per-device KV cache memory
+footprint compared to GQA-based models under the same tensor parallel configuration.
+GLA [20] was proposed to address the tensor parallelism limitations of MLA by dividing the attention heads and
+latent representations into g groups (typically g = 2), such that each group of heads only loads its corresponding latent
+representation. However, this paper identifies two key limitations of GLA: (1) the reduction in KV cache size for single
+device comes at the cost of decreased representational capacity for each attention head; and (2) GLA requires training
+from scratch, which demands significant computational resources to validate its effectiveness.
+To address these challenges, we propose Tensor Parallel Latent Attention (TPLA), a method that distributes the latent
+representations across multiple devices. Each attention head is split across devices, followed by an all-reduce operation
+on the output o. TPLA offers the following advantages: 1) Each attention head utilizes the full latent representation,
+preserving strong representational capacity; 2) Each device only loads a partition of the KV cache, improving inference
+speed under tensor parallelism; 3) TPLA can directly load pre-trained DeepSeek checkpoints, which incurs only a
+minor performance drop that is easily recovered; 4) We use reparameterized MLA for prefill and TPLA for decoding,
+reducing prefill latency while mitigating conversion-induced degradation. 4) TPLA can be viewed as a special case of
+GLA with more attention heads, making it compatible with FlashAttention-3.
+2 Related Works
+Reducing KV-Cache Memory Generative inference with large language models (LLMs) is often constrained by
+the memory footprint of the key–value (KV) cache, especially for long contexts. Several families of techniques
+have been explored to mitigate this burden: token pruning/evicting [21, 22, 23, 24, 25, 26] removes KV entries for
+low-importance tokens based on saliency or attention estimates; token merging [27, 28, 29] aggregates nearby or
+similar tokens into a single surrogate KV representation to eliminate redundancy while retaining context; cross-layer
+KV sharing/fusion [30, 31, 32, 33, 34] reuses one KV cache across adjacent layers to avoid per-layer storage; low-
+rank KV compression [35, 36, 37, 6] factorizes KV matrices into low-rank components (learned or SVD-based)
+to reduce dimensionality and memory; and KV-cache quantization [38, 39, 40, 41] stores K/V tensors at reduced
+numeric precision (e.g., int8 or int4), cutting memory and bandwidth with modest accuracy cost. Although effective,
+these approaches inevitably discard or alter information in the KV cache and can degrade model performance. In
+contrast, TPLA leaves the KV contents intact: it reduces the amount of cache each device must hold so the model
+retains full information while alleviating memory pressure. As a result, TPLA tends to preserve accuracy better than
+compression-based methods.
+Parallelism Strategies for Deployment Current LLMs scale to billions of parameters; to cope with the resulting
+memory and compute demands, engineers adopt distributed deployment to reduce wall-clock latency and time costs.
+Data parallelism [42, 43] partitions input data across the sample or batch dimension while replicating model parameters
+across devices. However, for very large models full replication becomes impractical; moreover, variable sequence
+2
+Tensor Parallel Latent Attention
+lengths introduce load imbalance (“bubbles”) that waste compute resources. Pipeline parallelism [44, 45] partitions
+the model into contiguous blocks of layers, each placed on a different device. Intermediate activations and gradients
+are communicated between stages to complete the forward and backward passes, reducing cross-node traffic. This
+staging overlaps computation across devices to increase throughput, but pipeline bubbles can still leave some devices
+idle. Tensor parallelism [46, 47, 48] splits linear layers along their row or column dimensions, sharding tensors
+across devices and performing distributed matrix–matrix multiplication with collective communication. It archieves
+optimal performance on systems where GPUs are fully interconnected via NVLink. TPLA leverages the strengths of
+TP while addressing MLA’s inability to reduce the KV cache under TP. Long sequences inflate the memory footprint
+of intermediate activations; sequence parallelism [49] mitigates this by replicating the model across devices and
+splitting inputs along the sequence dimension so that each device processes only a subsequence. Prefill/Decode
+Separation [50, 51, 52] refines sequence parallelism for LLM inference: the prefilling phase is compute-intensive and
+thus compute-bound, whereas the decoding phase has low per-token compute but frequent memory accesses and is
+memory-bandwidth-bound. To match these characteristics, different machine counts and architectures are used across
+the two phases to improve latency and throughput. In TPLA, we further employ different model structures across
+phases—MLA during prefill to preserve accuracy while reducing computation (improving latency), and TPLA during
+decoding to reduce memory traffic and increase throughput.
+3 Preliminary
+3.1 Multi-Head Latent Attention
+MLA is designed to reduce memory bandwidth overhead by compressing the Key-Value (KV) cache. Specifically, the
+multi-head keys and values are compressed into a single low-rank latent representation of dimension 4dh, denoted as
+cKV
+. Instead of reconstructing full-size keys and values from this latent representation, MLA adopts a more efficient
+decoding strategy. By isolating the Rotary Position Embedding (RoPE) operation, the up-projection matrix can be
+absorbed into the query activations, yielding Q. Similarly, the value projection is absorbed into the output projection
+matrix, resulting in WV O
+(See Section 3.3). This allows for direct attention computation between Q and the normalized
+latent cache ĉKV
+, followed by a projection through WV O
+to produce the final output Õ. For simplicity in this initial
+description, we omit the RoPE components. The core computation is as follows:
+cKV
+∈ RB×L×4dh
+, ĉKV
+= RMSNorm(cKV
+) ∈ RB×L×4dh
+,
+Q ∈ RB×1×hq×4dh
+, WV O
+∈ R hq·4dh
+
+×D
+,
+O = softmax
+Q (ĉKV
+)⊤
+√
+dh
+
+ĉKV
+∈ RB×1×hq×4dh
+, (1)
+Õ = O WV O
+∈ RB×1×D
+. (2)
+3.2 Grouped Latent Attention
+During tensor-parallel decoding, MLA replicates its single latent head on every device, resulting in high KV-cache
+memory load across all devices. GLA avoids this replication by partitioning the latent KV cache itself. Consider a
+two-way tensor-parallel configuration. The latent KV cache is divided into two shards, cKV
+0 and cKV
+1 , each assigned to
+one GPU. Simultaneously, attention heads hq are grouped such that the absorbed query projection matrix Q and output
+projection matrix WV O
+are partitioned along both the head dimension (hq) and the feature dimension (4dh), yielding
+four groups. Thus, GPU 0 operates on (cKV
+0 , Q0,0, WV O
+0,0 ), while GPU 1 operates on (cKV
+1 , Q1,1, WV O
+1,1 ). Each GPU
+independently computes its local attention output, denoted Õ0 and Õ1, respectively. The final output is obtained via an
+AllReduce operation that sums the local outputs across devices.
+cKV
+0 , cKV
+1 ∈ RB×L×2dh
+,
+(
+ˆ
+c0
+KV
+= RMSNorm(cKV
+0 ) ∈ RB×L×2dh
+,
+ˆ
+c1
+KV
+= RMSNorm(cKV
+1 ) ∈ RB×L×2dh
+,
+Qi,j∈{0,1} ∈ RB×1×
+hq
+2 ×2dh
+,
+
+Q0,0, Q0,1
+Q1,0, Q1,1
+
+= Q,
+WV O
+i,j∈{0,1} ∈ R
+
+hq
+2 ·2dh
+
+×D
+, WV O
+=
+
+WV O
+0,0 , WV O
+0,1
+WV O
+1,0 , WV O
+1,1
+
+,
+3
+Tensor Parallel Latent Attention
+O0 = softmax
+Q0,0 (ĉKV
+0 )⊤
+√
+dh
+
+ĉKV
+0 ∈ RB×1×
+hq
+2 ×2dh
+,
+O1 = softmax
+Q1,1 (ĉKV
+1 )⊤
+√
+dh
+
+ĉKV
+1 ∈ RB×1×
+hq
+2 ×2dh
+,
+˜
+O0 = O0 WV O
+0,0 ∈ RB×1×D
+, ˜
+O1 = O1 WV O
+1,1 ∈ RB×1×D
+,
+O = AllReduce
+
+˜
+O0 + ˜
+O1
+
+∈ RB×1×D
+. (3)
+3.3 Matrix Absorption
+Considering we apply orthogonal transformations U to reparameterize weight matrices, which involves matrix absorp-
+tion. To make this process intuitive, we here present the complete calculation pipeline of MLA and show how the
+absorbed matrices from Section 3.1 are derived.
+As stated in Section 3.1, MLA saves KV cache by multiplying the low-rank compress matrix WDKV
+∈ RD×4dh
+with
+the input sequence X ∈ RB×L×D
+to obtain low-rank latent features cKV
+. Then, it uses the matrices WUK
+, WUV
+∈
+R4dh×(hq·dh)
+to derive the full-heads key k and value v. Additionally, MLA also can decompose WQ
+∈ RD×(hq·dh)
+to WDQ
+∈ RD×rq
+and WUQ
+∈ Rrq×(hq·dh)
+, which reduces the activation memory during training. For positional
+embedding, MLA uses a decoupled RoPE strategy that uses additional multi-head queries qPE
+and a shared key kPE
+,
+generated by WQR
+∈ Rrq×(hq·dr)
+and WKR
+∈ RD×dr
+, to carry the rotary positional embeddings. The final attention
+output Õ is computed by separately combining the non-positional part (q k⊤
+) and positional part (qPE
+(kPE
+)⊤
+),
+followed by projection with WO
+∈ R(hq·dh)×D
+.
+cKV
+= XWDKV
+, cQ
+= XWDQ
+, ĉKV
+= RMSNorm(cKV
+),
+q = cQ
+WUQ
+, k = ĉKV
+WUK
+, v = WUV
+ĉKV
+,
+qPE
+= RoPE(cQ
+WQR
+), kPE
+= RoPE(X WKR
+),
+O = softmax
+q k⊤
++ qPE
+(kPE
+)⊤
+√
+dh + dr
+
+v, Õ = O WO
+. (4)
+In Equation 4, the RoPE component is explicitly isolated, allowing us to restructure the attention computation using
+associativity of matrix multiplication. For clarity, we can temporarily omit positional encoding components and the
+scaling factor.
+O WO
+= softmax(q k⊤
+) v WO
+= softmax(q (ĉKV
+WUK
+)⊤
+) ĉKV
+WUV
+WO
+= softmax(Q(ĉKV
+)⊤
+) ĉKV
+WV O
+. (5)
+Here, the matrix WUK
+can be absorbed into q to derive Q in Equation 2. Similarly, the matrix WUK
+can be absorbed
+into WO
+. In practice, however, WUV
+is typically not absorbed into WO
+to avoid generating an impractically large
+matrix.
+4
+Tensor Parallel Latent Attention
+4 Tensor Parallel Latent Attention (TPLA)
+Motivated by the hardware efficiency of GLA, we retain its core principle of distributing latent KV across GPUs to
+mitigate memory wastage and communication overload. However, directly translating an existing MLA-based model
+to GLA incurs a significant performance penalty, as shown in Figure 2. This degradation stems from a key limitation
+in standard GLA: the latent vector within each group only accesses half of the query heads, restricting the model’s
+expressive power and leading to suboptimal performance. Moreover, training a new GLA model from scratch requires a
+substantial cost. To address this, we further propose Tensor-Parallel Latent Attention (TPLA). Unlike standard GLA,
+TPLA partitions latent vectors into two groups while preserving full query heads visibility. Specifically,
+cKV
+0 , cKV
+1 ∈ RB×L×2dh
+,
+(
+ˆ
+c0
+KV
+= RMSNorm(cKV
+0 ) ∈ RB×L×2dh
+,
+ˆ
+c1
+KV
+= RMSNorm(cKV
+1 ) ∈ RB×L×2dh
+,
+Q0, Q1 ∈ RB×1×hq×2dh
+, (Q0, Q1) = Q,
+WV O
+0 , WV O
+1 ∈ R hq·2dh
+
+×D
+, WV O
+0 , WV O
+1
+
+= WV O
+,
+O0 = softmax
+Q0 (ĉKV
+0 )⊤
+√
+dh
+
+ĉKV
+0 ∈ RB×1×hq×2dh
+,
+O1 = softmax
+Q1 (ĉKV
+1 )⊤
+√
+dh
+
+ĉKV
+1 ∈ RB×1×hq×2dh
+, (6)
+˜
+O0 = O0 WV O
+0 ∈ RB×1×D
+, ˜
+O1 = O1 WV O
+1 ∈ RB×1×D
+,
+O = AllReduce
+
+˜
+O0 + ˜
+O1
+
+∈ RB×1×D
+. (7)
+This design ensures each latent vector attends to all query heads, mitigating the most performance loss. The residual
+performance loss now stems exclusively from tensor-parallel partitioning effects in RMSNorm and softmax operations.
+Through carefully designed mathematical reparameterization, TPLA can restore near-MLA performance. For illustration,
+we consider the case where the tensor-parallel degree of latent attention is 2, though the approach naturally scales to
+higher degrees.
+4.1 RMSNorm Slicing
+In MLA-like models, the “kv_a_layernorm” module normalizes input vectors using the Root Mean Square (RMS)
+value. Given an input vector x ∈ Rd
+(e.g., d = 4dh), the RMSNorm is computed as:
+RMS(x) =
+v
+u
+u
+t1
+d
+d
+X
+i=1
+x2
+i + ϵ
+=
+r
+1
+d
+∥x∥2
+2 + ϵ, (8)
+RMSNorm(γ, x) =
+x
+RMS(x)
+⊙ γ
+= RMSNorm(1, x) ⊙ γ, (9)
+where ϵ is a small constant for numerical stability; γ ∈ Rd
+is a learned scaling parameter and ⊙ denotes element-wise
+multiplication.
+However, we face the following challenge when applying this to tensor-parallel processing of latent attention: When
+input latent vector x ∈ Rd
+is split into two partitions, x(0)
+∈ Rd/2
+and x(1)
+∈ Rd/2
+, across different devices, the RMS
+computation on each local device uses only half the original dimension (d/2), while the true normalization requires the
+full RMS(x) over dimension d.
+To resolve this discrepancy, we introduce an orthogonal transformation U ∈ Rd×d
+(U U⊤
+= I) to reparamerize this
+module. Before introducing the conditions that this transformation U need satisfy, we first establish that RMSNorm
+can, in principle, be realized in a mathematically equivalent form under any orthogonal transformation.
+Proposition 1.
+RMSNorm(1, c) = RMSNorm(1, c U) U⊤
+(10)
+5
+Tensor Parallel Latent Attention
+Proof. we first represent the RMSNorm process as matrix multiplication. Let c ∈ RL×d
+be the input latent vector (for
+simplicity, we omit the batch size), we obtain:
+RMSNorm(γ, c) = RMSNorm(1, c) Wγ, (11)
+= Dc c Wγ, (12)
+where Dc is a diagonal matrix of size L × L with the reciprocal of the RMS values on the diagonal and Wγ is also a
+diagonal matrix of size d × d with each learnable scaling parameter:
+Dc = diag
+1
+RMS(c1)
+,
+1
+RMS(c2)
+, . . . ,
+1
+RMS(cL)
+
+, (13)
+Wγ = diag γ1, γ2, . . . , γd
+
+. (14)
+Since the orthogonal transformation preserves the norm (∥c U∥2
+2 = ∥c∥2
+2), we easily have RMS(c) = RMS(c U), i.e.,
+DcU = Dc. Thus, we can have:
+RMSNorm (γ, c U ) U⊤
+= Dc c U Wγ U⊤
+. (15)
+Matrix multiplication does not satisfy the commutative property. Therefore, when and only when Wγ = I, we can
+further prove:
+RMSNorm(1, c U)U⊤
+= Dc c U I U⊤
+= Dc c
+= RMSNorm(1, c). (16)
+Give by Equation 5, Equation 11 and Proposition 1, we can absorb Wγ into up-projection matrix WUKV
+=
+(WUK
+, WUV
+) to achieve the γ = 1, ensuring the orthogonal transformations U to c with keeping the RMSNorm value
+no change. In addition, the UT
+can be further absorbed into WUKV
+; U can be absorbed into WDKV
+, yielding the
+reparameterized weight matrix:
+WUKV
+new = U⊤
+Wγ WUKV
+, WDKV
+new = WDKV
+U. (17)
+We have proved that any transformation U can ensure the equivalence of RMSNorm. Now we will define some
+conditions that serve as the computational basis for U, deferring the specific calculation method to a later section.
+Condition 1 (RMSNorm Slicing Condition).
+α∥(c U)0∥2
+2 ≈ β∥(c U)1∥2
+2 ≈ ∥c U∥2
+2 = ∥c∥2
+2. (18)
+Here, α and β are fixed constants, invariant to changes in the input data distribution (How to calculate their specific
+values is detailed in Section 4.3). (c U)1 and (c U)2 are the two partitions of the transformed c split across devices. By
+satisfying this, the new RMS values computed from the two partitions are proportional to the global value, thereby
+providing an accurate approximation of the global RMSNorm:
+RMS(c) =
+r
+1
+d
+∥c∥2
+2 + ϵ
+≈
+r
+α
+d
+∥(c U)0∥2
+2 + ϵ
+≈
+r
+α
+2
+RMS ((c U)0) ≈
+r
+β
+2
+RMS ((c U)1) . (19)
+Thus, we can compute RMSNorm in a tensor-parallel manner while maintaining the integrity of the normalization
+process.
+4.2 Softmax Slicing
+In common tensor-parallel techniques, matrices are typically split across devices to perform either row or column
+parallelism. For our TPLA attention score computation, row parallelism is employed, where the weight matrix A is split
+across devices according to its rows. To ensure a valid matrix multiplication, the input matrix X is correspondingly
+partitioned column-wise into X1 and X2, such that
+XA = (X1 X2)
+
+A1
+A2
+
+= X1 · A1 + X2 · A2 = Y 1 + Y 2 = Y (20)
+6
+Tensor Parallel Latent Attention
+where X1 and A1 are computed on GPU 0 to produce Y1, and X2 and A2 are computed on GPU 1 to produce Y2. The
+final output Y is then all-reduced by summing Y1 and Y2.
+In the context of softmax computation (Equation 4), TPLA partitions cKV
+and ensures that the computation of positional
+components remains unaffected. Specifically, the shard of the key positional embedding kPE
+must be replicated
+across devices so that the local positional values remain consistent with the global values. As for non-positional parts
+(Q (ĉKV
+)⊤
+), the latent vectors c are split into two devices, and each device performs only its local computation, i.e.,
+GPU 0 computes Q0 (ĉKV
+0 )⊤
+, while GPU 1 computes Q1 (ĉKV
+1 )⊤
+. However, in most cases,
+softmax Q (ĉKV
+)⊤
++ qPE
+(kPE
+)⊤
+
+= softmax Q0 (ĉKV
+0 )⊤
++ Q1 (ĉKV
+1 )⊤
++ qPE
+(kPE
+)⊤
+
+̸= softmax Q0 (ĉKV
+0 )⊤
++ qPE
+(kPE
+)⊤
+
+[GPU 0]
+̸= softmax Q1 (ĉKV
+1 )⊤
++ qPE
+(kPE
+)⊤
+
+[GPU 1]
+Thus, the challenge of TPLA is how to ensure the global value of Q cKV
+)⊤
+can be approximated from local computations.
+We first show that applying any orthogonal transformation U does not alter the equivalence of the original softmax
+output. Based on Equation 5, we easily have:
+Q (ĉKV
+)⊤
+= QU (ĉKV
+U)⊤
+= q (U⊤
+WUK
+)⊤
+(ĉKV
+U)⊤
+= Q′
+(ĉKV
+U)⊤
+(21)
+Analogous to Section 4.1, by absorbing U into WUKV
+and WDKV
+(equivalently, into Q to obtain Q′
+), we can impose
+an orthogonal transformation U, which preserves the original softmax computation and must satisfy:
+Condition 2 (Softmax Slicing Condition).
+Q′
+(ĉKV
+U)⊤
+≈ µQ′
+0 (ĉKV
+U)⊤
+0 ≈ νQ′
+1 (ĉKV
+U)⊤
+1 (22)
+Accordingly, by determining the coefficients µ and ν, each device can perform its local computation and scale by the
+factor, thereby approximating the global value.
+4.3 Reparameterization Methods
+From the derivation above, we need to find one orthogonal transformation matrix U applied to projection weights,
+ensuring that the transformation satisfies Condition 1 and Condition 2 — local computations can accurately approximate
+the global RMSNorm and softmax values. To achieve this, we explore two potential methods: Hadamard Matrix
+Transformation and Principal Component Analysis (PCA).
+4.3.1 Hadamard Matrix Transformation
+Hadamard matrix is a special orthogonal matrix where each entry is either +1 or -1. It operates by balancing the numbers,
+thereby reducing extreme numerical deviations and promoting a more uniform distribution of data. In practice, we
+typically use the function scipy.linalg.hadamard(d) to generate a Sylvester-type Hadamard matrix (also known
+as a Walsh-Hadamard matrix) Hd ∈ Rd×d
+, constructed using a deterministic recursive rule:
+H2n =
+
+Hn Hn
+Hn −Hn
+
+, H1 = (1). (23)
+To increase robustness, a random diagonal matrix D, with entries drawn from ±1 is multiplied with Hd, thereby
+breaking deterministic structure while preserving orthogonality. Since HdH⊤
+d = d · I, orthonormality is achieved by
+scaling Hd by 1
+√
+d
+, ensuring that normalization values are preserved.
+Take an illustrative example. Consider a 4-dimensional vector c = (100, 0, 0, 0) and the 4 × 4 Hadamard matrix H4.
+The transformed vector c′
+= cH4 is:
+c′
+= (100, 0, 0, 0)
+
+
+
+
+1
+2
+1
+2
+1
+2
+1
+2
+1
+2 −1
+2
+1
+2 −1
+2
+1
+2
+1
+2 −1
+2 −1
+2
+1
+2 −1
+2 −1
+2
+1
+2
+
+
+
+ = (50, 50, 50, 50). (24)
+7
+Tensor Parallel Latent Attention
+When applied to an input vector c: c′
+= c Hd, d = 4dh, we obtain:
+∥(cHd)1∥2
+2
+d/2 ≈
+∥(cHd)2∥2
+2
+d/2 ≈
+∥cHd∥2
+2
+d =
+∥c∥2
+2
+d , satisfies
+our key Condition 1 and easily determine α = 2. This uniformity minimizes approximation error in tensor-parallel
+RMSNorm, validated experimentally in Figure 2.
+However, satisfying Condition 2 is more challenging. While the magnitudes of the Hadamard transformed vector
+elements are balanced, due to the presence of both positive and negative signs, this transformation does not guarantee
+that the multiplication of the two parts will be approximately clear. To illustrate this, consider the following example:
+let Q = (100, 0, 0, 0) and c = (0, 0, 80, 0). After applying the Hadamard transformation, we have:
+Q′
+= QH4 = (50, 50, 50, 50),
+c′
+= cH4 = (40, 40, −40, −40).
+The element-wise product is: Q · c′
+= (200, 200, −200, −200). When this product is split into two parts, we get:
+400 ̸= −400 ̸= 0. This demonstrates that a standard Hadamard transformation cannot ensure Condition 2. A potential
+direction to address this issue is to search for an optimized Hadamard matrix via dimension permutations that minimizes
+the discrepancy between partitions. We leave the investigation of such optimized transformations for future work.
+4.3.2 Principal Component Analysis (PCA)
+PCA is a widely used technique in statistics and machine learning for dimensionality reduction, feature extraction, etc. It
+transforms a dataset into a new coordinate system such that the greatest variances of the data are captured along the new
+axes (principal components). Each subsequent component is orthogonal to (i.e., uncorrelated with) the preceding ones.
+In our context, we leverage this property to project data onto orthogonal dimensions, with the eigenvalues indicating the
+variance captured along each eigenvector and thus reflecting the statistical importance of each dimension. Moreover, for
+mean-centered features, the variance is equivalent to mean of the squared values, closely related to squared RMS value.
+To implement this, we process a calibration dataset (e.g., Wikitext-2) to collect the KV latent cache (excluding position
+features) represented by F ∈ R(B·L)×d
+. We then compute the eigenvectors U and eigenvalues Λ by performing
+eigenvalue decomposition on the covariance matrix ΣF = UΛU⊤
+.
+Based on Condition 1, we define α as proportion of variance captured by the first d/2 principal components. Similarly,
+β represents the proportion of variance captured by the remaining components. These ratios are as follows:
+α =
+Pd/2
+i=1 λi
+Pd
+i=1 λi
+, β =
+Pd
+i=d/2 λi
+Pd
+i=1 λi
+. (25)
+For Condition 2, the metrics µ and ν are defined in the same manner, making them equivalent to α and β, respectively.
+4.4 TPLA as a Special Case of GLA
+Tensor parallelism in GLA employs a two-dimensional sharding scheme, splitting both head axis hq and the latent
+dimension axis 4dh across devices. For a query tensor Q ∈ RB×L×hq×4dh
+, this partitioning yields four logical
+sub-tensors:
+Q =
+
+Q0,0 Q0,1
+Q1,0 Q1,1
+
+, where Qi,j ∈ RB×L×
+hq
+2 ×2dh
+.
+In standard GLA, they are distributed with only two devices. Thus, only two diagonal blocks can be materialized
+locally—one per device—without additional communication:
+(
+Device 0: Q0,0 ∈ RB×L×
+hq
+2 ×2dh
+,
+Device 1: Q1,1 ∈ RB×L×
+hq
+2 ×2dh
+.
+Each latent slice (of width 2dh) is paired with only half of the query heads (hq/2) and thus unable to access the
+off-diagonal head slices Q1,0 and Q0,1. In effect, these parts do not contribute to the computation, resulting in
+significant performance degradation.
+In contrast, TPLA overcomes this limitation by enabling each partitioned latent vector to attend to all query heads. It
+achieves this by reformulating the computation to be algebraically equivalent to a GLA system with double the number
+of heads. Concretely, define a conceptual query tensor Q′
+that duplicates the original query along the head dimension:
+Q′
+=
+
+
+
+Q0,0 Q0,1
+Q1,0 Q1,1
+Q0,0 Q0,1
+Q1,0 Q1,1
+
+
+ ∈ RB×L×(2hq)×(4dh)
+,
+8
+Tensor Parallel Latent Attention
+For hq original heads, TPLA’s duplication additional creates hq heads. This is algebraically equivalent to a GLA system
+with 2hq heads 4dh latent dimension. Thus, we can perfectly follow the same as TPLA sharding way. When split into
+two device, we have: 
+Device 0:
+
+Q0,0 Q0,1
+
+∈ RB×L×hq×4dh
+Device 1:
+
+Q1,0 Q1,1
+
+∈ RB×L×hq×4dh
+Generalizing to k devices, let g denote the TPLA replication factor (number of latent-cache-slice groups). TPLA divides
+k devices into r group size of size k/g. Each group holds a disjoint slice of the latent axis of width 4dh/g and replicates
+the complete set of head parameters. Within each group, the head axis is sharded across the k/g devices, Consequently,
+each device processes
+hq
+k/g heads, and 4dh
+g latent features. For g = 2, k = 2, this recovers the two-device case above,
+where each device receives hq heads and 2dh latent width. The computational complexity arising from parameter
+replication is analyzed in Section 4.5.
+In summary, because TPLA preserves GLA’s sharding pattern—differing only by a constant-factor replication of head
+parameters—state-of-the-art attention optimizations (e.g., FlashAttention-3) can be applied to TPLA without substantial
+changes to the underlying framework.
+4.5 Prefill-Decode Separation
+Large language model inference is usually into two phases with distinct performance characteristics: prefill and decode.
+The prefill phase processes the entire prompt in a single, parallel pass to compute the initial Key-Value (KV) cache. This
+large-batch computation is fundamentally compute-bound. The subsequent decode phase autoregressively generates
+one token at a time. Each generation step requires reading the entire, growing KV cache from high-bandwidth memory
+(HBM) to on-chip SRAM. As the context length increases, this large data transfer becomes the primary bottleneck,
+making the decode phase memory-bound.
+Our proposed technique, TPLA, addresses this challenge by reducing the KV cache size on each device. This reduction
+effectively alleviates the memory bandwidth bottleneck at the cost of a minor increase in computation. In essence,
+TPLA shifts the decode phase from being memory-bound towards being more compute-bound. A detailed analysis is as
+below.
+Complexity Analysis of TPLA To maximize the degree of tensor parallelism and enable acceleration methods
+compatible with GLA, TPLA requires the replication of head-specific parameters across latent attention groups, as
+discussed in Section 4.4. Specifically, let’s analyze the case with a tensor parallelism (TP) degree of 2. We consider a
+hidden state X ∈ RLq×D
+for a single-batch inference using the MLA-absorbing strategy. The dominant cost lies in the
+attention computation. For a KV cache of length Skv, the complexity of the TPLA attention module (Equation 6) is
+approximately O(Lq ×SKV ×hq ×2dh ×2). In comparsion, for MLA (Equation 1), with TP=2, the heads are split into
+two groups of
+hq
+2 , leading to a complexity of O(Lq × SKV ×
+hq
+2 × 4dh × 2). These two complexities are arithmetically
+equivalent. (Strictly speaking, positional components introduce additional overhead, since TPLA doubles the number of
+heads without reducing the RoPE dimension, but this effect is relatively minor.) Similarly, the Õ computations are also
+equivalent.
+Beyond the main attention computation, TPLA modifies other calculations: the computation of cKV
+in TPLA is
+distributed across two devices, reducing complexity by O(Lq × D × 2dh × 2), while the computation of Q increases
+by O(Lq × D × 2hq × dh). However, as context length grows, the overall cost is increasingly dominated by the
+self-attention module (see Figure 4).
+To mitigate the additional computational overhead of TPLA, we also strategically decouple the attention mechanisms:
+retaining standard MLA during compute-intensive prefilling to minimize computation and reduce loss caused by
+converting MLA to TPLA, while activating TPLA exclusively during memory-bound decoding to minimize KV cache
+footprint. This hybrid approach thereby further optimizes performance by matching each phase to its most suitable
+mechanism.
+Discussion The above analysis focuses on MLA-absorbing computation. However, when constructing the full-size
+KV cache and performing attention, TPLA doubles the number of heads while maintaining the same head dimension
+dh. As a result, the overall computational load increases, making training TPLA from scratch potentially costly.
+Designing effective and efficient training strategies for TPLA remains an open problem, which we leave for future
+work. Nevertheless, one practical pathway is to adopt the existing MLA design during training and then convert it to
+TPLA with only minimal loss. This approach allows us to retain training efficiency while still benefiting from TPLA’s
+advantages in inference scenarios.
+9
+Tensor Parallel Latent Attention
+Table 1: WikiText-2 Perplexity and Commonsense reasoning performance when converting the MLA to TPLA.
+The six benchmarks include MMLU, ARC (easy and challenge), PIQA, HellaSwag, OpenBookQA (OBQA), and
+Winogrande(WG).
+Model PPL↓ Avg.↑ MMLU ARC PIQA HellaSwag WG OBQA
+DeepSeek-V2-Lite 6.31 61.75 43.19 60.39 80.20 74.46 65.43 45.80
+- GLA 2212. 33.77 25.32 26.77 51.47 25.65 49.88 23.60
+- TPLA 7.24 54.33 37.67 51.50 75.46 63.56 59.19 38.60
+- TPLA (align) 6.51 61.52 42.72 62.58 79.82 73.32 65.90 44.80
+- TPLA (pd sep.) 6.31 61.44 43.19 60.14 80.09 74.41 65.59 45.20
+DeepSeek-V2 3.89 68.32 51.91 69.09 83.13 82.17 74.03 49.60
+- TPLA 4.72 63.40 47.19 65.04 80.69 75.46 66.61 45.40
+DeepSeek-V3 3.24 72.10 60.85 77.16 85.58 85.41 75.22 48.40
+- TPLA 4.02 68.00 54.88 75.25 82.70 80.69 69.46 45.00
+Kimi-K2-Base 1.91 73.52 63.20 78.75 85.47 87.55 75.93 50.20
+- TPLA 2.44 70.49 57.64 76.00 83.79 83.53 72.38 49.60
+LLaMA-2-7B 5.47 59.85 41.43 59.24 78.40 73.29 64.96 41.80
+- TransMLA 5.88 58.95 40.38 57.64 78.18 70.59 62.90 44.00
+- TPLA 6.74 54.68 36.12 53.21 74.81 64.52 59.04 40.40
+5 Experiment
+An advantage of TPLA over GLA [20] is that TPLA can be applied without training a model from scratch. It allows
+direct loading of models originally trained with MLA (e.g., the DeepSeek series [53, 17, 19], Kimi-k2 [54], TransMLA
+[16]), and—through our proposed reparameterization method and Prefill/Decode Separation technology—mitigates
+performance degradation caused by changes in the attention mechanism.
+5.1 Performance on Commonsense Tasks
+In this section, we evaluate TPLA by directly loading MLA checkpoints without any additional training on short-text
+commonsense tasks. Performance is measured with the LightEval framework on MMLU [55], ARC (Easy/Challenge)
+[56], PIQA [57], HellaSwag [58], OpenBookQA (OBQA) [59], and WinoGrande (WG) [60]. Results are reported in
+Table 1. For GLA, following the procedure in Section 3.2, we partition the attention heads into two groups, assigning
+each group half of the latent dimension. As shown in Table 1, discarding half of each head’s KV cache causes severe
+performance degradation—for example, WikiText-2 perplexity (ppl) increases from 6.31 with MLA to 2212 with
+GLA—whereas TPLA, which allows each attention head to use the full latent dimension across different devices,
+maintains a ppl of 7.24. This comparison indicates that TPLA preserves MLA’s representational capacity while reducing
+the per-device KV-cache footprint. We therefore expect that pretraining TPLA from scratch would outperform GLA. For
+TPLA, we first use WikiText-2 [61] as a calibration set and, following Sections 4.1 and 4.2, slice the MLA components
+(the KVa RMSNorm and the softmax) to obtain TPLA weights. As shown in Table 1, this requires no fine-tuning
+and yields only minor accuracy degradation. The reparameterization method used here is the PCA-based approach
+described in Section 4.3.2. For TPLA (align), we use the SmolLM-Corpus [62] for lightweight alignment. First, we
+match the layer-wise input/output features of TPLA to those of the original MLA model using 256 random samples of
+length 2,048 for 10 epochs, minimizing MSE with the Muon optimizer (initial learning rate 1e−6). Next, we align
+the end-to-end model outputs using 100M tokens, following the TransMLA setting (batch size = 32, learning rate
+= 2e−5, warmup ratio = 0.03, cosine scheduler, max sequence length = 4096). Experiments are conducted on a
+node with 8× GPUs (96 GB per GPU, ∼148 FP16 TFLOPS each). This small amount of alignment data is sufficient
+to recover the performance of the converted model. For TPLA (PD-sep.), we use MLA in the prefilling stage with
+the same reparameterization but without slicing the RMSNorm or softmax; prefilling thus behaves identically to the
+original MLA, and the KV cache can be partially reused by TPLA during decoding. By avoiding slicing for most
+tokens, this prefill–decode separation achieves performance close to the original model without any training. For
+LLaMA-2-7B, we first apply TransMLA [16] to convert MHA/GQA to MLA (64 RoPE dimensions and 512 NoPE
+dimensions—corresponding to a pruning ratio of 92.97%.) and then fine-tune to recover performance. We subsequently
+convert the MLA checkpoint released by TransMLA directly into TPLA. With TransMLA as a bridge, TPLA can be
+applied to pretrained models that originally use MLA, GQA, or MHA.
+10
+Tensor Parallel Latent Attention
+Table 2: Longbench performance when converting the MLA to TPLA.
+Model Avg. MultiQA SingleQA Summarize Few-Shot Code Synthetic
+DeepSeek-V2-Lite 28.90 12.43 20.04 16.74 62.59 57.86 3.77
+- TPLA 10.98 6.96 9.20 6.91 25.29 14.41 3.11
+- TPLA (align) 22.60 10.97 14.67 16.59 58.03 31.59 3.77
+- TPLA (pd sep.) 24.44 13.95 15.07 8.62 59.10 46.67 3.23
+DeepSeek-V3 58.19 55.37 51.65 23.97 69.42 80.09 68.63
+- TPLA 44.52 35.02 38.53 12.55 53.01 61.20 66.83
+- TPLA (pd sep.) 56.04 53.01 50.17 21.39 67.22 75.97 68.47
+These experiments demonstrate that converting MLA-based models to TPLA can effectively preserve performance.
+Given the benefits of TPLA for tensor parallelism, this presents a promising approach for efficient model deployment
+and acceleration.
+5.2 Performance on Longbench Tasks
+As context length grows, memory traffic increases and the KV-cache size becomes a primary driver of latency and
+throughput. To assess how TPLA converted from MLA behaves on long inputs, we evaluate on LongBench [63], a
+bilingual (English/Chinese), multi-task benchmark for long-context understanding that comprises 21 tasks across six
+categories (e.g., question answering, summarization, and few-shot learning). Because long-text inference is slower, we
+report results only for DeepSeek-V2-Lite and DeepSeek-V3. Due to GPU memory constraints, the maximum input
+context length is set to 31,500 tokens for DeepSeek-V2-Lite and 127,500 tokens for DeepSeek-V3. For each task, the
+output length is kept the same as in the original paper. The outcomes are summarized in Table 2. We observe that slicing
+errors in RMSNorm and softmax accumulate with sequence length, leading to some degradation on LongBench. TPLA
+(align) follows the same alignment recipe as in the previous section, but its effectiveness is limited because the alignment
+corpus is formed by concatenating short texts. In contrast, TPLA (PD-sep.) adopts a prefill–decode separation: MLA is
+used unchanged in the prefill stage (no slicing of RMSNorm/softmax), and the resulting KV cache is partially reused by
+TPLA during decoding, which reduces first-token latency and accuracy loss. On DeepSeek-V2-Lite, the training-free
+TPLA (PD-sep.) surpasses the aligned variant, and on DeepSeek-V3 the model retains strong long-form reasoning with
+only a modest average drop of 2.15%. These small losses, compared with training from scratch, are likely recoverable
+with a small amount of additional training.
+5.3 Ablation Study
+5.3.1 Part 1
+We highlight two structural differences. (i) Per-head latent capacity: GLA gives each attention head only half of the
+latent dimension, whereas TPLA preserves the full latent dimension per head. (ii) Prefill–decode (PD) separation:
+during the compute-intensive prefill stage we keep the reparameterized MLA form without splitting RMSNorm or
+softmax; during decoding, TPLA uses PD separation while consuming the prefill KV cache. We analyze the results in
+Table 1 to quantify these effects:
+1) MLA → GLA conversion. Directly converting MLA to GLA forces each attention head to access only half of its
+original latent representation, causing substantial information loss and a marked accuracy drop across all benchmarks.
+2) Prefill–decode separation. Avoiding RMSNorm/softmax partitioning in prefill reduces approximation error for the
+vast majority of tokens. Moreover, the MLA reparameterization enables the prefill KV cache to be used directly by
+TPLA at decode time, improving both quality and efficiency.
+5.3.2 Part 2
+In Section 4, we identified RMSNorm and softmax as the primary sources of error when converting MLA to TPLA.
+To mitigate this, we proposed two reparameterization strategies, Hadamard-based and PCA-based, to reduce the
+performance degradation introduced by parallelizing these components. This section presents ablation studies analyzing
+the impact of each reparameterization method on individual modules. Figure 2 presents ablation results analyzing the
+effectiveness of each method. The key findings are:
+11
+Tensor Parallel Latent Attention
+MMLU ARC-avg PIQA HellaSwag OBQA Winogrande
+20
+30
+40
+50
+60
+70
+80
+90
+100
+Accuracy
+(%) MLA
+TPLA (norm only)-Vanilla
+TPLA (norm only)-Hardamard
+TPLA (norm only)-PCA
+TPLA (softmax only)-Vanilla
+TPLA (softmax only)-Hardamard
+TPLA (softmax only)-PCA
+TPLA-Vanilla
+TPLA-Hardamard
+TPLA-PCA
+Figure 2: Accuracy across multiple benchmarks under different tensor-parallelism methods (indicated by colors) and
+reparameterization strategies (indicated by textures). The purple horizontal line marks the original DeepSeek-V2-Lite
+accuracy, and the vertical bars show each method’s accuracy drop relative to this MLA baseline. TPLA (norm only)
+parallelizes RMSNorm across two devices, followed by an allgather before the softmax. TPLA (softmax only)
+applies RMSNorm normally and parallelizes the softmax. TPLA parallelizes both RMSNorm and softmax. Original
+splits parameters evenly; Hadamard balances parts prior to splitting; PCA concentrates information into earlier
+dimensions before splitting. To better visualize method-induced loss, TPLA results are reported without PD separation
+in this figure.
+1) Error ordering. Empirically, slicing RMSNorm incurs the least loss, slicing softmax is worse, and slicing both is
+worst:
+2) TP on RMSNorm only: The Hadamard-based method balances the norm computation across devices effectively,
+leading to performance comparable to the original MLA model on multiple tasks.
+3) TP on softmax only: The PCA-based method concentrates information into the dimensions assigned to device 1,
+effectively preserving performance. In contrast, the Hadamard-based method fails to improve softmax accuracy. We
+hypothesize that the exponential nature of softmax makes it more sensitive to imbalance. Although Hadamard-based
+reparameterization achieves statistical balance across devices, small per-sample perturbations may result in significant
+asymmetries, adversely affecting final performance.
+4) TP over both RMSNorm and softmax. When both components are parallelized, the PCA-based reparameterization
+consistently achieves the best performance. Consequently, we adopt this configuration for all experiments in the paper
+unless otherwise stated.
+5.4 Inference Speedup with TPLA
+5.4.1 Decoding Throughput
+LLM decoding is often memory-bandwidth bound. TPLA splits each attention head’s input dimension across two
+devices, reducing per-device memory traffic and alleviating the bandwidth bottleneck. We evaluate the speedup of
+TPLA over MLA on two large models, DeepSeek-V3-0324 (685B parameters) and Kimi-K2-Base (1T parameters).
+Because these models are extremely large and Mixture-of-Experts (MoE) routing can confound attention-speed effects,
+we remove MoE for timing. Both models are converted to BF16. All experiments use FlashAttention-3 to ensure a fair
+comparison.
+For TPLA with TP=2, the number of attention heads per device stays unchanged, while the latent dimension changes
+from 64+512 to (64+256) × 2, so each device holds a 320-dimensional KV cache. For MLA with TP=2, the latent
+dimension is unchanged and heads are distributed across devices (e.g., DeepSeek-V3: 64 heads ×2; Kimi-K2: 32 heads
+×2). For MLA with TP>2, we continue splitting along heads only. For TPLA with TP>2, we further split heads in
+addition to halving the latent dimension; for example, with TP=4 on Kimi-K2-TPLA, we use 32 heads ×2 per device
+with a 320-dimensional latent per head. In this setting, the per-device compute halves, while memory traffic matches
+TP=2; decoding remains memory-bound, so the speedup is similar to TP=2. Consequently, we report measurements on
+two GPUs.
+12
+Tensor Parallel Latent Attention
+Figure 3 configures the maximum batch size at each context length. At a decoding length of 4096, TPLA with 2dh
+achieves up to ∼2× the throughput of the single-head-latent MLA with 4dh, due to the smaller per-device KV cache.
+Our parallelization-friendly design raises peak throughput and is resilient under adverse serving loads. At a 32k context
+length, DeepSeek-TPLA is 1.79× faster than MLA, and Kimi-K2-TPLA is 1.93× faster.
+1k 2k 4k 8k 16k 32k
+Prefilling Length
+0
+100
+200
+300
+400
+500
+600
+Throughput
+(tokens/sec)
+1.33x
+1.38x
+1.45x
+1.57x
+1.65x
+1.79x
+MLA
+TPLA
+(a) DeepSeek-V3-0324
+1k 2k 4k 8k 16k 32k
+Prefilling Length
+0
+100
+200
+300
+400
+500
+600
+Throughput
+(tokens/sec)
+1.28x
+1.35x
+1.51x
+1.55x
+1.76x
+1.93x
+MLA
+TPLA
+(b) Kimi-K2-Base
+Figure 3: Throughout (Decoding) comparing MLA and TPLA.
+1k 2k 4k 8k 16k
+Prefilling Length
+10
+2
+10
+3
+TTFT
+(ms)
+1.45x
+1.40x
+1.32x
+1.22x
+1.12x
+TPLA (pd sep.)
+TPLA
+(a) DeepSeek-V3-0324
+1k 2k 4k 8k 16k
+Prefilling Length
+10
+2
+10
+3
+TTFT
+(ms)
+1.41x
+1.35x
+1.29x
+1.21x
+1.13x
+TPLA (pd sep.)
+TPLA
+(b) Kimi-K2-Base
+Figure 4: Latency (TTFT) comparing TPLA and TPLA (pd sep.).
+5.4.2 Prefilling Latency
+The prefilling stage of LLM inference is compute-bound. Under TPLA’s TP separation, each device retains the original
+number of heads, whereas MLA can reduce heads per device by splitting them across devices. As a result, the original
+TPLA is not ideal for the compute-bound prefill stage. To address this, we introduce TPLA (sep.): it applies the same
+reparameterization to MLA but does not slice RMSNorm or softmax, thereby introducing no approximation error.
+During prefill, the structure matches MLA: under TP we do not change the latent dimension but partition heads across
+devices. This significantly reduces per-device compute and alleviates the compute bottleneck.
+Figure 4 reports TTFT (Time to First Token) on two GPUs for MoE-removed DeepSeek-V3-0324 and Kimi-K2-Base.
+At a 1K prompt length, TPLA (sep.) is 1.4× faster than TPLA for both models. Given its accuracy-friendly design,
+this 1.4× gain is essentially a “free lunch.”
+6 Conclusion, Limitation and Future Work
+We introduce TPLA, which combines the KV cache compression efficiency of MLA with strong compatibility for Tensor
+Parallelism. It can directly inherit checkpoints from MLA-pretrained models. With two proposed reparameterization
+techniques, it substantially reduces the loss incurred by converting the attention formulation; combined with PD
+separation, the training-free conversion error can be driven to a very small level. We evaluate TPLA on commonsense
+reasoning tasks and the more challenging LongBench benchmark, finding that it preserves the original model’s
+performance well. Extensive ablations confirm the effectiveness of our TP slicing and reparameterization designs.
+13
+Tensor Parallel Latent Attention
+TPLA achieves up to 2× improvement in throughput, and PD separation delivers up to 29% latency reduction. Overall,
+TPLA shows strong potential as a powerful and efficient replacement for MLA.
+Limitation and Future Work. Although PCA demonstrates better performance over Hadamard transform, it has
+inherent limitations. Specifically, PCA concentrates most of the data’s informative content in the first few dimensions,
+which provide a representative summary of the global structure. In contrast, the later dimensions primarily capture
+negligible noise and minor variations that contribute minimally to the overall representation. Consequently, TPLA with
+group-partitions g = 2 can achieve good performance, but when g > 2, it probably fails to maintain effectiveness. By
+contrast, numerical-value balancing via orthogonal transforms, particularly the Hadamard transform, tends to be more
+effective when partitioning into multiple groups. Empirically, inserting a Hadamard transform into the RMSNorm slicing
+part yields almost no performance degradation. In future work, we will design and evaluate optimized Hadamard-like
+orthogonal matrices to balance softmax slicing, thereby improving both robustness and scalability. One advantage of
+TPLA is that it can directly inherit MLA checkpoints, but this also introduces some conversion errors. Our experiments
+fully validate TPLA’s expressive capacity and speed advantages. In future work, we will post-pretrain DeepSeek-V3, or
+train a TPLA-based model from scratch, to further demonstrate TPLA’s excellent expressiveness.
+References
+[1] OpenAI. Hello GPT-4o, 2024.
+[2] Anthropic. Claude 3.5 sonnet, 2024.
+[3] Gemini Team, Petko Georgiev, Ving Ian Lei, Ryan Burnell, Libin Bai, Anmol Gulati, Garrett Tanzer, Damien
+Vincent, Zhufeng Pan, Shibo Wang, et al. Gemini 1.5: Unlocking multimodal understanding across millions of
+tokens of context. arXiv preprint arXiv:2403.05530, 2024.
+[4] Alec Radford. Improving language understanding by generative pre-training. 2018.
+[5] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Nee-
+lakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. Advances
+in neural information processing systems, 33:1877–1901, 2020.
+[6] Chang Chi-Chih, Lin Wei-Cheng, Lin Chien-Yu, Chen Chong-Yan, Hu Yu-Fang, Wang Pei-Shuo, Huang Ning-Chi,
+Ceze Luis, Abdelfattah Mohamed, S., and Wu and, Kai-Chiang. Palu: Compressing kv-cache with low-rank
+projection. arXiv preprint arXiv:2407.21118, 2024.
+[7] Chang Chi-Chih, Lin Chien-Yu, Akhauri Yash, Lin Wei-Cheng, Wu Kai-Chiang, Ceze Luis, and Abdelfattah
+Mohamed, S. xkv: Cross-layer svd for kv-cache compression. arXiv preprint arXiv:2503.18893, 2025.
+[8] Oren Matanel, Hassid Michael, Yarden Nir, Adi Yossi, and Schwartz Roy. Transformers are multi-state rnns.
+arXiv preprint arXiv:2401.06104, 2024.
+[9] Liu Zirui, Yuan Jiayi, Jin Hongye, Zhong Shaochen, Xu Zhaozhuo, Braverman Vladimir, Chen Beidi, and Hu Xia.
+Kivi: A tuning-free asymmetric 2bit quantization for kv cache. arXiv preprint arXiv:2402.02750, 2024.
+[10] Zhang Muru, Mishra Mayank, Zhou Zhongzhu, Brandon William, Wang Jue, Kim Yoon, Ragan-Kelley Jonathan,
+Song Shuaiwen, Leon, Athiwaratkun Ben, and Dao Tri. Ladder-residual: parallelism-aware architecture for
+accelerating large model inference with communication overlapping. arXiv preprint arXiv:2501.06589, 2025.
+[11] Kim Han-Byul, Hoang Duc, Kundu Arnav, Samragh Mohammad, and Cho Minsik. Spd: Sync-point drop for
+efficient tensor parallelism of large language models. arXiv preprint arXiv:2502.20727, 2025.
+[12] Lamprecht Itay, Karnieli Asaf, Hanani Yair, Giladi Niv, and Soudry Daniel. Tensor-parallelism with partially
+synchronized activations. arXiv preprint arXiv:2506.19645v1, 2025.
+[13] Li Qingyuan, Zhang Bo, Ye Liang, Zhang Yifan, Wu Wei, Sun Yerui, Ma Lin, and Xie Yuchen. Flash com-
+munication: Reducing tensor parallelization bottleneck for fast large language model inference. arXiv preprint
+arXiv:2412.04964, 2024.
+[14] Smith Shaden, Patwary Mostofa, Norick Brandon, LeGresley Patrick, Rajbhandari Samyam, Casper Jared, Liu
+Zhun, Prabhumoye Shrimai, Zerveas George, Korthikanti Vijay, Zhang Elton, Child Rewon, Aminabadi Reza,
+Yazdani, Bernauer Julie, Song Xia, Shoeybi Mohammad, He Yuxiong, Houston Michael, Tiwary Saurabh, and
+Catanzaro and, Bryan. Using deepspeed and megatron to train megatron-turing nlg 530b, a large-scale generative
+language model. arXiv preprint arXiv:2201.11990, 2022.
+[15] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sang-
+hai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. arXiv preprint
+arXiv:2305.13245, 2023.
+14
+Tensor Parallel Latent Attention
+[16] Fanxu Meng, Pingzhi Tang, Zengwei Yao, and Muhan Zhang. Transmla: Multi-head latent attention is all you
+need. arXiv preprint arXiv:2502.07864, 2025.
+[17] DeepSeek-AI. Deepseek-v2: A strong, economical, and efficient mixture-of-experts language model. CoRR,
+abs/2405.04434, 2024.
+[18] AI@Meta. Llama 3 model card, 2024.
+[19] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 technical report. arXiv preprint arXiv:2412.19437, 2024.
+[20] Zadouri Ted, Strauss Hubert, and Dao Tri. Hardware-efficient attention for fast decoding. arXiv preprint
+arXiv:2505.21487v1, 2025.
+[21] Ge Suyu, Zhang Yunan, Liu Liyuan, Zhang Minjia, Han Jiawei, and Gao Jianfeng. Model tells you what to
+discard: Adaptive kv cache compression for llms. arXiv preprint arXiv:2310.01801, 2023.
+[22] Zhou Xiabin, Wang Wenbin, Zeng Minyan, Guo Jiaxian, Liu Xuebo, Shen Li, Zhang Min, and Ding Liang.
+Dynamickv: Task-aware adaptive kv cache compression for long context llms. arXiv preprint arXiv:2412.14838,
+2024.
+[23] Lin Xiaolin, Wang Jingcun, Kondrateva Olga, Shi Yiyu, Li Bing, and Zhang Grace, Li. Compresskv: Semantic
+retrieval heads know what tokens are not important before generation. arXiv preprint arXiv:2508.02401v1, 2025.
+[24] Li Yuhong, Huang Yingbing, Yang Bowen, Venkitesh Bharat, Locatelli Acyr, Ye Hanchen, Cai Tianle, Lewis
+Patrick, and Chen Deming. Snapkv: Llm knows what you are looking for before generation. arXiv preprint
+arXiv:2404.14469, 2024.
+[25] Fu Qichen, Cho Minsik, Merth Thomas, Mehta Sachin, Rastegari Mohammad, and Najibi Mahyar. Lazyllm:
+Dynamic token pruning for efficient long context llm inference. arXiv preprint arXiv:2407.14057, 2024.
+[26] Zhang Zhenyu, Sheng Ying, Zhou Tianyi, Chen Tianlong, Zheng Lianmin, Cai Ruisi, Song Zhao, Tian Yuandong,
+Ré Christopher, Barrett Clark, Wang Zhangyang, and Chen Beidi. H2o: Heavy-hitter oracle for efficient generative
+inference of large language models. arXiv preprint arXiv:2306.14048, 2023.
+[27] Wang Zheng, Jin Boxiao, Yu Zhongzhi, and Zhang Minjia. Model tells you where to merge: Adaptive kv cache
+merging for llms on long-context tasks. arXiv preprint arXiv:2407.08454, 2024.
+[28] Liu Xin, Liu Pei, and Tang Guoming. Zsmerge: Zero-shot kv cache compression for memory-efficient long-context
+llms. arXiv preprint arXiv:2503.10714, 2025.
+[29] Hu Jie, Wang Shengnan, He Yutong, Gong Ping, Yi Jiawei, Zhang Juncheng, Bai Youhui, Chen Renhai, Zhang
+Gong, Li Cheng, and Yuan Kun. Efficient long-context llm inference via kv cache clustering. arXiv preprint
+arXiv:2506.11418, 2025.
+[30] Yang Yifei, Cao Zouying, Chen Qiguang, Qin Libo, Yang Dongjie, Zhao Hai, and Chen Zhi. Kvsharer: Efficient
+inference via layer-wise dissimilar kv cache sharing. arXiv preprint arXiv:2410.18517, 2024.
+[31] Rajput Shashank, Sheng Ying, Owen Sean, and Chiley Vitaliy. Inference-friendly models with mixattention. arXiv
+preprint arXiv:2409.15012, 2024.
+[32] Wu Haoyi and Tu Kewei. Layer-condensed kv cache for efficient inference of large language models. arXiv
+preprint arXiv:2405.10637, 2024.
+[33] Wu You, Wu Haoyi, and Tu Kewei. A systematic study of cross-layer kv sharing for efficient llm inference. arXiv
+preprint arXiv:2410.14442, 2024.
+[34] Brandon William, Mishra Mayank, Nrusimha Aniruddha, Panda Rameswar, and Kelly Jonathan, Ragan. Reducing
+transformer key-value cache size with cross-layer attention. arXiv preprint arXiv:2405.12981, 2024.
+[35] Zhang Rongzhi, Wang Kuang, Liu Liyuan, Wang Shuohang, Cheng Hao, Zhang Chao, and Shen Yelong.
+Lorc: Low-rank compression for llms kv cache with a progressive compression strategy. arXiv preprint
+arXiv:2410.03111, 2024.
+[36] Lin Bokai, Zeng Zihao, Xiao Zipeng, Kou Siqi, Hou Tianqi, Gao Xiaofeng, Zhang Hao, and Deng Zhijie.
+Matryoshkakv: Adaptive kv compression via trainable orthogonal projection. arXiv preprint arXiv:2410.14731,
+2024.
+[37] Yu Hao, Yang Zelan, Li Shen, Li Yong, and Wu Jianxin. Effectively compress kv heads for llm. arXiv preprint
+arXiv:2406.07056, 2024.
+[38] Hooper Coleman, Kim Sehoon, Mohammadzadeh Hiva, Mahoney Michael, W., Shao Yakun, Sophia, Keutzer
+Kurt, and Gholami Amir. Kvquant: Towards 10 million context length llm inference with kv cache quantization.
+arXiv preprint arXiv:2401.18079, 2024.
+15
+Tensor Parallel Latent Attention
+[39] Wang Zongwu, Xu Peng, Liu Fangxin, Hu Yiwei, Sun Qingxiao, Li Gezi, Li Cheng, Wang Xuan, Jiang Li, and
+Guan Haibing. Million: Mastering long-context llm inference via outlier-immunized kv product quantization.
+arXiv preprint arXiv:2504.03661, 2025.
+[40] Dong Shichen, Cheng Wen, Qin Jiayu, and Wang Wei. Qaq: Quality adaptive quantization for llm kv cache. arXiv
+preprint arXiv:2403.04643, 2024.
+[41] Yao Dingyu, Shen Bowen, Lin Zheng, Liu Wei, Luan Jian, Wang Bin, and Wang Weiping. Tailorkv: A hybrid
+framework for long-context inference via tailored kv cache optimization. arXiv preprint arXiv:2505.19586, 2025.
+[42] Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc’aurelio Ranzato, Andrew
+Senior, Paul Tucker, Ke Yang, et al. Large scale distributed deep networks. Advances in neural information
+processing systems, 25, 2012.
+[43] Alexander Sergeev and Mike Del Balso. Horovod: fast and easy distributed deep learning in tensorflow. arXiv
+preprint arXiv:1802.05799, 2018.
+[44] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan
+Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural networks using pipeline parallelism.
+Advances in neural information processing systems, 32, 2019.
+[45] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger,
+Phillip B Gibbons, and Matei Zaharia. Pipedream: Generalized pipeline parallelism for dnn training. In
+Proceedings of the 27th ACM symposium on operating systems principles, pages 1–15, 2019.
+[46] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+Megatron-lm: Training multi-billion parameter language models using model parallelism. arXiv preprint
+arXiv:1909.08053, 2019.
+[47] Xu Qifan, Li Shenggui, Gong Chaoyu, and You Yang. An efficient 2d method for training super-large deep
+learning models. arXiv preprint arXiv:2104.05343, 2021.
+[48] Bian Zhengda, Xu Qifan, Wang Boxiang, and You Yang. Maximizing parallelism in distributed training for huge
+neural networks. arXiv preprint arXiv:2105.14450, 2021.
+[49] Li Shenggui, Xue Fuzhao, Baranwal Chaitanya, Li Yongbin, and You Yang. Sequence parallelism: Long sequence
+training from system perspective. arXiv preprint arXiv:2105.13120, 2021.
+[50] Amr Elmeleegy, Harry Kim, David Zier, Kyle Kranen, Neelay Shah, Ryan Olson, and Omri Kahalon. NVIDIA
+dynamo, a low-latency distributed inference framework for scaling reasoning ai models. NVIDIA Developer Blog,
+March 2025. Published March 18, 2025.
+[51] Juntao Zhao, Jiuru Li, and Chuan Wu. Sandwich: Separating prefill-decode compilation for efficient cpu llm
+serving. arXiv preprint arXiv:2507.18454, 2025.
+[52] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang.
+{DistServe}: Disaggregating prefill and decoding for goodput-optimized large language model serving. In 18th
+USENIX Symposium on Operating Systems Design and Implementation (OSDI 24), pages 193–210, 2024.
+[53] DeepSeek-AI. Deepseek LLM: scaling open-source language models with longtermism. CoRR, abs/2401.02954,
+2024.
+[54] Kimi Team, Yifan Bai, Yiping Bao, Guanduo Chen, Jiahao Chen, Ningxin Chen, Ruijue Chen, Yanru Chen,
+Yuankun Chen, Yutian Chen, et al. Kimi k2: Open agentic intelligence. arXiv preprint arXiv:2507.20534, 2025.
+[55] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. Mea-
+suring massive multitask language understanding. In 9th International Conference on Learning Representations,
+ICLR 2021, Virtual Event, Austria, May 3-7, 2021. OpenReview.net, 2021.
+[56] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and Oyvind Tafjord.
+Think you have solved question answering? try arc, the AI2 reasoning challenge. CoRR, abs/1803.05457, 2018.
+[57] Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, and Yejin Choi. PIQA: reasoning about physical
+commonsense in natural language. In The Thirty-Fourth AAAI Conference on Artificial Intelligence, AAAI 2020,
+The Thirty-Second Innovative Applications of Artificial Intelligence Conference, IAAI 2020, The Tenth AAAI
+Symposium on Educational Advances in Artificial Intelligence, EAAI 2020, New York, NY, USA, February 7-12,
+2020, pages 7432–7439. AAAI Press, 2020.
+[58] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a machine really
+finish your sentence? In Anna Korhonen, David R. Traum, and Lluís Màrquez, editors, Proceedings of the 57th
+Conference of the Association for Computational Linguistics, ACL 2019, Florence, Italy, July 28- August 2, 2019,
+Volume 1: Long Papers, pages 4791–4800. Association for Computational Linguistics, 2019.
+16
+Tensor Parallel Latent Attention
+[59] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct electricity? A new
+dataset for open book question answering. In Ellen Riloff, David Chiang, Julia Hockenmaier, and Jun’ichi Tsujii,
+editors, Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, Brussels,
+Belgium, October 31 - November 4, 2018, pages 2381–2391. Association for Computational Linguistics, 2018.
+[60] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: an adversarial winograd
+schema challenge at scale. Commun. ACM, 64(9):99–106, 2021.
+[61] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models, 2016.
+[62] Loubna Ben Allal, Anton Lozhkov, Guilherme Penedo, Thomas Wolf, and Leandro von Werra. Smollm-corpus.
+2024.
+[63] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan
+Zeng, Lei Hou, et al. Longbench: A bilingual, multitask benchmark for long context understanding. arXiv preprint
+arXiv:2308.14508, 2023.
+17
+

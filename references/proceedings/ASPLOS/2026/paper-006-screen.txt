@@ -1,0 +1,222 @@
+PAT: Accelerating LLM Decoding via Prefix-Aware
+Attention with Resource Efficient Multi-Tile Kernel
+Jinjun Yi†
+Tianjin University
+Tianjin, China
+march_h@tju.edu.cn
+Zhixin Zhao†
+Tianjin University
+Tianjin, China
+zhao612@tju.edu.cn
+Yitao Hu∗
+Tianjin University
+Tianjin, China
+yitao@tju.edu.cn
+Ke Yan
+Tianjin University
+Tianjin, China
+yank@tju.edu.cn
+Weiwei Sun
+Tianjin University
+Tianjin, China
+sww@tju.edu.cn
+Hao Wang
+Stevens Institute of
+Technology
+Hoboken, NJ, USA
+hwang9@stevens.edu
+Laiping Zhao
+Tianjin University
+Tianjin, China
+laiping@tju.edu.cn
+Yuhao Zhang
+Tianjin University
+Tianjin, China
+yuhaozhang@tju.edu.cn
+Wenxin Li
+Tianjin University
+Tianjin, China
+toliwenxin@tju.edu.cn
+Keqiu Li
+Tianjin University
+Tianjin, China
+keqiu@tju.edu.cn
+Abstract
+LLM serving is increasingly dominated by decode attention,
+which is a memory-bound operation due to massive KV
+cache loading from global memory. Meanwhile, real-world
+workloads exhibit substantial, hierarchical shared prefixes
+across requests (e.g., system prompts, tools/templates, RAG).
+Existing attention implementations fail to fully exploit pre-
+fix sharing: one-query-per-CTA execution repeatedly loads
+shared prefix KV cache, while one-size-fits-all tiling leaves
+on-chip resources idle and exacerbates bubbles for uneven
+KV lengths. These choices amplify memory bandwidth pres-
+sure and stall memory-bound decode attention.
+This paper introduces PAT, a prefix-aware attention kernel
+implementation for LLM decoding that organizes execution
+with a pack-forward-merge paradigm. PAT packs queries by
+shared prefix to reduce repeated memory accesses, runs a
+customized multi-tile kernel to achieve high resource effi-
+ciency. It further applies practical multi-stream forwarding
+and KV splitting to reduce resource bubbles. The final merge
+performs online softmax with negligible overhead. We im-
+plement PAT as an off-the-shelf plugin for vLLM. Evaluation
+on both real-world and synthetic workloads shows that PAT
+reduces attention latency by 53.5% on average and TPOT
+†Both authors contributed equally to this work.
+∗Corresponding author.
+This work is licensed under a Creative Commons Attribution 4.0 Interna-
+tional License.
+ASPLOS ’26, Pittsburgh, PA, USA.
+© 2026 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-2359-9/2026/03
+https://doi.org/10.1145/3779212.3790200
+by 17.0-93.1% under the same configurations against state-
+of-the-art attention kernels. PAT’s source code is publicly
+available at https://github.com/flashserve/PAT.
+CCS Concepts: • Computing methodologies → Machine
+learning; • Computer systems organization → Cloud
+computing.
+Keywords: Large Language Models; LLM Inference; Prefix
+Aware Attention; GPU Kernel Scheduling
+ACM Reference Format:
+Jinjun Yi, Zhixin Zhao, Yitao Hu, Ke Yan, Weiwei Sun, Hao Wang,
+Laiping Zhao, Yuhao Zhang, Wenxin Li, and Keqiu Li. 2026. PAT:
+Accelerating LLM Decoding via Prefix-Aware Attention with Re-
+source Efficient Multi-Tile Kernel. In Proceedings of the 30th ACM
+International Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2 (ASPLOS ’26), March 21–
+26, 2026, Pittsburgh, PA, USA. ACM, New York, NY, USA, 17 pages.
+https://doi.org/10.1145/3779212.3790200
+1 Introduction
+Transformer-based Large Language Models (LLMs) have
+rapidly advanced across diverse domains, including conver-
+sational assistants [7, 10], code generation [4, 12], retrieval-
+augmented generation (RAG) [18, 48], and agent/tool work-
+flows [22, 53]. As deployment grows, latency and resource
+efficiency of online inference have become increasingly criti-
+cal. While prior work has explored optimizations in memory
+management [16, 45], scheduling [39, 57], quantization [6,
+20], and architecture [21, 58], there remain new challenges
+and opportunities. We highlight two emerging trends below.
+Longer contexts and outputs. Context length has scaled
+to millions of tokens [2], while techniques like Chain-of-
+Thought (CoT) [43] demand longer outputs. As a result, de-
+code attention (i.e., attention operations in the decoding
+arXiv:2511.22333v3
+[cs.DC]
+16
+Mar
+2026
+ASPLOS ’26, March 21–26, 2026, Pittsburgh, PA, USA. Jinjun Yi et al.
+stage) increasingly dominates end-to-end latency due to re-
+peated loading of growing KV caches from global to on-chip
+memory, which poses a memory-bound challenge.
+Shared prefixes across requests. System prompts, RAG
+documents, and agent templates introduce multi-level shared
+prefixes across requests, creating an optimization opportu-
+nity. Existing systems [16, 55] implement prefix KV cache
+reuse, which reduces memory footprint by storing and reusing
+KV cache across requests. However, it can not reduce global
+memory accesses, which is the bottleneck for decode atten-
+tion, thereby leading to higher attention latency.
+Recent attention kernel implementations aim to reduce
+attention latency [33, 36, 38, 49, 50, 60], but still face redun-
+dant KV cache loads from global memory and inefficient
+resource utilization. Query-centric kernels [8, 9, 38, 50] fol-
+low a one-query-per-CTA strategy to map each query and
+corresponding KV cache into an independent Cooperative
+Thread Array (CTA; also known as a thread block) for exe-
+cution on the GPU, causing redundant global memory loads
+for shared prefixes. KV-centric kernels [33, 47, 49, 60] instead
+pack the KV cache of cross-query shared prefix into one CTA
+to reduce redundant memory accesses, but adopt a one-size-
+fits-all design that fixes the tile size of the GPU kernel [25]
+and applies padding to fill the tile, which wastes on-chip
+memory and limits CTA concurrency.
+Based on the analysis, we argue that an efficient atten-
+tion kernel implementation for LLM decoding should
+be memory-oriented with prefix-aware execution, so
+as to reduce redundant memory accesses and maintain high
+resource efficiency. However, the dynamicity of workloads
+makes this design non-trivial. First, the combination of multi-
+level shared prefixes and the dynamic join-and-leave nature
+of continuous batching makes the structure of shared KV
+caches in a decode batch (i.e., batched queries in decode
+stage) variable across decode steps. The attention kernel
+must pack the decode batch into CTAs effectively, so as to
+reduce redundant global memory accesses with low runtime
+overhead. Second, the autoregressive nature of LLMs makes
+queries have diverse KV lengths, and the number of queries
+that share the same KV blocks in one CTA varies over time.
+These features bring dynamic hardware resource require-
+ments per CTA, which in turn affect the memory bandwidth
+usage and GPU utilization. The attention kernel must adapt
+to the dynamicity to achieve high resource efficiency.
+To address these challenges, we present PAT, an atten-
+tion kernel implementation for LLM decode stage with a
+pack–forward–merge execution paradigm. Specifically, in the
+pack stage (§5), PAT employs a prefix-aware pack scheduler
+and a lazy update mechanism, which efficiently pack decode
+batches into CTAs to reduce redundant global memory ac-
+cesses with negligible overhead. It further designs a multi-tile
+kernel based on resource-efficiency analysis, so as to adapt
+to CTA dynamicity and avoid on-chip memory waste. In
+the forward stage (§6), PAT designs a multi-stream forward
+and long-KV split strategy, which parallelizes the multi-tile
+kernel across multiple CUDA streams and splits CTAs with
+excessively long KV lengths. These designs enable PAT to
+eliminate execution bubbles and achieve high global memory
+bandwidth utilization. In the merge stage (§7), PAT applies a
+lightweight kernel with online softmax [9], which merges
+partial results across CTAs for each query.
+In summary, this paper makes the following contributions:
+1. We provide an in-depth analysis of the bottlenecks in
+decode attention (§2) and the optimization opportuni-
+ties and challenges introduced by shared prefixes (§3),
+from both hardware characteristics and the attention
+execution pipeline perspectives.
+2. We design and implement a prefix-aware attention ker-
+nel PAT for LLM decoding. It incorporates several novel
+designs within the pack–forward–merge paradigm to
+reduce redundant global memory accesses and achieve
+efficient hardware utilization (§4-§7).
+3. We evaluate PAT on synthetic and real-world workloads,
+demonstrating that compared with state-of-the-art base-
+lines, it reduces attention latency by 53.5% on average
+under the same decode batches (§8.3) and lowers TPOT
+by 17.0-93.1% under the same request rate (§8.4).
+2 Background
+2.1 LLM Inference and Attention
+Transformer-based Large Language Models (LLMs) follow an
+autoregressive inference process with two phases: prefill and
+decode. In the prefill phase, the model performs a full forward
+pass over the input sequence to generate the first token. The
+decode phase then iteratively generates one token at a time
+until reaching an end-of-sequence token or a preset length.
+Each decode step involves three major computations: Self-
+Attention, Query-Key-Value-Output (QKVO) projection, and
+Multi-Layer Perceptron (MLP). Among these, Self-Attention
+is central for modeling global dependencies as:
+Attention(𝑄, 𝐾,𝑉 ) = softmax
+
+𝑸𝑲𝑻
+√
+𝑑𝑘
+
+𝑽
+During decoding, the query 𝑄 from the current token at-
+tends to all previous keys 𝐾 and values 𝑉 . Since 𝐾 and 𝑉 do
+not change across steps, they are stored in global memory
+using a Key-Value (KV) Cache, reducing redundant compu-
+tation but increasing memory footprint.
+2.2 Memory Bottleneck of Attention
+Driven by the inference scaling law [44], LLMs are trend-
+ing toward longer contexts and longer outputs. For instance,
+Llama-4 supports up to 10 million input tokens [2], and
+Chain-of-Thought prompting [43] has significantly increased
+output lengths for complex reasoning.
+Although KV Caching avoids repeated computation, it
+has shifted the bottleneck from compute to memory access:
+

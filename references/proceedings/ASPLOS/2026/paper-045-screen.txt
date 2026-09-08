@@ -1,0 +1,108 @@
+TPLA: TENSOR PARALLEL LATENT ATTENTION FOR EFFICIENT
+DISAGGREGATED PREFILL & DECODE INFERENCE
+Xiaojuan Tang1,3∗
+, Fanxu Meng 1,3∗
+, Pingzhi Tang1
+, Yuxuan Wang1
+, Di Yin3
+, Xing Sun3
+, Muhan Zhang1,2†
+1
+Institute for Artificial Intelligence, Peking University
+2
+State Key Laboratory of General Artificial Intelligence, BIGAI
+3
+Tencent Youtu Lab, Shanghai, China
+https://github.com/fxmeng/TransMLA
+ABSTRACT
+Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, compresses key–value states into
+a low-rank latent vector cKV
+, caching only this vector to reduce memory. In tensor parallelism
+(TP), however, attention heads are computed across multiple devices, and each device must load
+the full cKV
+, eroding the advantage of MLA over Grouped Query Attention (GQA). We propose
+Tensor-Parallel Latent Attention (TPLA): a scheme that partitions both the latent representation
+and each head’s input dimension across devices, performs attention independently per shard, and
+then combines results with an all-reduce. TPLA preserves the benefits of a compressed KV cache
+while unlocking TP efficiency. Unlike Grouped Latent Attention (GLA), every head in TPLA still
+leverages the full latent representation, maintaining stronger representational capacity. TPLA is
+drop-in compatible with models pre-trained using MLA: it supports MLA-style prefilling and enables
+efficient tensor-parallel decoding without retraining. Applying simple orthogonal transforms—e.g.,
+the Hadamard transform or PCA—before TP slicing further mitigates cross-shard interference,
+yielding minimal accuracy degradation. By reducing the per-device KV cache for DeepSeek-V3 and
+Kimi-K2, we achieve 1.79× and 1.93× speedups, respectively, at a 32K-token context length while
+maintaining performance on commonsense and LongBench benchmarks. TPLA can be implemented
+with FlashAttention-3, enabling practical end-to-end acceleration.
+1 Introduction
+Currently, large language models (LLMs) [1, 2, 3, 4, 5] are typically memory-bound (limited by memory bandwidth)
+rather than compute-bound (limited by floating-point operations per second, FLOPs) during inference. To address this,
+KV cache compression [6, 7, 8, 9] and tensor parallelism [10, 11, 12, 13, 14] have emerged as two critical techniques
+for enabling efficient auto-regressive decoding in LLMs. KV cache compression methods prune/merge/share/quantize
+intermediate key–value pairs to reduce memory overhead. Tensor parallelism addresses memory and compute lim-
+itations by splitting large tensors—such as weight matrices—across multiple devices, enabling intra-layer parallel
+computation for models that cannot fit on a single GPU. GQA [15] inherently supports both KV cache compression
+and tensor parallelism by grouping query heads so that all heads within a group share a common set of key and value
+representations, which facilitates efficient distribution across multiple devices. Both theoretical analyses and empirical
+results demonstrate that the representational capacity of GQA is inferior to that of MLA [16, 17]. MLA introduces a
+pre-trained KV cache compression strategy that achieves an excellent trade-off between computational efficiency and
+model performance. However, when multiple attention heads are computed in parallel across multiple devices using
+tensor parallelism, MLA encounters a critical limitation: each device must load the full latent vector cKV , undermining
+the memory savings that MLA offers over GQA. For example, in LLaMA-3-70B [18], the dimension of the KV cache
+per token is 2 × 8 × 128 = 2048, and under tensor parallelism with TP = 4, each device holds a partitioned KV cache
+of size 512. In contrast, Deepseek-V3 [19] has a fixed KV cache dimension of 64 + 512 = 576, which must be fully
+∗
+Equal contribution.
+†
+Corresponding author: muhan@pku.edu.cn
+arXiv:2508.15881v2
+[cs.LG]
+25
+Aug
+2025
+Tensor Parallel Latent Attention
+Device 0
+Device 1
+a) MLA b) GLA
+AllReduce
+c) TPLA
+Prefill AllReduce
+Decode
+Figure 1: Comparison of MLA, GLA, and TPLA. In MLA, each device must load the entire KV cache. In GLA, each
+attention head only accesses the portion of the KV cache stored on its own device. In TPLA, the prefilling phase follows
+MLA for efficiency and accuracy, while during the decoding phase, attention heads are distributed across devices, each
+relying on the KV cache stored locally on its assigned device.
+replicated on each device regardless of the parallelism degree. This results in a higher per-device KV cache memory
+footprint compared to GQA-based models under the same tensor parallel configuration.
+GLA [20] was proposed to address the tensor parallelism limitations of MLA by dividing the attention heads and
+latent representations into g groups (typically g = 2), such that each group of heads only loads its corresponding latent
+representation. However, this paper identifies two key limitations of GLA: (1) the reduction in KV cache size for single
+device comes at the cost of decreased representational capacity for each attention head; and (2) GLA requires training
+from scratch, which demands significant computational resources to validate its effectiveness.
+To address these challenges, we propose Tensor Parallel Latent Attention (TPLA), a method that distributes the latent
+representations across multiple devices. Each attention head is split across devices, followed by an all-reduce operation
+on the output o. TPLA offers the following advantages: 1) Each attention head utilizes the full latent representation,
+preserving strong representational capacity; 2) Each device only loads a partition of the KV cache, improving inference
+speed under tensor parallelism; 3) TPLA can directly load pre-trained DeepSeek checkpoints, which incurs only a
+minor performance drop that is easily recovered; 4) We use reparameterized MLA for prefill and TPLA for decoding,
+reducing prefill latency while mitigating conversion-induced degradation. 4) TPLA can be viewed as a special case of
+GLA with more attention heads, making it compatible with FlashAttention-3.
+2 Related Works
+Reducing KV-Cache Memory Generative inference with large language models (LLMs) is often constrained by
+the memory footprint of the key–value (KV) cache, especially for long contexts. Several families of techniques
+have been explored to mitigate this burden: token pruning/evicting [21, 22, 23, 24, 25, 26] removes KV entries for
+low-importance tokens based on saliency or attention estimates; token merging [27, 28, 29] aggregates nearby or
+similar tokens into a single surrogate KV representation to eliminate redundancy while retaining context; cross-layer
+KV sharing/fusion [30, 31, 32, 33, 34] reuses one KV cache across adjacent layers to avoid per-layer storage; low-
+rank KV compression [35, 36, 37, 6] factorizes KV matrices into low-rank components (learned or SVD-based)
+to reduce dimensionality and memory; and KV-cache quantization [38, 39, 40, 41] stores K/V tensors at reduced
+numeric precision (e.g., int8 or int4), cutting memory and bandwidth with modest accuracy cost. Although effective,
+these approaches inevitably discard or alter information in the KV cache and can degrade model performance. In
+contrast, TPLA leaves the KV contents intact: it reduces the amount of cache each device must hold so the model
+retains full information while alleviating memory pressure. As a result, TPLA tends to preserve accuracy better than
+compression-based methods.
+Parallelism Strategies for Deployment Current LLMs scale to billions of parameters; to cope with the resulting
+memory and compute demands, engineers adopt distributed deployment to reduce wall-clock latency and time costs.
+Data parallelism [42, 43] partitions input data across the sample or batch dimension while replicating model parameters
+across devices. However, for very large models full replication becomes impractical; moreover, variable sequence
+2
+
