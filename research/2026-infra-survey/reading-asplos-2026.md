@@ -2,7 +2,15 @@
 
 编写依据是[当前章节清单](../../outlines/chapters.json)和[草案 22 的依赖](../../outlines/structure.md)。第 8–12 章依次为单实例推理、分布式推理、训练系统、资源调度与运行环境、端边云协同；下面按问题定位，不沿用历史章号。
 
-沿日程逐批筛读，当前 **100 篇完整原始摘要已读，39 篇正文候选、37 篇备查、24 篇排除；68 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser 与 RhymeRL 已完成下述声明范围，其余三十四篇候选正文待读。96 份代表 PDF 共 1,653 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+沿日程逐批筛读，当前 **100 篇完整原始摘要已读，39 篇正文候选、37 篇备查、24 篇排除；68 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser、RhymeRL 与 LOOPRAG 已完成下述声明范围，其余三十三篇候选正文待读。96 份代表 PDF 共 1,653 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+
+## LOOPRAG：验证条件与部署收益
+
+选读公开 v1 的物理页 4–13、18–22，实际查看页 8、10、18、21。方法、基准、超时、失败项与均值、附录的语义限制分别保留在[页级记录](../../references/proceedings/ASPLOS/2026/looprag-reading.json)。这不是完整 22 页阅读，也没有获得作者数据集正文；原链接返回 HTTP 401。
+
+**采用的判断是：候选分数、正确性合同与生产时间需要分别计算。** CPU SCoP 评估中，LOOPRAG 对 PLuTo 的优势随基准变化，均值受到极大值与失败项处理影响。Listing 8 的索引与原 GEMM 不一致，作者工件待核，因而不把该清单作为书中可执行参考，也不移用论文速度。
+
+对照固定 FlashInfer-Bench 与比赛资料，将数值参考、优化基线、容差覆盖和 `apply()` 分派区分。两个形状的[独立算例](../../case-studies/optimization-evaluation-and-deployment.md)说明：平均分数 5.25 的候选在等频调用时可能比原实现更慢；改变频数后选择又会翻转。只补入现有 5.3.5、实验 5-6／5-9 与图 5-5，未增加编号。完整引擎集成、硬件匹配和 GPU 实测仍未完成。
 
 ## 第 106–130 项：顺序、迁移与自动优化
 

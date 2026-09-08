@@ -15,6 +15,7 @@
 | 图片或工具参数加入后，关键路径改变在哪里？ | vLLM／SGLang 编码交接、Ollama 本地入口；[截图的阶段与字节](../../case-studies/multimodal-stage-placement.md)、[语法准备与采样汇合](../../case-studies/structured-generation.md) | 第 3 章先定义 E→P→D；8.1／9.1 处理执行条件，11.1 处理工具任务，12.1／12.2 再改变网络和位置；实验 8-2、9-10、11-1、12-2、12-3 |
 | 推理引擎接进 RL，还缺哪些状态与一致性条件？ | vLLM／SGLang 确定性、休眠和权重交接；[概率、路由与 KV 版本](../../case-studies/rl-state-and-reproducibility.md)，以及[阶段峰值与分片权重交接](../../case-studies/weight-handoff.md)；研究系统负责跨角色协调 | 5.1／5.4 执行语义→8.1 服务条件→10.5 RL 闭环→11.2／11.3 环境及调度；实验 10-8、10-9、11-4、11-5 |
 | 历史匹配能否换成有效产出？ | vLLM 2024 prompt lookup、2025 Arctic 插件提议及 2026 suffix 入口，SGLang NGRAM；[确定性草稿、索引成本与 RL 供给](../../case-studies/history-drafts-and-rollout.md) | 8.3.1 每轮收支→10.5.3 阶段配比；实验 8-5、10-8 |
+| 自动优化的分数能否换成部署收益？ | LOOPRAG 的 CPU 反馈方法与固定 FlashInfer-Bench 评估、评分、配置和分派；[参考／基线与调用频数](../../case-studies/optimization-evaluation-and-deployment.md) | 5.3.5 候选验证→5.5.2 实际请求；实验 5-6、5-9。完整引擎集成、硬件匹配与真实替换仍待实验验证 |
 
 此前补查的结构化生成连接了冷 schema 准备、CPU 掩码、GPU 前向的重叠条件和推测回滚。当前 8.1.3 先讲请求调度，把语法、视觉、数值一致性作为执行条件留在实验变体和延伸材料；沿用实验 8-2 和图 8-1，不恢复成一个新的主小节。各框架的定位不同，只在同模型、精度、任务与执行条件可以对齐时做性能比较。
 

@@ -694,3 +694,7 @@
 | `rhymerl-vllm-suffix-guide` | [vLLM 固定 Suffix 指南](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-suffix-guide.txt) | 补充 | 补充／版本参照 | 8.3.1 扩写；完整指南，未执行示例 |
 | `rhymerl-vllm-rejection` | [vLLM 固定 rejection sampler](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-rejection.txt) | 补充 | 补充／版本参照 | 草稿与目标概率；仅读取登记行段，不代表全部采样路径审计 |
 | `rhymerl-arctic-cache` | [Arctic 固定历史缓存](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/arctic-cache.txt) | 补充 | 补充／版本参照 | 实验 8-5／10-8；完整静态阅读，容量上限与请求数分别计量 |
+| `asplos26-paper-127` | [LOOPRAG：候选反馈与评测范围](../references/proceedings/ASPLOS/2026/paper-127.pdf) | 补充 | 补充／版本参照 | 5.3.5 扩写；选读公开 v1 页 4–13、18–22，采用方法与条件，不移用 CPU 加速倍数 |
+| `optval-fib-evaluation` | [FlashInfer 比赛：B200、基线与评分](../references/framework-history/2026-09-08/optimization-validation/starter-evaluation.md) | 补充 | 补充／版本参照 | 实验 5-6；固定比赛提交，不作为所有 GPU／模型的默认评测条件 |
+| `optval-fib-default` | [FlashInfer-Bench 默认评估器](../references/framework-history/2026-09-08/optimization-validation/fib-default.py) | 补充 | 补充／版本参照 | 5.3.5；完整静态阅读，专用 evaluator 与时间后端另核 |
+| `optval-fib-runtime` | [FlashInfer-Bench apply 运行时](../references/framework-history/2026-09-08/optimization-validation/fib-runtime.py) | 补充 | 补充／版本参照 | 实验 5-9；完整静态阅读，匹配表与完整引擎集成待核 |
