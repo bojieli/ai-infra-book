@@ -732,3 +732,6 @@
 | `asplos26-camp-body` | [Camp 正文范围](../references/proceedings/ASPLOS/2026/camp-reading.json) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；未饱和预测、加权交错及平台条件 |
 | `memory-tiering-fixed-implementations` | [分层内存固定实现对照](../references/framework-history/2026-09-09/memory-tiering/README.md) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；PACT 工件演进、Camp 补丁、Linux 与 vLLM 对象边界 |
 | `memory-tiering-qwen3-case` | [Qwen3 权重放置推算](../case-studies/memory-criticality-and-tiering.md) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；现有实验 6-9／9-7 的扩写依据；不新增编号 |
+| `asplos26-morphlux-body` | [Morphlux 正文范围](../references/proceedings/ASPLOS/2026/morphlux-reading.json) | 6、7、11 | 补充／版本参照 | 6.4→7.5／7.6→11.3；公开 v3 与正式版本、三种验证层次分开 |
+| `torus-allocation-fixed-artifact` | [资源分配与固定工件](../references/framework-history/2026-09-09/torus-allocation/README.md) | 6、7、11 | 补充／版本参照 | 形状、端口、容量与恢复；NCCL 接口不等于端口收益保证 |
+| `torus-allocation-arithmetic` | [Qwen3 消息与位置枚举](../research/2026-infra-survey/torus-allocation-arithmetic.json) | 6、7、11 | 补充／版本参照 | 现有实验 6-4、7-8、11-3；计算示例不替代物理系统实测 |

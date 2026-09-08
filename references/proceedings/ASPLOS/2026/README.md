@@ -2,13 +2,15 @@
 
 本目录采用已复核的 [168 项日程—DOI 映射](../../catalog-review/2026-09-08/asplos2026-program-doi-map.json)，不重新推断会议论文数。[正式日程快照](../../discovery/2026-09-08/asplos2026-program.html)顶部仍写 167，详细条目是 168；差异未获官方解释。日程包含 ASPLOS 2026 第一卷 20 项、第二卷 132 项和 ASPLOS 2025 第三卷 16 项。这是本日程的组成，不代表各出版卷全集。
 
-当前累计 **127 篇完整摘要、122 份代表 PDF／2,098 页**；45 篇正文候选中十篇已选读声明范围，三十五篇待读，另四十七篇备查、三十五篇排除，41 篇摘要待补。下文按阶段保留阅读过程。另存四页 IEEE CAL 2024 的 STRAW 与十四页 2022 COGENT 早期稿，不计入会议覆盖。
+当前累计 **127 篇完整摘要、122 份代表 PDF／2,098 页**；45 篇正文候选中十一篇已选读声明范围，三十四篇待读，另四十七篇备查、三十五篇排除，41 篇摘要待补。下文按阶段保留阅读过程。另存四页 IEEE CAL 2024 的 STRAW 与十四页 2022 COGENT 早期稿，不计入会议覆盖。
+
+Morphlux 的[十三页声明范围](morphlux-reading.json)与五张图页随后选读，对照固定作者工件、TPU v4 和 NCCL 文档；[现有集合通信案例](../../../../case-studies/network-planning-and-collectives.md)增加分配形状、割集与重构收益。Cornell 的正式题名讲座确认项目关系，旧稿与最终全文仍分开，未新增代表 PDF 或摘要。
 
 PACT／Camp 随后完成[九页](pact-reading.json)／[十页](camp-reading.json)声明正文范围与八张图页查看，接入已有权重卸载案例的[内存放置扩写](../../../../case-studies/memory-criticality-and-tiering.md)。固定工件、主线 NUMA API、vLLM 缓冲路径与论文实验条件分别核对；没有追加会议摘要或采用性能倍数。
 
 第 131–168 项续筛二十一篇完整摘要，新增二十份公开 PDF／343 页与十四份网页响应；Apple TSO 使用机构原始完整摘要。九张首页实际查看，脚注、版权与 Radshield 的题词按位置排除。[本批记录](program-tail-screening-notes.json)保留五篇正文候选、八篇备查、八篇排除及二十八处作者／版本网页范围；这些摘要没有增加正文阅读、案例或大纲内容。本段的第 132、137、140、144、149、160、161、163、164、167 项仍缺完整原始摘要。
 
-Morphlux 采用 2025-10-03 的 arXiv v3，正式版已改名；对应关系由日程题名和同一作者组推断，作者正式出版条目尚未直接关联该预印本。COMPAS 的 arXiv 元数据明确关联会议 DOI，TreeVQA 标注 ASPLOS 2026，CHEHAB 只保留题名与作者对应，不把这些稿件称为正式出版全文。Chips Need DIP 当前作者稿的对照 profiler error 为 26.9%，不混用另一文件检索结果中的 29.6%；Cheddar 用 v2 的作者顺序与摘要。Wave 属于 2025 第三卷、2026 日程，与另一个 WAVE 分开。未取得正文的作者条目和短项目介绍不算完整摘要；同名 Neura 的其他技术报告也不替代本届论文。
+Morphlux 采用 2025-10-03 的 arXiv v3，正式版已改名；初筛由日程题名和同一作者组推断对应关系，随后由 Cornell 正式题名讲座确认项目关联。讲座仍不能证明旧稿与最终全文完全一致。COMPAS 的 arXiv 元数据明确关联会议 DOI，TreeVQA 标注 ASPLOS 2026，CHEHAB 只保留题名与作者对应，不把这些稿件称为正式出版全文。Chips Need DIP 当前作者稿的对照 profiler error 为 26.9%，不混用另一文件检索结果中的 29.6%；Cheddar 用 v2 的作者顺序与摘要。Wave 属于 2025 第三卷、2026 日程，与另一个 WAVE 分开。未取得正文的作者条目和短项目介绍不算完整摘要；同名 Neura 的其他技术报告也不替代本届论文。
 
 第 131–155 项先完成六篇摘要，六份代表 PDF 共 102 页；三十份新响应中二十四份为出版商 403，剩余十八项摘要继续从作者和机构查找。[本批记录](program131-screening-notes.json)保留逐项取舍。Configuration Wall 的[声明正文范围](configuration-wall-reading.json)为页 3–11 及页 12 的 §6.2.1，另查看三张公式／评估页；两张跨栏摘要首页单独计入摘要校验。其配置模型、硬件约束和模拟边界补入[既有图执行案例](../../../../case-studies/graph-execution-tradeoffs.md)，未移用论文加速比，未改主大纲或 skeleton。
 

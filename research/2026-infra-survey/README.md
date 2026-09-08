@@ -16,11 +16,13 @@
 
 ## 当前入口
 
-最新沿第 6 章内存借用接第 9 章卸载／KV 层次，补读 PACT 与 Camp 的十九页正文声明范围，对照固定工件、Linux 内存接口和三段 vLLM 路径。[同一份权重的内存放置推算](../../case-studies/memory-criticality-and-tiering.md)解释访问频率、预取提前量和迁移收益；版本／硬件适用条件留在[来源记录](../../references/framework-history/2026-09-09/memory-tiering/README.md)。累计 1,334 篇完整摘要、52 篇声明正文范围；不是完整论文阅读数量。
+最新沿超节点→数据中心网络→资源调度，选读 Morphlux 公开稿的十三页声明范围，核对固定分配、NCCL 和训练重启路径。[现有网络案例](../../case-studies/network-planning-and-collectives.md)补同一模型的大／小消息、资源形状与重构回本；芯片封装提议、10 Gbps 原型和模拟分别引用。累计 1,334 篇完整摘要、53 篇声明正文范围；不等于完整论文阅读。
 
-最新补读 Configuration Wall 的配置模型、编译约束与评估范围，将[主机准备和设备执行的时间线](../../case-studies/graph-execution-tradeoffs.md)接入现有图执行案例。当前框架的图路径与研究原型分别说明，不移用模拟加速比。[第七批面试来源](../../references/interviews/2026-09-09/seventh-pass/README.md)另补两个主帖的方向依据，来自同一作者；没有扩充题目或章节数量。
+此前沿第 6 章内存借用接第 9 章卸载／KV 层次，补读 PACT 与 Camp 的十九页正文声明范围，对照固定工件、Linux 内存接口和三段 vLLM 路径。[同一份权重的内存放置推算](../../case-studies/memory-criticality-and-tiering.md)解释访问频率、预取提前量和迁移收益；版本／硬件适用条件留在[来源记录](../../references/framework-history/2026-09-09/memory-tiering/README.md)。该内存阶段结束时累计 1,334 篇完整摘要、52 篇声明正文范围；不是完整论文阅读数量。
 
-最新沿第 11 章可抢占资源补读 RLBoost 实现、评估与附录，对照固定 PolyRL／SGLang 扩展和官方 Qwen3-14B 配置。[权重准备与有效产出](../../case-studies/preemptible-rollout-and-weight-readiness.md)补清共享出口、批量恢复与费用交点；保留论文模型表格和官方配置的差异。此前围绕 RL 验证的批次约束补读 DistRS 调度与评估，并对照固定 verl 评分入口和 PolyRL 项目说明。[剩余时间与验证资源](../../case-studies/reward-deadlines-and-feedback.md)将第 3 章长尾、第 5 章反馈、第 10 章批次接到 11.3.3，区分执行超时、反馈与实际释放。此前围绕跨卡访问选读远端排序论文，并对照 NVSHMEM 文档与固定公共 IB 实现。[窗口与完成案例](../../case-studies/remote-ordering-and-completion.md)将并发上界、串行服务和消费者可见性接入第 7 章，承接第 6 章内存池、第 9 章 KV 交接；论文新硬件与现有路径分别说明。上一批 LOOPRAG 的评测与部署推算仍保留在第 5 章。
+此前补读 Configuration Wall 的配置模型、编译约束与评估范围，将[主机准备和设备执行的时间线](../../case-studies/graph-execution-tradeoffs.md)接入现有图执行案例。当前框架的图路径与研究原型分别说明，不移用模拟加速比。[第七批面试来源](../../references/interviews/2026-09-09/seventh-pass/README.md)另补两个主帖的方向依据，来自同一作者；没有扩充题目或章节数量。
+
+此前沿第 11 章可抢占资源补读 RLBoost 实现、评估与附录，对照固定 PolyRL／SGLang 扩展和官方 Qwen3-14B 配置。[权重准备与有效产出](../../case-studies/preemptible-rollout-and-weight-readiness.md)补清共享出口、批量恢复与费用交点；保留论文模型表格和官方配置的差异。此前围绕 RL 验证的批次约束补读 DistRS 调度与评估，并对照固定 verl 评分入口和 PolyRL 项目说明。[剩余时间与验证资源](../../case-studies/reward-deadlines-and-feedback.md)将第 3 章长尾、第 5 章反馈、第 10 章批次接到 11.3.3，区分执行超时、反馈与实际释放。此前围绕跨卡访问选读远端排序论文，并对照 NVSHMEM 文档与固定公共 IB 实现。[窗口与完成案例](../../case-studies/remote-ordering-and-completion.md)将并发上界、串行服务和消费者可见性接入第 7 章，承接第 6 章内存池、第 9 章 KV 交接；论文新硬件与现有路径分别说明。上一批 LOOPRAG 的评测与部署推算仍保留在第 5 章。
 
 - [会议归档](../../references/proceedings/README.md)：各届官方目录、逐篇原件、文本和哈希。
 - [面试资料](../../references/interviews/2026-09-07/README.md)：公开来源及证据分类。
@@ -29,7 +31,7 @@
 - [MLSys 2026 阅读](reading-mlsys-2026.md)：全部 135 篇完整摘要筛选，六篇重点章节；MoE／启动、FA4 的计算资源配比和有效训练进展随对应机制接回当前章节。
 - [ASPLOS／ISCA／MICRO 入口](../../references/proceedings/discovery/2026-09-08/README.md)：八份官方日程提取、ASPLOS 2024 摘要集、公开 DOI 与失败状态；尚未完成对应论文集及阅读。
 - [ASPLOS 目录复核](../../references/proceedings/catalog-review/2026-09-08/README.md)：修正 16 个获奖标签和一个空白时段，ASPLOS 2026 全部 168 个详细条目匹配不同 DOI；跨年份卷、题名变化和 keynote 单独记录。
-- [ASPLOS 2026 阅读记录](reading-asplos-2026.md)：168 个已核身份进入逐篇清单，127 篇完整摘要已筛；122 份代表 PDF／2,098 页含两份复用原件。45 篇正文候选中十篇声明范围已读，另三十五篇待读；四十七篇备查、三十五篇排除，41 篇摘要待补。另存十八页的两份早期／相关稿不计入本届覆盖。
+- [ASPLOS 2026 阅读记录](reading-asplos-2026.md)：168 个已核身份进入逐篇清单，127 篇完整摘要已筛；122 份代表 PDF／2,098 页含两份复用原件。45 篇正文候选中十一篇声明范围已读，另三十四篇待读；四十七篇备查、三十五篇排除，41 篇摘要待补。另存十八页的两份早期／相关稿不计入本届覆盖。
 - [ISCA 2024 阅读记录](reading-isca-2024.md)：87 项日程已匹配 DOI，70 份公开稿／1,081 页、77 篇完整摘要已筛（含 7 篇机构原始摘要）；Orojenesis、FEATHER 与 MAD-Max 按声明范围选读，另 10 篇摘要及候选正文待补。
 - [MICRO 2024 阅读记录](reading-micro-2024.md)：113 篇论文已匹配 DOI，原日程另含 10 个活动；41 篇完整摘要、39 份公开稿／602 页，Mess 的 4 页已选读并补入既有访存估算，72 篇摘要待补。新增 26 篇只完成摘要取舍，正文候选待比较。
 - [MICRO 2025 阅读记录](reading-micro-2025.md)：123 个主日程 DOI 已匹配，13 份代表公开稿／208 页、13 篇完整摘要已筛；另存一份早期稿，110 篇摘要待补。StreamTensor／LLM.265 共 22 页已选读，两项推导接回实验 5-2／8-7；另三篇候选正文待核。
