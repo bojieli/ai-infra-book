@@ -341,7 +341,8 @@ def verify():
         from verify_memory_tiering import verify as verify_memory_tiering
         from verify_torus_allocation import verify as verify_torus_allocation
         from verify_metadata_quantization import verify as verify_metadata_quantization
-        validators = {4: verify_shift, 23: verify_superoffload, 41: verify_attention, 68: verify_fusion, 101: verify_history, 116: verify_ordering, 127: verify_optimization, 150: verify_torus_allocation, 151: verify_configuration, 155: verify_metadata_quantization}
+        from verify_smartnic_policy import verify as verify_smartnic_policy
+        validators = {4: verify_shift, 23: verify_superoffload, 41: verify_attention, 68: verify_fusion, 101: verify_history, 116: verify_ordering, 127: verify_optimization, 150: verify_torus_allocation, 151: verify_configuration, 155: verify_metadata_quantization, 168: verify_smartnic_policy}
         for item in selected:
             if item['program_order'] not in (145, 147):
                 validators[item['program_order']]()

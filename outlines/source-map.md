@@ -738,3 +738,6 @@
 | `asplos26-m2xfp-body` | [M²XFP 正文范围](../references/proceedings/ASPLOS/2026/m2xfp-reading.json) | 4、5、8 | 补充／版本参照 | 4.2.5→5.3→8.4；静态与动态编码、元数据及专用架构条件 |
 | `metadata-quantization-implementations` | [格式与实际实现](../references/framework-history/2026-09-09/metadata-quantization/README.md) | 4、5、8 | 补充／版本参照 | 伪量化、vLLM v0.12.0 与固定当前路径；质量与执行分别核对 |
 | `metadata-quantization-qwen3-case` | [同一 Qwen3 权重的表示](../case-studies/kernel-orchestration-and-quantization.md) | 4、5、8 | 补充／版本参照 | 现有实验 4-2／5-4 与图 4-3；容量、搜索与缓冲推算，不新增编号 |
+| `asplos26-wave-body` | [Wave 正文范围](../references/proceedings/ASPLOS/2026/wave-reading.json) | 1、11 | 补充／版本参照 | 2025 出版卷、2026 日程；十三页正文范围与五张实际查看图页 |
+| `smartnic-policy-interfaces` | [Wave 与公开 ghOSt 接口](../references/framework-history/2026-09-09/smartnic-policy/README.md) | 1、5、8、11 | 补充／版本参照 | 固定接口、硬件与主机请求路径分别核对；无引擎集成结论 |
+| `smartnic-policy-agent-budget` | [主机调度与 Agent 平台预算](../case-studies/host-policy-and-dispatch.md) | 1、11 | 扩写 1,11 | 实验 1-6／11-1 的延伸；核数翻转点、环境容量与任务吞吐 |

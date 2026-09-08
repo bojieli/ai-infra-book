@@ -2,7 +2,13 @@
 
 编写依据是[当前章节清单](../../outlines/chapters.json)和[草案 22 的依赖](../../outlines/structure.md)。第 8–12 章依次为单实例推理、分布式推理、训练系统、资源调度与运行环境、端边云协同；下面按问题定位，不沿用历史章号。
 
-沿日程逐批筛读，当前 **127 篇完整原始摘要已读，45 篇正文候选、47 篇备查、35 篇排除；41 篇摘要待补。** 十二篇候选已完成各自声明的正文范围，另三十三篇待读。122 份代表 PDF 共 2,098 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整下载不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+沿日程逐批筛读，当前 **127 篇完整原始摘要已读，45 篇正文候选、47 篇备查、35 篇排除；41 篇摘要待补。** 十三篇候选已完成各自声明的正文范围，另三十二篇待读。122 份代表 PDF 共 2,098 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整下载不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+
+## 主机策略卸载与任务吞吐
+
+Wave 选读物理页 2–14，实际查看五张页面；[记录](../../references/proceedings/ASPLOS/2026/wave-reading.json)保留局部耗时、完整切换、物理／逻辑核心以及 AMD／UPI 表述的区别。沿 1.5.2→11.1.2，以[同一 Agent 平台预算](../../case-studies/host-policy-and-dispatch.md)先求省核的 6.25% 翻转点，再加入环境容量；CPU 能力提高不保证完成任务增加。
+
+[八份原始响应与十个声明范围](../../references/framework-history/2026-09-09/smartnic-policy/README.md)核对 ghOSt 公开接口，另复核两段已有 vLLM 准入代码。Wave 的 CPU 实验、公开前置框架与本书 AI 教学输入分开，未核到 Wave 公开实现，也未运行源码。只补既有实验 1-6／11-1 的扩写材料，没有新增编号或改变主章节。
 
 ## 低比特格式、在线工作与实际执行
 
@@ -36,7 +42,7 @@ Morphlux 公开 v3 选读物理页 2–11、14–16，实际查看五张图表�
 
 **低比特收益需要哪些硬件。** 摘要阶段将 M²XFP 列为候选；上方现已记录声明正文与实现对照。质量损失减少、平均位宽和真实执行各自计量，所读模拟收益没有作为现成 Blackwell 内核的性能。
 
-**卸载后把成本记在哪里。** Wave 接第 1、11 章 SmartNIC 的动机：主机释放了几个核，SmartNIC 多占多少资源，控制交互增加多少时间，是否仍满足服务目标。待核其用户态资源管理和主机通信 API，不能仅凭主机 CPU 降低就认定系统效率提高。它属于 2025 出版卷、2026 日程，与本届另一篇 WAVE 分开记录。
+**卸载后把成本记在哪里。** 摘要阶段将 Wave 列为第 1、11 章候选；其后已完成上方声明正文范围和公开 ghOSt 接口对照。Wave 自身工件与具体 AI 平台集成仍未核到。它属于 2025 出版卷、2026 日程，与本届另一篇 WAVE 分开记录。
 
 其余八篇备查、八篇排除均在逐项表中说明原因。PF-LLM 是大模型离线生成 CPU 预取提示；Streaming Tokenization 是流式词法分析；TreeVQA 是变分量子算法；CHEHAB RL 是用 RL 优化 FHE 编译。名称相近不构成推理或训练系统证据。WSE 的 MLIR 工作比较 HPC stencil，Apple TSO 工作研究 CPU，二者均保留负载／硬件边界。CHERI-SIMT 采用机构的正式 accepted version，不使用另一个技术报告替代。
 

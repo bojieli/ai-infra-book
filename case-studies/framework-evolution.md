@@ -70,7 +70,7 @@ MLX 预览的比较同时改变了 NVFP4 与 Q4_K_M，不能把整个加速归�
 
 长期调研补读 MLSys 2024 的 Punica／S-LoRA，将共享基座、多 adapter 批处理和状态容量接到 8.2；用当前 vLLM／SGLang 支持与 Ollama 的 ADAPTER 入口对照，避免沿用旧论文对早期引擎的限制。[阅读与推算](multi-lora-serving.md)保留论文条件；完整逐版本历史仍在[持续调研](../research/2026-infra-survey/README.md)。
 
-MLSys 2025 的四篇重点阅读补上了变化之间的联系：FlashInfer v0.2 的 plan/run 为 5.4 的动态图执行提供具体实现；Marconi 的混合状态准入与淘汰接到 8.2 的 Unified Radix Cache；KV 压缩评估补 8.4 的自然输出长度与任务质量；Rubick 把 6、11 的执行方案选择接到 12 的资源调度。版本和算例见[状态与执行取舍](cache-and-reconfiguration.md)。这些是同题比较，不声称当前框架直接继承所有论文实现。
+MLSys 2025 的四篇重点阅读补上了变化之间的联系：FlashInfer v0.2 的 plan/run 为 5.4 的动态图执行提供具体实现；Marconi 的混合状态准入与淘汰接到 8.2 的 Unified Radix Cache；KV 压缩评估补 8.4 的自然输出长度与任务质量；Rubick 把第 6、10 章的执行方案选择接到第 11 章的资源调度。版本和算例见[状态与执行取舍](cache-and-reconfiguration.md)。这些是同题比较，不声称当前框架直接继承所有论文实现。
 
 MLSys 2026 首批阅读进一步把 MoE 实际执行接回第 6 章的切分估算：独立活跃专家、后端 padding 和逐层副本预算共同决定第 9 章的放置。另用 vLLM v0.10.1.1 的启动分解，对照当前固定提交的编译缓存设计，解释“多做准备换稳态效率”的适用寿命。历史实验、当前实现边界与 Qwen3 算例见[专家与启动取舍](moe-and-startup.md)，没有将 CRAFT 当作已合入当前框架的特性。
 
