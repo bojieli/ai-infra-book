@@ -16,7 +16,9 @@
 
 ## 当前入口
 
-最新补筛 ASPLOS 2025 十三篇完整摘要、归档十三份代表 PDF，并选读 PICACHU 十一页正文范围。资源配比、共享缓冲及 RoPE 系数缓存接入[既有 Qwen3 案例](../../case-studies/component-utilization-and-overlap.md)，不采用旧模型总加速比。累计 **1,358 篇完整摘要／60 篇声明正文范围**；其余会议、框架和全书逐例复核继续。
+最新补读 Apophenia 十三页声明正文／工件附录范围，并将公开 Legion 工件与固定 vLLM 图封装对照。沿[现有图执行案例](../../case-studies/graph-execution-tradeoffs.md)补任务身份、等待收齐与完成时间，仍用 5.4.4／实验 5-8／图 5-7。累计 **1,358 篇完整摘要／61 篇声明正文范围**；不新增摘要或 PDF，也未重跑本书 GPU 实验。
+
+此前补筛 ASPLOS 2025 十三篇完整摘要、归档十三份代表 PDF，并选读 PICACHU 十一页正文范围。资源配比、共享缓冲及 RoPE 系数缓存接入[既有 Qwen3 案例](../../case-studies/component-utilization-and-overlap.md)，不采用旧模型总加速比。累计 **1,358 篇完整摘要／60 篇声明正文范围**；其余会议、框架和全书逐例复核继续。
 
 此前补核多 LoRA 的代表版本与实际准入，沿[同一 Qwen3 案例](../../case-studies/multi-lora-serving.md)比较槽位、分组空槽和异步加载的合批代价。十九份框架响应／三十七个读取范围；面试检索另保留三份响应但未新增可用的一手样本。正文仍用既有实验 8-3／图 8-2，会议累计阅读数量不变。
 

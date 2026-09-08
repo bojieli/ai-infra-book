@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 47 份代表 PDF／811 页、完成 48 篇原始完整摘要筛选，七篇有声明范围的正文阅读；其余 136 篇摘要未读。本轮增加十三篇摘要，并选读 PICACHU 物理页 2–12 与五页图表，深化现有资源配比案例。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 47 份代表 PDF／811 页、完成 48 篇原始完整摘要筛选，八篇有声明范围的正文阅读；其余 136 篇摘要未读。此前增加十三篇摘要并选读 PICACHU；本轮补读 Apophenia 物理页 2–12、16–17，共十三页与六张实际查看图页，接现有图执行案例。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -33,7 +33,7 @@
 | 40. [ARC: Warp-level Adaptive Atomic Reduction in GPUs to Accelerate Differentiable Rendering](../../references/proceedings/ASPLOS/2025/public/paper-040.pdf) | 候选待读 | 可微渲染梯度的原子归约在 SM 与 L2 间分工；可检验只看总 FLOPs／HBM 的遗漏，需分清软件路径和硬件模拟。 |
 | 41. [Treelet Accelerated Ray Tracing on GPUs](../../references/proceedings/ASPLOS/2025/public/paper-041.pdf) | 备查 | RT 遍历用队列和 warp 重组改善局部性；不是当前 LLM 注意力路径，暂不增加光追案例。 |
 | 43. [Mint: Cost-Efficient Tracing with All Requests Collection via Commonality and Variability Analysis](../../references/proceedings/ASPLOS/2025/public/paper-043.pdf) | 备查 | trace 模式聚合与参数过滤降低采集成本；全请求覆盖不等于保留全部信息，供实验记录取舍备查。 |
-| 44. [Automatic Tracing in Task-Based Runtime Systems](../../references/proceedings/ASPLOS/2025/public/paper-044.pdf) | 候选待读 | Apophenia 自动发现重复任务片段并复用依赖分析；可对照 5 的图执行准备成本，区别于采样 profiler 和 CUDA Graph。 |
+| 44. [Automatic Tracing in Task-Based Runtime Systems](../../references/proceedings/ASPLOS/2025/public/paper-044.pdf) | 重点阅读并整合 | 物理页 2–12、16–17 已读；身份、匹配等待与准备成本接 5.4.4／实验 5-8。Legion 工件与固定 vLLM 图封装分开；历史 DP 训练结果不外推当前模型。 |
 | 46. [Rethinking Java Performance Analysis](../../references/proceedings/ASPLOS/2025/public/paper-046.pdf) | 备查 | DaCapo 负载更新和用户延迟方法支持测量取舍；已有 AI 调优案例，保留方法参照而不添加 Java 专节。 |
 | 48. [Cinnamon: A Framework for Scale-Out Encrypted AI](../../references/proceedings/ASPLOS/2025/public/paper-048.pdf) | 备查 | FHE 的多层并行与芯片资源配比，任务语义与普通推理不同；不能将加密 CPU 基线倍数并入常规 GPU 比较。 |
 | 49. [PipeLLM: Fast and Confidential Large Language Model Services with Speculative Pipelined Encryption](../../references/proceedings/ASPLOS/2025/public/paper-049.pdf) | 候选待读 | H100 机密计算下交换与加密流水，候选连接 5／8／11 的主机工作和依赖；需核预测失误与当前引擎版本。 |
@@ -89,6 +89,10 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 
 其 45 nm RTL 综合、Timeloop 建模、FP16 线性层保留与 U280 DMA 测量分别说明。对 A100 的端到端比较同时改变矩阵和非矩阵路径，不作为已流片产品或当前引擎实测。表 1 的 tanh 分式写反，图 7c 的有限缓冲与 unlimited 仍有差距；原件保留，正文不复制公式或据此断言普适最优容量。与[固定 vLLM RoPE 基类](../../references/framework-history/2026-09-09/nonlinear-resources/README.md)对照后，现有 Qwen3 案例区分系数准备、稳态旋转、主张量接口流量和真实 HBM 读取，接实验 4-1／图 4-2 与 13.4.2，不新增架构专题。
 
+**Apophenia**：声明物理页 2–12 与完整工件附录 16–17，共十三页，六页图像已查看，见[页级记录](../../references/proceedings/ASPLOS/2025/apophenia-reading.json)。重复片段需要保持影响依赖的身份；异步寻找候选、收齐匹配、记录与稳态重放各自计量。FlexFlow 强扩展仅采用当时的 CANDLE／DP 配置，短 trace 在部分规模更好；任务发起的 7／12 μs、另一阶段的 100 μs 与 30–300 次预热不能改写成通用 GPU 开销。
+
+[公开工件与 vLLM 对照](../../references/framework-history/2026-09-09/trace-identification/README.md)保存三份原始响应、精确 ZIP 成员和九个读取范围。附录的未公开依赖、所读 hash 的省略字段、固定图封装对外部缓冲的要求分别保留。现有 Qwen3 案例只补地址绑定和收齐片段后的流水推算；不展开字符串算法、不移植论文总加速比，也不声称当前引擎采用该自动识别系统。
+
 ## 尚缺的材料
 
 - 首个 session 中 Mosaic、DynaX、RASSM 的原始摘要／正文仍有缺口；DynaX 的作者 README 不能代替论文。TFHE 作者页面的 PDF 按钮仍指向 ACM。
@@ -101,4 +105,4 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 
 Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正式 DOI 的 Crossref 记录列五位，未列该名字。题名与其余五位作者一致，按较早作者版本归档；此处仅记录元数据差异，不推断正式 PDF 的作者名单已经变更。
 
-本轮十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，其余备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。
+前一批十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。首轮将 StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，Apophenia 随后完成上述选读，其余三篇仍为正文候选；该批其他论文备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。

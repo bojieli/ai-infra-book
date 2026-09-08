@@ -757,3 +757,6 @@
 | `asplos25-picachu-body` | [PICACHU 正文范围](../references/proceedings/ASPLOS/2025/picachu-reading.json) | 4、5、13 | 补充／版本参照 | 十一页正文范围与五张实际查看图页；资源配比、共享缓冲与建模条件 |
 | `nonlinear-resources-framework` | [实际函数求值与缓存](../references/framework-history/2026-09-09/nonlinear-resources/README.md) | 4、5、13 | 补充／版本参照 | 固定 vLLM 基类入口；准备与稳态分别计量，不代表完整设备内核审计 |
 | `nonlinear-resources-case` | [同一 Qwen3 的非矩阵工作](../case-studies/component-utilization-and-overlap.md) | 4、5、13 | 扩写 4,13 | 既有实验 4-1／图 4-2；旋转、系数表、主张量流量与缓冲条件 |
+| `asplos25-apophenia-body` | [Apophenia 正文与工件附录](../references/proceedings/ASPLOS/2025/apophenia-reading.json) | 5、8 | 补充／版本参照 | 十三页声明范围与六张实际查看图页；重复身份、匹配等待与稳态条件 |
+| `trace-identification-framework` | [任务匹配与图封装](../references/framework-history/2026-09-09/trace-identification/README.md) | 5、8 | 补充／版本参照 | 公开 Legion 工件与固定 vLLM 源码；缓冲责任和实现范围分别取证 |
+| `trace-identification-case` | [图执行的身份与等待](../case-studies/graph-execution-tradeoffs.md) | 5、8 | 扩写 5 | 同一输入槽位与独立流水推算；既有实验 5-8／图 5-7 |

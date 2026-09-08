@@ -783,6 +783,8 @@ from verify_lora_admission import verify as verify_lora_admission
 lora_admission=verify_lora_admission()
 from verify_nonlinear_resources import verify as verify_nonlinear_resources
 nonlinear_resources=verify_nonlinear_resources()
+from verify_trace_identification import verify as verify_trace_identification
+trace_identification=verify_trace_identification()
 from verify_isca2024 import verify as verify_isca2024
 isca2024=verify_isca2024()
 from verify_isca2025 import verify as verify_isca2025
@@ -814,4 +816,5 @@ report['snapshot_residency']=snapshot_residency
 report['tuning_measurement']=tuning_measurement
 report['lora_admission']=lora_admission
 report['nonlinear_resources']=nonlinear_resources
+report['trace_identification']=trace_identification
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors
