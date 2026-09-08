@@ -109,3 +109,5 @@ NSDI 2026 的 ServeGen 为这些框架实验补充负载依据：全局相同的
 动态 EP 补查将三个时间尺度接在一起：已有副本的 token 分派、专家权重重排、运行中改变组规模。SGLang 2026 Waterfill／LPLB 和 vLLM Elastic EP 的文章、合入日期及固定源码见[专家分派与重配](expert-dispatch-and-resizing.md)；只在 9.4、9.6、11.3 增补原有实验变体。Qwen3 离线算例不冒充当前 LPLB 的可运行模型，单输出 token 的历史测试不当作长 decode 结论。
 
 KV 量化的版本比较接回 8.4.4：vLLM 从 2024 scalar-scale 文档到 2026 Attention 融合／分层选择，SGLang 从 2025 FP4 存储到当前分阶段访问，Ollama 从早期 KV 选项到当前后端入口。用同一 Qwen3 请求计算格式、scale、工作区，再判断转换成本，见[算例](kv-quantization-and-execution.md)与[固定资料范围](../references/framework-history/2026-09-08/kv-quantization/README.md)。沿用实验 8-8，不增加框架功能节。
+
+2026-09-09 多 LoRA 复核补上代表版本的准入语义：vLLM 2024 逐请求到 2025 动态加载和固定 2026 文档入口，SGLang 2025 前缀身份／CSGMV 到 2026 加载重叠与排空；Ollama 三期 adapter 变更重载作为不同服务方式的对照。[读取范围与合入日期](../references/framework-history/2026-09-09/lora-admission/README.md)分别记录；Inkling 的 B200 W4A16 TP8 专用双流实现不能推广给全部模型。四请求算例比较平均与最晚完成时间，接现有实验 8-3，不新增工具介绍节。

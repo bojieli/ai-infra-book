@@ -751,3 +751,6 @@
 | `asplos25-darwingame-body` | [DarwinGame 正文范围](../references/proceedings/ASPLOS/2025/darwingame-reading.json) | 5 | 补充／版本参照 | 十三页正文与七张图页；CPU 配置比赛的噪声与争用条件 |
 | `tuning-measurement-framework` | [公开工件与框架计时](../references/framework-history/2026-09-09/tuning-measurement/README.md) | 5、8 | 补充／版本参照 | vLLM 三个年份、FlashInfer-Bench 固定入口；十四份响应和二十一个范围 |
 | `tuning-measurement-case` | [比较顺序与实际形状](../case-studies/optimization-evaluation-and-deployment.md) | 2、5 | 扩写 5 | 实验 5-6／5-9：配对、争用和 Qwen3 SwiGLU 局部宽度 |
+| `lora-admission-versions` | [多 LoRA 版本与实际准入](../references/framework-history/2026-09-09/lora-admission/README.md) | 5、8、10 | 补充／版本参照 | 十九份框架响应／三十七个范围；动态接口、加载事件、排空和专用模型条件 |
+| `lora-admission-case` | [槽位、分组与等待](../case-studies/multi-lora-serving.md) | 5、8 | 扩写 8 | 实验 8-3／图 8-2；同一 Qwen3 的准入、空槽和合批时间变体 |
+| `interview-eighth-discovery` | [第八次面试资料核对](../references/interviews/2026-09-09/eighth-pass/README.md) | 8、10 | 补充／版本参照 | 二次整理与受限原页，仅作线索；未新增一手样本或题号 |

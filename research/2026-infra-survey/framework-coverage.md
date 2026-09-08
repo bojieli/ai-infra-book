@@ -10,6 +10,7 @@
 | KV 位宽降低以后，容量和执行各改善多少？ | vLLM FP8 Attention、SGLang 分阶段配方、Ollama block 格式；[数值、scale、工作区和转换交点](../../case-studies/kv-quantization-and-execution.md) | 8.4.4 KV 压缩与模型状态；实验 8-8／图 8-7 |
 | 标为四位的模型，是否真的按四位保存和执行？ | M²XFP 伪量化与专用架构分开；vLLM v0.12.0 的 MoE 路径到固定当前 Linear 在线量化；[权重、激活与实际表示](../../case-studies/kernel-orchestration-and-quantization.md) | 4.2.5 格式与计算→5.3 融合／生存期→8.4 容量与质量；实验 4-2／5-4，图 4-3 |
 | 前缀匹配之后，能够从哪里恢复？ | vLLM 混合状态准入与部分块、SGLang 统一树、Ollama 选择性快照；[K3 逐卡检查点、保留间隔与尾段重算](../../case-studies/hybrid-prefix-state.md) | 2.4 模型状态→8.2 前缀复用→9.5 跨层身份与复用；实验 8-4／图 8-3 |
+| adapter 已注册，为何请求仍进不了批次？ | vLLM 三期接口、SGLang 分组／前缀／异步加载／排空，以及 Ollama 三期重载条件；[容量、分组和等待](../../case-studies/multi-lora-serving.md) | 5 小矩阵分块→8.2.2 共享与准入；实验 8-3／图 8-2。专用 Inkling B200 路径和通用接口分开 |
 | 能放下模型以后，能服务多少请求？ | vLLM 权重预取、SGLang CPU 专家协同、Ollama 加载反馈；[权重、KV、缓冲和链路分别计量](../../case-studies/weight-offload-execution.md) | 8.4 压缩与卸载→9.3 AF；实验 8-7、9-3、9-5 |
 | 哪些状态值得保存，应该把请求送到哪里？ | vLLM 原生 offload、SGLang HiCache／Model Gateway、Ollama 模型保留与状态寿命；[取回、排队与重算](../../case-studies/cache-tiers-and-routing.md)，以及[事件、位置与尾延迟](../../case-studies/cache-events-and-routing.md) | 5.2 缓冲寿命→8.2 状态复用→9.5 KV 层次与路由；实验 8-4、9-7、9-8、9-9 |
 | 模型并行估算怎样变成实际执行？ | vLLM／SGLang 通信分派、MoE 重叠、专家副本及[分派／动态重配](../../case-studies/expert-dispatch-and-resizing.md)；[共享资源](../../case-studies/resource-sharing-and-placement.md)、[专家实际工作](../../case-studies/moe-and-startup.md)与 ArcticInference 的[并行切换状态条件](../../case-studies/parallel-switching-and-state.md) | 6 超节点→7 数据中心网络→9.4 专家放置／9.6 部署，训练接 10.3；实验 6-2、6-5、9-6、9-10 |

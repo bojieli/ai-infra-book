@@ -779,6 +779,8 @@ from verify_snapshot_residency import verify as verify_snapshot_residency
 snapshot_residency=verify_snapshot_residency()
 from verify_tuning_measurement import verify as verify_tuning_measurement
 tuning_measurement=verify_tuning_measurement()
+from verify_lora_admission import verify as verify_lora_admission
+lora_admission=verify_lora_admission()
 from verify_isca2024 import verify as verify_isca2024
 isca2024=verify_isca2024()
 from verify_isca2025 import verify as verify_isca2025
@@ -808,4 +810,5 @@ report['hybrid_state']=hybrid_state
 report['ascend_components']=ascend_components
 report['snapshot_residency']=snapshot_residency
 report['tuning_measurement']=tuning_measurement
+report['lora_admission']=lora_admission
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors
