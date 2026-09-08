@@ -1,0 +1,1458 @@
+ ByteCheckpoint: A Unified Checkpointing System
+    for Large Foundation Model Development
+Borui Wan, The University of Hong Kong; Mingji Han, Yiyao Sheng, Yanghua Peng,
+Haibin Lin, Mofan Zhang, Zhichao Lai, Menghan Yu, Junda Zhang, Zuquan Song,
+      and Xin Liu, ByteDance Inc.; Chuan Wu, The University of Hong Kong
+           https://www.usenix.org/conference/nsdi25/presentation/wan-borui
+
+
+
+
+                 This paper is included in the
+        Proceedings of the 22nd USENIX Symposium on
+        Networked Systems Design and Implementation.
+                   April 28–30, 2025 • Philadelphia, PA, USA
+                                 978-1-939133-46-5
+
+
+
+                                          Open access to the Proceedings of the
+                                         22nd USENIX Symposium on Networked
+                                          Systems Design and Implementation
+                                                    is sponsored by
+    ByteCheckpoint: A Unified Checkpointing System for Large Foundation Model
+                                  Development
+
+        Borui Wan1,∗ Mingji Han2,∗ Yiyao Sheng2 Yanghua Peng2 Haibin Lin2 Mofan Zhang2
+           Zhichao Lai2 Menghan Yu2 Junda Zhang2 Zuquan Song2 Xin Liu2 Chuan Wu1
+
+                                       1 The University of Hong Kong 2 ByteDance
+
+
+
+
+                                                                        Unlike traditional deep learning model training, LFM train-
+                                                                     ing is significantly more complex. It has multiple training
+                            Abstract                                 stages, including pre-training [9, 25] and post-training [38,
+Checkpointing to preserve training states is crucial during          46, 67, 70]. Furthermore, evaluation tasks are integrated into
+the development of Large Foundation Models (LFMs), for               these stages to effectively assess model quality. Beyond the
+training resumption upon various failures or changes in GPU          complexity, the development of LFMs is notably resource-
+resources and parallelism configurations. In addition, saved         intensive and time-consuming, largely due to immense model
+checkpoints are dispatched to evaluation tasks or transferred        sizes and massive training datasets (e.g., DeepSeek-V3 com-
+across different training stages (e.g., from pre-training to post-   prises 671 billion total parameters, and is pre-trained on 14.8
+training). All these scenarios require resharding distributed        trillion tokens) [13, 33]. The scale of LFM training can even
+checkpoints from one parallelism to another. In production           be up to running on 12,288 GPUs [25].
+environments, different LFMs are trained with various frame-
+                                                                        As a fundamental technique for preserving training states,
+works and storage backends, depending on model sizes and
+                                                                     checkpointing captures snapshots of these states and stores
+training scales. A high-performance checkpointing system is
+                                                                     them in persistent storage to facilitate training resuming. Ad-
+needed to enable efficient checkpoint management at scale
+                                                                     ditionally, during LFM training, checkpoints are required for
+throughout the lifecycle of LFM development.
+                                                                     concurrent evaluation tasks that continually assess model qual-
+   We introduce ByteCheckpoint, an industrial-grade check-
+                                                                     ity. Another use-case of checkpoints is dispatching those snap-
+pointing system for large-scale LFM training. ByteCheck-
+                                                                     shots from pre-training to downstream post-training tasks,
+point features: a parallelism-agnostic checkpoint representa-
+                                                                     such as Supervised Fine-Tuning (SFT) or reinforcement learn-
+tion that enables efficient load-time checkpoint resharding; a
+                                                                     ing. The complex development pipeline, enormous scale, and
+generic checkpoint saving/loading workflow to accommodate
+                                                                     prolonged duration of LFM training present significant chal-
+multiple training frameworks and support different storage
+                                                                     lenges to designing a highly efficient checkpointing system.
+backends; full-stack optimizations to ensure high I/O effi-
+ciency and scalability; a suite of monitoring tools to stream-          First, efficient and unified checkpoint management is neces-
+line large-scale performance analysis and bottleneck detec-          sary throughout the life cycle of real-world LFM development.
+tion. Compared to existing open-source checkpointing sys-            During training, checkpoint resharding is commonly required.
+tems [52, 58], ByteCheckpoint significantly reduces runtime          This procedure transforms saved distributed checkpoints so
+checkpoint stalls, achieving an average reduction of 54.20×.         they can be correctly loaded into a new parallelism config-
+For saving and loading times, ByteCheckpoint achieves im-            uration that differs from the one used for their creation. In
+provements of up to 9.96× and 8.80×, respectively.                   pre-training, variations in parallelism occur when problem-
+                                                                     atic machines are removed, the available GPU quota fluctu-
+                                                                     ates [29, 72], or training configurations (e.g., context length)
+1    Introduction                                                    and system optimization techniques [25] (e.g., kernel fusion,
+                                                                     computation and communication overlapping ) are adjusted.
+Large Foundation Models (LFMs) in language [5, 13, 33, 43],          Across different stages and tasks, parallelism varies according
+vision [40, 44], audio [59] and other modalities are revolution-     to the scales of resources and datasets in use. Highly efficient
+izing today’s AI landscape, spawning a variety of downstream         checkpoint resharding is needed to minimize extra overhead
+applications such as conversational agents [49, 56], coding          and maximize the end-to-end Effective Training Time Ratio
+assistants [51], painting tools [53], and video [55] generators.     (ETTR, calculated as the ratio between the productive train-
+    ∗ Equal contribution.                                            ing time and the wallclock time of a job) [27]. Moreover, on
+
+
+
+USENIX Association                           22nd USENIX Symposium on Networked Systems Design and Implementation               559
+an industrial AI platform, LFM training jobs are initiated by                                     Pre-training                                Post-training
+
+various internal users or cloud customers who may choose dif-                        Failure          Continual pre-training
+                                                                                                                                SFT   Reward Modeling         PPO
+                                                                                                                 long context
+ferent training frameworks (e.g., Megatron-LM [47], PyTorch               training             training
+                                                                                                                   training                                   DPO
+FSDP [73], DDP [31], and others [63]) and select storage                      auto-eval            auto-eval                      auto-eval      auto-eval
+
+backends such as local disk, Hadoop Distributed File Sys-
+tem (HDFS), or Network-Attached Storage (NAS) for stor-                 Figure 1: An overview of the training pipeline of LFM.
+ing checkpoints according to job characteristics and personal
+preferences. Crafting customized checkpointing modules and          are then passed to a framework and storage backend agnostic
+workflows to accommodate these ad-hoc implementations               engine to execute the I/O tasks. ByteCheckpoint’s workflow
+complicates system development and substantially increases          utilizes this isolation in architecture, executing the same sav-
+maintenance costs. It is vital to provide generic workflows for     ing/loading steps for users with different training frameworks
+different training frameworks and storage backends.                 and storage backends.
+   Second, Substantial I/O operations are involved in the              ▷ ByteCheckpoint implements multiple optimizations
+checkpointing system for saving distributed checkpoints into        (Sec. 4) to enhance I/O performance, including balanced and
+persistent storage and loading them back for model training         zero-redundancy plan generation, fully asynchronous execu-
+under various scenarios. To minimize I/O blocking time and          tion pipelines, and efficient irregular tensor processing. We
+promptly save training states to persistent storage, it is cru-     share our engineering experience in optimizing storage sys-
+cial to expedite the I/O workloads. In addition, ensuring the       tems to support massive I/O requests, optimizing collective
+scalability of the checkpointing system is also essential since     communications to guarantee stability, and designing moni-
+modern LFM training typically operates at large scales.             toring and visualization tools for performance analysis and
+   Existing checkpointing systems [14, 19, 35, 66] assume           bottleneck detection (Sec. 5). This full-stack approach scales
+consistent parallelism, and fail to address the demands for         ByteCheckpoint to support the training of a 405B LFM on
+checkpoint resharding. Although some efforts from the open-         8,960 GPUs while still maintaining high efficiency.
+source community are devoted to developing checkpointing               ByteCheckpoint is deployed on our industrial AI platform
+systems capable of resharding, they have several limitations.       with tens of thousands of GPUs for various LFM training
+Some perform resharding in an inefficient offline manner [32],      tasks, including pre-training and post-training of language
+while others only support specific training frameworks and          models, multi-modal understanding, and generation models
+storage backends [52, 58]. Moreover, without customized op-         (e.g., for video generation). ByteCheckpoint demonstrates
+timizations and deployment experience, they suffer from sub-        significant advantages over existing open-source checkpoint-
+optimal I/O performance and lack the scalability to support         ing systems, including PyTorch DCP [58] and Megatron
+large-scale LFM training in real-world production.                  Distributed Checkpoint [52] (MCP). Compared to the base-
+   This paper presents the design, implementation, and de-          lines, ByteCheckpoint achieves improvements ranging from
+ployment experience of ByteCheckpoint, a checkpointing sys-         12.13× to 161.50× in terms of checkpoint stalls reduction,
+tem crafted for LFM development. ByteCheckpoint incorpo-            making the end-to-end checkpoint saving and loading proce-
+rates a unified architecture (Sec. 3.1) featuring an automatic      dures 6.05× and 3.88× faster on average, respectively.
+resharding-on-loading mechanism for distributed checkpoints
+(load-time checkpoint resharding) and supports multiple train-
+ing frameworks and storage backends. It integrates full-stack
+                                                                    2     Background and Motivation
+I/O performance and scalability optimization techniques.
+                                                                    2.1      LFM development
+   ▷ ByteCheckpoint’s checkpoint representation is decou-
+pled from the specific parallelism adopted during training          Production pipeline. As depicted in Fig. 1, the develop-
+(Sec. 3.2), enabling efficient load-time checkpoint resharding.     ment of LFM comprises pre-training and post-training stages.
+For model and optimizer state representation, we separate           During the initial pre-training phase, The LFM is iteratively
+each tensor shard’s metadata from its numerical values and          trained on extensive data collected from multiple sources to
+consolidate all the metadata into one global file. The metadata     absorb knowledge about the world. Subsequently, continual
+of a tensor shard includes its basic runtime, position, and stor-   pre-training is employed to enhance the foundation model’s
+age information. For the representation of dataloader states,       capabilities. For instance, the pre-training of large language
+we divide them into replicated and sharded states, storing          models (LLMs) typically involves long-context continual
+sharded states in individual files while the replicated ones are    training to gradually increase the supported context length
+only saved by the training worker whose global rank is 0.           of LLMs. Post-training is employed to align the pre-trained
+   ▷ ByteCheckpoint offers a generic workflow for LFM train-        model with human feedback or enhance the model’s reason-
+ing tasks employing different training frameworks and various       ing capabilities [18,57]. Various task-specific labeled datasets
+storage backends (Sec. 3.3). It tailors a planner for each frame-   (e.g., multilingual, code, math, reasoning, etc.) are involved
+work to generate unified saving/loading plans. These plans          in fine-tuning the LFMs, followed by reinforcement learning,
+
+
+
+560   22nd USENIX Symposium on Networked Systems Design and Implementation                                                            USENIX Association
+              Pre-Training               LFM               GPU States                   Distributed Checkpoints
+
+           TP=2 DP=2 PP=2
+                                                                                                                    chines [22, 25], adding new machines released from com-
+                                                                               CKPT 0              CKPT 4
+GPU 0 A0 A0         GPU 4 B0 B0
+                                                                               CKPT 1              CKPT 5
+                                                                                                                    pleted tasks, or running on tidal resources [12, 29, 68, 72]. It
+GPU 1 A1 A1         GPU 5 B1 B1
+                                                       Layer A    Layer B      CKPT 2               CKPT 6
+                                                                                                                    is often necessary to adjust training parallelism in response to
+GPU 2 A0 A2         GPU 6 B0 B2
+
+                                                          Model states
+                                                                               CKPT 3               CKPT 7          the resource changes, to maximize resource utilization. Addi-
+GPU 3 A1 A3         GPU 7 B1 B3
+                                                          Optimizer states                                          tionally, at the onset of large-scale pre-training, AI engineers
+         Resume Pre-Training
+
+          TP=2 DP=3 PP=1                       Supervised Fine-Tuning                      Auto-Evaluation
+                                                                                                                    often need to experiment with various model configurations
+GPU 0 A0 B0 A0 B0 GPU 3 A1 B1 A3 B3
+                                                 TP=2 DP=1 PP=2                           TP=1 DP=4 PP=1            and optimization techniques [25], since conclusions from
+GPU 1 A1 B1 A1 B1 GPU 4 A0 B0 A4 B4   GPU 0 A0    A0       GPU 2 B0      B0   GPU 0 A0 A1 B0 B1 GPU 2 A0 A1 B0 B1
+                                                                                                                    small-scale profiling or simulations do not always translate
+GPU 2 A0 B0 A2 B2 GPU 5 A1 B1 A5 B5   GPU 1 A1    A1       GPU 3 B1      B1   GPU 1 A0 A1 B0 B1 GPU 3 A0 A1 B0 B1
+                                                                                                                    to optimal performance in large-scale training. In this phase,
+                                                                                                                    adjusting parallelism configurations is common, resulting in
+Figure 2: Checkpoint resharding scenarios in LFM training.
+                                                                                                                    frequent training resumption. Moreover, long-context training
+We only show GPU states for clarity of the figure.
+                                                                                                                    changes the context length, which also requires GPU quota
+                                                                                                                    or parallelism adjustment. As shown in the example in Fig. 2,
+typically including the reward modeling and then performing                                                         8 distributed checkpoint files are initially stored, then loaded
+Proximal Policy Optimization [45] (PPO), or directly con-                                                           into 6 training workers upon resuming.
+ducting Direct Preference Optimization [41] (DPO). Due to                                                           (2) Cross-Stage Transition. When entering post-training , the
+the reduced size of these datasets, relatively fewer GPUs are                                                       number of GPUs involved typically decreases due to reduced
+involved in post-training. Automatic evaluation [14, 22] is                                                         training data in the latter. Checkpoints saved from pre-training
+periodically triggered to get intermediate model checkpoints                                                        are frequently resharded to align with the specific workloads
+and assess the quality with diverse criteria.                                                                       of each post-training task. As depicted in Fig. 2, only 4 GPUs
+Checkpointing. Training states of LFM training jobs to be                                                           are involved for a fine-tuning task in the post-training stage,
+checkpointed include GPU and CPU states. GPU states are                                                             so the checkpoints are resharded accordingly.
+learnable parameters in the LFM model and optimizer infor-                                                          (3) Evaluation. Evaluation tasks in both stages require load-
+mation (e.g., the float32 precision replica of the model and                                                        ing model checkpoints and conducting inference on separate
+its momentum and variance in Adam [26]). In state-of-the-                                                           resources; their parallelism needs to be adjusted to align with
+art parallel training [28], these states are sharded and placed                                                     assigned GPUs used for specific datasets. Fig. 2 shows a 4-
+across multiple GPUs. CPU states include dataloader mod-                                                            GPU eval task reshards model checkpoints from pre-training.
+ule, Random Number Generator (RNG) state, global training                                                              We collected the number of times of checkpoint resharding
+step number, and learning-rate scheduler, all stored in CPU                                                         demands on our AI platform (training text, image, and video
+memory. Our dataloader module incorporates a token buffer                                                           generation models) over the past six months and identified
+to cache input samples of varying lengths read from the data                                                        1,870 instances of checkpoint resharding during pre-training
+sources; when the number of accumulated tokens reaches the                                                          resumption, 13,080 due to cross-stage reconfiguration, and
+context window size [13, 25, 69, 71], the dataloader assembles                                                      19,844 for running evaluation tasks.
+all cached samples into a batch (micro-batch). Due to the
+volatile nature of GPU and CPU memory, these training states
+                                                                                                                    2.3    LFM Checkpointing Requirements
+should be periodically saved into persistent storage to tolerate
+any faults and prepare for evaluation tasks.                                                                        Load-time checkpoint resharding. As a critical step in the
+Storage backends. In production environments, separate dis-                                                         life cycle of LFM development, the efficiency of checkpoint
+tributed file systems (such as Tectonic [39] for Llama 3.1                                                          resharding is vital to minimize extra overheads. In our AI
+training [13]) are employed to store checkpoints [14, 20] for                                                       platform, the previous common practice is to develop offline
+formal tasks. Given that various hardware failures and soft-                                                        checkpoint resharding scripts and adapt the scripts whenever
+ware bugs are inevitable during training [13, 22, 25], storing                                                      a new checkpoint resharding scenario arises. This approach
+checkpoints at different global training steps is necessary to                                                      is inefficient and labor-intensive (see Appendix A for further
+safeguard training. Distributed file systems (e.g., HDFS, NAS)                                                      details). In addition to the development costs, running re-
+provide adequate storage capacity to accommodate multiple                                                           sharding scripts leads to a substantial waste of GPU time and
+checkpoints of large models.                                                                                        resources. Table 1 presents the cost of executing resharding
+                                                                                                                    jobs in various scenarios. Before training can resume or new
+2.2        Checkpoint Resharding Scenarios                                                                          evaluation tasks can begin, independent jobs that execute the
+                                                                                                                    resharding scripts must be submitted in advance. These jobs
+During the life cycle of LFM development, checkpoint re-                                                            download checkpoints from the storage systems, reshard dis-
+sharding is consistently required due to changes in parallelism                                                     tributed checkpoints to given parallelism configurations and
+under different scenarios (Fig. 2):                                                                                 upload new checkpoints back to the storage systems. The tar-
+(1) Training Resumption. GPU quota allocated for an LFM                                                             geted training or evaluation jobs cannot be executed until the
+training job can vary due to the removal of faulty ma-                                                              completion of resharding jobs, resulting in prolonged pend-
+
+
+
+USENIX Association                                                              22nd USENIX Symposium on Networked Systems Design and Implementation                           561
+Table 1: Average completion time of executing offline reshard-                                       Low Checkpointing Efficiency
+
+ing jobs under different scenarios.
+                                                                         step 10 D2H . . . step 20 D2H . . . step 30 D2H . . . step 40            Failure Recovery
+
+                                                                                                 ckpt 10                         ckpt 20               ckpt 10
+ Training Resumption          Cross-Stage Transition      Evaluation     Waiting
+                                                                                                                        eval 0
+
+        1870.38s                      650.34s              593.21s                                  High Checkpointing Efficiency
+
+
+                                                                         step 10 D2H . . . step 20 D2H . . . step 30 D2H . . . step 40            Failure Recovery
+Table 2: Top three training frameworks used on our platform                               ckpt 10             ckpt 20               ckpt 30            ckpt 30
+                                                                         Waiting
+                                                                                                     eval 0                eval 1             eval 2
+  Framework    Pre-training     Post-training   Average #GPUs Per Job
+ Megatron-LM       13727           68621                 301
+    FSDP           16842             †                   25             Figure 3: Checkpointing efficiency impacts failure recovery
+    DDP            25393             †                    6             and evaluation tasks. D2H denotes the Device-to-Host copy.
+
+                                                                        feature extensive model sizes, reaching hundreds of billions
+ing time. Moreover, since checkpoints created by resharding             of parameters [13]. Consequently, the size of training states
+scripts are coupled with specific parallelism, they cannot be           also increases significantly, imposing substantial overhead for
+reused freely, which in turn increases the storage overhead.            checkpoint saving and loading. By analyzing our previous
+   Instead of executing scripts in independent jobs for check-          LFM training jobs, we observe that the average end-to-end
+point resharding, load-time checkpoint resharding [58] (also            time required to save checkpoints of a GPT 175B model,
+known as online resharding) is preferred for LFM training.              trained on 4096 GPUs, to HDFS can be 200 seconds. This du-
+It automatically identifies and retrieves necessary data from           ration substantially exceeds the time required for a single train-
+existing distributed checkpoints during the loading procedure.          ing iteration. Even though this time-consuming procedure can
+To achieve this, the storage representation of checkpoints              be partially removed from the critical path of model train-
+should be designed to be independent of specific parallelism.           ing by adopting asynchronous checkpointing [25, 34, 35, 65],
+Multiple frameworks and storage backends. On our AI                     expediting end-to-end checkpointing remains crucial to mini-
+platform, a wide range of training frameworks are used, such            mize training progress loss [66] caused by inevitable frequent
+as Megatron-LM [47], DDP [31], FSDP [73], veScale [25,63],              failures in large-scale training [25]. As depicted in Fig. 3,
+etc. Table 2 lists the top three preferred training frameworks          although checkpointing overlaps with training, its rapid com-
+on our platform, based on six months of trace analysis. Users           pletion allows more intermediate checkpoints to be stored
+typically adopt Megatron-LM [47] for training large lan-                before a failure occurs, enabling resumption from more re-
+guage foundation models. FSDP [73] is preferred for training            cent states and improving ETTR. Besides, evaluation tasks
+tasks involving text-to-video or text-to-speech models, and             are triggered during training, and intermediate checkpoints
+DDP [31] is commonly used to train image encoder com-                   are periodically pulled for these tasks. Faster checkpointing
+ponents of multimodal foundation models or for routine al-              ensures their timely execution, reducing blocking time due to
+gorithm testing. In addition, users can choose from various             preparing these checkpoints in remote persistent storage.
+storage backends for checkpoint persistence depending on the               Scaling the checkpointing system while maintaining the
+scenario, ranging from local disks for debugging to HDFS                high I/O performance is non-trivial. Sub-optimal and risky
+or NAS for formal training tasks. Each training framework               designs, which are hard to detect in small-scale settings, can
+comes with its own checkpoint module, file format, and ad-              lead to severe performance bottlenecks or even catastrophic
+hoc implementation of the save/load logic. However, these               job failures in large-scale training. For example, massive
+modules lack critical features for production, such as load-            read/write requests for checkpoint files from the training
+time resharding, asynchronous checkpointing, and support                cluster to the storage systems (e.g., HDFS) can overload the
+for remote persistent storage. Integrating these features for           master node, causing delays in file metadata operations. Addi-
+each framework’s checkpoint module and tailoring optimized              tionally, naive implementations of collective communications,
+implementations requires repeated engineering efforts. This             such as integrity-checking barriers, introduce substantial ini-
+leads to inconsistent checkpointing interfaces across training          tialization and synchronization overheads. These overheads
+frameworks and storage backends, complicating the codebase.             can even result in communication timeouts, ultimately caus-
+Moreover, the maintenance of diverse checkpoint file formats            ing the entire training job to fail. Furthermore, as training
+from different frameworks adds to the complexity of imple-              scales up, efficiently analyzing system performance and de-
+menting checkpoint transfer logic across training stages and            tecting errors among training and I/O workers across multiple
+deploying models for evaluation and inference tasks. There-             machines becomes increasingly challenging.
+fore, it is vital to provide generic workflows for different               Existing checkpointing systems, such as CheckFreq [35],
+training frameworks and storage backends.                               Check-N-Run [14], and Gemini [66], operate under the as-
+Efficient and scalable I/O performance. Mainstream LFMs                 sumption of consistent parallelism and do not address the
+
+
+
+562   22nd USENIX Symposium on Networked Systems Design and Implementation                                                             USENIX Association
+                                                                                                   Loading and saving distributed checkpoints with ByteCheckpoint
+      Megatron-LM         DDP              FSDP            veScale
+                                                                           # Import the ByteCheckpoint library
+       User Code       User Code         User Code        User Code
+                                                                           import bytecheckpoint
+
+                                                                           # Prepare checkpoint states
+                            ByteCheckpoint API
+                                                                           ckpt_states = {"model": model, "optimizer": optimizer, "dataloader": dataloader, "extra_states": extra_states}
+    Megatron Planner   DDP Planner      FSDP Planner    veScale Planner    # Load checkpoints of Megatron-LM from HDFS with overlapping mode
+
+                                                                           bytecheckpoint.load('hdfs://demo_0/checkpoints', ckpt_states, framework='megatron', overlap_loading=True)
+                             Execution Engine
+                                                                           # Train model for several steps.
+      Memory I/O        Disk I/O         HDFS I/O          NAS I/O         # Save checkpoints of Megatron-LM to HDFS asynchronously
+                                                                           bytecheckpoint.save('hdfs://demo_0/checkpoints', ckpt_states, framework='megatron', async_checkpoint=True)
+
+        Memory            Disk             HDFS              NAS
+
+                                                                               Figure 5: Examples of using ByteCheckpoint’s APIs.
+            Figure 4: Architecture of ByteCheckpoint.
+
+                                                                          states to save/load for each worker. Each worker leverages
+need for checkpoint resharding. DCP [58] and MCP [58] in-                 the Planner to initially create local plans and subsequently
+corporate checkpoint resharding capabilities but are limited in           collaborates to create global plans. We implement a tailored
+terms of supported parallelism strategies and training frame-             planner for each training framework to extract information
+works, I/O performance, and scalability. A comprehensive                  from these specifications and generate plans.
+discussion with related works is provided in Appendix F. In               Execution Engine. The Engine, running on each training
+ByteCheckpoint, we design decoupled storage representation                worker, executes the saving/loading plans generated by the
+for efficient load-time checkpoint resharding, propose generic            Planner when the respective API is called. It analyzes the
+saving/loading workflows to support multiple frameworks                   given checkpoint path to determine the appropriate storage
+and storage backends, integrate full-stack optimizations to en-           backend, then interacts with the Storage I/O layer to execute
+hance I/O performance and share our experience in scaling the             the actual I/O tasks specified in the plans.
+checkpointing system to support real-world LFM training.                  Storage I/O. Analogous to the design of the Planner layer, the
+                                                                          Storage I/O layer encapsulates different storage backends and
+3      System Design                                                      manages backend-specific read/write operations and optimiza-
+                                                                          tions. The interface between the Engine layer and the Storage
+Based on the above observations, we design ByteCheckpoint                 I/O layer remains unified across different storage backends,
+according to the following key principles:                                facilitating the seamless integration of new storage backends.
+(1) Decoupling. The checkpoint representation remains inde-               ByteCheckpoint supports multiple storage options, including
+pendent of specific runtime parallelism. Interfaces of training           in-memory checkpoint storage [66], local disk storage, and
+frameworks and storage backends are separated from the core               remote storage systems.
+execution engine, ensuring robust extensibility.                             Fig. 5 illustrates a typical use case of ByteCheckpoint.
+(2) User-friendliness. The APIs should be concise, making it              Initially, users define a dictionary specifying the states to
+seamless for AI researchers and engineers to integrate them               be saved or loaded, encompassing the model, optimizer, dat-
+into their code and runtime environments.                                 aloader, and additional states. At the outset of training resump-
+                                                                          tion, stage transition, or evaluation, bytecheckpoint.load
+                                                                          is invoked to load saved checkpoints. Checkpoint resharding
+3.1       Unified Architecture                                            occurs automatically during loading when there are changes
+The architecture of ByteCheckpoint is illustrated in Fig. 4.              in parallelism. During training, bytecheckpoint.save is
+Each component is introduced in detail as follows:                        periodically invoked to save checkpoints.
+API. ByteCheckpoint’s APIs (bytecheckpoint.save and
+bytecheckpoint.load) provide a unified entrypoint for user                3.2         Decoupled Checkpoint Representation
+code across various training frameworks. For instance, to save
+checkpoints, users first prepare the corresponding training               To achieve parallelism-agnostic checkpointing to enable auto-
+states, checkpoint path, framework name, and performance-                 matic load-time resharding, we develop a formal specification
+related options, then call bytecheckpoint.save. This high-                of model and optimizer tensors in distributed training. Our
+level entrypoint abstracts underlying system complexities,                design conforms to the Distributed Tensor and Checkpoint
+such as sharding specification, save/reshard plan generation,             concepts in the PyTorch Distributed library [31].
+and I/O operations.                                                       Model and optimizer states. Each tensor is uniquely identi-
+Planner. The Planner serves as the interface for training                 fied by a "fully qualified name" (FQN) and has a global shape,
+frameworks. It receives arguments (training states, checkpoint            representing its original shape before sharding. Tensors can be
+path, etc.) from the API layer, creates ShardMeta (Sec. 3.2) for          either sharded or replicated across ranks (aka training work-
+each tensor shard based on the worker’s rank and framework-               ers). For sharded tensors, the specific shard held by a worker
+specific sharding specification such as Megatron ShardedTen-              is determined by three factors: the parallelism (e.g., tensor
+sor or FSDP DTensor, and determines the tensors and other                 parallelism) applied to the tensor, the sharding dimension, and
+
+
+
+USENIX Association                                   22nd USENIX Symposium on Networked Systems Design and Implementation                                                                   563
+                Global Metadata File: TensorShardtoBasicByteMap, LoaderShardtoByteMap, ...                               Optimizer Tensor Sharding                Optimizer Tensor Distribution
+                                                                                                                             TP=2 DP=2 PP=1
+ Rank 0                 Tensor Metadata                   Rank 1                 Tensor Metadata                                                             Rank 0    A0    B0    Rank 2     B0   C0
+                                                                                                                               TP Sharding
+  BasicMeta (stride, device, requires_grad), ...           BasicMeta (stride, device, requires_grad), ...
+                                                                                                                             B0 B0     B1 B1                 Rank 1    A1    B1    Rank 3     B1   C1
+ ShardMeta (fqn, nD_offsets, nD_lengths), ...             ShardMeta (fqn, nD_offsets, nD_lengths), ...               A0 A0                      C0 C0
+  ByteMeta    (file_name, byte_offset, byte_size), ...     ByteMeta    (file_name, byte_offset, byte_size), ...              B0 B0     B1 B1
+                                                                                                                     A1 A1   B0 B0     B1 B1    C1 C1
+                                       Storage Files                                            Storage Files                                                    ShardMeta Generation in Rank 0
+
+ CPU States                                               CPU States                                                         ZeRO DP Sharding
+                                                                                                                                                        A0 A0 fqn:"A",nD_offsets:[0, 0],nD_lengths:[1, 2]
+ GPU States                                               GPU States                                                A0 A0 B0 B0 B0     B0 B0 B0 C0 C0
+                                                                                                                                                        B0 B0   fqn:"B",nD_offsets:[0, 0],nD_lengths:[1, 2]
+
+                   Model States        Optimizer States      Dataloader States        Extra States                  A1 A1 B1 B1 B1    B1 B1 B1 C1 C1    B0      fqn:"C",nD_offsets:[1, 0],nD_lengths:[1, 1]
+
+
+
+Figure 6: Checkpoint representation in ByteCheckpoint. The                                                        Figure 7: ShardMeta of irregular tensors in optimizer states.
+pipeline parallelism is applied in this example.
+                                                                                                                  and ByteMeta of each tensor shard, ensuring accurate data
+the group rank within the corresponding parallelism group.                                                        retrieval. The global metadata file also includes a Loader-
+Based on a tensor’s FQN, global shape, and sharding speci-                                                        ShardtoByteMap, which records the file index information
+fication, ByteCheckpoint creates the tensor shard metadata                                                        of sharded states in each dataloader. All storage files and
+(ShardMeta) for each rank, which is utilized in checkpoint                                                        the global metadata file are stored in the specified storage
+storage to represent the tensor shard, independent of paral-                                                      backend designated by the checkpoint path.
+lelism. More precisely, ShardMeta for a tensor shard is an                                                        Decomposing irregular tensors. We define irregular tensors
+index tuple (fqn, nD_offsets, nD_lengths), where nD_offsets                                                       as those which, when flattened before sharding, cannot be
+and nD_lengths indicate the local shard’s offsets and lengths                                                     reshaped back to their original dimensions. These tensors typ-
+along the original multi-dimensional axes in its global shape.                                                    ically arise when applying the Zero Redundancy Optimizer
+Dataloader and extra states. The dataloader states can be                                                         (ZeRO) [42], as implemented in Megatron-LM ZeRO2 and
+categorized into two types: replicated states and sharded                                                         FSDP ZeRO3 [73]. In these implementations, optimizer states
+states. Replicated states include the number of data reading                                                      within a DP group are flattened, concatenated, and sharded.
+workers, paths to source datasets, and sampling ratios, and are                                                   Consequently, the resulting 1D tensor slices often cannot be
+identical across all I/O workers (subprocesses) in different                                                      directly represented using n-dimensional shapes and offsets.
+ranks. Sharded states are unique to each I/O worker, including                                                    Fig. 7 illustrates an example of irregular tensor sharding: Un-
+the token buffer and data retrieval offsets for different data                                                    like tensors A and C, tensor B, with an original shape of (3, 2),
+sources. In ByteCheckpoint, sharded states are saved in in-                                                       is evenly split into two shards. Each shard, containing three el-
+dividual files, while replicated states are saved only by the                                                     ements, cannot be directly represented as a two-dimensional
+I/O worker in rank 0. This reduces overall size of dataloader                                                     shape with corresponding offsets. One intuitive approach
+states to be saved and facilitates dataloader resharding when                                                     to addressing the challenge of irregular tensor shards is to
+parallelism configurations change since the separation of data                                                    merge all tensor shards into complete tensors before saving
+states into distinct files simplifies states merging and redis-                                                   checkpoints, thereby simplifying the generation of Shard-
+tributing according to the new parallelism. For other extra                                                       Meta. For example, to eliminate potential irregular tensors in
+states such as the RNG state, we pack and serialize them into                                                     DCP [58], FSDP performs synchronous all-gather communi-
+one compact byte object before dumping them into storage.                                                         cation operations, interleaved with D2H copy operations for
+Checkpoint representation. Fig. 6 illustrates the checkpoint                                                      each tensor shard, regardless of whether the shard is irregu-
+representation in ByteCheckpoint. Distributed checkpoints                                                         larly sharded. However, this approach incurs significant com-
+comprise a global metadata file and multiple storage files.                                                       munication overhead and requires frequent synchronization
+Each rank generates three distinct files: a model state file, an                                                  between GPU and CPU, substantially impeding efficiency.
+optimizer state file, and an extra state file. The Dataloader                                                        To mitigate the overhead associated with merging ten-
+state file is generated only by training workers whose ranks                                                      sor shards, ByteCheckpoint employs a tensor decomposition
+for all parallelism degrees, except for DP degrees, are 0. For                                                    strategy for managing irregular tensor shards. Specifically,
+tensor shards in model and optimizer states, their Metadata                                                       ByteCheckpoint decomposes an irregular tensor into a series
+consists of three parts: BasicMeta, which records essential                                                       of regular ones, representing each with index tuples. For ex-
+information of individual tensor shards such as stride and                                                        ample, consider the irregular tensor shard of tensor B with
+device, critical for recovering the runtime state; ShardMeta,                                                     three elements on rank 0 in Fig. 7. ByteCheckpoint decom-
+as previously introduced, recording relative position infor-                                                      poses this shard into two regular tensors that can be directly
+mation of shards in the complete tensor; ByteMeta, which                                                          represented by nD_o f f sets and nD_lengths. This approach
+specifies the byte start offset and length of each tensor shard                                                   allows ByteCheckpoint to use multiple ShardMeta entries
+within the storage file. All tensor metadata are consolidated                                                     to represent a single irregular tensor shard. Although such
+into the global metadata file, and a mapping, termed Tensor-                                                      decomposition slightly increases the metadata size and adds
+ShardtoBasicByteMap, is established between saved tensor                                                          steps to the loading procedure, as reconstructing the target
+shards and storage files based on the ShardMeta, BasicMeta,                                                       tensor may require looking up multiple smaller segments of
+
+
+
+564       22nd USENIX Symposium on Networked Systems Design and Implementation                                                                                              USENIX Association
+                                  Online Resharding Workflow                                                                             Saved Checkpoints
+                                                                                                              Split Buffer                   TP=1 DP=2                    Copy Buffer
+                                                 step 2
+
+                                                                                     Checkpoint 0             TP=1 DP=4                                                   TP=2 DP=2
+                                             Rank 1                 step 5
+                                                                                                                                               Token Buffer 0
+                                                                                                                             Rank 0                                                     Rank 0
+                         step 1         step 3            step 4                                        Token Buffer 0                                              Token Buffer 0
+                                                                       step 6        Checkpoint 1
+                                                                                                                             Rank 1            Token Buffer 1                           Rank 1
+  Global Metadata File     step 1     Rank 0/Coordinator
+                                                                                                        Token Buffer 0                                              Token Buffer 0
+                                        step 3            step 4
+                                                                     step 5          Checkpoint 2
+                         step 1                                                                                              Rank 2                                                     Rank 2
+                                                                                                                                            Merge Buffer
+                                             Rank 2                                  Checkpoint 3
+                                                                                                        Token Buffer 1                                              Token Buffer 1
+                                                                                                                                             TP=1 DP=1
+                                                                                                                             Rank 3                                                     Rank 3
+                                                 step 2                                                                                                    Rank 0
+                                                                                                        Token Buffer 1                                              Token Buffer 1
+                                    Matches Identify Details                                                                          Token Buffer 0&1
+
+          TP=2, DP=2, PP=1                                          TP=4, DP=2, PP=1
+                      ShardMeta                            Rank 1                  ByteData         Figure 9: Examples of dataloader resharding. Sharded states
+                  fqn: 'MLP_0'
+                                                    fqn: 'MLP_0'
+                  offsets: [0, 0]
+                                                    offsets: [128, 0]
+                                                                                                    such as cumulative token buffers are resharded according to
+  Checkpoint 0
+                  lengths: [256, 512]                                                ...
+                                                    lengths: [128, 512]                             the changes of parallelism configurations. We do not depict
+                         ShardMeta                         Rank 2
+                    fqn 'MLP_0'
+                                                                                                    data retrieval offsets for clarity of the figure.
+                                                    fqn: 'MLP_0'                   ByteData
+                    offsets: [256, 0]
+                                                    offsets: [256, 0]
+  Checkpoint 1      lengths: [256, 512]
+                                                    lengths: [128, 512]
+
+                                                                                                    Step 5. The execution engine on each rank selects the storage
+Figure 8: Load-time tensor resharding workflow. Checkpoint                                          backend wrapper in the Storage I/O layer based on the check-
+k denotes the checkpoint saved by a previous live worker k.                                         point path and then executes the loading pipeline (Sec. 4.2).
+                                                                                                    Step 6. Upon completion of the loading pipeline, each rank
+irregular shards, it avoids the costly communication of tensor                                      utilizes the optimized asynchronous collective barrier primi-
+shards without extra blocking time during saving.                                                   tive ensuring the atomicity of the distributed loading. Further
+                                                                                                    details can be found in Appendix B.
+                                                                                                    Dataloader resharding. Similar to tensor resharding in Fig 8,
+3.3      Checkpoint Resharding Workflow                                                             ByteCheckpoint reshards the dataloader by querying the Load-
+ByteCheckpoint implements a generic workflow for saving                                             erShardtoByteMap. The illustration of dataloader reshard-
+and loading, automatically resharding checkpoints during the                                        ing is depicted in Fig. 9. When parallelism configuration
+loading process. Leveraging the independence between the                                            changes, for the dataloader checkpoints, common items in
+Engine Layer, Planner Layer, and Storage I/O Layer, we can                                          the dataloader checkpoints can be loaded directly, whereas
+execute consistent saving and loading steps across different                                        unique items such as accumulative token buffers and data
+training frameworks and storage backends. We take tensor                                            retrieval offsets require resharding. Specifically, when the DP
+resharding as an example in Fig. 8, emphasizing how our                                             degree size remains constant while other parallel degrees are
+checkpoint representation enables flexible load-time reshard-                                       altered (TP degree changes in the example of Fig. 9), the
+ing. The process for checkpoint saving and loading without                                          token buffers should be copied to the destination workers for
+resharding follows a similar procedure.                                                             bitwise-correct resuming. when there is a change in the DP
+                                                                                                    degree size, the token buffers must be either split or merged
+Step 1. To initiate load-time checkpoint resharding, each rank
+                                                                                                    accordingly to ensure that the resumed dataloaders do not
+invokes the bytecheckpoint.load() API, specifying the
+                                                                                                    discard cached data and do not retrain data that has already
+checkpoint path along with the model/optimizer to be restored.
+                                                                                                    been sampled and fed. Thanks to the split storage strategy
+All ranks then load the global metadata file from the path.
+                                                                                                    designed for the dataloader module, ByteCheckpoint can pre-
+Step 2. For each tensor shard in the given model/optimizer,
+                                                                                                    cisely identify the unique items that require resharding and
+each rank queries the TensorShardToBasicByteMap within
+                                                                                                    process them efficiently.
+the global metadata file, identifying matching segments be-
+tween the saved tensor shards and the sharding specification
+of new shards. After identifying these matches, the planner                                         4      Performance Optimization
+constructs a local load plan, which includes BasicMeta and
+ByteMeta tailored to the specific shard. This identification                                        We now elaborate on ByteCheckpoint’s performance opti-
+mechanism is illustrated at the bottom of Fig. 8.                                                   mization techniques, focusing on minimizing the overhead
+Step 3. The coordinator planner, typically residing in rank 0,                                      associated with checkpoint saving and loading.
+initiates a gather operation to aggregate loading plans from
+all ranks. It then optimizes each local plan by applying the
+                                                                                                    4.1        Optimized Plan Generation
+redundant elimination optimization (Sec. 4.1) to distribute
+tensor shard loading workloads for reduced completion time.                                         Balancing saving workload. In training scenarios employ-
+Step 4. The coordinator initiates a scatter operation to dis-                                       ing data parallelism (DP), model states are replicated across
+tribute the finalized loading plan. Each rank then receives its                                     all DP groups, resulting in duplicated model states. Existing
+final loading plan from the coordinator.                                                            checkpointing systems [52, 58] address this issue by designat-
+
+
+
+USENIX Association                                                           22nd USENIX Symposium on Networked Systems Design and Implementation                                         565
+ing the first DP group to save all model states. However, this                                      Naive Loading Pipeline
+approach leads to workload imbalance, potentially causing              Rank 0   0     0    0   1        1    1   2        2    2    3    3   4     4       4   ...
+training workers in the first DP group to become stragglers. To        Rank 1   0     0    0   1        1    1   2        2    2    3    3   4     4       4   ...
+address this challenge, we implement a workload-balancing
+                                                                                          Fully Asynchronous Loading Pipeline
+deduplication mechanism during the planning procedure, uti-
+                                                                       Rank 0   0      2        4        6        8       10        12     14
+lizing a Worst-Fit algorithm. Specifically, the coordinator                           0        2        4        6        8        10     12    14
+                                                                                           0        2        4        6        8      10     12    14
+planner distributes the saving workload based on the size of                                   01       23       45       67       89    1011 1213 1415
+each tensor shard, assigning the current tensor shard to the           Rank 1   1      3        5        7        9       11        13     15
+                                                                                      1        3        5        7        9        11     13    15
+rank with the smallest cumulative tensor shard size. This ap-                              1        3        5        7        9      11     13    15
+                                                                                               01       23       45       67       89    1011   123   1415
+proach ensures a more equitable distribution of the saving
+                                                                      Time
+workload across ranks. This balances workloads across all                           Read            Deserialize               H2D Copy           All2All
+workers, improving saving efficiency.
+Eliminating redundant loading. When loading checkpoints              Figure 10: Comparison between ByteCheckpoint’s loading
+into parallelism configurations that include data parallelism,       pipeline and the naive implementation.
+ByteCheckpoint optimizes the process by eliminating repeti-
+tive tensor reading across DP groups, effectively combining
+storage file reading with tensor transferring. A crucial obser-      for parallel file downloading and deserialization. The H2D
+vation is that idle inter-GPU bandwidth can be utilized to           copy operation transfers tensors from CPU memory to GPUs,
+concurrently transfer loaded tensors to peer GPUs during the         while All2All facilitates tensor transferring within the DP
+file reading process. As illustrated in Fig. 10, tensor reading      group. For saving, we implement a symmetrical, fully asyn-
+workloads across DP groups are evenly distributed among              chronous pipeline comprising D2H copy, serialization, and
+training workers during the planning phase, thereby avoiding         file uploading operations. To mitigate the performance impact
+duplication of reads. Subsequently, I/O threads are launched         of D2H copy on training, we employ a pinned CPU memory
+to read the allocated tensor shards. Concurrently, in the main       pool combined with a Ping-Pong buffering mechanism to ac-
+thread, shards read into CPU memory are first copied into            celerate this operation. We run multiple parallel processes to
+GPU memory and then transferred to other workers that re-            serialize tensors and dump files into shared memory. Upload-
+quire them, utilizing all-to-all collective communication.           ing threads actively monitor and initiate file uploading upon
+Plan and metadata cache. In large-scale training, the execu-         the completion of the dumping phase.
+tion of the planning procedure can introduce significant com-
+munication overhead, particularly when checkpoint saving
+occurs frequently. For example, planning the saving proce-
+                                                                     4.3     High Performance Read/Write
+dure for a 405B transformer model distributed across 8960            We optimize the read and write throughput of checkpointing
+GPUs requires 62 seconds. However, we have observed that             by tailoring our implementation to optimal I/O usage of com-
+both the save plans and the global metadata file, although           monly used storage backends. For example, while HDFS is
+coupled with specific parallelism, remain constant throughout        not primarily designed for random data access, it does offer
+a single training session. This allows for caching strategies to     some random read capabilities via its SDK, allowing applica-
+reduce planning times and associated overheads in subsequent         tions to access specific file offsets and retrieve data from those
+checkpoint operations. We introduce plan metadata caching,           positions. We leverage this feature and enable multi-threaded
+transforming the planning into a one-time cost. Once estab-          reading of a single file, significantly accelerating the down-
+lished for the first time, the save plans and global metadata file   load speed of checkpoint files from HDFS. In our production
+are cached for future reuse, eliminating repetitive planning.        platform, single-file read speed has improved from 400 MB/s
+                                                                     to 2-3 GB/s, all tested on H800 servers equipped with over
+                                                                     100 CPU cores, TB-level memory, and a 200Gbps NIC.
+4.2    Fully Asynchronous Engine Pipeline
+                                                                        For file writing, HDFS’s append-only write makes it im-
+ByteCheckpoint Engine optimizes operation execution during           practical to split a single file into multiple parts based on
+checkpoint saving and loading (resharding) through pipelin-          offsets for multi-threaded writing. To overcome this limita-
+ing. Using loading as an example (Fig. 10), we pipeline              tion, we split the target file into several sub-files of fixed size
+file reading, deserialization, Host-to-Device (H2D) copy, and        and concurrently write them into HDFS using multi-threading.
+inter-GPU communication for each tensor shard, thereby               After the upload is complete, we perform metadata-level con-
+achieving higher efficiency. The read operation downloads            catenation to seamlessly merge the sub-files back into a single
+files containing desired tensors from the storage system and         entity, ensuring the integrity of the stored data blocks. With-
+places them into shared memory (e.g., the dev/shm direc-             out network congestion, single-file upload speed can reach 3
+tory). The deserialize operation deserializes tensors from           GB/s, far exceeding the average read/write throughput of a
+shared memory. ByteCheckpoint employs multiple threads               single HDFS client (under 100 MB/s [48]).
+
+
+
+566   22nd USENIX Symposium on Networked Systems Design and Implementation                                                           USENIX Association
+4.4    Prefetching Dataloader States                             evaluation tasks shortly after their creation. However, where
+                                                                 no training anomalies such as loss spikes occur, the access
+Each dataloader employs multiple subprocesses, referred to       frequency of these files decreases significantly after being
+as read workers, to handle data loading and preprocessing.       downloaded by evaluation tasks. Nonetheless, all checkpoint
+When checkpointing is initiated, the main read worker signals    files must be preserved for traceability. To efficiently manage
+all other read workers to prepare their states. The training     storage space while ensuring data availability, we have devel-
+process is paused until all states are collected to ensure ac-   oped a data cool-down mechanism that migrates data from
+curacy, as any update in the main process would result in        SSD to HDD storage, thus ensuring that high-performance
+the state change of workers. The duration of this blocking       hot storage consistently has sufficient space for operations.
+period depends on both the number of workers and the size        Specifically, we cool down all files that exceed the reten-
+of the accumulated token buffers. For instance, when using       tion threshold based on their last modification time. We then
+a dataloader configured with 4 workers and a total state size    remap the original file paths to the new HDD storage locations
+of approximately 1GB, the state collection process typically     through pure metadata operations. This strategy applies to
+takes around 8 seconds.                                          HDFS directories and preserves the original access paths of
+   To alleviate this overhead, we adopt prefetching. Based on    the cooled-down files, providing a seamless user experience.
+the pre-set checkpoint frequency, each read worker prepares
+its state during the training step just before checkpointing
+and puts the state into its state queue. At the checkpointing    5.2    Collective Communication
+step, the main read worker gathers those prepared states im-
+                                                                 Collective communications (e.g., scatter, gather, barrier) are
+mediately through queue polling. This optimization allows
+                                                                 crucial in ByteCheckpoint’s workflow (Sec.3.3), particularly
+ByteCheckpoint to achieve near-zero dataloader state gather-
+                                                                 for planning and checkpoint integrity guarantee. We initially
+ing delays.
+                                                                 used NCCL [54] as the communication backend to execute
+                                                                 gather and scatter operations at the coordinator. However,
+5     Checkpointing at Scale                                     when scaling a pre-training task to 8960 GPUs, we observed
+                                                                 that NCCL requires a long time to lazily build communication
+This section explores in depth the methods employed to opti-     channels and allocate GPU memory during the planning stage
+mize checkpointing for large-scale LFM training.                 of ByteCheckpoint’s saving workflow. In some cases, it be-
+                                                                 comes unresponsive or causes CUDA out-of-memory (OOM)
+                                                                 errors, as scatter or gather operations necessitate establish-
+5.1    Storage Support                                           ing peer-to-peer communication with each GPU. These GPU
+High throughput, scalable storage system. HDFS is the            OOM issues and long initialization times are not apparent in
+primary storage backend for ByteCheckpoint, we have im-          small-scale trials but become significant at larger scales.
+plemented several optimizations to enhance throughput and           To enhance communication stability during planning, we
+scalability for large-scale checkpointing. We have rewritten     have re-implemented the procedure using the gRPC frame-
+all HDFS components, including NameNode, DataNode, and           work [17], which eliminates GPU memory usage during plan-
+SDK [15], in C++, effectively doubling performance com-          ning. However, when scaling training to tens of thousands of
+pared to the original Java-based implementation. Additionally,   GPUs, centralized gathering and scattering operations contin-
+we have refined its architecture by introducing a new compo-     ued to impose a significant burden on the coordinator, leading
+nent named NNProxy [1]. NNProxy functions as a stateless         to communication failures. We further improved its stability
+RPC proxy for HDFS NameNode, facilitating large-scale fed-       by implementing a tree-based hierarchical communication
+erated deployments of NameNodes while maintaining min-           topology. Training workers on a single machine are organized
+imal querying latency. The NNProxy design addresses the          into first-level subtrees, with the worker of local rank 0 des-
+QPS bottleneck of HDFS NameNode metadata requests, a             ignated as the root. For inter-machine communication, we
+challenge intensified by the high volume of distributed check-   iteratively group multiple machines, designating the worker
+points. NNProxy also provides additional features such as au-    with the lowest global rank in each group as the root. This
+thentication, rate limiting, and metadata query caching. These   procedure continues until all workers are integrated into a hi-
+capabilities enable more granular management of checkpoints      erarchy converging at the global root (i.e., the coordinator). In
+in production environments. Our optimized HDFS achieves a        large-scale 3D parallel training scenarios, a TP-DP-PP com-
+substantial capacity of hundreds of PBs, 10 TB/s read/write      munication tree naturally forms, removing extra connections.
+bandwidth, and approximately 100,000 metadata QPS.
+Checkpoint cool-down strategy. We have implemented a             5.3    Monitoring and Analysis
+two-tier hot-cold storage architecture using a combination of
+SSD and HDD storage servers. Our key observation is that         During training, ByteCheckpoint continuously collects criti-
+newly stored checkpoint files are typically downloaded by        cal performance measurements and visualize them for real-
+
+
+
+USENIX Association                        22nd USENIX Symposium on Networked Systems Design and Implementation               567
+                                           TP=4 DP=4 PP=2                                                          development and in production environments. For instance,
+                      0                    4                         8                   12
+                                                                                                                   if certain nodes experience network issues, increased upload
+                      1                    5                         9                   13                        or download times during the HDFS transfer phase would be
+                      2                    6                        10                   14
+                      3                    7                        11                   15              34286
+                                                                                                                   readily apparent. Furthermore, detailed timeline breakdowns
+                    Host 0              Host 1                  Host 2              Host 3                         of checkpointing procedures at each rank are accessible via
+                     16                   20                        24                   28
+                                                                                                                   the heat map topology overview, enabling users to thoroughly
+                     17                   21                        25                   29                        evaluate all optimizations in the system. Fig. 12 illustrates
+                     18                   22                        26                   30
+                     19                   23                        27                   31                        the execution details of each checkpoint-saving phase for a
+                                                                                                         2344
+                    Host 4              Host 5                  Host 6              Host 7                         specific rank.
+                             TP Comm.            DP Comm.                     PP Comm.        duration (ms)
+                                                                                                                   Storage-side monitoring. On the storage client side, we mon-
+                                                                                                              er
+              En
+                d                          py               tio
+                                                                n                                          rri
+           -             ing            Co               iza           mp                ad              Ba        itor the latency and I/O size of each atomic read/write oper-
+         to            nn                            l               Du
+                                                                                     lo              c
+      d-            Pla          D2
+                                    H             ria                             Up              mi
+   En                                           Se                                            At
+                                                                                                 o
+                                                                                                                   ation at the I/O chunk level. All collected metrics are peri-
+                                                                                                                   odically transmitted via a message queue to a ClickHouse
+Figure 11: End-to-end checkpoint saving time heat map from                                                         service, where the data are aggregated and analyzed. Un-
+a 3D parallel training task with Megatron-LM on 32 GPUs.                                                           expectedly high latency or low bandwidth triggers alerts to
+The color denotes the time of a selected phase on a rank.                                                          engineers for further investigation. On the storage cluster side,
+    Total:901MB|Model:112MB|Optimizer:672MB|Loader:116MB|Extra: 1MB                                                our primary focus is on overall performance metrics, includ-
+                     upload_extra_state
+            serialize_dump_extra_state                                                                             ing metadata request QPS, cluster-level read/write throughput,
+                   upload_unique@loader                                                                            and storage capacity utilization. This comprehensive monitor-
+          serialize_dump_unique@loader
+                  upload_common@loader                                                                             ing system plays a crucial role in identifying issues such as
+        serialize_dump_common@loader
+                         upload_optimizer                                                                          slow checkpoint reads and writes, and even complete system
+                          dump_optimizer
+                       serialize_optimizer                                                                         unavailability due to storage capacity exhaustion, facilitat-
+                            D2H_optimizer
+                       planning_optimizer                                                                          ing the implementation of preventive measures for enhancing
+                             upload_model
+                              dump_model
+                                                                                     Name: upload_optimizer
+                                                                                     Duration: 223ms
+                                                                                                                   system reliability and efficiency.
+                           serialize_model                                           Size: 672.08MB
+                                D2H_model                                            Bandwith: 332.22MB/s
+                          planning_model
+                              save_api_call
+                                                                             ms          ms     1m
+                                                                                                   s
+                                                                                                                   6     Evaluation
+                              bytecheckpoint.save()                        51        951     95
+                                                                         69       11       16
+                             enter               return
+                                                                                                                   In this section, we detail our deployment and operational
+Figure 12: Time breakdown of checkpoint saving on rank 0.                                                          experiences with ByteCheckpoint. ByteCheckpoint is built
+                                                                                                                   upon DCP [58] (commit hash: 80c07df), a state-of-the-art
+time performance monitoring and analysis. This approach                                                            open-source checkpointing system that supports checkpoint
+enables quick checkpointing issues detection, such as low                                                          resharding for FSDP [73]. The implementation of ByteCheck-
+read/write throughput, stragglers, and upload failures and re-                                                     point consists of about 20,000 lines of Python code.
+tries.
+Data collection. We have designed a user-friendly metrics                                                          6.1    Checkpointing Efficiency
+system based on Python’s context manager and decorator
+syntax to monitor critical procedures flexibly. It automatically                                                   We demonstrate checkpointing performance of ByteCheck-
+captures the duration and I/O size of each operation, along                                                        point relative to baselines [52, 58] with different workloads.
+with relevant metadata such as each worker’s rank, the file                                                        Workloads. We adopt two different transformer-based [62]
+path, and the current step. All collected metrics are transferred                                                  structures, i.e. DiT [40] and GPT-3 [9] to implement two
+to a remote database via a background message queue.                                                               models referred to as vDiT and tGPT, respectively. The vDiT
+Visualization. ByteCheckpoint provides users with a compre-                                                        model is fine-tuned with the FSDP framework for video gen-
+hensive topological performance overview of all ranks asso-                                                        eration on a cluster of NVIDIA A100 80GB GPUs, while
+ciated with different checkpoint phases, as well as detailed                                                       the tGPT model is trained for text generation with Megatron-
+duration breakdowns for any specific rank. Fig. 11 presents an                                                     LM [47] on NVIDIA H800 80GB GPUs. Detailed config-
+exemplary heat-map visualization of checkpoint saving times                                                        urations for model and parallelism are provided in Table 3,
+within a 3D parallel training topology. The visualization high-                                                    where the source number of GPUs and parallelism pertain to
+lights that ranks 0, 4, 8, and 12 experience the longest saving                                                    the saving and loading evaluations, while the target number
+times as their checkpoints including dataloader states. Addi-                                                      of GPUs and parallelism correspond to the configurations
+tional metrics visualizations are also available for detailed                                                      used for load-time resharding evaluations. All machines in
+analysis, such as blocking time and fine-grained phases like                                                       the training clusters are interconnected via InfiniBand, with
+planning and D2H copy. These visualizations enable users                                                           HDFS selected as the persistent storage solution for all exper-
+to easily pinpoint straggler nodes or phases for both system                                                       iments. We integrate the test models into our LFM training
+
+
+
+568     22nd USENIX Symposium on Networked Systems Design and Implementation                                                                                 USENIX Association
+                                              Table 3: Model and parallelism configurations.
+
+ Model     Hidden Size   #Heads     #Layers     #Parameters      Source #GPUs            Soure Parallelism       Target #GPUs       Target Parallelism
+                                                                         32                  ZeRO-2                    64                    ZeRO-2
+  vDiT           1664      16           48           4B
+                                                                        128                  ZeRO-2                    64                    ZeRO-2
+                                                                        2400            TP=4, DP=75, PP=8             4800         TP=4, DP=150, PP=8
+  tGPT           8192      64           80          70B
+                                                                        4800            TP=4, DP=150, PP=8            2400         TP=4, DP=75, PP=8
+
+
+                          Table 4: I/O performance comparison among ByteCheckpoint, DCP and MCP.
+
+ Model and Framework     Source #GPUs              Method                  TBlock (s)         TSave (s)        TLoad (s)     TReshard (s)      ETTR (%)
+                                                   DCP                        16.25             86.82            50.12           74.89            38.60
+         vDiT 4B              32
+                                         ByteCheckpoint (GPU states)     0.54 (30.09×)      27.47 (3.16×)    11.69 (4.29×)   16.01 (4.68×)    46.22 (1.20×)
+                                                   DCP                        61.37            236.34           105.74           91.01            41.62
+          FSDP               128
+                                         ByteCheckpoint (GPU states)     0.38 (161.50×)     23.74 (9.96×)    12.01 (8.80×)   13.64 (6.67×)    48.92 (1.18×)
+                                                   MCP                        4.73              28.97            69.87          126.30            34.61
+         tGPT 70B            2400        ByteCheckpoint (GPU states)     0.39 (12.13×)      13.11 (2.21×)    49.48 (1.41×)   62.10 (2.03×)    40.18 (1.16×)
+                                         ByteCheckpoint (full states)         0.50              20.55            72.35          401.21            28.80
+                                                   MCP                        4.70              76.21           123.80           64.62            31.28
+     Megatron-LM             4800        ByteCheckpoint (GPU states)     0.36 (13.06×)      8.59 (8.87×)     64.39 (2.00×)   54.31 (1.19×)    40.29 (1.29×)
+                                         ByteCheckpoint (full states)         0.43              25.04            83.56          115.95            34.70
+
+
+
+trials, conducting training over 500 steps and saving check-                   reductions ranging from 13.06× to 161.50×. This improve-
+points every 100 steps. We then resume training under two                      ment reduces the average checkpoint stall time from minutes
+scenarios: with and without changes in GPU numbers and                         or seconds to sub-second durations, outperforming both DCP
+parallelism configurations, to assess the performance of load-                 and MCP. In terms of end-to-end saving time, ByteCheck-
+time resharding and standard checkpoint loading. Saving per-                   point delivers an average speedup of 6.05×, primarily driven
+formance is evaluated based on average additional overheads,                   by our fine-grained performance optimizations. Notably, the
+specifically checkpoint stalls (training blocking time) and                    acceleration provided by ByteCheckpoint scales with the size
+end-to-end checkpoint saving time (from the save API call to                   of the training workload, increasing from 2.21× for 2400
+the completion of checkpoint integrity checking). Addition-                    GPUs to 8.87× for 4800 GPUs. This can be attributed to
+ally, we measure the end-to-end checkpoint loading time (the                   the workload balancing mechanism, which becomes more
+blocking time of the load API call) for both load-time reshard-                effective with larger DP sizes. Additionally, we observe a
+ing and standard loading scenarios. We use the average ETTR                    particularly significant reduction in blocking time for FSDP
+as the metric to evaluate the end-to-end system performance.                   workloads. This results from the high communication and
+Following GEMINI [66], we assume a consistent occurrence                       synchronization overheads caused by FSDP’s irregular tensor
+of failures within each checkpointing interval (100 steps),                    shard processing when using DCP for distributed checkpoint
+calculating the average wasted time to derive the achieved                     storage. These overheads grow as the training scale increases,
+ETTR. Calculation details can be found in Appendix C.                          making DCP less suitable for large-scale training. In contrast,
+Baselines. In experiments with FSDP, we use DCP (com-                          ByteCheckpoint’s decomposition representation strategy in-
+mit hash: c7338f4) as the baseline, while for Megatron-LM,                     curs zero communication overhead during metadata genera-
+MCP [52] (commit hash: 3fb5c51) serves as the baseline. We                     tion, leading to improved training efficiency. We also provide
+ensure that all hyper-parameters, such as batch size and con-                  a detailed overhead breakdown in Appendix D for further
+text length, remain consistent across systems for a fair compar-               investigation. For training with Megatron-LM, we report I/O
+ison. Both baselines support asynchronous checkpointing and                    performance for the handling of full training states.
+load-time checkpoint resharding for the model and optimizer,                   Loading and resharding performance. In experiments in-
+but not for dataloader states. Consequently, we compare I/O                    volving the loading of distributed checkpoints into unchanged
+performance with these baselines only for GPU states and                       parallelism configurations, ByteCheckpoint achieves perfor-
+additionally evaluate the performance of ByteCheckpoint for                    mance improvements ranging from 1.41× to 8.80× compared
+the full training states. Since neither DCP nor MCP supports                   to baseline methods. Our approach leverages an asynchronous
+HDFS, we implement the logic to enable HDFS access for                         loading pipeline, which overlaps tensor reading and transfer-
+them, using the same configurations (e.g., thread count, file                  ring, significantly reducing blocking time before training be-
+chunk size, etc.) as those employed in ByteCheckpoint.                         gins. When it comes to the resharding efficiency of model and
+Saving performance. As shown in Table 4, ByteCheckpoint                        optimizer states, ByteCheckpoint delivers an average accel-
+significantly reduces checkpoint stalls during runtime, with                   eration of 3.64×. By eliminating the need for running costly
+
+
+
+USENIX Association                             22nd USENIX Symposium on Networked Systems Design and Implementation                                    569
+        Table 5: Saving optimization microbenchmark.                          work, while for resharding, we employed FSDP.
+                                                                                 In Table 5, we compare the end-to-end saving times with
+ Workload    Parallel Config.        Optimization           Saving Time (s)   and without ByteCheckpoint features, as described in Sec. 4.
+                                      No Optim.                  50.26        The results demonstrate that asynchronous saving pipeline
+                                         Async.              34.68 (1.45×)
+ tGPT 13B   TP=2, DP=8, PP=2
+                                     Async. + WB.            20.28 (2.48×)    achieves significant reduction in saving time compared to the
+                                 Async. + WB. + Cache.       19.97 (2.52×)    unoptimized settings, yielding speedups of 1.45× and 1.81×
+                                       No Optim.                 46.34        for tGPT 13B and tGPT 30B, respectively. The workload bal-
+                                         Async.              25.56 (1.81×)    ancing mechanism and plan cache of ByteCheckpoint can
+ tGPT 30B   TP=2, DP=8, PP=4
+                                     Async. + W.B.           18.83 (2.46×)
+                                 Async. + W.B. + Cache.      18.56 (2.50×)    further boost these improvements. When applying all I/O op-
+                                                                              timization techniques to both model and optimizer states, the
+       Table 6: Loading optimization microbenchmark.                          average saving time for these models is reduced from 48.3
+                                                                              seconds to 19.27 seconds. In Table 6, we present the perfor-
+   Model      Parallel Config.       Optimization         Loading Time (s)    mance gains achieved by the asynchronous loading pipeline
+                                      No Optim.                63.48
+                                                                              and read-communication overlap techniques. For tGPT 13B
+ tGPT 13B    TP=2, DP=8, PP=2          Async.              48.43 (1.31×)      and tGPT 30B, the baseline loading times were 1.53× and
+                                   Async. + Overlap.       41.38 (1.53×)      1.58× longer than those achieved with ByteCheckpoint.
+                                      No Optim.                77.02             For load-time resharding, we compared the irregular ten-
+ tGPT 30B    TP=2, DP=8, PP=4          Async.              74.54 (1.03×)      sor processing time between FSDP and ByteCheckpoint’s
+                                   Async. + Overlap.       48.73 (1.58×)
+                                                                              irregular tensor decomposition strategy. As shown in Table 7,
+                                                                              ByteCheckpoint incurs an average blocking time of just 0.20s,
+      Table 7: Resharding optimization microbenchmark.                        which is 25.15× shorter than that of FSDP. Moreover, our
+                                                                              approach consistently achieves microsecond-level blocking
+   Model     Parallel Config.     Optimization         Processing Time (s)
+                                                                              times, regardless of the training scale. (see results in Sec. 6.1
+                                 All-gather + D2H.             4.12           and Sec. 6.4).
+ tGPT 13B   ZeRO-2 32 GPUs
+                                    Decompose.            0.21 (19.80×)
+                                 All-gather + D2H.             5.84
+ tGPT 30B   ZeRO-2 64 GPUs
+                                    Decompose.            0.19 (30.50×)       6.3    Correctness Verification
+                                                                              In Fig. 13, we depict normalized training loss curves of tGPT
+offline resharding jobs, ByteCheckpoint enables flexible and                  13B before and after resharding with ByteCheckpoint in vari-
+efficient checkpoint transformations across various scenarios.                ous situations. For PP and TP resharding, the normalized loss
+However, we observe that including CPU states, primarily dat-                 curve after resharding can smoothly match that in the previous
+aloader states, increases the end-to-end load-time resharding                 phase and continue to display a consistent decline trend. Unit
+time. This is largely due to the time-consuming processing                    testing confirms that ByteCheckpoint can correctly transform
+of unique components within the dataloader states, such as                    distributed checkpoints across varying parallelism. Results of
+the token buffer, which can grow as large as 20GB in text-                    DP and hybrid resharding are in Appendix E.
+to-video LFM training. Additionally, since only a subset of                      We further verify the bit-wise alignment ability of
+workers hold these dataloader states, they often become strag-                ByteCheckpoint when training resumes without changes in
+glers during the checkpoint saving and loading (resharding)                   parallelism configurations. We show the normalized loss
+procedures. We leave the design of a more efficient dataloader                curve from real production in Fig. 14, where a 175B language
+to our future works.                                                          foundation model is trained. As highlighted, the normalized
+End-to-end performance. ByteCheckpoint outperforms both                       loss before and after resuming are exactly the same.
+DCP and MCP in terms of the average end-to-end ETTR,
+achieving improvements ranging from 1.16× to 1.29×. Lever-                    6.4    Checkpointing in Real LFM Production
+aging full-stack optimizations, ByteCheckpoint improves the
+execution efficiency of each checkpoint-related operation,                    We share our experience deploying ByteCheckpoint in real-
+thereby effectively minimizing training downtime.                             world LFM production environments, highlighting the issues
+                                                                              we encountered and resolved.
+                                                                              Scalabilty. As shown in Table 8, ByteCheckpoint was used
+6.2     Microbenchmarks
+                                                                              to train two transformer-based LFMs for image and text gen-
+We conduct several micro-benchmarks (Table 5, Table 6 and                     eration on H800 GPUs, respectively. ByteCheckpoint con-
+Table 7) to highlight the performance improvements. To eval-                  sistently maintained average checkpoint stalls under 600ms,
+uate different model sizes, We modify the tGPT 70B model                      even at the largest scale with 8,960 GPUs. Additionally, end-
+to create tGPT 13B and tGPT 30B. For saving and loading                       to-end checkpointings were completed efficiently, typically
+microbenchmarks, we used the Megatron-LM training frame-                      within a few seconds.
+
+
+
+570    22nd USENIX Symposium on Networked Systems Design and Implementation                                             USENIX Association
+                                                                       Table 8: I/O performance of ByteCheckpoint in large-scale LFM training.
+
+                                   Model and Framework                                                                              #GPUs                        Parallelism          TBlock (s)    TSave (s)     TLoad (s)
+                      Vision Transformer 7B FSDP                                                                                     1488                          ZeRO-2                0.34         20.13        265.73
+                  Text Transformer 405B Megatron-LM                                                                                  8960                    TP=8, DP=70, PP=16          0.59         51.06        129.49
+
+
+                              Before Resharding            After Resharding                                   Before Resharding           After Resharding
+                                                                                                                                                                 execution of the concatenation operation. Another issue that
+                  1.0                                                                             1.0
+Normalized Loss
+
+
+
+
+                                                                                Normalized Loss
+                  0.8                                                                             0.8
+                                                                                                                                                                 emerged was related to our initial use of the HDFS SDK. For
+                  0.6                                                                             0.6
+                                                                                                                                                                 the convenience of the users, the SDK encapsulates a lot of
+                  0.4                                                                             0.4                                                            safeguard logic, leading to unnecessary overheads introduced
+                  0.2                                                                             0.2                                                            by checking, creating parent directories, and verifying target
+                  0.0
+                        0.0      0.2     0.4         0.6      0.8      1.0
+                                                                                                  0.0
+                                                                                                        0.0      0.2     0.4        0.6      0.8      1.0
+                                                                                                                                                                 files. To address this, we optimized ByteCheckpoint by ensur-
+                                   Normalized Step                                                                 Normalized Step                               ing directory existence and file uniqueness prior to invoking
+(a) PP resharding from TP=1, (b) TP resharding from TP=1,                                                                                                        HDFS APIs, reducing redundant metadata operations and im-
+DP=4, PP=4 to TP=1, DP=4, DP=4, PP=4 to TP=2, DP=4,                                                                                                              proving performance significantly. By addressing these issues,
+PP=8.                        PP=4.                                                                                                                               we reduced the maximum metadata overhead of HDFS write
+                                                                                                                                                                 operations for a single checkpoint file from 3s to 150ms.
+                              Figure 13: Resharding correctness verification.
+
+                  
+                                                                                                                                                                 7   Conclusion
+ 
+
+
+
+
+                  
+
+
+                  
+                                                                                                                                                                 This paper presents the design, implementation, and deploy-
+                  
+                                        0.0399                               0.0162                                      0.0096                                  ment of ByteCheckpoint, a production-grade checkpointing
+                                        0.0399                               0.0162                                      0.0096
+                  
+                                                                                                                                                                 system built for LFM development. ByteCheckpoint advo-
+                  
+                                                                                                                                       
+                                                                                                                                                                 cates a unified architecture for checkpoint representation and
+                                                                          
+                                                                                                                                                                 workflow, enables efficient load-time resharding and supports
+                                                                                                                                                                 multiple training frameworks and storage backends. It enables
+Figure 14: Training resuming with ByteCheckpoint in real
+                                                                                                                                                                 full-stack I/O performance and scalability optimizations and
+production run on 2080 H800 GPUs for several days. Color
+                                                                                                                                                                 incorporates efficient performance monitoring and analysis
+changes indicate training resuming.
+                                                                                                                                                                 tools for LFM development at scale. Compared to state-of-
+                                                                                                                                                                 the-art baselines [52,58], ByteCheckpoint reduces checkpoint
+Dataloader stragglers. By analyzing the performance vi-
+                                                                                                                                                                 stalls by up to 161.50× and shortens end-to-end checkpoint-
+sualization results from our monitoring tools (Sec. 5.3), we
+                                                                                                                                                                 ing completion time by up to 9.96×. Additionally, the loading
+identified prolonged uploading time for dataloader checkpoint
+                                                                                                                                                                 (resharding) procedure is optimized to be 3.88× faster on
+files. To support dataloader state resharding, ByteCheckpoint
+                                                                                                                                                                 average. We believe our system not only provides valuable
+divides the states of a dataloader into multiple parts (e.g., 6
+                                                                                                                                                                 practical experience to those building checkpointing systems
+parts for the tGPT experiments in Sec. 6.1) and stores them as
+                                                                                                                                                                 for real-world LFM development but also offers deep insights
+individual files. These files can be independently loaded dur-
+                                                                                                                                                                 for future research in the community.
+ing resharding. However, uploading these small files sequen-
+tially leads to low bandwidth utilization, causing performance
+degradation. In cases like the 7B vision transformer, upload-                                                                                                    8   Acknowledgments
+ing time of dataloader states can account for 73.16% of total
+saving time. To fix this issue, we implemented a process pool                                                                                                    We would like to thank our shepherd Ayush Goel and the
+for concurrent uploads, significantly reducing saving time.                                                                                                      anonymous reviewers for their constructive feedback. We
+HDFS metadata bottleneck. Through monitoring, we iden-                                                                                                           thank Juncai Liu and Xiang Li for their efforts in facilitat-
+tified several bottlenecks related to HDFS. Despite applying                                                                                                     ing our large-scale experiments. We thank Shibiao Nong,
+the parallel optimization techniques for single-file uploads                                                                                                     Shuaishuai Cao, Wei Jia, Jingzhe Tang, Jun Wang, Xi Wang,
+described in Sec. 4.3, the actual HDFS upload performance                                                                                                        Sa Wang, and other contributors for refining our system and
+fell short of our expectations. A detailed profiling revealed                                                                                                    extending its functionalities. We thank Liyang Zhao and the
+that the metadata concatenation operation in the HDFS Na-                                                                                                        HDFS team of ByteDance for their support. This work was
+meNode was performed serially, making it a significant per-                                                                                                      supported in part by a ByteDance Research Collaboration
+formance bottleneck when large volumes of checkpoint files                                                                                                       Project, and grants from Hong Kong RGC under the contracts
+were generated. We mitigated this issue by enabling parallel                                                                                                     HKU 17204423 and C7004-22G (CRF).
+
+
+
+USENIX Association                                                                                                     22nd USENIX Symposium on Networked Systems Design and Implementation                               571
+References                                                       [13] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+                                                                      Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+ [1] HDFS Federation Solution: NameNodeProxy. https:                  Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan,
+     //github.com/bytedance/nnproxy, 2016.                            et al. The Llama 3 herd of models. arXiv preprint
+                                                                      arXiv:2407.21783, 2024.
+ [2] Safetensors.   https://huggingface.co/docs/
+     safetensors/index, 2024.                                    [14] Assaf Eisenman, Kiran Kumar Matam, Steven Ingram,
+                                                                      Dheevatsa Mudigere, Raghuraman Krishnamoorthi, Kr-
+ [3] TensorStore.        https://google.github.io/
+                                                                      ishnakumar Nair, Misha Smelyanskiy, and Murali An-
+     tensorstore/, 2024.
+                                                                      navaram. Check-N-Run: A checkpointing system for
+ [4] Zarr. https://zarr.dev/, 2024.                                   training deep learning recommendation models. In 19th
+                                                                      USENIX Symposium on Networked Systems Design
+ [5] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama                and Implementation (NSDI 22), pages 929–943, 2022.
+     Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo
+     Almeida, Janko Altenschmidt, Sam Altman, Shyamal            [15] Apache Software Foundation. Hadoop Distributed
+     Anadkat, et al. GPT-4 technical report. arXiv preprint           File System. https://hadoop.apache.org/docs/
+     arXiv:2303.08774, 2023.                                          current/hadoop-project-dist/hadoop-hdfs/
+                                                                      HdfsDesign.html, 2024.
+ [6] Wei An, Xiao Bi, Guanting Chen, Shanhuang Chen,
+     Chengqi Deng, Honghui Ding, Kai Dong, Qiushi Du,            [16] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian
+     Wenjun Gao, Kang Guan, et al. Fire-Flyer AI-HPC:                 Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo
+     A cost-effective software-hardware co-design for deep            Mai. {ServerlessLLM}:{Low-Latency} serverless
+     learning. arXiv preprint arXiv:2408.14158, 2024.                 inference for large language models.      In 18th
+                                                                      USENIX Symposium on Operating Systems Design
+ [7] Sanjith Athlur, Nitika Saran, Muthian Sivathanu, Ra-             and Implementation (OSDI 24), pages 135–153, 2024.
+     machandran Ramjee, and Nipun Kwatra. Varuna:
+     scalable, low-cost training of massive deep learning        [17] gRPC Team. grpc: A high performance, open source
+     models. In Proceedings of the Seventeenth European               universal rpc framework get started! https://grpc.
+     Conference on Computer Systems, pages 472–487,                   io/, 2024.
+     2022.
+                                                                 [18] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song,
+ [8] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E                   Ruoyu Zhang, Runxin Xu, Qihao Zhu, Shirong Ma,
+     Hinton.     Layer normalization. arXiv preprint                  Peiyi Wang, Xiao Bi, et al. Deepseek-r1: Incentivizing
+     arXiv:1607.06450, 2016.                                          reasoning capability in llms via reinforcement learning.
+                                                                      arXiv preprint arXiv:2501.12948, 2025.
+ [9] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Sub-
+     biah, Jared D Kaplan, Prafulla Dhariwal, Arvind Nee-        [19] Tanmaey Gupta, Sanjeev Krishnan, Rituraj Kumar, Ab-
+     lakantan, Pranav Shyam, Girish Sastry, Amanda Askell,            hishek Vijeev, Bhargav Gulavani, Nipun Kwatra, Ra-
+     et al. Language models are few-shot learners. Advances           machandran Ramjee, and Muthian Sivathanu. Just-
+     in Neural Information Processing Systems, 33:1877–               In-Time Checkpointing: Low cost error recovery from
+     1901, 2020.                                                      deep learning training failures. In Proceedings of
+                                                                      the Nineteenth European Conference on Computer
+[10] Trishul Chilimbi, Yutaka Suzue, Johnson Apacible, and            Systems, pages 1110–1125, 2024.
+     Karthik Kalyanaraman. Project adam: Building an effi-
+     cient and scalable deep learning training system. In 11th   [20] Tao He, Xue Li, Zhibin Wang, Kun Qian, Jingbo Xu,
+     USENIX Symposium on Operating Systems Design                     Wenyuan Yu, and Jingren Zhou. Unicron: Economiz-
+     and Implementation (OSDI 14), pages 571–582, 2014.               ing self-healing llm training at scale. arXiv preprint
+                                                                      arXiv:2401.00134, 2023.
+[11] et al. DeepSeek-AI. Deepseek-v2: A strong, economical,
+     and efficient mixture-of-experts language model, 2024.      [21] Frank Herold, Sven Breuner, and Jan Heichler. An
+                                                                      introduction to BeeGFS. ThinkParQ, Kaiserslautern,
+[12] Jiangfei Duan, Ziang Song, Xupeng Miao, Xiaoli Xi,               Germany, Tech. Rep, 2014.
+     Dahua Lin, Harry Xu, Minjia Zhang, and Zhihao Jia.
+     Parcae: Proactive,{Liveput-Optimized}{DNN} training         [22] Qinghao Hu, Zhisheng Ye, Zerui Wang, Guoteng Wang,
+     on preemptible instances. In 21st USENIX Symposium               Meng Zhang, Qiaoling Chen, Peng Sun, Dahua Lin, Xi-
+     on Networked Systems Design and Implementation                   aolin Wang, Yingwei Luo, et al. Characterization of
+     (NSDI 24), pages 1121–1139, 2024.                                large language model development in the datacenter.
+
+
+
+572   22nd USENIX Symposium on Networked Systems Design and Implementation                              USENIX Association
+     In 21st USENIX Symposium on Networked Systems                   Brian Vaughan, Pritam Damania, et al. Pytorch dis-
+     Design and Implementation (NSDI 24), pages 709–729,             tributed: Experiences on accelerating data parallel train-
+     2024.                                                           ing. arXiv preprint arXiv:2006.15704, 2020.
+
+[23] Drew A Hudson and Christopher D Manning. GQA:              [32] Xinyu Lian, Sam Ade Jacobs, Lev Kurilenko, Masahiro
+     A new dataset for real-world visual reasoning and com-          Tanaka, Stas Bekman, Olatunji Ruwase, and Minjia
+     positional question answering. In Proceedings of the            Zhang. Universal checkpointing: Efficient and flexi-
+     IEEE/CVF conference on computer vision and pattern              ble checkpointing for large scale distributed training.
+     recognition, pages 6700–6709, 2019.                             arXiv preprint arXiv:2406.18820, 2024.
+
+[24] Insu Jang, Zhenning Yang, Zhen Zhang, Xin Jin, and         [33] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao
+     Mosharaf Chowdhury. Oobleck: Resilient distributed              Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+     training of large models using pipeline templates.              Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 techni-
+     In Proceedings of the 29th Symposium on Operating               cal report. arXiv preprint arXiv:2412.19437, 2024.
+     Systems Principles, pages 382–395, 2023.
+                                                                [34] Avinash Maurya, Robert Underwood, M Mustafa
+[25] Ziheng Jiang, Haibin Lin, Yinmin Zhong, Qi Huang,               Rafique, Franck Cappello, and Bogdan Nicolae.
+     Yangrui Chen, Zhi Zhang, Yanghua Peng, Xiang Li,                DataStates-LLM: Lazy asynchronous checkpoint-
+     Cong Xie, Shibiao Nong, et al. MegaScale: Scaling large         ing for large language models.  arXiv preprint
+     language model training to more than 10,000 GPUs.               arXiv:2406.10707, 2024.
+     In 21st USENIX Symposium on Networked Systems
+                                                                [35] Jayashree Mohan, Amar Phanishayee, and Vijay Chi-
+     Design and Implementation (NSDI 24), pages 745–760,
+                                                                     dambaram. CheckFreq: Frequent, fine-Grained DNN
+     2024.
+                                                                     checkpointing. In 19th USENIX Conference on File
+[26] Diederik P Kingma and Jimmy Ba.         Adam: A                 and Storage Technologies (FAST 21), pages 203–216,
+     method for stochastic optimization. arXiv preprint              2021.
+     arXiv:1412.6980, 2014.
+                                                                [36] Deepak Narayanan, Mohammad Shoeybi, Jared Casper,
+[27] Apostolos Kokolis, Michael Kuchnik, John Hoffman,               Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti,
+     Adithya Kumar, Parth Malani, Faye Ma, Zachary De-               Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer,
+     Vito, Shubho Sengupta, Kalyan Saladi, and Carole-Jean           Bryan Catanzaro, et al. Efficient large-scale lan-
+     Wu. Revisiting reliability in large-scale machine learn-        guage model training on gpu clusters using Megatron-
+     ing research clusters. arXiv preprint arXiv:2410.21680,         LM. In Proceedings of the International Conference for
+     2024.                                                           High Performance Computing, Networking, Storage
+                                                                     and Analysis, pages 1–15, 2021.
+[28] Vijay Anand Korthikanti, Jared Casper, Sangkug Lym,
+     Lawrence McAfee, Michael Andersch, Mohammad                [37] Bogdan Nicolae, Jiali Li, Justin M Wozniak, George
+     Shoeybi, and Bryan Catanzaro. Reducing activation re-           Bosilca, Matthieu Dorier, and Franck Cappello. Deep-
+     computation in large transformer models. Proceedings            freeze: Towards scalable asynchronous checkpoint-
+     of Machine Learning and Systems, 5:341–353, 2023.               ing of deep learning models.          In 2020 20th
+                                                                     IEEE/ACM International Symposium on Cluster,
+[29] Jiamin Li, Hong Xu, Yibo Zhu, Zherui Liu, Chuanx-               Cloud and Internet Computing (CCGRID), pages 172–
+     iong Guo, and Cong Wang. Lyra: Elastic scheduling for           181. IEEE, 2020.
+     deep learning clusters. In Proceedings of the Eighteenth
+     European Conference on Computer Systems, pages             [38] Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida,
+     835–850, 2023.                                                  Carroll Wainwright, Pamela Mishkin, Chong Zhang,
+                                                                     Sandhini Agarwal, Katarina Slama, Alex Ray, et al.
+[30] Mingzhen Li, Wencong Xiao, Hailong Yang, Biao Sun,              Training language models to follow instructions with
+     Hanyu Zhao, Shiru Ren, Zhongzhi Luan, Xianyan Jia,              human feedback. Advances in neural information
+     Yi Liu, Yong Li, et al. Easyscale: Elastic training with        processing systems, 35:27730–27744, 2022.
+     consistent accuracy and improved utilization on gpus.
+     In Proceedings of the International Conference for         [39] Satadru Pan, Theano Stavrinos, Yunqiao Zhang, Atul
+     High Performance Computing, Networking, Storage                 Sikaria, Pavel Zakharov, Abhinav Sharma, Mike Shuey,
+     and Analysis, pages 1–14, 2023.                                 Richard Wareing, Monika Gangapuram, Guanglei Cao,
+                                                                     et al. Facebook’s tectonic filesystem: Efficiency from
+[31] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar,               exascale. In 19th USENIX Conference on File and
+     Pieter Noordhuis, Teng Li, Adam Paszke, Jeff Smith,             Storage Technologies (FAST 21), pages 217–231, 2021.
+
+
+
+USENIX Association                       22nd USENIX Symposium on Networked Systems Design and Implementation             573
+[40] William Peebles and Saining Xie. Scalable diffu-           [52] Megatron Team.     Dist checkpointing package.
+     sion models with transformers. In Proceedings of                https://docs.nvidia.com/megatron-core/
+     the IEEE/CVF International Conference on Computer               developer-guide/latest/api-guide/dist_
+     Vision, pages 4195–4205, 2023.                                  checkpointing.html, 2024.
+[41] Rafael Rafailov, Archit Sharma, Eric Mitchell, Christo-    [53] Midjourney Team.   Midjourney.           https://www.
+     pher D Manning, Stefano Ermon, and Chelsea Finn. Di-            midjourney.com/home, 2023.
+     rect preference optimization: Your language model is se-
+     cretly a reward model. Advances in Neural Information      [54] NVIDIA NCCL Team. Nvidia collective communi-
+     Processing Systems, 36, 2024.                                   cations library (nccl). https://developer.nvidia.
+                                                                     com/nccl, 2024.
+[42] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase,
+     and Yuxiong He. ZERO: Memory optimizations                 [55] OpenAI Team. Creating video from text. https://
+     toward training trillion parameter models.       In             openai.com/index/sora/, 2024.
+     SC20: International Conference for High Performance
+                                                                [56] OpenAI Team. Introducing ChatGPT.            https://
+     Computing, Networking, Storage and Analysis, pages
+                                                                     openai.com/index/chatgpt/, 2024.
+     1–16. IEEE, 2020.
+                                                                [57] OpenAI Team. Introducing OpenAI o1. https://
+[43] Machel Reid, Nikolay Savinov, Denis Teplyashin,
+                                                                     openai.com/o1/, 2024.
+     Dmitry Lepikhin, Timothy Lillicrap, Jean-baptiste
+     Alayrac, Radu Soricut, Angeliki Lazaridou, Orhan Fi-       [58] PyTorch Team. Getting started with Distributed Check-
+     rat, Julian Schrittwieser, et al. Gemini 1.5: Unlocking         point (DCP). https://pytorch.org/tutorials/
+     multimodal understanding across millions of tokens of           recipes/distributed_checkpoint_recipe.html,
+     context. arXiv preprint arXiv:2403.05530, 2024.                 2023.
+[44] Robin Rombach, Andreas Blattmann, Dominik Lorenz,          [59] Suno Team. Bark is a transformer-based text-to-
+     Patrick Esser, and Björn Ommer. High-resolution image           audio model created by suno. https://github.com/
+     synthesis with latent diffusion models. In Proceedings          suno-ai/bark, 2023.
+     of the IEEE/CVF conference on computer vision and
+     pattern recognition, pages 10684–10695, 2022.              [60] Zarr Team. Zarr: chunked, compressed, n-dimensional
+                                                                     arrays. https://zarr.dev/, 2024.
+[45] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec
+     Radford, and Oleg Klimov. Proximal policy opti-            [61] John Thorpe, Pengzhan Zhao, Jonathan Eyolfson, Yi-
+     mization algorithms. arXiv preprint arXiv:1707.06347,           fan Qiao, Zhihao Jia, Minjia Zhang, Ravi Netravali, and
+     2017.                                                           Guoqing Harry Xu. Bamboo: Making preemptible in-
+                                                                     stances resilient for affordable training of large DNNs.
+[46] Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu,            In 20th USENIX Symposium on Networked Systems
+     Wang Zhang, Ru Zhang, Yanghua Peng, Haibin Lin, and             Design and Implementation (NSDI 23), pages 497–513,
+     Chuan Wu. Hybridflow: A flexible and efficient rlhf             Boston, MA, April 2023. USENIX Association.
+     framework. arXiv preprint arXiv:2409.19256, 2024.
+                                                                [62] A Vaswani. Attention is all you need. Advances in
+[47] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,                   Neural Information Processing Systems, 2017.
+     Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+     Megatron-LM: Training multi-billion parameter lan-         [63] veScale Team. veScale: A PyTorch Native LLM Train-
+     guage models using model parallelism. arXiv preprint            ing Framework. https://github.com/volcengine/
+     arXiv:1909.08053, 2019.                                         veScale, 2024.
+[48] Konstantin V. Shvachko. HDFS Scalability: The limits       [64] Marcel Wagenländer, Guo Li, Bo Zhao, Luo Mai, and
+     to growth. USENIX Magazine, 35, 2010.                           Peter Pietzuch. Tenplex: Dynamic parallelism for deep
+                                                                     learning using parallelizable tensor collections. In
+[49] Character AI Team. Character.ai. https://character.
+                                                                     Proceedings of the ACM SIGOPS 30th Symposium on
+     ai/, 2024.
+                                                                     Operating Systems Principles, pages 195–210, 2024.
+[50] DeepSeek Team. Fire-flyer file system. https://
+                                                                [65] Yuxin Wang, Shaohuai Shi, Xin He, Zhenheng Tang,
+     github.com/deepseek-ai/3FS, 2025.
+                                                                     Xinglin Pan, Yang Zheng, Xiaoyu Wu, Amelie Chi Zhou,
+[51] Github Team. The world’s most widely adopted                    Bingsheng He, and Xiaowen Chu. Reliable and efficient
+     ai developer tool. https://github.com/features/                 in-memory fault tolerance of large language model pre-
+     copilot/, 2024.                                                 training. arXiv preprint arXiv:2310.12670, 2023.
+
+
+
+574   22nd USENIX Symposium on Networked Systems Design and Implementation                             USENIX Association
+[66] Zhuang Wang, Zhen Jia, Shuai Zheng, Zhen Zhang, Xin-          Shirong Ma, et al. DeepSeek-Coder-V2: Breaking the
+     wei Fu, TS Eugene Ng, and Yida Wang. Gemini: Fast             Barrier of Closed-Source Models in Code Intelligence.
+     failure recovery in distributed training with in-memory       arXiv preprint arXiv:2406.11931, 2024.
+     checkpoints. In Proceedings of the 29th Symposium on
+     Operating Systems Principles, pages 364–381, 2023.
+
+[67] Jason Wei, Maarten Bosma, Vincent Y Zhao, Kelvin
+     Guu, Adams Wei Yu, Brian Lester, Nan Du, Andrew M
+     Dai, and Quoc V Le. Finetuned language models are
+     zero-shot learners. arXiv preprint arXiv:2109.01652,
+     2021.
+
+[68] Wencong Xiao, Shiru Ren, Yong Li, Yang Zhang,
+     Pengyang Hou, Zhi Li, Yihui Feng, Wei Lin, and
+     Yangqing Jia. {AntMan}: Dynamic scaling on {GPU}
+     clusters for deep learning. In 14th USENIX Symposium
+     on Operating Systems Design and Implementation
+     (OSDI 20), pages 533–548, 2020.
+
+[69] Aohan Zeng, Xiao Liu, Zhengxiao Du, Zihan Wang,
+     Hanyu Lai, Ming Ding, Zhuoyi Yang, Yifan Xu, Wendi
+     Zheng, Xiao Xia, et al. GLM-130b: An open bilingual
+     pre-trained model. arXiv preprint arXiv:2210.02414,
+     2022.
+
+[70] Chi Zhang, Guangming Sheng, Siyao Liu, Jiahao
+     Li, Ziyuan Feng, Zherui Liu, Xin Liu, Xiaoying Jia,
+     Yanghua Peng, Haibin Lin, et al. A framework for
+     training large language models for code generation via
+     proximal policy optimization.
+
+[71] Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+     Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+     wan, Mona Diab, Xian Li, Xi Victoria Lin, et al. OPT:
+     Open pre-trained transformer language models. arXiv
+     preprint arXiv:2205.01068, 2022.
+
+[72] Juntao Zhao, Borui Wan, Yanghua Peng, Haibin Lin,
+     Yibo Zhu, and Chuan Wu. QSync: Quantization-
+     minimized synchronous distributed training across hy-
+     brid devices. arXiv preprint arXiv:2407.02327, 2024.
+
+[73] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo,
+     Chien-Chin Huang, Min Xu, Less Wright, Hamid Sho-
+     janazeri, Myle Ott, Sam Shleifer, et al. Pytorch FSDP:
+     Experiences on scaling fully sharded data parallel. arXiv
+     preprint arXiv:2304.11277, 2023.
+
+[74] Yuchen Zhong, Guangming Sheng, Juncheng Liu, Jin-
+     hui Yuan, and Chuan Wu. Swift: Expedited failure re-
+     covery for large-scale dnn training. In Proceedings
+     of the 28th ACM SIGPLAN Annual Symposium on
+     Principles and Practice of Parallel Programming, pages
+     447–449, 2023.
+
+[75] Qihao Zhu, Daya Guo, Zhihong Shao, Dejian Yang,
+     Peiyi Wang, Runxin Xu, Y Wu, Yukun Li, Huazuo Gao,
+
+
+
+USENIX Association                        22nd USENIX Symposium on Networked Systems Design and Implementation     575
+                          Offline Script for MoE Checkpoint Resharding
+                                                                                              integrity checks asynchronously, effectively eliminating the
+ python3 reshard_megatron_ckpt/reshard_moe_v2_3.py --prev_tp=8 --prev_dp=100 --prev_pp=12 \
+ --target_tp=4 --target_dp=200 --target_pp=8 --gate_fp32=True --sp_attn=True
+                                                                                              blocking time. We also incorporate upload/download retry
+                          Offline Script for GPT Checkpoint Resharding
+                                                                                              mechanisms in ByteCheckpoint’s I/O workers and integrate
+ python3 reshard_megatron_ckpt/reshard_gpt_v4_8.py --prev_tp=8 --prev_dp=100 --prev_pp=6 \    failure logging, which records the exact stage of failure within
+ --prev_vp=10 --target_tp=8 --target_dp=200 --target_pp=6 --target_vp=10 --sp_attn=False      the checkpoint saving/loading pipelines in workers who fail
+                                                                                              to complete checkpointing tasks.
+Figure 15: Examples of running offline scripts for checkpoint
+resharding.
+                                                                                              C    Average ETTR Calculation
+A      More Background on Maintaining Reshard-
+                                                                                              Failures that happened during training introduce progress loss
+       ing Scripts                                                                            and the last checkpoint loading overhead. Assume failures
+                                                                                              are evenly distributed within one checkpoint interval [66],
+Examples of offline resharding with customized scripts are
+                                                                                              the best case is that a failure occurs just after the comple-
+given in Fig. 15. Customizing offline scripts is labor-intensive.
+                                                                                              tion of a checkpoint end-to-end saving procedure whereas the
+For GPU state resharding, the offline scripts must cover all
+                                                                                              worst case is just before that. Given the per iteration training
+different components in the LFM and its optimizer and cater
+                                                                                              time Titer , checkpoint interval N, end-to-end checkpoint sav-
+to the diverse behavior of each component under different par-
+                                                                                              ing time Tsave and loading (resharding) time Tload , we derive
+allelism strategies. For example, with Tensor Parallelism (TP),
+                                                                                              the average wasted time Twasted as:
+GEMM operators in attention and MLP blocks are sharded
+along different dimensions, while other operators like Lay-                                                                             N · Titer
+erNorm [8] are replicated across GPUs. When hybrid 3D                                                       Twasted = Tsave + Tload +                     (1)
+                                                                                                                                           2
+parallelism [36] is adopted, TP-sharded tensors of one layer
+(module) in the distributed optimizer are first flattened and                                 Therefore, the average ETTR is:
+then merged before being sharded according to the designated
+Data Parallelism (DP) degree. Offline scripts must implement                                                                     Twasted
+resharding logic that is tightly coupled with combinations of                                             ET T R = 1 −                                    (2)
+                                                                                                                         Tsave + Tload + N · Titer
+model (optimizer) components and parallelism strategies. Ad-
+ditionally, special algorithmic optimization techniques such                                    The end-to-end ETTR results presented in Table 4 are aver-
+as GQA [23] and MLA [75] change the tensor layout of cer-                                     aged across standard loading and resharding settings.
+tain operators (e.g., the query-key-value projection GEMM
+operator in the attention block), necessitating corresponding
+resharding support. To handle various cases in our production
+                                                                                              D    Checkpointing Overhead Breakdown
+environment, our largest script even includes 3193 lines of
+Python code. This complexity results in significant engineer-
+                                                                                              We break down the end-to-end checkpoint saving time (Tsave )
+ing efforts for both development and maintenance.
+                                                                                              for rank 0 by dividing it into several phases and investigating
+                                                                                              the overhead of each part. The results are depicted in Table 9,
+                                                                                              where TFirst                                              Cache
+B      Efficient Integrity Guarantee                                                                   Plan denotes the initial planning cost while TPlan
+                                                                                              refers to the overhead when using the plan and metadata
+A complete checkpoint consists of multiple files stored by                                    cache for subsequent checkpointing operations. Costs of other
+different workers. The failure of any single worker can cor-                                  phases are averaged over various checkpointing steps. We
+rupt the entire checkpoint. To prevent such issues, a barrier                                 find that the communication overhead of planning increases
+mechanism is essential to achieve atomic save/load operations                                 as training scales up, leading to significant stalls. Thanks to
+among all training workers.                                                                   the caching strategy (Sec. 4.1), it becomes a one-time ex-
+   Checkpointing modules in training frameworks like                                          pense for each (resumed) training session. In addition, the
+Megatron-LM [47] rely on the barrier function in                                              adoption of the pinned memory CPU pool renders the block-
+torch.distributed to perform integrity checks. This ap-                                       ing time of D2H almost negligible, while our asynchronous
+proach synchronizes training workers to ensure that all check-                                engine pipeline overlaps the execution time of serialization,
+point saving/loading operations are finished. We observed                                     shared memory dumping, and HDFS uploading, diminishing
+that when scaling training to involving approximately 10,000                                  the end-to-end time. Furthermore, the load-balancing mech-
+GPUs, this behavior results in stalls of about 20 seconds                                     anism exploits the capabilities for parallel uploading within
+each time. To address this inefficiency, we re-implement the                                  each DP group and achieves more performance gains at larger
+barrier function using the aforementioned method (gRPC                                        training scales (e.g., the uploading speed of model states with
+with tree-based communication topology) and conduct the                                       4800 GPUs is 3.03× faster than that with 2400 GPUs).
+
+
+
+576      22nd USENIX Symposium on Networked Systems Design and Implementation                                                            USENIX Association
+                                                                    Table 9: Detailed overhead breakdown of the checkpoint saving procedure for rank 0.
+
+                          Model and Framework                                       Source #GPUs                                       State                   TFirst
+                                                                                                                                                                Plan (s)     TCache
+                                                                                                                                                                              Plan (s)   TD2H (s)    TSerialize (s)   TDump (s)   TUpload (s)
+                                                                                                                                    Model                            0.05        0.00      0.15          0.52           0.50        11.04
+                                        vDiT 4B                                                           32
+                                                                                                                                   Optimizer                         0.65        0.00      0.37          0.93           1.03        14.60
+                                                                                                                                    Model                            0.35        0.00      0.06          0.29           0.12        10.57
+                                          FSDP                                                       128
+                                                                                                                                   Optimizer                         0.89        0.00      0.06          0.29           0.26         9.85
+                                                                                                                                    Model                             8.39       0.00      0.08          1.93           0.48         6.67
+                                        tGPT 70B                                                2400
+                                                                                                                                   Optimizer                          5.02       0.00      0.17          2.00           2.23         2.30
+                                                                                                                                    Model                            17.09       0.00      0.08          1.95           0.47         2.20
+                                      Megatron-LM                                               4800
+                                                                                                                                   Optimizer                          6.46       0.00      0.03          1.69           0.35         1.67
+
+
+
+                          1.0
+                                        Before Resharding       After Resharding
+
+                                                                                                               1.0
+                                                                                                                           Before Resharding      After Resharding
+                                                                                                                                                                             F     Related Work
+Normalized Loss
+
+
+
+
+                                                                                             Normalized Loss
+
+
+
+
+                          0.8                                                                                  0.8
+
+
+                          0.6                                                                                  0.6                                                           Checkpointing frameworks. Some industrial initiatives fo-
+                          0.4                                                                                  0.4                                                           cus on developing checkpointing systems for deep learn-
+                          0.2                                                                                  0.2
+                                                                                                                                                                             ing. Prior to DCP [58], PyTorch provided torch.save and
+                          0.0                                                                                  0.0
+                                0.0     0.2       0.4         0.6      0.8          1.0                              0.0   0.2       0.4        0.6      0.8           1.0
+                                                                                                                                                                             torch.load APIs for local checkpoint management, without
+                                              Normalized Step                                                                    Normalized Step
+                                                                                                                                                                             native resharding support. DCP [58] introduced resharding
+(a) DP resharding from TP=1, (b) Hybrid resharding from TP=1,                                                                                                                capabilities for FSDP but lacks support for parallelism strate-
+DP=4, PP=4 to TP=1, DP=8, DP=4, PP=4 to TP=2, DP=8,                                                                                                                          gies such as TP and PP. DeepSpeed-UCP [32] provides a
+PP=4.                        PP=2.                                                                                                                                           unified format for DeepSpeed checkpoints and offers reshard-
+                                                                                                                                                                             ing capabilities through offline scripts. Megatron MCP [52]
+                                      Figure 16: Resharding correctness verification.                                                                                        builds upon the workflow of DCP [58] and extends storage op-
+                                                                                                                                                                             tions to formats like Zarr [60]. All these frameworks provide
+                                                                                                                                                                             limited support for various parallelism strategies and training
+  
+
+
+
+
+                          
+                                                                                                                                                                             frameworks, and their I/O performance does not scale well in
+                          
+                                                                                                                                                                             large-scale training.
+                          
+                                                                                                                                                                             Checkpointing optimizations. Several works [10, 37] in-
+                                             0.6012                                   0.6335                                    0.6363                                    vestigated reducing checkpointing costs from different per-
+                                                0.6012                                   0.6335                                    0.6363
+                                                                                                                                                                          spectives. Check-N-Run [14], designed for recommendation
+                          
+                                                                                                                                                                             models, employs differential checkpointing to store only the
+                                                                             
+                                                                                      
+                                                                                                                                                             
+                                                                                                                                                                             modified portions of the model, alongside quantization to re-
+                                                                                                                                                                             duce checkpoint size. CheckFreq [35] pipelines snapshot and
+Figure 17: The normalized sample length curves of the dat-                                                                                                                   save operations with computation to minimize checkpoint
+aloader with multiple training restarts.                                                                                                                                     stalls and introduces an online algorithm for tuning check-
+                                                                                                                                                                             point frequency to further lower costs. Gemini [66] advocates
+                                                                                                                                                                             for in-memory checkpointing with inter-machine backup for
+                                                                                                                                                                             fast recovery, interleaving checkpoint communication with
+E More Resharding Correctness Experiments                                                                                                                                    training traffic to enable frequent checkpoints per iteration.
+                                                                                                                                                                             JIT-Checkpointing [19] adopts just-in-time checkpointing for
+                                                                                                                                                                             low-cost error recovery. In industrial use cases, it is crucial
+The normalized loss curves for DP and hybrid resharding                                                                                                                      to store checkpoints in separate persistent storage for various
+correctness are shown in Fig. 16. In the case of DP and hybrid                                                                                                               tasks such as auto-evaluation [22], hyper-parameter tuning,
+resharding, since we also increase the global batch size, the                                                                                                                and model debugging. ServerlessLLM [16] focuses on the
+loss curve after resharding declines more rapidly.                                                                                                                           demand for loading optimizations which is critical in server-
+   We further show that ByteCheckpoint can achieve bit-wise                                                                                                                  less inference scenarios. It proposes a chunk-based, multi-tier
+correct resuming for dataloader states. Since the RNG state                                                                                                                  loading pipeline to accelerate checkpoint loading. Unlike ex-
+is fixed, correct resumptions should yield the same data sam-                                                                                                                isting solutions, ByteCheckpoint champions both optimized
+pling trajectory. Therefore, we use the normalized data sam-                                                                                                                 I/O performance and flexible load-time checkpoint resharding,
+ple length curve (Fig. 17) for evaluation. As highlighted, the                                                                                                               supporting general LFM development.
+normalized data sample length before and after restarts is                                                                                                                   Checkpoint representation. PyTorch’s torch.save/load
+identical.                                                                                                                                                                   functionality relies on pickle for serialization and deserial-
+
+
+
+USENIX Association                                                                                                               22nd USENIX Symposium on Networked Systems Design and Implementation                                       577
+ization. This format lacks crucial tensor shard metadata, such
+as global shape information, precluding automatic resharding.
+DCP [58] addresses this limitation by introducing a disaggre-
+gated format that separates metadata from tensor data. This
+metadata, which includes global shape and offset details, en-
+ables automatic resharding in DCP. Tenplex [64] introduces
+Parallelizable Tensor Collection (PTC) to flexibly represent
+and transform tensor states across diverse parallelism con-
+figurations. To build a PyTorch-native checkpointing system,
+ByteCheckpoint adopts the representation of DCP and in-
+corporates necessary adaptations to handle irregular tensor
+sharding. Array-based storage systems like Zarr [4] and Ten-
+sorStore [3] allow tensors to be saved as individual arrays,
+supporting concurrent reads and writes. MCP [52] supports
+distributed checkpointing using the Zarr format. For secure
+and efficient tensor storage, Safetensors [2] is a file format for
+saving tensors safely and loading them efficiently. To improve
+compatibility with the Hugging Face open-source ecosystem,
+ByteCheckpoint incorporates functionality to export check-
+points in the Safetensors format.
+Storage systems for LFM. Large-scale checkpointing re-
+quires robust storage systems. The LLaMA 3.1 report [13]
+highlights Tectonic [39], Meta’s general-purpose file system,
+as the backbone for storing checkpoints during pre-training.
+One of the key challenges for this system is managing high-
+frequency checkpoint writes. Similarly, FireFlyer [6], the AI-
+HPC system developed by DeepSeek [11, 18, 33] for LFM
+training, utilizes the custom-built 3FS Distributed File Sys-
+tem [50], which is akin to other parallel file systems like
+BeeGFS [21], to manage checkpoint storage.
+Elastic training systems. Some orthogonal efforts are de-
+voted to enhancing the elasticity of DL training jobs [7, 12,
+24, 30, 61, 74]. For instance, Varuna introduces job morph-
+ing to reconfigure training jobs in both pipeline and data
+parallelism degrees, without changing the hyper-parameters.
+Bamboo [61] leverages cross-stage redundant computa-
+tions into the pipeline for elastic training on spot instances.
+Oobleck [24] implements a pipeline instantiation mechanism
+via predefined templates to tolerate concurrent failures in
+different pipelines. These works are limited to specific paral-
+lelism strategies (e.g., DP without ZeRO), while ByteCheck-
+point does not assume any specific parallelism, supporting
+real-world production. The flexibility of elastic training sys-
+tems can be significantly enhanced by adopting our check-
+point representation for training state management.
+
+
+
+
+578   22nd USENIX Symposium on Networked Systems Design and Implementation   USENIX Association
+
