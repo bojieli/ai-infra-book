@@ -2,7 +2,21 @@
 
 编写依据是[当前章节清单](../../outlines/chapters.json)和[草案 22 的依赖](../../outlines/structure.md)。第 8–12 章依次为单实例推理、分布式推理、训练系统、资源调度与运行环境、端边云协同；下面按问题定位，不沿用历史章号。
 
-沿日程逐批筛读，当前 **85 篇完整原始摘要已读，35 篇正文候选、31 篇备查、19 篇排除；83 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser 与 RhymeRL 已完成下述声明范围，其余三十篇候选正文待读。82 份代表 PDF 共 1,411 页，包含两份复用原件；另有一份四页的旧 STRAW 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+沿日程逐批筛读，当前 **100 篇完整原始摘要已读，39 篇正文候选、37 篇备查、24 篇排除；68 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser 与 RhymeRL 已完成下述声明范围，其余三十四篇候选正文待读。96 份代表 PDF 共 1,653 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+
+## 第 106–130 项：顺序、迁移与自动优化
+
+本批新增十五篇完整摘要、十四份代表公开稿／242 页，保留四篇正文候选、六篇备查、五篇排除。[来源与范围](../../references/proceedings/ASPLOS/2026/program106-screening-notes.json)记录八张实际查看的首页、十五处网页／文本／JSON 元数据范围和十个会议摘要缺口。下面列的是正文选读要解决的问题，尚未把摘要收益写入书中。
+
+**顺序怎样限制在途工作。** [远端内存排序](../../references/proceedings/ASPLOS/2026/paper-116.pdf)适合接 7.3.2 的并发窗口，再回到 7.4.2 的必要依赖：源端等待与目的端排序改变了哪条关键路径？待读时分别核对 MMIO、DMA、RDMA 的请求类型、排序语义和硬件修改，不能将提议中的 PCIe／ISA 扩展当成现有网卡能力。已有 stream-order、rPCIeBench 与 UB 案例足以解释的部分不重复增加。
+
+**搬到本地为何可能拖慢共享。** [PIPM](../../references/proceedings/ASPLOS/2026/paper-118.pdf)提出部分、增量页面迁移。沿 6.6.2 的访问权与 9.5.1 的远端状态访问，待读一个主机受益时其他主机增加多少等待、迁移粒度和重映射表占多少容量、共享写入如何保持正确。先明确是假想硬件还是现有实现，再把迁移成本放回受益访问次数，不能仅比较标称本地／远端带宽。
+
+**优化候选的复用与验证成本。** [ISAMORE](../../references/proceedings/ASPLOS/2026/paper-126-clean.pdf)面向自定义指令，不能与 GPU 内核融合混为一谈。重点读跨程序复用次数、profile 权重和面积预算怎样影响选择，以及量化 LLM 案例的完整执行分母；若只提供局部指令加速，就不足以支撑第 13 章的系统收益。[LOOPRAG](../../references/proceedings/ASPLOS/2026/paper-127.pdf)则面向 C 语言 SCoP，将检索示例与编译、测试、计时反馈结合。对照 5.3.5／实验 5-6，待读相同搜索预算、未见输入、浮点及依赖语义；差分测试的通过不能扩大为普遍等价证明，CPU 基准倍数也不能代替 Qwen3 GPU 算子的实测。
+
+Lilac、Anvil、Abacus、RTeAAL Sim、Hopps 和 TapDB 先作备查：它们分别提供接口、时序、设备状态、表示方式、稀疏容量和下推位置的另一种观察，但本书已有更直接的 AI 案例。XPDL、TempGraph、CREST、zkVM 优化与 DejaVuzz 不纳入主线；图处理、事务 KV 和硬件推测执行各有自己的语义，不能按名字套到 GNN、KV cache 或推测解码。
+
+版本核对中，2022 年 `Generic Tagging for RISC-V Binaries` 只有 v1，尚无原始来源证明可用它替代本届 COGENT 摘要，故单独保存。RTeAAL Sim 扩展稿为 20 页，出版元数据为 17 页；Lilac 的公开稿为 13 页、出版版为 14 页。下载完整文件与完成声明范围的阅读继续分别记录。
 
 ## RhymeRL：历史复用改变哪些供给
 

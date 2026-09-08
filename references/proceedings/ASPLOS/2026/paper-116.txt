@@ -1,0 +1,977 @@
+Efficient Remote Memory Ordering for Non-Coherent
+                   Interconnects
+               Wei Siew Liew∗                            Md Ashfaqur Rahaman∗                             Adarsh Patil
+             u1529306@utah.edu                              ashfaq@cs.utah.edu                        Adarsh.Patil@arm.com
+               University of Utah                             University of Utah                              Arm
+           Salt Lake City, Utah, USA                      Salt Lake City, Utah, USA                      Cambridge, UK
+
+                                         Ryan Stutsman                            Vijay Nagarajan
+                                     stutsman@cs.utah.edu                         vijay@cs.utah.edu
+                                        University of Utah                        University of Utah
+                                    Salt Lake City, Utah, USA                 Salt Lake City, Utah, USA
+
+Abstract                                                                  Languages and Operating Systems, Volume 2 (ASPLOS ’26), March 22–
+Software using non-coherent interconnects like PCI Express                26, 2026, Pittsburgh, PA, USA. ACM, New York, NY, USA, 15 pages.
+                                                                          https://doi.org/10.1145/3779212.3790156
+requires fine-grained memory ordering, but current hard-
+ware mandates the use of costly source-side serialization.
+We show that this architectural mismatch severely limits                  1   Introduction
+the performance of two critical applications: (1) the trans-              Modern servers are frequently limited by the performance of
+mission of network packets from a CPU to a NIC (requiring                 the interconnects that link CPUs with devices like network
+write-to-write ordering) and (2) key-value store lookups by               interface cards (NICs) and GPUs. We focus on non-coherent
+an RDMA-enabled NIC (requiring read-to-read ordering).                    interconnects, like PCI Express (PCIe), which drive today’s
+   We address this by proposing a new destination-based or-               I/O systems. While coherent I/O interconnects like Com-
+dering model and the hardware-software co-design compris-                 pute Express Link (CXL) [8] represent a new direction, thor-
+ing PCIe extensions and ISA extensions that allow software                oughly understanding and optimizing existing systems is a
+to express ordering intent efficiently. Novel microarchitec-              prerequisite to justifying the added complexity and cost of a
+ture at the Root Complex enforces these expressed semantics,              full-coherence paradigm. This work examines the interaction
+eliminating source-side stalls. Our approach significantly                between a NIC and host CPUs across a PCIe interconnect, ex-
+improves the throughput of these application kernels and                  posing a fundamental bottleneck: the high cost of enforcing
+enables new, simpler protocols that outperform the state-of-              ordering on remote memory operations.
+the-art.                                                                     Remote ordering issues arise when a device (CPU, GPU,
+                                                                          NIC, etc.) accesses two or more addresses belonging to an-
+CCS Concepts: • Hardware → Buses and high-speed                           other device in a specific sequence, a requirement for many
+links; Networking hardware; • Computer systems organi-                    communication patterns. For example, when a host sends
+zation → Interconnection architectures.                                   packets to a NIC via memory-mapped I/O (MMIO) writes,
+Keywords: Memory Consistency Models, I/O Interconnects,                   the packet order must be maintained. Similarly, in an RDMA-
+Non-Coherent Interconnects, RDMA, PCIe                                    based key-value store (KVS), the NIC may first need to ac-
+                                                                          quire a lock and then read the targeted object; violating this
+ACM Reference Format:                                                     ordering constraint would compromise data integrity.
+Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman,             The core problem today is a mismatch between the mem-
+and Vijay Nagarajan. 2026. Efficient Remote Memory Ordering for           ory consistency model required by modern I/O software and
+Non-Coherent Interconnects. In Proceedings of the 31st ACM In-            the capabilities of the PCIe I/O stack. Specifically, the PCIe
+ternational Conference on Architectural Support for Programming
+                                                                          specification [14] currently lacks the semantics to express
+                                                                          and enforce fine-grained memory ordering end-to-end. This
+∗ Both authors contributed equally to this work.
+                                                                          forces systems to rely on costly, source-side ordering mecha-
+                                                                          nisms, resulting in serialization and significant performance
+                                                                          overheads. For example, in a CPU-NIC transmit path, achiev-
+                                                                          ing ordering requires a store fence from the source CPU after
+This work is licensed under a Creative Commons Attribution 4.0 Interna-   every MMIO write, making a direct MMIO-based path com-
+tional License.
+ASPLOS ’26, Pittsburgh, PA, USA
+                                                                          pletely impractical. This is why modern transmit paths are
+© 2026 Copyright held by the owner/author(s).                             built on complex workarounds involving MMIO doorbells
+ACM ISBN 979-8-4007-2359-9/2026/03                                        and DMA reads [19, 20, 30, 31]. Likewise, in a KVS accessed
+https://doi.org/10.1145/3779212.3790156                                   via RDMA, enforcing ordering at the source—either at the
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA            Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+server’s NIC or at the client—can make ordered remote reads                                                                          CPU
+over an order of magnitude slower than their unordered
+                                                                                                                       LLC           $Dir
+counterparts. These costly mechanisms that serialize at the                                                                                         Host
+                                                                                                          PCIe Root Complex                       Memory
+source to preserve ordering hurt performance significantly.
+                                                                                               MMIO       MMIO               DMA     DMA
+   To overcome this, we propose a new, destination-based                                       Stores     Loads     PCIe     Reads   Writes
+
+ordering paradigm. Our solution co-designs a new PCIe in-                                               Ctrl Regs
+terface and a suite of microarchitectural mechanisms that                                               Doorbells
+shift the responsibility for ordering from the initiating source                        Ethernet                       NIC Memory NIC
+to hardware at or near the remote destination. This allows                    Figure 1. System Memory Interactions. MMIOs from CPU are
+remote operations to be issued concurrently while ordering                    routed over PCIe via the Root Complex (RC) to the NIC. DMAs
+is enforced efficiently at the target. Our approach enables a                 from the NIC access host memory via the RC. Our work proposes
+simple and efficient MMIO-based transmit path to achieve                      extending PCIe TLPs for ordering, extending the CPU’s ISA to
+line-rate throughput (100 Gb/s on a single core) without store                specify MMIO ordering, and a Remote Load-Store Queue at the RC.
+fences and near-zero penalty DMA read ordering.
+                                                                                             Table 1. PCIe Ordering Guarantees
+   The foundation of our approach is to make memory order-
+ing an explicit, first-class concern from the instruction set                                W→W             R→R           R→W         W→R
+architecture (ISA) down to the interconnect. We introduce                                       Yes               No          No            Yes
+acquire/release semantics directly into the PCIe specification,
+bridging the conceptual gap between how programmers rea-                      • We present a design for RDMA-based KVS lookups that
+son about memory consistency and how the interconnect                           exploits our efficient remote memory ordering and is sim-
+enforces it. We also propose elevating release consistency-                     pler than existing approaches while delivering throughput
+style MMIO loads and stores to first-class citizens within the                  1.6× higher than FaRM [11].
+host’s ISA, providing a precise, hardware-supported interface
+for a processor to signal its memory ordering intent. Our key
+insight is that by making memory ordering explicit, we can
+                                                                              2     Remote Memory Ordering Today
+enable a more efficient hardware implementation. Specif-                      Achieving efficient remote memory ordering between a host
+ically, our solution includes a Remote Load-Store Queue                       CPU and a NIC is fundamentally constrained by the asym-
+(RLSQ) in the PCIe Root Complex capable of enforcing the                      metric nature of the underlying PCIe interconnect. Com-
+new acquire/release rules with minimal performance penal-                     munication in this system model (Figure 1) relies on two
+ties.                                                                         primitives: Memory-Mapped I/O (MMIO), where the CPU
+   In this work 1 we make the following contributions:                        accesses NIC memory, and Direct Memory Access (DMA),
+• We identify performance pathologies for remote memory                       where the NIC accesses host memory.
+   ordering with non-coherent interconnects (e.g. PCIe). We                      While PCIe provides strong ordering for posted writes, its
+   analyze the overheads for MMIO and DMA ordering, and                       weak ordering for non-posted reads (Table 1) [14] creates sig-
+   we quantify the costs with application kernels.                            nificant performance bottlenecks for common Read-to-Read
+• We propose a destination-based ordering architecture for                    (R→R) patterns. For example, a slow DMA read from main
+   non-coherent interconnects. We introduce new acquire/rel-                  memory can be passed by a faster DMA read that hits in the
+   ease semantics in the PCIe specification and acquire/release               host cache, violating the fine-grained ordering required by
+   MMIO instructions in the host ISA that explicitly commu-                   software. For MMIO, however, the bottleneck stems from
+   nicate ordering requirements, enabling endpoints to avoid                  how the host CPU interacts with the PCIe interface, which
+   costly serialization at the source.                                        causes inefficiencies in both W→W and R→R MMIO order-
+• We define novel microarchitectural support to efficiently                   ing. This section analyzes the architectural roots of these
+   enforce destination-based ordering. Our design includes a                  overheads for both DMA and MMIO and demonstrates their
+   Remote Load-Store Queue (RLSQ) in the Root Complex,                        impact on modern CPU-NIC software stacks.
+   which leverages the new PCIe semantics to enforce order-
+   ing while maximizing parallelism.                                          2.1   DMA Ordering
+• We demonstrate significant performance gains on applica-                    R→R DMA ordering presents a significant bottleneck. Con-
+   tion kernels. Our results show that our approach enables a                 sider a litmus test where a NIC must read a status flag be-
+   simple, fence-free MMIO transmit path that delivers line-                  fore its corresponding data; correctness dictates that the
+   rate throughput. An optimized RLSQ improves RDMA-                          NIC not see stale data after seeing an updated flag. Today’s
+   based KVS performance by up to 50.9× for 64 B objects                      only solution is for the NIC to enforce this by serializing
+   using a single RDMA queue pair in simulation.                              the requests—issuing the flag read, waiting for the full PCIe
+                                                                              round-trip completion, and only then issuing the data read.
+1 https://github.com/icsa-caps/efficient-remote-memory-ordering.git           This synchronous “stop-and-wait” execution significantly
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                                       ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+
+                         Two Ordered DMA        One DMA                                                         READ        WRITE
+                         Two Unordered DMA      All MMIO                                         15
+
+
+
+
+                                                                              Bandwidth (Gb/s)
+                                                                                                                                       30
+               1.0
+                                                                                                 10                                    20
+
+
+
+
+                                                                                                                                           M op/s
+         CDF
+
+               0.5                                                                                5                                    10
+               0.0                                                                                0                                    0
+                     0     1000 2000 3000 4000 5000                                                         1                   2
+                                 Latency (ns)                                                                   Number of QPs
+Figure 2. Distribution of RDMA WRITE latency between two hosts      Figure 3. Pipelined RDMA read/write bandwidth for 64 B objects
+using different patterns for operation submission. Including One    with 1 and 2 QPs. The ordered write bandwidth is significantly
+DMA read as part of the submission adds about 300 ns to the delay   higher than the read bandwidth.
+over All MMIO (zero DMAs). Using Two Ordered DMA reads adds
+about another 300 ns, while using Two Unordered DMA reads is           In One DMA, each WRITE WQE is provided to the client
+about the same as One DMA since the two DMAs can be overlapped.     NIC via MMIO, but the 64 B that it must transmit is placed
+                                                                    in the client host’s memory. Hence, the NIC triggers a single
+reduces read throughput. Simple alternative approaches to           DMA read to fetch the data after receiving the WQE. In this
+efficient ordering are insufficient: pipelining the reads fails     setup, the median operation completes in 3,234 ns, adding
+because the PCIe fabric can reorder them, and a NIC-side            293 ns of delay compared to the case where the NIC does
+reorder buffer fails because the host-side completions can          not issue DMA operations; this represents the latency of one
+return out of order (e.g., a cached data value may return           64 B DMA read.
+before an uncached flag value).                                        In Two Unordered DMA, each WRITE WQE is issued via
+W→W DMA ordering, however, is handled efficiently. Con-             MMIO, but it specifies (via a scatter-gather list provided as
+sider a litmus test where a NIC must write data before its cor-     part of the MMIO) two 64 B data buffers for transmission. In
+responding status flag. Because PCIe guarantees that posted         this case, the median WRITE completes in 3,271 ns, 330 ns
+writes from the same source are not reordered, the NIC can          more than when the NIC issues no DMA operations, and just
+pipeline data and flag writes, relying on the interconnect to       37 ns slower than when the NIC issues a single DMA opera-
+preserve their order with minimal performance impact.               tion. This implies that the client NIC overlaps the two DMA
+The Cost of DMA Ordering. To evaluate the performance               reads by relying on the fact that RDMA does not guarantee
+impact of enforcing R→R DMA ordering, we devised an                 cache line access order when issuing an RDMA WRITE.
+experiment to isolate the latency cost of serializing DMA              Finally, in Two Ordered DMA, WRITEs are not issued via
+reads. Our strategy relies on the fact that an RDMA WRITE           MMIO. Instead, the WQE for the operation is placed in mem-
+operation inherently requires the client NIC to read data           ory and references a 64 B data payload elsewhere in memory.
+from host memory. By manipulating how these WRITE op-               When the client NIC receives the MMIO doorbell write, it
+erations are submitted—specifically the layout of the Work          must first fetch the WQE for client host memory by issuing
+Queue Element (WQE) and its payload—we can force the NIC            a DMA and waiting for its completion to retrieve the address
+into specific DMA read patterns, ranging from fully parallel        of the payload. Then, it must issue a separate DMA to re-
+(unordered) to strictly serialized (ordered).                       trieve the 64 B to transmit. As a result, each operation takes
+   We used ConnectX-6 Dx 100 Gb/s NICs to implement this            3,613 ns to complete—672 ns longer than when no DMA is
+(§6.4 provides full details). Each experiment posts one-sided       performed and 342 ns longer than Two Unordered DMA. This
+RDMA WRITE operations to a client NIC using different               shows that when there is an ordering dependency between
+submission techniques (e.g., BlueFlame MMIO vs. standard            the two DMAs, the NIC must issue each operation and wait,
+DMA) to produce the desired DMA read behaviors on the               resulting in about a 300 ns delay.
+client host. We plot the cumulative distribution function              What is the impact of this stop-and-wait ordering? Today,
+(CDF) of the end-to-end 64 B RDMA WRITE latency (client             without PCIe R→R ordering guarantees, any two RDMA
+issue time until completion). All measurements are for a            read operations that require ordering must be stalled at the
+single client thread using one Queue Pair (QP).                     server NIC, which introduces a serialization delay between
+   Figure 2 shows the results of the experiment. When the           the reads.
+RDMA WRITE WQE and the data to be transmitted are pro-                 This latency penalty directly constrains the maximum
+vided to the client NIC via MMIO using NVIDIA’s BlueFlame           achievable throughput. When we pipeline many 64 B RDMA
+optimization (All MMIO), each operation takes a median of           READ operations over a single QP, we observe that the server
+2,941 ns. This case issues no DMAs at the client NIC and            NIC performs READs with inter-read latencies similar to
+serves as a baseline that only measures the end-to-end la-          the previously measured DMA latency of about 300 ns. Fig-
+tency of a 64 B RDMA WRITE operation.                               ure 3 shows that with pipelined RDMA READs, throughput
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA   Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+reaches approximately 5.0 Mop/s (2.37 Gb/s), implying that                                    200
+the server NIC completes an operation every 200 ns. The                                                                WC + no fence
+RDMA specification does not require the server NIC to en-                                                              WC + sfence
+
+
+
+
+                                                                           Bandwidth (Gb/s)
+force RDMA R → R ordering, but these results suggest that
+                                                                                              150
+if strict ordering were enforced on current hardware, perfor-
+mance could not exceed this limit.                                                            100          NIC Bandwidth Limit
+   In contrast, RDMA WRITEs provide much higher through-
+put than RDMA READs (3×). Because of RDMA’s strong                                             50
+W→W ordering guarantees, the server NIC can begin pro-
+cessing the next WRITE as soon as the write DMA opera-                                          0
+tions for the previous WRITE are enqueued, allowing the                                             64 128 256 512 1K 2K 4K 8K
+server NIC to issue incoming RDMA WRITEs from the QP                                                       Message Size (B)
+efficiently.
+                                                                     Figure 4. MMIO Write Bandwidth for Combined Stores to a
+   Our goal is to make the same high-performance pipelining
+                                                                     ConnectX-6 Dx. sfences thwart achieving line rate transmission.
+that is currently possible for writes available for reads.
+Impact. The high cost of R→R ordering has significant im-            to a write-combining memory region. Write-combining effi-
+plications for applications like one-sided key-value stores. A       ciently batches MMIO transfers [21, 31], but the CPU does
+typical get operation requires a “check-before-read” pattern—        not guarantee these buffered writes reach the Root Complex
+reading a lock or metadata before the object itself—to ensure        in program order. If two cache line-sized writes must be
+correctness against concurrent puts. Due to the lack of R→R          written in order from the host to the NIC’s memory, soft-
+ordering guarantees in current PCIe implementations, this            ware must insert a store fence between the writes. This fence
+ordering must be enforced at the server NIC (assuming a              forces a hard serialization point, stalling the processor un-
+smart NIC capable of lock value checks and subsequent ob-            til the first write is flushed to the Root Complex, negating
+ject reads [6, 29]). We observe that enforcing this ordering         the pipelining benefits of PCIe’s otherwise efficient posted
+reduces get throughput by more than an order of magnitude            writes.
+compared to an ideal low-cost ordering primitive. Worse,
+                                                                    The Cost of W→W MMIO Ordering. Given the expected
+this ordering is typically enforced in applications by stalling
+                                                                    similarity in cost between R→R MMIO and DMA ordering,
+at the client NIC—waiting for the round-trip completion of
+                                                                    we focused our experimental evaluation on W→W MMIO or-
+one operation before issuing the next, which results in dis-
+                                                                    dering. We replicate an experiment from prior works [22, 31].
+astrously low performance.
+                                                                    The experiment measures the throughput of write-combined
+   To circumvent this limitation, state-of-the-art key-value
+                                                                    stores to NIC memory, enforcing order by inserting a store
+stores are forced into complex workarounds such as embed-
+                                                                    fence after every B bytes (emulating a packet of size B), and
+ding versioning metadata into every cache line [16]. While
+                                                                    it compares this to a baseline without fences.
+functional, these protocols impose their own significant tax:
+                                                                       Figure 4 corroborates recent results [22, 31]. Without or-
+they complicate application development and, as we show
+                                                                    dering, we achieved a throughput of 122 Gb/s. Enforcing or-
+later, the overhead of stripping this metadata at the client
+                                                                    dering, even with packet sizes as large as 512 bytes, reduced
+reduces the performance of otherwise advanced systems
+                                                                    throughput by 89.5%. We also confirmed that using strictly
+like FaRM. This illustrates a clear architectural limitation—
+                                                                    non-cacheable stores—which also enforce order—yields even
+software is paying a heavy price in both performance and
+                                                                    worse performance. These results provide quantitative evi-
+complexity to compensate for the interconnect’s lack of an
+                                                                    dence that the sfence is the primary architectural bottleneck,
+efficient, hardware-supported ordering mechanism.
+                                                                    validating our analysis of W→W MMIO ordering.
+                                                                    Impact. The above benchmark models a CPU-to-NIC trans-
+                                                                    mit path, where maintaining packet order is crucial. The
+2.2   MMIO Ordering                                                 results reveal a common misconception: the bottleneck is not
+R→R MMIO Ordering is also inefficient due to the weak or-           that CPUs cannot saturate the PCIe bus, but rather the archi-
+dering guarantees of PCIe reads. To ensure ordering between         tectural cost of ordering. While unordered MMIO writes can
+reads, a host CPU must serialize read requests, mirroring the       exceed 100 Gb/s, the sfence required for ordering slashes
+performance bottleneck observed with DMA R→R ordering.              throughput by an order of magnitude for small packets.
+This serialization prevents concurrent PCIe read transactions,         This severe performance penalty explains why modern
+leading to significant latency and reduced throughput.              systems abandon the simple, direct MMIO transmit path.
+W→W MMIO Ordering is also inefficient, but solely due               Instead, they rely on a costly workaround: the CPU writes
+to host CPUs’ microarchitecture. The bottleneck is the store        packet data to host memory and then writes to an MMIO
+fence instruction needed to enforce order between writes            “doorbell” register. This doorbell triggers the NIC to initiate a
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                     ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+separate DMA operation to fetch the data. This complex, in-        value. This mechanism ensures that in the common case
+direct path adds significant round-trip latency and still strug-   without such conflicts, ordered reads perform at nearly the
+gles to achieve line rate without specialized hardware [30].       same speed as fully unordered reads, effectively solving the
+These workarounds are a direct consequence of a missing            bottleneck.
+architectural primitive for software to efficiently express its    Efficient W→W MMIO Ordering. The CPU-NIC transmit
+fine-grained ordering requirements to the hardware.                path is severely throttled by the architectural cost of enforc-
+                                                                   ing W→W MMIO ordering. To ensure writes arrive at the
+                                                                   Root Complex in order, current systems must execute a store
+3    Fast Remote Memory Ordering Overview
+                                                                   fence after each packet. This serialization adds ≈100 ns of
+Our approach is a hardware-software co-design with new             latency per packet, capping the achievable throughput for
+architectural and microarchitectural support to eliminate          64-byte packets at ≈5 Gb/s—a fraction of a modern 100 Gb/s
+remote ordering bottlenecks. We propose PCIe and host ISA          link. To eliminate this bottleneck, we propose labeling trans-
+extensions to express ordering, as well as changes at the Root     actions with sequence numbers and using a reorder buffer at
+Complex (RC) to enforce these ordering semantics efficiently.      the destination, taking inspiration from our previous work [22].
+Efficient R→R DMA Ordering. Our solution to the R→R                To realize this idea, we propose enhancements to the host
+DMA bottleneck is a two-part co-design. First, we extend           ISA to explicitly identify remote MMIO/PCIe write opera-
+the PCIe specification to allow a NIC to pipeline ordered          tions and their ordering requirements. This allows the CPU
+reads (e.g., a lock check and a subsequent data read) by ex-       to issue a stream of packets without stalling on a fence. A
+plicitly annotating their required order. Second, we enhance       reorder buffer (ROB) at the Root Complex then uses these
+the Root Complex (RC) to enforce this ordering against the         sequence numbers to reconstruct the correct program or-
+host’s coherent memory. This second step is crucial: merely        der before forwarding the writes to the NIC in an ordered
+preserving order across the interconnect is insufficient, as       manner.
+parallel requests to the host memory system can complete
+out of order (e.g., a data read that hits in the cache can pass
+the lock read that misses). Even a simple, sequential enforce-     4     Architectural Support
+ment at the RC could provide a benefit.                            This section details the architectural support underpinning
+   This gain stems from shifting the serialization point from      our approach to fast remote memory ordering. This support
+the source (the NIC) to the destination (the RC). In the base-     encompasses two key components: extensions to the PCIe
+line, NIC-side serialization incurs the full round-trip latency    specification to express the ordering requirements of PCIe
+of the interconnect and the host memory access, a stall of         reads (enabling R→R ordering), and extensions to the host
+≈500 ns. This limits throughput to roughly 2 million ordered       ISA allowing it to express MMIO loads, stores, and their
+reads per second (Mops/s). By moving enforcement to the            ordering.
+RC, our approach allows the NIC to pipeline read requests,
+amortizing the long interconnect latency. The throughput
+bottleneck then becomes the RC’s sequential access to host         4.1   PCIe Extensions for Remote Memory Ordering
+memory via the RC’s Remote Load-Store Queue (RLSQ),                To address the inefficiencies in R→R ordering, we propose
+which is ≈100 ns per read. This improves throughput by             extending the PCIe specification to enable devices to express
+5× to 10 Mops/s.                                                   ordering requirements for their read requests. Similar to the
+   To eliminate this remaining serialization and achieve near-     existing distinction between ordered and unordered writes
+ideal performance, our advanced design draws inspiration           in PCIe, our extension introduces the ability to differentiate
+from speculative memory ordering techniques employed in            between ordered and unordered reads. However, prevalent
+out-of-order processors [7, 12]. It allows the RLSQ to execute     producer-consumer communication patterns in host-device
+reads speculatively and in parallel, buffering the results and     interactions necessitate a more nuanced approach than sim-
+delivering the data to the waiting PCIe requests while hon-        ply adopting strong and relaxed ordering semantics.
+oring the required ordering. This “out-of-order execute, in-          Consider a common scenario where the host writes a se-
+order commit” model allows the latency of multiple memory          ries of data items to memory and subsequently sets a flag
+accesses to be overlapped, significantly boosting throughput.      to signal their availability. A device then polls the flag, and
+   Correctness is maintained by cleanly integrating the RLSQ       upon observing it set, proceeds to read the previously writ-
+with the host’s existing cache coherence protocol. The queue       ten data. Examining the device’s actions (a flag DMA read
+tracks in-flight speculative reads and snoops the coherence        followed by data DMA reads), we find that the data reads
+fabric, much like a CPU cache. An intervening write from           must occur after the flag read, but the data reads themselves
+a host core to a speculatively read address triggers an in-        do not have an inherent order relative to each other. This
+validation message to the queue. This invalidation squashes        pattern cannot be accurately and efficiently expressed using
+the speculation and retries the read to fetch the up-to-date       only strong or relaxed ordering. Marking all reads as strong
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA    Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+would be correct but overly conservative, hindering poten-            key limitation is the implementation that has to be conserva-
+tial performance optimizations. Conversely, marking only              tive, owing to a mismatch between the CPU’s behavior and
+the flag read as strong would fail to enforce the necessary           the interconnect’s guarantees. Today, a compliant CPU must
+ordering of data reads after the flag.                                still stall at the fence until prior operations drain. Our model
+   The ideal interface for expressing such producer-consumer          reinterprets this. Instead of a stall, the fence acts as a direc-
+relationships is through the use of acquire and release seman-        tive for the microarchitecture to inject ordering metadata
+tics, a model effectively employed by several ISA memory              (e.g., sequence numbers) into the MMIO stream. This pro-
+consistency models like ARM and RISC-V. Therefore, we                 vides the same ordering guarantee to downstream hardware
+advocate for the adoption of acquire and release semantics            without processor stalls, transforming the fence from a costly
+within the PCIe specification. Revisiting our example, the            serialization point into a lightweight ordering directive.
+DMA read for the flag would be marked as an acquire op-                  While reinterpreting fences is a pragmatic step, the most
+eration, ensuring that all subsequent memory accesses by              principled solution is to elevate ordered remote operations
+the device (the data reads) observe the state of memory at            to first-class citizens in the ISA. This aligns the host ISA
+or after the flag was read. The subsequent DMA reads for              with the acquire/release semantics we proposed for PCIe,
+the data items could then be marked as relaxed, allowing              ensuring a unified ordering model from the CPU to the device.
+them to be reordered with respect to each other while still           We therefore propose four new instruction variants: MMIO-
+being correctly ordered after the flag read—precisely the de-         Store, MMIO-Release, MMIO-Load, and MMIO-Acquire. To
+sired behavior for maximizing performance in this common              be correct and intuitive, their semantics must integrate with
+pattern. Conversely, we also advocate for the use of PCIe re-         the host’s memory model: an MMIO-Release must ensure all
+lease writes and unordered writes instead of simply strongly          prior host memory operations are visible before the MMIO
+ordered writes and weakly ordered writes.                             write is observed, and an MMIO-Acquire must ensure all
+   Encoding acquire and release ordering in PCIe is straight-         subsequent host memory operations happen only after the
+forward. For writes, we can re-purpose an existing relaxed            MMIO read completes. This provides a clean programming
+ordering bit. When this bit is set for a write, it can be inter-      model for managing ordering across the complex host-device
+preted by the Root Complex and PCIe devices as a release              boundary.
+operation, signaling that prior actions should become visible
+to other agents. For reads, we can add a new, analogous ac-           5     Microarchitectural Support
+quire bit in the TLP header. Setting this bit for a read would
+                                                                      This section details the two key microarchitectural compo-
+indicate to the Root Complex and the requesting device that
+                                                                      nents of our design: an enhanced Remote Load-Store Queue
+subsequent actions should see the results of this read.
+                                                                      (RLSQ) in the Root Complex to efficiently order DMA re-
+4.2   Host ISA extensions for MMIO                                    quests, and the host CPU support required to implement our
+                                                                      new MMIO instructions.
+To efficiently enforce remote ordering, a host CPU ISA must
+be rich enough to express ordering constraints for MMIO
+                                                                      5.1   Remote Load-Store-Queue
+loads and stores. Current host ISAs typically lack explicit
+mechanisms to differentiate between local memory accesses             The RLSQ in the PCIe Root Complex is the microarchitectural
+and MMIO operations targeting remote devices. Instead, to-            bridge that enforces the PCIe interconnect’s ordering rules
+day’s systems rely on the host processor’s support for map-           on the host’s coherent memory system.
+ping addresses as non-cacheable or write-combining [1],               Baseline. In the baseline design [10, 32], the RLSQ’s behavior
+augmented with host memory ordering instructions (fences)             is a reflection of PCIe’s guarantees. Because PCIe reads are
+for enforcing ordering between the processor and the Root             weakly-ordered, the RLSQ dispatches incoming DMA read
+Complex. Hence, many ISAs have complex and non-intuitive              requests to the coherence directory in parallel.
+interactions between their memory ordering guarantees and                Conversely, because PCIe writes are strongly-ordered, the
+PCIe ordering rules. For example, x86 processors strictly se-         RLSQ processes DMA write requests serially to ensure they
+rialize reads to uncached MMIO regions, stalling execution            are applied to memory in the correct order. However, the
+to preserve order at the source. This performance penalty is          RLSQ can optimize by issuing the coherence requests (e.g.,
+effectively wasted, however, as the PCIe fabric is permitted          invalidations or ownership requests) for multiple pending
+to reorder these requests in flight!                                  writes in parallel. While these coherence actions are in flight,
+   The RISC-V ISA, with its flexible fence that expresses             the actual data writes to the cache or memory controller
+both MMIO ordering and host memory ordering (fence                    are strictly serialized, committing only from the head of
+iorw,iorw) offers a clearer path forward. Its fences are al-          the RLSQ’s FIFO queue after all preceding operations have
+ready expressive enough to describe the necessary software            completed. This allows high latency coherence messages to
+constraints, from simple MMIO Write-after-Write (fence                be overlapped, improving throughput while ensuring that
+o,o) to complex memory-to-I/O patterns (fence w,o). The               writes become visible to the host in the correct PCIe order.
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                      ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+Proposed design: Release-Acquire RLSQ. Our proposed                   Correctness against concurrent host writes is ensured
+design faithfully implements the ordering guarantees of the        by integrating the RLSQ with the host’s coherence proto-
+new acquire and release operations. Relaxed PCIe reads and         col. This requires no changes to the protocol itself—which
+writes are issued concurrently from the RLSQ. However,             is notoriously hard to design and verify—but simply treats
+a PCIe acquire blocks the issue of all subsequent requests         the RLSQ as a new coherent agent, akin to adding another
+until its own coherent request completes. Conversely, a PCIe       cache. The RLSQ is tracked as a temporary sharer for in-flight
+release stalls until all prior requests have been completed        speculative reads, allowing it to snoop coherence traffic. An
+before its own coherent request is issued.                         intervening host write to a speculative address triggers a
+   These semantics are key to enabling high-performance,           standard directory invalidation, which squashes the buffered
+optimistic NICs without sacrificing correctness. Consider a        result and forces a retry of that single read to fetch the up-to-
+NIC that, to hide latency, speculatively pipelines an acquire      date value. Crucially, unlike a CPU’s Load-Store Queue, only
+read of a key-value store lock followed by a data read. In         the conflicting read is squashed, not all subsequent specu-
+a baseline Root Complex, these parallel requests can race          lative operations. Because the RLSQ speculates on known
+within the host memory system, potentially allowing the            addresses, the penalty for mis-speculation is low, making
+data read to return a stale value even after the acquire read      the approach highly efficient.
+completes. This violates the acquire semantic and breaks              This speculative principle also applies to Write→Release
+correctness. Our RLSQ prevents this race by stalling the           ordering. The RLSQ can speculatively issue the coherence
+speculative data read until the acquire is fully resolved, guar-   actions (e.g., invalidations) for a release concurrently with
+anteeing a consistent memory view and making aggressive,           the preceding data writes. Once the data writes are con-
+high-performance NIC designs safe.                                 firmed complete by the memory system, the release can also
+Optimization: Thread-specific Ordering. The simple Rele-           complete, having already finished its high-latency coherence
+ase-Acquire RLSQ is overly conservative, creating false de-        work in parallel.
+pendencies by enforcing order globally across all NIC traf-
+                                                                   5.2   Host Support for MMIO Operations
+fic. An acquire from one thread context (e.g., a Queue Pair)
+will needlessly stall an independent request from a different      Next, we turn our attention to the microarchitectural support
+thread. To solve this, we propose extending the PCIe TLP           required for the new MMIO load and store instructions in-
+to carry a thread ID. The RLSQ then uses this ID to enforce        troduced in §4.2; specifically we describe efficient implemen-
+acquire/release semantics on a per-thread basis, allowing          tations for the MMIO-Load, MMIO-Store, MMIO-Acquire,
+requests from different threads to proceed in parallel. This is    and MMIO-Release instructions, ensuring that their order-
+a logical extension of the ID-based Ordering (IDO) principle       ing semantics are enforced when interacting with remote
+that the PCIe specification already provides for writes [14],      devices over the PCIe interconnect.
+applying a similar thread-aware model to our new domain               Elevating MMIO operations to first-class citizens in the
+of ordered reads.                                                  ISA lets the microarchitecture manage their memory order-
+   Microarchitecturally, this per-thread ordering can be im-       ing more effectively. The key microarchitectural support
+plemented efficiently. While physically partitioning the RLSQ      involves associating a sequence number with each MMIO
+into separate queues is possible, a more resource-efficient        operation. For instance, an MMIO-Store to address 𝑋 fol-
+design uses a single, logically partitioned queue [24]. This       lowed by an MMIO-Release to address 𝑌 would be assigned
+approach maintains a small amount of per-thread state (e.g.,       strictly increasing sequence numbers, explicitly denoting
+an “awaiting acquire” flag). An incoming request is stalled        their order. We then maintain a reorder buffer (ROB) at the
+only if its thread ID matches a thread that is currently in this   Root Complex to reconstruct this order. If the MMIO-Release
+waiting state. This design eliminates false dependencies and       (with a higher sequence number) arrives at the root complex
+maximizes parallelism between independent contexts.                before the MMIO-Store (with a lower sequence number), the
+Optimization: Speculative DMA Ordering. To eliminate               ROB recognizes that a later operation has been received out
+stalls within a single thread, our most advanced design em-        of order. The Root Complex delays issuing the PCIe write cor-
+ploys speculation, similar to modern processors [12]. For an       responding to the MMIO-Release to the device until the PCIe
+Acquire→Read sequence (e.g., an acquire on 𝑋 , then a read         write for the earlier MMIO-Store (with the lower sequence
+on 𝑌 ), the RLSQ issues both requests to the host memory           number) has also arrived and been issued.
+system speculatively and in parallel. To preserve correctness,        As with DMA operations, we incorporate the hardware
+it buffers the result of the speculative read (𝑌 ) and responds    thread ID as part of the sequence number. This allows the
+to the NIC only after the acquire (𝑋 ) has completed. This         ROB to distinguish and independently manage the ordering
+maintains the illusion of serial execution while overlapping       of MMIO operations originating from different hardware
+the memory latencies.                                              threads within the CPU.
+                                                                      The microarchitectural implementation of the ROB is
+                                                                   straightforward. We can maintain a simple state machine
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA   Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+that tracks the highest sequence number for which all preced-              Table 2. Simulation Configurations for DMA Experiments
+ing sequence numbers have also been received. Once such               Processor
+a contiguous sequence is identified, all the corresponding            Core                   1 SimpleTimingCPU, 3 GHz
+MMIO operations within that sequence can be dispatched
+                                                                      Cache Hierarchy
+as ordered PCIe writes towards the target device.
+                                                                      L1 Instruction         16 KiB, 2-way associative, 2 cycle latency
+   This sequence number-based approach is flexible in its
+                                                                      L1 Data                64 KiB, 2-way associative, 2 cycle latency
+placement of the ROB. The Root Complex is an obvious                  L1 to L2 bus           256-bit wide, 1 cycle latency
+choice, but this mechanism would also support ROBs at                 L2                     256 KiB, 8-way associative, 20 cycle latency
+device endpoints. Placing the ROB at the endpoint opens
+                                                                      Memory
+up the possibility of using unordered PCIe reads and writes
+                                                                      Memory bus             128-bit wide, 7 cycle latency
+throughout the interconnect for MMIO reads and writes
+                                                                      Memory Interface       DDR3-1600 in 8x8 configuration
+since end-to-end ordering can be guaranteed solely by the             Bandwidth              8 channels, 12.8 GB/s per channel
+sequence numbers and the ROB at the final destination (the
+device).                                                              I/O System
+                                                                      I/O bus                128-bit wide, 200 ns latency
+   By embedding ordering information within the transac-
+                                                                      Root Complex           17 ns latency, 256 tracker entries
+tions themselves, intermediate links—including the PCIe fab-
+                                                                      RLSQ                   256 entries
+ric and the Root Complex—no longer need to enforce strict             NIC                    3 ns DMA request issue latency
+ordering. This allows the Root Complex to aggressively for-
+ward PCIe reads and writes without serialization, signifi-              Table 3. Simulation Configurations for MMIO Experiments
+cantly increasing interconnect utilization and performance.
+                                                                      Processor
+                                                                      Core                   1 O3CPU, 3 GHz
+6     Evaluation                                                      Cache Hierarchy        Same as configuration as Table 2
+In this section, we assess the performance benefits of our pro-       Memory                 Same as configuration as Table 2
+posed architectural and microarchitectural enhancements for           I/O System
+fast remote memory ordering using a two-pronged approach.             I/O bus                128-bit wide, 200 ns latency
+The first relies on simulation, and the second emulates re-           Root Complex           60 ns latency, 16 entry buffer
+mote ordering performance on existing NVIDIA ConnectX                 NIC                    10 ns MMIO processing latency
+NICs to understand what the gains might be in practice.
+   We first describe the simulation infrastructure and bench-        600 ns round-trip latency for DMA reads reported in prior
+marks used for evaluation. Next, we present the overall per-         work [27]
+formance improvement achieved by our complete approach,                 Table 3 lists the simulation configuration for MMIO write
+incorporating PCIe extensions, ISA modifications, and the            experiments, which use the O3CPU model to accurately cap-
+optimized RLSQ design compared to today’s baseline tech-             ture the performance of core-initiated operations. Posted
+niques that rely on store fences for W→W MMIO ordering               PCIe writes are modeled with zero latency response packets
+and implicit serialization for R→R DMA. Finally, we provide          on the non-coherent crossbar that models the PCIe intercon-
+an estimate of the area and static power overheads of the            nect. The Root Complex schedules a response packet to the
+RLSQ and ROB.                                                        CPU cache controller without delay. Writes without source
+                                                                     ordering are modeled by the cache controller acknowledging
+                                                                     uncacheable MMIO writes without delay. Fence instructions
+6.1   Simulation Infrastructure
+                                                                     stall until a response from the root complex is received.
+Our proposed designs are simulated on gem5 [5] using the
+classic cache model. For the DMA experiments, we use a
+                                                                     6.2     Benchmarks
+SimpleTimingCPU model, as these operations are device-
+initiated; this focuses the evaluation on the I/O path perfor-       We use three main benchmark kernels to demonstrate the
+mance rather than the detailed microarchitecture of the host         benefits of remote ordering.
+core.                                                                Ordered DMA Reads: The first is a microbenchmark that
+   Table 2 lists the simulation configuration for DMA read           simulates clients issuing DMA reads of various sizes (sim-
+experiments. We modeled a baseline Root Complex described            ilar to a NIC handling a workload of RDMA READs). We
+in prior art [10, 32]. In particular, tracker entries are used       vary the approach the NIC uses to order PCIe reads within
+to track requests that access the same cache line. Our RLSQ          each DMA read; this benchmark shows the effectiveness
+model is integrated into this Root Complex. In gem5, DMA             of remote ordering and speculative remote ordering. This
+requests are split into 64 B packets on the I/O bus. We use          microbenchmark is simulated using a NIC that issues DMA
+a one-way I/O bus latency of 200 ns, estimated from the              read requests from a trace of increasing addresses.
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                      ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+                                                                   (e.g., lowest-to-highest address), then a NIC would need to
+                                                                   execute each cache line access synchronously (NIC), destroy-
+                                      NIC       RC-opt             ing throughput both for small and large accesses since the
+                                      RC        Unordered
+                                                                   number of stalls is proportional to the number of cache lines
+      Throughput (GB/s)
+
+
+                                                                   read. Delegating this responsibility to the Root Complex (RC)
+                          30                                       reduces the length of these stalls, but it still prevents the read
+                                                                   bandwidth from scaling. However, speculative ordering (RC-
+                          20                                       opt) ensures that ordered reads can be pipelined to the host
+                                                                   coherence subsystem without stalling, allowing ordered read
+                          10                                       performance to match that of unordered accesses.
+                                                                   Key-Value Stores. Next, we benchmark RDMA-based key-
+                           0
+                               64 128 256 512 1K 2K 4K 8K          value store get operations. In our benchmarks, we vary the
+                                     DMA Read Size (B)             approach we use to order the PCIe reads triggered by the
+                                                                   RDMA READs as part of these get operations, comparing the
+Figure 5. Throughput of DMA reads in simulation using one QP.      performance of reads that are ordered by the NIC, remotely
+Speculative ordering achieves ordering at no cost.                 by the Root Complex (RC), and with speculative ordering at
+                                                                   the Root Complex (RC-opt).
+Key-value Store (KVS) Gets: RDMA-based KVSs that hold                 In our benchmark, we use the optimistic, validation-based
+small items in memory accessed by a user-supplied key have         get algorithm described by Jasny et. al. [16]. In this approach,
+become important in recent years [9, 11, 17, 25, 26, 33]. Often    an item get operation is performed at a server NIC using two
+the algorithms that get items from a KVS have subtle order-        RDMA READs. In the first RDMA READ, a client reads an
+ing constraints that result in complexity, stalls, and extra       item header version number and the item. After receiving
+round trips on today’s unordered interconnects. We bench-          the results from the first RDMA READ the client issues a
+mark several KVS get implementations showing the benefits          second RDMA READ that fetches a second copy of the item
+of remote ordering for throughput and reducing complex-            header version number. If the version numbers match, the
+ity. We validate these results by comparing our simulation         read item is returned to the caller. If the version numbers do
+results to implementations of these algorithms on existing         not match, the protocol repeats.
+NICs. In order to better represent real applications that batch       This protocol is unsafe today because PCIe reads are un-
+get requests [28], our simulation includes batch size and is-      ordered within an RDMA read; in the first RDMA READ it
+sue interval parameters. We use batch sizes of 100 and 500         is possible that the cache line containing the header version
+requests with an inter-batch issue interval of 1 µs based on       number is read after the cache lines containing the data item.
+the halo3d and sweep3d communication patterns [15].                Even if an ordered writer correctly updated the data item be-
+NIC Packet Transmission: Ethernet link speeds of 100 Gb/s          tween its updates to the header, the reader could see stale or
+and higher have made it crucial for software to be able to         torn reads. With our proposed read ordering, the unmodified
+coordinate the transfer of packet data to NICs efficiently [30].   protocol works correctly.
+We show that our proposed Release ordering for MMIO                   Figure 6a shows the results when a single client (one QP)
+makes MMIO efficient enough that software may be able              issues batches of 100 gets. All operations within a batch
+to directly transfer packet data while preserving correct or-      are executed according to their order in the batch. As with
+dering without costly sfence instructions that prevent this        our ordered DMA reads benchmark, using the NIC to order
+today. In simulation, cache line sized MMIO writes are mod-        reads results in a 440 ns synchronous stall between the NIC
+eled by writes to addresses that are one cache line apart.         and the CPU coherence subsystem to fetch each cache line
+MMIO writes are issued to increasing addresses to simulate         separately; this results in poor performance, and it cannot be
+writes with increasing sequence numbers. The simulated             amortized across larger items. Ordering at the RC reduces the
+NIC checks if the write packets arrive in the correct order.       stall between fetching cache lines substantially improving
+                                                                   performance by 29.1× over NIC ordered reads. RC-Opt’s
+                                                                   speculative ordering allows all cache line reads within each
+6.3    Simulation Results                                          request and all requests themselves to be pipelined to the
+Ordered Reads. We simulate a single thread of execution on         memory system, incurring stalls only between whole batches
+a NIC performing reads of varying length sequential regions.       of requests making it 50.9× faster than NIC ordering.
+Figure 5 shows the results. Today, when a NIC issues a DMA            Figure 6b shows that even as more clients/QPs offer re-
+read, each cache line in the DMA is read in an arbitrary order,    quests to the server, these gains hold. Increasing client count
+making it efficient enough to saturate a 100 Gb/s network          helps NIC-based ordering the most since it can overlap the
+link even with 64 B granularity accesses (Unordered). If an        PCIe reads of up to 16 get operations at a time. However, the
+application requires cache lines to be read in a specific order
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                                                Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+
+                                 NIC           RC        RC-opt                                       NIC          RC                           RC-opt                                     NIC           RC        RC-opt
+                                                                                         60
+                                                                                                                                                                                 150
+                        50
+ Throughput (M GET/s)
+
+
+
+
+                                                                  Throughput (M GET/s)
+
+
+
+
+                                                                                                                                                          Throughput (M GET/s)
+                                                                                         50                                                                                      125
+                        40                                                               40                                                                                      100
+                        30                                                               30                                                                                       75
+                        20                                                               20                                                                                       50
+                        10                                                               10                                                                                       25
+                         0                                                                0                                                                                        0
+                             64 128 256 512 1K 2K 4K 8K                                       1          2         4           8                     16                                64 128 256 512 1K 2K 4K 8K
+                                       Object Size (B)                                                Number of queue pairs                                                                      Object Size (B)
+                                         (a)                                                                 (b)                                                                                   (c)
+Figure 6. Key-Value Get Throughput. (a) uses a single client QP submitting batches of 100 get requests; (b) scales the workload across
+multiple QPs/clients; (c) uses 16 QPs/clients each submitting batches of 500 get requests. Across all these configurations RC-opt shows robust
+performance gains.
+
+
+            CloudLab sm110p (one as client, one as server)
+                                                                                                                                                                            Validation               Single Read
+            CPU               1× Intel Xeon Silver 4314 16-cores @ 2.40 GHz                                                                                                 FaRM                     Pessimistic
+                              (Ice Lake)                                                                                                        40
+
+
+                                                                                                                         Throughput (M GET/s)
+            RAM               128 GB ECC DDR4-3200
+            NIC               NVIDIA ConnectX-6 Dx EN 100 Gb/s PCIe 4.0 ×16                                                                     30
+Table 4. Hardware Setup for Emulation Experiments (Figure 7).                                                                                   20
+increased parallelism is not enough for NIC ordering to make                                                                                    10
+up for its long stalls. In practice, the NVIDIA ConnectX-6 Dx
+                                                                                                                                                 0
+NICs that we have benchmarked do not scale performance                                                                                               64 128 256 512 1K 2K 4K 8K
+substantially beyond 16 QPs for deeply pipelined RDMA                                                                                                          Object Size (B)
+READs, suggesting that NIC-based ordering is unlikely to
+ever converge to RC’s performance even with an unbounded                                                           Figure 7. Throughput of gets on a key-value store implemented via
+number of clients.                                                                                                 RDMA using various algorithms on a 100 Gb/s NVIDIA ConnectX-6
+   Finally, since RC-Opt can fully pipeline memory opera-                                                          Dx. Validation and Single Read require R→R ordering for correct-
+tions for requests within a batch, Figure 6c shows that if                                                         ness. Our proposed Single Read algorithm, enabled by hardware
+clients use larger batch sizes and offer more concurrency,                                                         ordering, is simpler and outperforms all baselines, including a 1.6×
+speculative remote ordering becomes crucial for scaling                                                            gain over FaRM for 64 B objects.
+throughput. For small object sizes—the most challenging
+                                                                                                                   that our simulation results closely match the performance
+case for interconnect overhead—RC-opt is the only approach
+                                                                                                                   measured on the real hardware (Table 4).
+that maintains correctness of the protocol while approaching
+                                                                                                                      A recent paper reimplemented several approaches to fetch-
+the 100 Gb/s link that modern NICs support.
+                                                                                                                   ing and synchronizing access to remote records in a KVS [16].
+                                                                                                                   Their work compares numerous state-of-the-art approaches,
+6.4                     Emulation on Existing NICs                                                                 groups common approaches (e.g., optimistic protocols versus
+To validate our simulation and gain further confidence in                                                          pessimistic, locking-based approaches), and ensures that the
+our results, we emulate our architecture’s expected best-case                                                      uniform platform and benchmark harness illustrate differ-
+performance using real hardware. Our simulation results                                                            ences in the algorithms rather than the implementations.
+(§6.3) show that in read-only workloads where there are                                                            Building on their harness, we repeat their experiments here
+no conflicts, the performance of our speculative ordering                                                          on our hardware, and we extend the results to include an
+mechanism is identical to that of today’s fully unordered                                                          algorithm that is only safe with a NIC and an interconnect
+hardware. This key finding allows us to use existing NVIDIA                                                        that supports ordered reads.
+ConnectX-6 Dx NICs as a realistic performance proxy to                                                                In the implementation of all of these algorithms we batch
+emulate our proposed architecture. Even though these NICs                                                          32 concurrent get operations before polling for operation
+do not enforce order, their unordered throughput represents                                                        completion at the client to ensure each of the 16 client threads
+the performance our ordered speculative design can achieve.
+We validate this assumption in Section 6.5, where we show
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                                        ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+offers substantial concurrency to the server NIC and to amor-
+tize polling costs at the client.                                                                           Validation           Single Read
+                                                                                                 30
+
+
+
+
+                                                                          Throughput (M GET/s)
+Pessimistic [16]: Pessimistic protocols are prevalent in sev-
+eral state-of-the-art RDMA-enabled KVSs [16, 23, 37]. In this
+protocol, a client pipelines an RDMA fetch-and-add to incre-                                     20
+ment the reader count for a key-value item and an RDMA
+READ for the item to the server’s NIC, which also includes
+a lock bit for the writer. If the lock bit is set by the writer,                                 10
+then the operation is restarted. Otherwise, the client asyn-
+chronously issues another RDMA fetch-and-add to decre-
+                                                                                                  0
+ment the reader count, and it makes the read value available                                          64 128 256 512 1K 2K 4K 8K
+to the caller of the get operation.                                                                              Object Size (B)
+Optimistic with Validation [26]: We described this algo-
+rithm in §6.3. It uses two RDMA READs per get request;              Figure 8. Throughput of get operations in simulation using both
+it requires R→R order for correctness. Though our system            Single Read and Validation with 16 queue pairs and batch size 32.
+does not actually order PCIe reads, based on our simulation
+results, in cases like this where there are no writes the results   fetch-and-add needed to lock access to each item. Valida-
+should be representative.                                           tion’s protocol only relies on RDMA READs, and it performs
+FaRM [11]: FaRM and XStore [35] get operations fetch key-           much better. For example, with 512 B items it is able to
+value items using a single RDMA READ. In this approach,             transfer more than 60 Gb/s, letting applications use most of
+each item contains a header with a version number, and each         the 100 Gb/s link between the client and server. However, a
+cache line that is part of the item also includes (part of) the     correct implementation of Validation would only be able to
+item version number. Writers first update the header version        perform this well using the remote ordering that we describe
+number and then update each cache line with the new data            in this paper. Single Read substantially improves on Valida-
+and the new version number embedded in it. Clients issue a          tion at every item size with about double the throughput
+single RDMA READ for a whole item. If the version number            with small items, and it uses less network bandwidth.
+in the header matches the version number in every cache                Like with Single Read, FaRM get operations are processed
+line, then the data in the cache lines is safe to use, and it       with a single RDMA READ. However, since FaRM embeds
+is returned to the caller. If there is a mismatch, the RDMA         ordering metadata within items, clients must strip metadata
+READ is repeated. The version numbers in cache lines ensure         out of items before returning items to most applications.
+the protocol is correct even if PCIe reads within the RDMA          Effectively, FaRM requires an extra deserialization step at
+READ are reordered.                                                 clients that requires copying item data into a contiguous
+Single Read: Single Read is a simpler protocol that previ-          buffer. At the high > 10 GB/s data rates of modern NICs this
+ously was not possible due to PCIe read reordering. In it,          becomes a substantial overhead. In our setup this additional
+each item includes a header version and a footer version.           copying limits FaRM get throughput to less than what Vali-
+Clients issue a single RDMA READ for a whole item includ-           dation can achieve for all but the smallest item sizes. Relying
+ing its version numbers. If the two version numbers match,          on remote ordering allows Single Read to avoid the need for
+the item is returned to the caller; if the version numbers          this extra metadata and copying without hurting efficiency.
+do not match, the RDMA READ is repeated. Unlike FaRM,                  Overall, these results show that remote ordering may
+this protocol does not require any version information em-          enable simpler algorithms that beat state-of-the-art perfor-
+bedded in the individual cache lines of each of the items.          mance for important applications. We simplified the descrip-
+For correctness, writers must work from back to front, first        tions of each algorithm to ignore how they safely coordinate
+updating the footer version number, then the item data, then        concurrent writes to items. Each individual paper provides
+the header version number. This avoids a race where a reader        full details; however, this can generally be done in a straight-
+and writer could interleave in an order where the reader sees       forward manner for each of the algorithms, e.g., by having
+the updated header, stale data, and an updated footer. Some         writers perform a compare-and-swap on the version number.
+past systems have used a similar approach, though they were
+incorrect since they implicitly relied on DMA read ordering         6.5    Cross-Validating Simulation and Emulation
+within each RDMA READ [16, 26, 34, 38].                             This final step performs a crucial cross-validation. First, it
+                                                                    validates that our simulation infrastructure is well-calibrated
+  Figure 7 shows the get throughput of each of these al-            by showing it can accurately model the performance of real
+gorithms for a range of item sizes. At sizes less than 4 KB,        hardware. Second, it validates that our hardware emulation is
+Pessimistic suffers from the high overhead of the RDMA              a meaningful proxy for our proposed architecture’s potential.
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA                  Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+                                                                                       If strict ordering is enforced by the interconnect, or if net-
+                                   Reads to CPU, no P2P transfers                   work resources are naively shared, a slow device can penalize
+                                   Reads to CPU, P2P transfers                      a fast destination. Specifically, suppose application 𝐴1 sends
+                                   Reads to P2P device                              read request 𝑅1 to device 𝐷 1 and application 𝐴2 sends read
+                                                                                    request 𝑅2 to device 𝐷 2 . If 𝐷 1 is congested, requests targeting
+      Throughput (Gb/s)
+
+
+                                                                                    it may fill the interconnect buffers. If the switch uses a single
+                          200                                                       shared queue, request 𝑅2 (targeting the uncongested 𝐷 2 ) gets
+                                                                                    stuck behind 𝑅1 . This is Head-of-Line (HOL) blocking. We
+                          100                                                       propose using Virtual Output Queues (VOQs) [24] to isolate
+                                                                                    these flows and prevent such degradation.
+                                                                                       To quantify the impact of HOL blocking and the efficacy
+                            0
+                                64 128 256 512 1K 2K 4K 8K                          of VOQs, we simulated three system configurations:
+                                       Object Size (B)                              • RC-opt (Baseline): A standard system where the source
+                                                                                       device, a NIC, issues ordered reads to the CPU.
+Figure 9. For each request size, the left bar represents the baseline               • P2P-VOQ: Adds a congested P2P device to the baseline.
+with no P2P transfers, the middle bar represents P2P-VOQ, the right                    The NIC connects to the CPU and the congested device via
+bar represents P2P-noVOQ.                                                              a crossbar switch equipped with VOQs (separate queues
+                                                                                       for each destination).
+   To do this, we repeated the Validation and Single Read                           • P2P-noVOQ: Adds the same congested P2P device, but the
+benchmarks in our simulation, configuring them to match                                crossbar switch uses a single shared 32-entry queue for
+the real NIC’s behavior of serially issuing RDMA READs                                 all incoming requests, regardless of destination.
+from each QP. The results show a strong correlation: the                               We used the Single Read protocol (§6.4) with two distinct
+simulated throughput in Figure 8 closely tracks the real hard-                      threads running on the NIC:
+ware performance from Figure 7. The curves diverge only                             • Thread A (CPU Flow): Issues batches of 100 requests to
+when limited by different bottlenecks—the wider PCIe bus                               the CPU with a 1 µs inter-batch interval.
+in simulation versus the narrower Ethernet link on the real                         • Thread B (P2P Flow): Issues requests to the P2P device.
+hardware. This close match gives us high confidence in both                            To simulate congestion, the P2P device is modeled with
+our simulation’s predictions and our emulation’s findings,                             a service time of 100 ns per request and an input limit of
+suggesting the benefits of our architecture will hold on real                          one request at a time. Thread B attempts to issue requests
+systems.                                                                               at the same rate as Thread A but without the inter-batch
+                                                                                       delay, ensuring the P2P device is constantly saturated.
+6.6    Peer-to-Peer Experiments                                                        In the P2P-noVOQ configuration, the slow consumption
+The previous sections studied ordered read requests issued by                       rate of the P2P device causes the shared 32-entry switch
+a single NIC to a single CPU root complex; however, systems                         queue to fill rapidly. Once full, the switch rejects new re-
+can have topologies involving multiple destination devices.                         quests from both threads. The NIC handles this backpressure
+One example is peer-to-peer (P2P) transfers in PCIe [14].                           using a round-robin scheduler to retry failed requests. Hence,
+This section discusses how read requests originating from the                       the high-speed CPU flow is throttled to match the drain rate
+same source device that target different destination devices                        of the slow P2P flow, as it must wait for free buffer space.
+can be handled. There are two cases to consider:                                       Figure 9 illustrates the results. In the P2P-noVOQ scenario,
+Case 1: Requests originate from the same process and                                the shared queue causes significant performance degrada-
+R→R order is required. An example of such a scenario                                tion: read throughput to the CPU drops by up to 167× for
+would be a client application running at a device (e.g. a NIC)                      8192 B objects compared to the baseline. In contrast, the
+that needs to read data from GPU memory after reading some                          P2P-VOQ setup successfully isolates the flows. Throughput
+synchronization variable from CPU memory. Even if read                              is restored to near-baseline levels across all object sizes.
+requests are ordered by the interconnect, we must guarantee
+that a read request 𝑅2 at device 𝐷 2 will be handled only after
+a read request 𝑅1 at device 𝐷 1 has been handled. In this case,
+we revert to ordering at the source NIC by issuing 𝑅2 to 𝐷 2                        6.7   Ordered MMIO Writes
+only after receiving the completion for 𝑅1 issued to 𝐷 1 .                          Section 2.2 showed that enforcing W→W MMIO ordering
+Case 2: Requests originate from different processes                                 in CPU-NIC transmit paths via sfence significantly hurts
+and R→R order is not required. An example of this case                              throughput compared to unordered MMIO stores. Figure 4
+would be different clients on a single machine reading from                         illustrates this performance degradation observed on an
+two different devices. Since these read requests originate                          NVIDIA ConnectX-6 Dx NIC. To validate this observation,
+from distinct clients, ordering is not required.                                    we replicated the experiment in our simulator. The simulator
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                               ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+                                                                             7   Related Work
+                                    MMIO                   NIC B/W Limit     Efficient Memory Consistency Models (MCMs). Efficient
+                                    MMIO + fence                             enforcement of MCMs has been the subject of extensive
+                          100                                                research. Our proposed interface builds on Release Consis-
+      Throughput (Gb/s)
+
+
+                                                                             tency [13], which forms the foundation of prevalent modern
+                           80                                                MCMs found in architectures like ARM, RISC-V [3], and
+                           60                                                even in language-level specifications [18]. A key insight of
+                                                                             our work is that there is no fundamental reason for high-
+                           40
+                                                                             performance interconnects like PCIe to operate with order-
+                           20                                                ing semantics divorced from the well-established concepts
+                            0                                                and best practices developed within the MCM community.
+                                64 128 256 512 1K 2K 4K 8K                      Our techniques for enforcing memory ordering draw in-
+                                          Message Size (B)                   spiration from classic works on MCM enforcement in pro-
+                                                                             cessor pipelines. For example, our approach to speculative
+Figure 10. MMIO write throughput in simulation. Inserting a fence            memory ordering is inspired by seminal work such as [12].
+after every message enforces message order at the source.                    However, there are crucial differences between a Remote
+                            Table 5. Estimate of Hardware Area               Load-Store Queue (RLSQ) and a traditional processor-centric
+                                                                             Load-Store Queue (LSQ). By definition, a processor LSQ is
+                                        Area in mm2      % of I/O Hub        local to a single core, whereas the RLSQ is shared by multiple
+                        RLSQ                0.9693           0.6853          independent thread contexts within the connected device.
+                        ROB                 0.2330           0.1647          This fundamental difference underscores the criticality of in-
+                    I/O Hub [10]            141.44             100           corporating our thread-context-based ordering optimization
+                                                                             in the RLSQ. Furthermore, the invalidation-based tracking
+                                Table 6. Estimate of Static Power
+                                                                             for speculative reads in the RLSQ presents another subtle
+                                     Static Power in mW      % of I/O Hub    difference as the RLSQ itself does not maintain a coherent
+                                                                             cache. Despite these differences, our core contribution lies
+          RLSQ                              49.2018                 0.4920
+          ROB                               4.8092                  0.0481   in identifying the significant ordering challenges in contem-
+      I/O Hub [10]                           10000                    100    porary high-speed interconnects, formalizing this problem
+                                                                             within the well-understood framework of memory consis-
+configuration is summarized in Table 3. Figure 10 shows sim-                 tency models, and consequently enabling the adaptation and
+ilar trends to the results on the NIC. MMIO write throughput                 application of these classic enforcement techniques to a new
+drops significantly when fences are used to ensure ordering.                 and increasingly important domain.
+                                                                             Non-coherent interconnects. While this work focuses on
+6.8    Hardware Area and Static Power Overhead                               PCIe, our destination-based ordering concepts are equally ap-
+                                                                             plicable to other non-coherent fabrics. Here, we focus on two
+We estimate the area required and the static power consump-                  publicly available non-coherent interconnects. CXL.io [8] ex-
+tion for the RLSQ and ROB using CACTI [4]. The RLSQ and                      plicitly inherits PCIe’s ordering rules, so our analysis trans-
+ROB are modeled as caches with 64 B blocks.                                  fers directly. In the case of AMBA AXI [2], another widely
+   The RLSQ is modeled as a 256 block, fully-associative                     deployed non-coherent interconnect, the performance impli-
+cache with 1 read port, 1 write port and 1 search port. The                  cations are even more significant. AXI does not guarantee or-
+RLSQ is fully associative so that speculative loads can be in-               dering between transactions to different memory addresses—
+validated when invalidation messages are received. The ROB                   even if they share the same Transaction ID. Consequently,
+is modeled as a 32 block, direct-mapped cache (indexed by                    to implement a reliable Read→Read ordering (e.g., reading
+the sequence number) with 1 read port and 1 write port. The                  data then a flag), current AXI systems must enforce strict
+ROB uses 32 blocks to implement separate virtual networks                    source-side serialization, waiting for the first response before
+for relaxed stores and release stores, each with 16 entries.                 issuing the second. Our proposed release/acquire semantics
+   For comparison against the reported die area and idle                     overcome this limitation by attaching explicit ordering at-
+power consumption of the Intel I/O Hub design [10], the                      tributes to requests; this allows the source to pipeline ordered
+CACTI models for the RLSQ and the ROB both use the same                      reads efficiently, relying on the destination to enforce order
+65 nm process technology.                                                    locally via the RLSQ mechanism.
+   The hardware area estimate is presented in Table 5 and
+                                                                             Coherent Interconnects. Recent research has explored
+static power estimate in Table 6. Overall, adding the RLSQ
+                                                                             cache-coherent I/O interconnects [30, 31] to achieve high
+and ROB to the I/O Hub would increase chip area by less
+                                                                             bandwidth, low-latency CPU-NIC communication. CC-NIC
+than 0.9% and increase static power by less than 0.6%.
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA    Wei Siew Liew, Md Ashfaqur Rahaman, Adarsh Patil, Ryan Stutsman, and Vijay Nagarajan
+
+
+[31], a cache-coherent NIC interface, considered an MMIO-             an implicit property of the fabric, but as an explicit, first-class
+based PCIe baseline but dismissed it due to the perceived             semantic co-designed with the ISA, enabling fast and correct
+cost of ordering fences. Given MMIO’s capability to achieve           I/O for future systems. By establishing a high-performance
+line rate and low latency without compromising ordering               baseline for non-coherent I/O, this work raises the question
+(through our proposed mechanisms), there is little need for           of whether the complexity of coherent interconnects (like
+coherence in CPU-NIC communication patterns. Instead,                 CXL) is truly necessary for future host-device communica-
+coherence protocols like CXL (a MESI variant) can hinder ef-          tion.
+ficient CPU-NIC producer-consumer communication. These
+protocols typically require obtaining ownership and transi-           Acknowledgments
+tioning to an exclusive state on writes, so a CPU producer            We thank the reviewers, and particularly our shepherd, Hag-
+write pulls the cache block into an exclusive state. A subse-         gai Eran, for their detailed and helpful feedback. This ma-
+quent consumer read by the NIC necessitates an indirection—           terial is based upon work supported by the National Sci-
+the data must be fetched from the CPU’s caches, thus increas-         ence Foundation under Grant Nos. CCF-2525270 and CNS-
+ing latency. Creative optimizations in software [31] or the           2245999. Any opinions, findings and conclusions or recom-
+protocol [30] can work around these inefficiencies, but we            mendations expressed in this material are those of the au-
+contend that these optimizations are effectively striving to          thor(s) and do not necessarily reflect the views of the Na-
+achieve what our PCIe-based transmit path inherently pro-             tional Science Foundation. This work was also supported in
+vides: high throughput and low latency without the need for           part by Arm, Google, VMware, Meta.
+complex workarounds layered on top of coherence proto-
+cols. Our earlier work made a similar observation for MMIO            References
+writes and NIC transmission paths [22], yet it stopped short
+                                                                       [1] 2016. Semantics of MMIO mapping attributes across architectures. Avail-
+of proposing a holistic ordering framework for non-coherent                able at https://lwn.net/Articles/698014/.
+interconnects.                                                         [2] 2023. AMBA® AXI Protocol Specification. Technical Report ARM IHI
+Other Devices. While our optimizations target CPU-NIC                      0022 Issue K. Arm Limited.
+interaction, the core concept of destination-based order-              [3] 2025. The RISC-V Instruction Set Manual: Volume I: Unprivileged
+                                                                           Architecture.
+ing also applies to other devices such as GPUs and FPGAs.              [4] Rajeev Balasubramonian, Andrew B. Kahng, Naveen Muralimanohar,
+Yu et al. [36] recently proposed a directory-based ordering                Ali Shafiee, and Vaishnav Srinivas. 2017. CACTI 7: New Tools for
+mechanism tailored for efficient store→release ordering in                 Interconnect Exploration in Innovative Off-Chip Memories. ACM
+CPU-GPU systems; they also propose a mechanism for effi-                   Trans. Archit. Code Optim. 14, 2, Article 14 (June 2017), 25 pages. doi:10.
+ciently enforcing ordering across multiple devices. In con-                1145/3085572
+                                                                       [5] Nathan Binkert, Bradford Beckmann, Gabriel Black, Steven K. Rein-
+trast, our approach introduces techniques to enforce both                  hardt, Ali Saidi, Arkaprava Basu, Joel Hestness, Derek R. Hower, Tushar
+store→release and acquire→load orderings. Future work                      Krishna, Somayeh Sardashti, Rathijit Sen, Korey Sewell, Muhammad
+could integrate these ideas—CORD’s distributed coordina-                   Shoaib, Nilay Vaish, Mark D. Hill, and David A. Wood. 2011. The
+tion and our bidirectional ordering support—to create a uni-               gem5 simulator. SIGARCH Comput. Archit. News 39, 2 (Aug. 2011), 1–7.
+fied ordering framework for heterogeneous systems.                         doi:10.1145/2024716.2024718
+                                                                       [6] Matthew Burke, Sowmya Dharanipragada, Shannon Joyner, Adriana
+                                                                           Szekeres, Jacob Nelson, Irene Zhang, and Dan R. K. Ports. 2021. PRISM:
+                                                                           Rethinking the RDMA Interface for Distributed Systems. In Proceedings
+8    Conclusion                                                            of the ACM SIGOPS 28th Symposium on Operating Systems Principles
+The PCIe specification has been a cornerstone of system in-                (Virtual Event, Germany) (SOSP ’21). Association for Computing Ma-
+terconnects for decades. However, its original design catered              chinery, New York, NY, USA, 228–242. doi:10.1145/3477132.3483587
+to an era of slow I/O devices optimized for bulk data transfers.       [7] Harold W Cain and Mikko H Lipasti. 2004. Memory ordering: A value-
+                                                                           based approach. ACM SIGARCH Computer Architecture News 32, 2
+The rise of heterogeneous computing and high-bandwidth,                    (2004), 90.
+low-latency interconnects has fundamentally transformed                [8] Compute Express Link Consortium, Inc. 2023. Compute Express Link
+the nature of host-device communication. In this context,                  (CXL) Specification. Compute Express Link Consortium, Inc. Available
+we have identified crucial inefficiencies in how current sys-              at https://www.computeexpresslink.org/download-the-specification.
+tems order remote memory operations. To address these                  [9] Mahesh Dananjaya, Vasilis Gavrielatos, Antonios Katsarakis, Nikos
+                                                                           Ntarmos, and Vijay Nagarajan. 2025. Fast, Highly Available, and
+challenges, we have proposed a new PCIe interface designed                 Recoverable Transactions on Disaggregated Data Stores. (2025).
+to integrate effectively with contemporary host memory                [10] Debendra Das Sharma. 2009. Intel® 5520 chipset: An I/O hub chipset
+consistency models. Additionally, we have introduced novel                 for server, workstation, and high end desktop . In 2009 IEEE Hot Chips
+and efficient microarchitectural techniques for enforcing                  21 Symposium (HCS). IEEE Computer Society, Los Alamitos, CA, USA,
+remote memory ordering, drawing inspiration from estab-                    1–18. doi:10.1109/HOTCHIPS.2009.7478355
+                                                                      [11] Aleksandar Dragojević, Dushyanth Narayanan, Orion Hodson, and
+lished methods used to enforce memory consistency models                   Miguel Castro. 2014. FaRM: fast remote memory. In Proceedings of the
+in host processors. Ultimately, this work argues for a funda-              11th USENIX Conference on Networked Systems Design and Implemen-
+mental shift in interconnect design: treating ordering not as              tation (Seattle, WA) (NSDI’14). USENIX Association, USA, 401–414.
+Efficient Remote Memory Ordering for Non-Coherent Interconnects                                     ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+
+[12] Kourosh Gharachorloo, Anoop Gupta, and John L Hennessy. 1991. Two               PCIe performance for end host networking. In Proceedings of the 2018
+     techniques to enhance the performance of memory consistency models.             Conference of the ACM Special Interest Group on Data Communication
+     Computer Systems Laboratory, Stanford University.                               (Budapest, Hungary) (SIGCOMM ’18). Association for Computing Ma-
+[13] Kourosh Gharachorloo, Daniel Lenoski, James Laudon, Phillip Gibbons,            chinery, New York, NY, USA, 327–341. doi:10.1145/3230543.3230560
+     Anoop Gupta, and John Hennessy. 1998. Memory consistency and               [28] Rajesh Nishtala, Hans Fugal, Steven Grimm, Marc Kwiatkowski, Her-
+     event ordering in scalable shared-memory multiprocessors. In 25 Years           man Lee, Harry C. Li, Ryan McElroy, Mike Paleczny, Daniel Peek, Paul
+     of the International Symposia on Computer Architecture (Selected Papers)        Saab, David Stafford, Tony Tung, and Venkateshwaran Venkataramani.
+     (Barcelona, Spain) (ISCA ’98). Association for Computing Machinery,             2013. Scaling Memcache at Facebook. In 10th USENIX Symposium on
+     New York, NY, USA, 376–387. doi:10.1145/285930.285997                           Networked Systems Design and Implementation (NSDI 13). USENIX As-
+[14] Peripheral Component Interconnect Special Interest Group. 2017. PCI             sociation, Lombard, IL, 385–398. https://www.usenix.org/conference/
+     Express® Base Specification Revision 4.0. Available at https://pcisig.          nsdi13/technical-sessions/presentation/nishtala
+     com/specifications/pciexpress/.                                            [29] Waleed Reda, Marco Canini, Dejan Kostić, and Simon Peter. 2022.
+[15] Simon David Hammond, Karl Scott Hemmert, Michael J Levenhagen,                  RDMA is Turing complete, we just did not know it yet!. In 19th USENIX
+     Arun F Rodrigues, and Gwendolyn Renae Voskuilen. 2015. Ember:                   Symposium on Networked Systems Design and Implementation (NSDI
+     Reference Communication Patterns for Exascale. Technical Report.                22). USENIX Association, Renton, WA, 71–85. https://www.usenix.
+     Sandia National Lab.(SNL-NM), Albuquerque, NM (United States).                  org/conference/nsdi22/presentation/reda
+[16] Matthias Jasny, Tobias Ziegler, Jacob Nelson-Slivon, Viktor Leis, and      [30] Hugo Sadok, Nirav Atre, Zhipeng Zhao, Daniel S. Berger, James C.
+     Carsten Binnig. 2025. Synchronizing Disaggregated Data Structures               Hoe, Aurojit Panda, Justine Sherry, and Ren Wang. 2023. Enso: A
+     with One-Sided RDMA: Pitfalls, Experiments and Design Guidelines.               Streaming Interface for NIC-Application Communication. In 17th
+     ACM Trans. Database Syst. 50, 1, Article 4 (March 2025), 40 pages.              USENIX Symposium on Operating Systems Design and Implementa-
+     doi:10.1145/3716377                                                             tion (OSDI 23). USENIX Association, Boston, MA, 1005–1025. https:
+[17] Anuj Kalia, Michael Kaminsky, and David G. Andersen. 2014. Using                //www.usenix.org/conference/osdi23/presentation/sadok
+     RDMA efficiently for key-value services. SIGCOMM Comput. Commun.           [31] Henry N. Schuh, Arvind Krishnamurthy, David Culler, Henry M. Levy,
+     Rev. 44, 4 (Aug. 2014), 295–306. doi:10.1145/2740070.2626299                    Luigi Rizzo, Samira Khan, and Brent E. Stephens. 2024. CC-NIC: a
+[18] Ori Lahav, Viktor Vafeiadis, Jeehoon Kang, Chung-Kil Hur, and Derek             Cache-Coherent Interface to the NIC. In Proceedings of the 29th ACM
+     Dreyer. 2017. Repairing sequential consistency in C/C++11. In Pro-              International Conference on Architectural Support for Programming Lan-
+     ceedings of the 38th ACM SIGPLAN Conference on Programming Lan-                 guages and Operating Systems, Volume 1 (La Jolla, CA, USA) (ASPLOS
+     guage Design and Implementation (Barcelona, Spain) (PLDI 2017). As-             ’24). Association for Computing Machinery, New York, NY, USA, 52–68.
+     sociation for Computing Machinery, New York, NY, USA, 618–632.                  doi:10.1145/3617232.3624868
+     doi:10.1145/3062341.3062352                                                [32] Gurbir Singh, Robert Safranek, Nilesh Bhagat, Rob Blankenship, Ken
+[19] Steen Larsen and Ben Lee. 2011. Platform io dma transaction accelera-           Creta, Debendra Das Sharma, David L Hill, David Johnson, and
+     tion. CACHES. ACM (2011).                                                       Robert A Maddox. 2010. The Feeding Of High-Performance Processor
+[20] Steen Larsen and Ben Lee. 2014. Chapter Two - Survey on System                  Cores–QuickPath Interconnects and the New I/O Hubs. Intel Technol-
+     I/O Hardware Transactions and Impact on Latency, Throughput, and                ogy Journal 14, 3 (2010).
+     Other Factors. Advances in Computers, Vol. 92. Elsevier, 67–104.           [33] Arjun Singhvi, Aditya Akella, Maggie Anderson, Rob Cauble, Har-
+     doi:10.1016/B978-0-12-420232-0.00002-7                                          shad Deshmukh, Dan Gibson, Milo MK Martin, Amanda Strominger,
+[21] Steen Larsen, Ben Lee, et al. 2015. Reevaluation of programmed I/O              Thomas F Wenisch, and Amin Vahdat. 2021. CliqueMap: productioniz-
+     with write-combining buffers to improve I/O performance on cluster              ing an RMA-based distributed caching system. In Proceedings of the
+     systems.. In NAS. 345–346.                                                      2021 ACM SIGCOMM 2021 Conference. 93–105.
+[22] Wei Siew Liew, Md Ashfaqur Rahaman, James McMahon, Ryan                    [34] Qing Wang, Youyou Lu, and Jiwu Shu. 2022. Sherman: A Write-
+     Stutsman, and Vijay Nagarajan. 2025. Stop Taking the Scenic Route:              Optimized Distributed B+Tree Index on Disaggregated Memory. In
+     the Shortest Distance Between the CPU and the NIC is MMIO. In Pro-              Proceedings of the 2022 International Conference on Management of Data
+     ceedings of the 2025 Workshop on Hot Topics in Operating Systems (Banff,        (Philadelphia, PA, USA) (SIGMOD ’22). Association for Computing Ma-
+     AB, Canada) (HotOS ’25). Association for Computing Machinery, New               chinery, New York, NY, USA, 1033–1048. doi:10.1145/3514221.3517824
+     York, NY, USA, 144–150. doi:10.1145/3713082.3730389                        [35] Xingda Wei, Rong Chen, Haibo Chen, and Binyu Zang. 2021. XStore:
+[23] Haodi Lu, Haikun Liu, Yujian Zhang, Zhuohui Duan, Xiaofei Liao, Hai             Fast RDMA-Based Ordered Key-Value Store Using Remote Learned
+     Jin, and Yu Zhang. 2025. Fast Distributed Transactions for RDMA-                Cache. ACM Transactions on Storage (TOS) 17, 3 (2021), 1–32.
+     based Disaggregated Memory. In 2025 USENIX Annual Technical Con-           [36] Yanpeng Yu, Nicolai Oswald, and Anurag Khandelwal. 2025. CORD:
+     ference (USENIX ATC 25). 943–958.                                               Low-Latency, Bandwidth-Efficient and Scalable Release Consistency
+[24] Nick McKeown, Adisak Mekkittikul, Venkat Anantharam, and Jean C.                via Directory Ordering. In Proceedings of the 52nd Annual Inter-
+     Walrand. 1999. Achieving 100% throughput in an input-queued switch.             national Symposium on Computer Architecture (ISCA ’25). Associ-
+     IEEE Trans. Commun. 47, 8 (1999), 1260–1267. doi:10.1109/26.780463              ation for Computing Machinery, New York, NY, USA, 1311–1326.
+[25] Christopher Mitchell, Yifeng Geng, and Jinyang Li. 2013. Using                  doi:10.1145/3695053.3731074
+     One-Sided RDMA Reads to Build a Fast, CPU-Efficient Key-Value              [37] Ming Zhang, Yu Hua, Pengfei Zuo, and Lurong Liu. 2022. FORD: Fast
+     Store. In 2013 USENIX Annual Technical Conference (USENIX ATC 13).              One-sided RDMA-based Distributed Transactions for Disaggregated
+     USENIX Association, San Jose, CA, 103–114. https://www.usenix.org/              Persistent Memory. In 20th USENIX Conference on File and Storage
+     conference/atc13/technical-sessions/presentation/mitchell                       Technologies (FAST 22). USENIX Association, Santa Clara, CA, 51–68.
+[26] Christopher Mitchell, Kate Montgomery, Lamont Nelson, Siddhartha                https://www.usenix.org/conference/fast22/presentation/zhang-ming
+     Sen, and Jinyang Li. 2016. Balancing CPU and Network in the                [38] Tobias Ziegler, Sumukha Tumkur Vani, Carsten Binnig, Rodrigo Fon-
+     Cell Distributed B-Tree Store. In 2016 USENIX Annual Technical Con-             seca, and Tim Kraska. 2019. Designing Distributed Tree-based Index
+     ference (USENIX ATC 16). USENIX Association, Denver, CO, 451–                   Structures for Fast RDMA-capable Networks. In Proceedings of the
+     464. https://www.usenix.org/conference/atc16/technical-sessions/                2019 International Conference on Management of Data (Amsterdam,
+     presentation/mitchell                                                           Netherlands) (SIGMOD ’19). Association for Computing Machinery,
+[27] Rolf Neugebauer, Gianni Antichi, José Fernando Zazo, Yury Audzevich,            New York, NY, USA, 741–758. doi:10.1145/3299869.3300081
+     Sergio López-Buedo, and Andrew W. Moore. 2018. Understanding
+

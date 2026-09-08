@@ -101,8 +101,14 @@ def verify():
             assert sha(path) == record['html_sha256'] == source['sha256']
             soup = BeautifulSoup(path.read_text(), 'html.parser')
             assert soup.select_one(record['abstract_selector']).get_text(' ', strip=True) == record['abstract']
-            assert soup.select_one('meta[name="citation_doi"]')['content'] == record['doi']
-            assert [s['content'] for s in soup.select('meta[name="citation_author"]')] == record['identity']['citation_authors']
+            if record['identity'].get('metadata_scheme') == 'eprints':
+                assert soup.select_one('meta[name="eprints.id_number"]')['content'] == record['doi']
+                assert soup.select_one('meta[name="eprints.abstract"]')['content'] == record['abstract']
+                assert soup.select_one('meta[name="eprints.title"]')['content'] == record['public_title']
+                assert [s['content'] for s in soup.select('meta[name="eprints.creators_name"]')] == record['identity']['citation_authors']
+            else:
+                assert soup.select_one('meta[name="citation_doi"]')['content'] == record['doi']
+                assert [s['content'] for s in soup.select('meta[name="citation_author"]')] == record['identity']['citation_authors']
     assert sum('screening' in p for p in papers) == len(readings)
     expanded_path = DEST / 'expanded-screening-notes.json'
     if expanded_path.exists():
@@ -225,6 +231,65 @@ def verify():
             assert sha(ROOT / item['text_file']) == item['text_sha256']
             assert [dict(text=a.get_text(' ', strip=True), href=a['href']) for a in node.select('a[href]')] == item['links']
         assert set(phase['remaining_gap_orders']).isdisjoint(phase['new_abstract_orders'])
+    program106_path = DEST / 'program106-screening-notes.json'
+    if program106_path.exists():
+        phase = json.loads(program106_path.read_text())
+        assert not phase['book_outline_changed'] and phase['body_sections_read'] == 0
+        assert not phase['downloaded_code_executed'] and not phase['hardware_experiments_run']
+        assert set(phase['new_abstract_orders']) == set(range(106, 131)) - set(phase['remaining_gap_orders'])
+        batch = [r for r in readings if r['program_order'] in phase['new_abstract_orders']]
+        assert len(batch) == phase['new_abstracts'] == 15
+        assert sum(r.get('pdf_pages', 0) for r in batch) == phase['new_representative_pdf_pages'] == 242
+        assert [r['program_order'] for r in batch if 'pdf_file' in r] == phase['new_representative_pdf_orders']
+        assert Counter(r['screening']['decision'] for r in batch) == phase['decisions']
+        assert sum(len(r.get('viewed_pages', [])) for r in batch) == phase['viewed_representative_pages'] == 7
+        responses = []
+        for item in phase['fetch_batches']:
+            path = ROOT / item['file']; assert sha(path) == item['sha256']
+            responses.extend(json.loads(path.read_text()))
+        ids = [r['id'] for r in responses if 'id' in r]
+        assert ids == phase['new_response_ids'] and len(ids) == len(set(ids)) == 38
+        assert phase['response_counts'] == dict(
+            pdf=sum(by_id[sid]['file'].endswith('.pdf') for sid in ids),
+            http_403=sum(by_id[sid]['status_code'] == 403 for sid in ids),
+            http_404=sum(by_id[sid]['status_code'] == 404 for sid in ids),
+            successful=sum(by_id[sid]['status_code'] == 200 for sid in ids),
+            errors_without_response=sum('id' not in r for r in responses))
+        for item in phase['source_followups']:
+            path = ROOT / item['file']
+            assert sha(path) == item['sha256'] == by_id[item['source_id']]['sha256']
+            node = BeautifulSoup(path.read_text(), 'html.parser').select(item['selector'])[item['selector_index']]
+            assert node.get_text(' ', strip=True) + '\n' == (ROOT / item['text_file']).read_text()
+            assert sha(ROOT / item['text_file']) == item['text_sha256']
+            links = ([node] if node.name == 'a' else []) + node.select('a[href]')
+            assert [dict(text=a.get_text(' ', strip=True), href=a['href']) for a in links] == item['links']
+        for item in phase['text_followups']:
+            path = ROOT / item['file']
+            assert sha(path) == item['sha256'] == by_id[item['source_id']]['sha256']
+            assert path.read_text()[item['start']:item['end']] == (ROOT / item['text_file']).read_text()
+            assert sha(ROOT / item['text_file']) == item['text_sha256']
+        for item in phase['json_followups']:
+            path = ROOT / item['file']; raw = json.loads(path.read_text())
+            assert sha(path) == item['sha256'] == by_id[item['source_id']]['sha256']
+            assert {k: raw[k] for k in item['fields']} == json.loads((ROOT / item['selected_file']).read_text())
+            assert sha(ROOT / item['selected_file']) == item['selected_sha256']
+        for item in phase['related_prior_work']:
+            pdf = ROOT / item['pdf_file']; related_pdfs += 1
+            assert sha(pdf) == item['pdf_sha256'] == by_id[item['source_id']]['sha256']
+            assert not any(r.get('pdf_file') == item['pdf_file'] for r in readings)
+            info = subprocess.check_output(['pdfinfo', str(pdf)], text=True, stderr=subprocess.PIPE)
+            assert int(re.search(r'^Pages:\s+(\d+)', info, re.M)[1]) == item['pdf_pages']
+            related_pdf_pages += item['pdf_pages']
+            raw = subprocess.check_output(['pdftotext', '-raw', '-f', '1', '-l', '2', str(pdf), '-'], text=True, stderr=subprocess.PIPE)
+            assert raw == (ROOT / item['screen_file']).read_text()
+            assert sha(ROOT / item['screen_file']) == item['screen_sha256']
+            assert sha(ROOT / item['archive_text_file']) == item['archive_text_sha256']
+            abstract = ''.join(raw[a:b] for a, b in item['abstract_ranges'])
+            assert ' '.join(re.sub(r'(?<=\w)-\n(?=\w)', '', abstract).split()) == item['abstract']
+            viewed = item['viewed_page']
+            assert viewed['actually_viewed'] and sha(ROOT / viewed['file']) == viewed['sha256']
+            assert 'arXiv:2212.05614v1' in raw
+        assert phase['actually_viewed_page_count'] == phase['viewed_representative_pages'] + len(phase['related_prior_work']) == 8
     if selected:
         from verify_shift_parallel import verify as verify_shift
         from verify_superoffload import verify as verify_superoffload
