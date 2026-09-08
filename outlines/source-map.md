@@ -698,3 +698,9 @@
 | `optval-fib-evaluation` | [FlashInfer 比赛：B200、基线与评分](../references/framework-history/2026-09-08/optimization-validation/starter-evaluation.md) | 补充 | 补充／版本参照 | 实验 5-6；固定比赛提交，不作为所有 GPU／模型的默认评测条件 |
 | `optval-fib-default` | [FlashInfer-Bench 默认评估器](../references/framework-history/2026-09-08/optimization-validation/fib-default.py) | 补充 | 补充／版本参照 | 5.3.5；完整静态阅读，专用 evaluator 与时间后端另核 |
 | `optval-fib-runtime` | [FlashInfer-Bench apply 运行时](../references/framework-history/2026-09-08/optimization-validation/fib-runtime.py) | 补充 | 补充／版本参照 | 实验 5-9；完整静态阅读，匹配表与完整引擎集成待核 |
+| `remote-ordering-paper` | [Efficient Remote Memory Ordering（作者公开稿）](../references/proceedings/ASPLOS/2026/paper-116.pdf) | 7 | 补充／版本参照 | 正文页 2–13 选读；新硬件方案与无写冲突性能参照分别记录 |
+| `remote-ordering-nvshmem-using` | [远端排序对照：nvshmem-using](../references/framework-history/2026-09-09/remote-ordering/nvshmem-using.html) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
+| `remote-ordering-nvshmem-ordering` | [远端排序对照：nvshmem-ordering](../references/framework-history/2026-09-09/remote-ordering/nvshmem-ordering.html) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
+| `remote-ordering-nvshmem-sync` | [远端排序对照：nvshmem-sync](../references/framework-history/2026-09-09/remote-ordering/nvshmem-sync.html) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
+| `remote-ordering-author-readme` | [远端排序对照：author-readme](../references/framework-history/2026-09-09/remote-ordering/author-readme.md) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
+| `remote-ordering-nvshmem-ib-common` | [远端排序对照：nvshmem-ib-common](../references/framework-history/2026-09-09/remote-ordering/nvshmem-ib-common.cpp) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |

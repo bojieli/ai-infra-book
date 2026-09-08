@@ -2,7 +2,15 @@
 
 编写依据是[当前章节清单](../../outlines/chapters.json)和[草案 22 的依赖](../../outlines/structure.md)。第 8–12 章依次为单实例推理、分布式推理、训练系统、资源调度与运行环境、端边云协同；下面按问题定位，不沿用历史章号。
 
-沿日程逐批筛读，当前 **100 篇完整原始摘要已读，39 篇正文候选、37 篇备查、24 篇排除；68 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser、RhymeRL 与 LOOPRAG 已完成下述声明范围，其余三十三篇候选正文待读。96 份代表 PDF 共 1,653 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+沿日程逐批筛读，当前 **100 篇完整原始摘要已读，39 篇正文候选、37 篇备查、24 篇排除；68 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser、RhymeRL、LOOPRAG 与远端排序论文已完成下述声明范围，其余三十二篇候选正文待读。96 份代表 PDF 共 1,653 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+
+## 远端排序：等待放在哪里
+
+围绕 7.3.2→7.4.2 选读作者稿物理页 2–13，实际查看页 3、8、10；[阅读范围](../../references/proceedings/ASPLOS/2026/remote-ordering-reading.json)与[固定实现对照](../../references/framework-history/2026-09-09/remote-ordering/README.md)分别保存。十一份成功响应、一次无正文的 TLS 失败；不重复下载已有论文，也没有运行模拟器。
+
+新增判断是：窗口预算还要加上串行服务的限制，保留必要顺序也可以改变检查位置；按顺序交付已经读旧的数据仍可能错误。[同一组 256 B／2 μs 输入](../../case-studies/remote-ordering-and-completion.md)推算三种上界，再以四种观察到可用标志的事件安排说明重读条件。论文的 WQE 地址依赖、跨目标依赖、gem5 与无写冲突实测各自保留范围。
+
+NVSHMEM 同目标 fence 与 quiet 的语义差别，不直接等于实现成本差别：固定公共 IB 路径在指定条件下用 quiet 完成 fence。这里只读两个函数，没有核对完整调用链，不能扩大为所有 GPU 传输或推理引擎的能力。内容接第 6 章内存池与第 9 章 KV 交接，复用原有实验和图，不另起内存模型教程。
 
 ## LOOPRAG：验证条件与部署收益
 
