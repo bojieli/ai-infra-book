@@ -669,3 +669,24 @@
 | `hybrid-vllm-pr-47782` | [[Core] Preserve Marconi caching with selective hybrid cache retention](../references/framework-history/2026-09-08/hybrid-state/vllm-pr-47782.json) | 补充 | 补充／版本参照 | 已归档；固定快照 |
 | `hybrid-vllm-pr-49502` | [[3/N][Core][KV Connector] Support reliable partial-tail KV offload for sub-block prompts](../references/framework-history/2026-09-08/hybrid-state/vllm-pr-49502.json) | 补充 | 补充／版本参照 | 已归档；固定快照 |
 | `micro24-paper-011` | [A Mess of Memory System Benchmarking, Simulation and Application Profiling](../references/proceedings/MICRO/2024/paper-011.pdf) | 补充 | 章末 1,4 | 已归档；固定快照 |
+| `micro25-paper-014` | [StreamTensor](../references/proceedings/MICRO/2025/paper-014.pdf) | 补充 | 章末 5 | 已选读物理页 3–14；FPGA 条件独立登记 |
+| `micro25-paper-030` | [LLM.265](../references/proceedings/MICRO/2025/paper-030.pdf) | 补充 | 章末 8 | 已选读物理页 4–13；现有引擎、硬件设计与模型估计分开 |
+| `micro25-nvidia-codec-matrix` | [NVIDIA 编解码支持表](../references/proceedings/MICRO/2025/nvidia-codec-matrix.html) | 补充 | 补充／版本参照 | 固定网页；只核相应设备的编码／解码表行 |
+| `micro25-dynamo-codec-requirements` | [Dynamo 视频解码条件](../references/proceedings/MICRO/2025/dynamo-codec-requirements.html) | 补充 | 补充／版本参照 | 固定网页；核设备表行，不作为张量压缩实现证据 |
+| `asplos26-paper-004` | [Shift Parallelism: Low-Latency, High-Throughput LLM Inference for Dynamic Workloads](../references/proceedings/ASPLOS/2026/paper-004.pdf) | 补充 | 章末 6 | 物理页 1–12 已选读；arXiv v2 与会议年份分别记录 |
+| `shift-v007-runner` | [ArcticInference v0.0.7 runner](../references/framework-history/2026-09-08/shift-parallelism/v007-runner.py) | 补充 | 章末 9 | 选读加载、KV 绑定、调度与捕获范围；未运行 |
+| `shift-runner` | [ArcticInference 当前固定 runner](../references/framework-history/2026-09-08/shift-parallelism/runner.py) | 补充 | 章末 9 | 固定 aca5d9a；选读模式、状态绑定与图分派，未审计全文件 |
+| `shift-shift-guide` | [Arctic Shift Parallelism 指南](../references/framework-history/2026-09-08/shift-parallelism/shift-guide.rst) | 补充 | 补充／版本参照 | 完整指南已读；阈值表述与配置差异另记 |
+| `asplos26-paper-023` | [SuperOffload：arXiv v1，选读 3–12、16 页](../references/proceedings/ASPLOS/2026/paper-023.pdf) | 论文／官方实现 | 章末 10 | 梯度转换与更新放置；教学计算另列 |
+| `superoffload-pytorch-2025` | [PyTorch SuperOffload，2025-10-09](../references/framework-history/2026-09-08/training-superchip/pytorch-superoffload.html) | 论文／官方实现 | 章末 10 | 发布版本与机制文字；未新增图像性能读数 |
+| `superoffload-example-readme` | [DeepSpeed SuperOffload 固定示例](../references/framework-history/2026-09-08/training-superchip/examples-readme.md) | 论文／官方实现 | 章末 10 | 完整 README 及另存启动脚本；未运行 |
+| `asplos26-paper-041` | [AttenIO：选读物理页 2–13](../references/proceedings/ASPLOS/2026/paper-041.pdf) | 论文／作者稿 | 补充／版本参照 | 分块、驻留与流量；仿真和扩大资源的 GPU 对比分开 |
+| `attenio-fa259-launch` | [FA2 v2.5.9 固定分块实现](../references/proceedings/ASPLOS/2026/attenio-crosschecks/flash_fwd_launch_template.h) | 官方实现 | 补充／版本参照 | 只读 head_dim=64 分支，类型定义另核；未执行 |
+| `attenio-fa259-softmax` | [FA2 v2.5.9 固定 Softmax 实现](../references/proceedings/ASPLOS/2026/attenio-crosschecks/softmax.h) | 官方实现 | 补充／版本参照 | 选读缩放与归一化，独立小例子检查递推 |
+| `attenio-saha24-abstract` | [Saha／Ye，ICML 2024](../references/proceedings/ASPLOS/2026/attenio-crosschecks/saha24a.html) | 原始完整摘要 | 补充／版本参照 | 大小缓存区域的下界线索；未读完整证明 |
+| `asplos26-paper-068` | [RedFuser：归约融合的设计与数值条件](../references/proceedings/ASPLOS/2026/paper-068.pdf) | 论文／作者稿 | 补充／版本参照 | 5.3.3；选读页 2–12、15–18 内声明范围，含第 12 页左栏结论 |
+| `redfuser-decompose` | [RedFuser 固定符号分解实现](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/decompose.txt) | 官方实现 | 补充／版本参照 | 5.3.3 扩写；完整静态阅读，未执行或审计全部依赖 |
+| `redfuser-online-expr` | [RedFuser 在线表达式生成入口](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/online-expr.txt) | 官方实现 | 补充／版本参照 | 5.3.3 扩写；完整静态阅读，顺序与分段路径分别记录 |
+| `redfuser-quant-generated` | [RedFuser FP8 生成示例](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/quant-generated.txt) | 官方实现 | 补充／版本参照 | 实验 5-4 扩写；前缀尺度与 cast 核对，未运行内核 |
+| `redfuser-quant-test` | [RedFuser FP8 参考与误差测试](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/quant-test.txt) | 官方实现 | 补充／版本参照 | 实验 5-4 扩写；完整静态阅读，随机输入容差不代表普遍等价 |
+| `redfuser-onnx-float8` | [ONNX Float8 类型与转换](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/onnx-float8.html) | 官方文档 | 补充／版本参照 | 实验 5-4 扩写；只读 E4M3FN/E5M2 定义与 Cast 两节 |
