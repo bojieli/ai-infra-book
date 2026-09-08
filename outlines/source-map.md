@@ -728,3 +728,7 @@
 | `rlboost-recovery-rlboost-polyrl-receiver` | [可抢占资源对照：rlboost-polyrl-receiver](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-receiver.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
 | `rlboost-recovery-rlboost-polyrl-sglang-patches` | [可抢占资源对照：rlboost-polyrl-sglang-patches](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-patches.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
 | `rlboost-recovery-rlboost-polyrl-tcp-engine` | [可抢占资源对照：rlboost-polyrl-tcp-engine](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-tcp-engine.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `asplos26-pact-body` | [PACT 正文范围](../references/proceedings/ASPLOS/2026/pact-reading.json) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；窗口停顿、迁移与 NUMA 模拟条件 |
+| `asplos26-camp-body` | [Camp 正文范围](../references/proceedings/ASPLOS/2026/camp-reading.json) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；未饱和预测、加权交错及平台条件 |
+| `memory-tiering-fixed-implementations` | [分层内存固定实现对照](../references/framework-history/2026-09-09/memory-tiering/README.md) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；PACT 工件演进、Camp 补丁、Linux 与 vLLM 对象边界 |
+| `memory-tiering-qwen3-case` | [Qwen3 权重放置推算](../case-studies/memory-criticality-and-tiering.md) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；现有实验 6-9／9-7 的扩写依据；不新增编号 |

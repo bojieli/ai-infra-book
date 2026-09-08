@@ -338,9 +338,14 @@ def verify():
         from verify_optimization_evaluation import verify as verify_optimization
         from verify_remote_ordering import verify as verify_ordering
         from verify_configuration_wall import verify as verify_configuration
+        from verify_memory_tiering import verify as verify_memory_tiering
         validators = {4: verify_shift, 23: verify_superoffload, 41: verify_attention, 68: verify_fusion, 101: verify_history, 116: verify_ordering, 127: verify_optimization, 151: verify_configuration}
         for item in selected:
-            validators[item['program_order']]()
+            if item['program_order'] not in (145, 147):
+                validators[item['program_order']]()
+        if any(item['program_order'] in (145, 147) for item in selected):
+            assert {145, 147} <= {item['program_order'] for item in selected}
+            verify_memory_tiering()
     return dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed',
                 scope='Program catalog, declared primary abstract screens and selected paper scopes; not complete conference reading.',
                 program_papers=len(papers), responses=len(sources),
