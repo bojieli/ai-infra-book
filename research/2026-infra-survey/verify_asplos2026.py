@@ -290,6 +290,45 @@ def verify():
             assert viewed['actually_viewed'] and sha(ROOT / viewed['file']) == viewed['sha256']
             assert 'arXiv:2212.05614v1' in raw
         assert phase['actually_viewed_page_count'] == phase['viewed_representative_pages'] + len(phase['related_prior_work']) == 8
+    tail_path = DEST / 'program-tail-screening-notes.json'
+    if tail_path.exists():
+        phase = json.loads(tail_path.read_text())
+        assert not phase['book_outline_changed'] and not phase['skeleton_changed']
+        assert not phase['case_notes_changed'] and phase['body_sections_read'] == 0
+        assert not phase['downloaded_code_executed'] and not phase['hardware_experiments_run']
+        batch = [r for r in readings if r['program_order'] in phase['new_abstract_orders']]
+        assert len(batch) == phase['new_abstracts'] == 21
+        assert sum(r.get('pdf_pages', 0) for r in batch) == phase['new_representative_pdf_pages'] == 343
+        assert [r['program_order'] for r in batch if 'pdf_file' in r] == phase['new_representative_pdf_orders']
+        assert Counter(r['screening']['decision'] for r in batch) == phase['decisions']
+        assert sum(len(r.get('viewed_pages', [])) for r in batch) == phase['actually_viewed_page_count'] == 9
+        fetched = []
+        for item in phase['fetch_batches']:
+            path = ROOT / item['file']; assert sha(path) == item['sha256']
+            fetched.extend(r['id'] for r in json.loads(path.read_text()))
+        assert fetched == phase['new_response_ids'] and len(set(fetched)) == 34
+        assert Counter('pdf' if by_id[sid]['file'].endswith('.pdf') else 'html' for sid in fetched) == phase['response_counts']
+        assert Counter(str(by_id[sid]['status_code']) for sid in fetched) == phase['response_status_counts']
+        for item in phase['source_followups']:
+            path = ROOT / item['file']
+            assert sha(path) == item['sha256'] == by_id[item['source_id']]['sha256']
+            node = BeautifulSoup(path.read_text(), 'html.parser').select(item['selector'])[item['selector_index']]
+            assert node.get_text(' ', strip=True) + '\n' == (ROOT / item['text_file']).read_text()
+            assert sha(ROOT / item['text_file']) == item['text_sha256']
+            links = ([node] if node.name == 'a' else []) + node.select('a[href]')
+            assert [dict(text=a.get_text(' ', strip=True), href=a['href']) for a in links] == item['links']
+        for item in phase['negative_location_searches']:
+            path = ROOT / item['file']
+            assert sha(path) == item['sha256'] == by_id[item['source_id']]['sha256']
+            text = BeautifulSoup(path.read_text(), 'html.parser').get_text(' ', strip=True).casefold()
+            assert (item['needle'] in text) == item['match_found'] == False
+        assert set(phase['remaining_gap_orders']).isdisjoint(phase['new_abstract_orders'])
+        morphlux = next(r for r in batch if r['program_order'] == 150)
+        assert not morphlux['identity']['doi_present']
+        assert morphlux['identity']['arxiv_version'] == '2508.03674v3'
+        assert morphlux['public_title'] != morphlux['published_title']
+        assert 'inference' in morphlux['version_note']
+        assert 'HAL, 2001' not in next(r for r in batch if r['program_order'] == 162)['abstract']
     if selected:
         from verify_shift_parallel import verify as verify_shift
         from verify_superoffload import verify as verify_superoffload
