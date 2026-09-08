@@ -1,0 +1,1456 @@
+ NanoFlow: Towards Optimal Large Language Model
+              Serving Throughput
+  Kan Zhu, University of Washington; Yufei Gao, Tsinghua University and University
+  of Washington; Yilong Zhao, University of Washington and University of California,
+ Berkeley; Liangyu Zhao, University of Washington; Gefei Zuo, University of Michigan;
+     Yile Gu and Dedong Xie, University of Washington; Tian Tang and Qinyu Xu,
+   Tsinghua University and University of Washington; Zihao Ye, Keisuke Kamahori,
+  and Chien-Yu Lin, University of Washington; Ziren Wang, Tsinghua University and
+          University of Washington; Stephanie Wang, Arvind Krishnamurthy,
+                       and Baris Kasikci, University of Washington
+              https://www.usenix.org/conference/osdi25/presentation/zhu-kan
+
+
+
+
+This paper is included in the Proceedings of the 19th USENIX Symposium
+          on Operating Systems Design and Implementation.
+                          July 7–9, 2025 • Boston, MA, USA
+                                 ISBN 978-1-939133-47-2
+
+             Open access to the Proceedings of the 19th USENIX Symposium
+            on Operating Systems Design and Implementation is sponsored by
+      NanoFlow: Towards Optimal Large Language Model Serving Throughput
+
+                  Kan Zhu                               Yufei Gao                         Yilong Zhao
+          University of Washington               University of Washington            University of Washington
+                                                   Tsinghua University                    UC Berkeley
+                Liangyu Zhao                            Gefei Zuo                           Yile Gu
+           University of Washington               University of Michigan            University of Washington
+                Dedong Xie                              Tian Tang                           Qinyu Xu
+          University of Washington               University of Washington            University of Washington
+                                                   Tsinghua University                 Tsinghua University
+                 Zihao Ye                          Keisuke Kamahori                       Chien-Yu Lin
+          University of Washington               University of Washington            University of Washington
+                Ziren Wang                           Stephanie Wang                   Arvind Krishnamurthy
+          University of Washington               University of Washington            University of Washington
+            Tsinghua University
+                                                      Baris Kasikci
+                                                 University of Washington
+
+                         Abstract                                boost compared to state-of-the-art serving systems, achieving
+Large Language Models (LLMs) have resulted in a surging          between 50% to 72% of optimal throughput across popular
+demand for planet-scale serving systems, where tens of thou-     models.
+sands of GPUs continuously serve hundreds of millions of
+                                                                 1   Introduction
+users. Consequently, throughput has emerged as a key met-
+ric that determines serving systems’ performance. Due to         Large language models (LLMs) based on transformers power
+large model sizes and memory-intensive self-attention, LLM       applications like chatbots, search engines, and office software
+serving has been commonly assumed to be memory-bound.            but are highly resource-intensive [21, 28, 41]. Reports indi-
+Through a detailed analysis, we show that despite having         cate over 200 million weekly ChatGPT users, with API usage
+memory-intensive components, end-to-end LLM serving is           doubling after GPT-4o Mini’s release [31, 35, 40]. Given the
+compute bound for most common workloads and LLMs. Alas,          massive demand and limited GPU availability [11, 47], maxi-
+most existing serving engines fall short from optimal com-       mizing hardware utilization is critical. In particular, through-
+pute utilization, because the heterogeneous operations that      put, measured as tokens per device per second, has become a
+comprise LLM serving—compute, memory, networking—are             key factor in reducing serving costs [13, 17, 26].
+executed sequentially within a device.                              LLMs are more resource-intensive than earlier DNNs
+   We propose NanoFlow, a novel serving framework that           due to unique characteristics. Their model sizes are vastly
+exploits intra-device parallelism, which overlaps the usage of   larger, for example, GPT-3 with 175B parameters requires
+heterogeneous resources within a single device. NanoFlow         five A100 80 GB GPUs to store weights in 16-bit precision,
+splits inputs into smaller nano-batches and duplicates oper-     with some closed-source models even larger [7]. Moreover,
+ations to operate on each portion independently, enabling        LLMs’ self-attention mechanism [51] scales total memory
+overlapping. NanoFlow automatically identifies the number,       loading quadratically with the context length—the aggregate
+size, ordering, and GPU resource allocation of nano-batches      length of input and output sequences—during token genera-
+to minimize the execution time, while considering the inter-     tion. LLM serving systems often cache per-request state in a
+ference of concurrent operations. We evaluate NanoFlow’s         key-value cache (KV-cache), whose size can surpass the size
+end-to-end serving throughput on several popular models such     of model weights [44], driving up memory demands. More-
+as LLaMA-2-70B, Mixtral 8×7B, LLaMA-3-8B, etc. With              over, each LLM iteration loads the entire model weights plus
+practical workloads, NanoFlow provides 1.91× throughput          the KV-cache, while only producing one output token for each
+
+
+
+USENIX Association                          19th USENIX Symposium on Operating Systems Design and Implementation            749
+decoding sequence, further increasing memory pressure. Due          Designing NanoFlow presents several major challenges.
+to these characteristics, LLM serving is commonly assumed        First, given the multitude and diversity of LLMs, determining
+to be overall memory bandwidth bound.                            the appropriate number of nano-batches, the input batch size
+   In this paper, we show that while the self-attention opera-   for each nano-operation, and the execution order of nano-
+tion is indeed memory-bound, LLM serving is often compute-       operations involves navigating a large search space. Sec-
+bound when considered as a whole. We provide a detailed          ond, when memory- or network-bound kernels run along-
+analysis (which we also validate empirically) of the common      side compute-bound kernels, competition for GPU resources
+operations used in current LLMs and find that: (1) Batching      (e.g., execution units, caches) causes unpredictable perfor-
+prefill and decode requests amortizes weight loading, making     mance interference, slowing down kernels running in par-
+general matrix multiplications (GEMMs) compute-bound. (2)        allel [43]. Balancing these trade-offs is critical. Allocating
+Although batched decode requests still need to load a unique     more resources to compute-bound kernels may excessively
+KV-cache per sequence, novel optimizations such as grouped       delay memory- or network-bound kernels, while prioritiz-
+query attention [5] (GQA) can reduce the memory loads. (3)       ing memory- or network-bound kernels could hinder overall
+As model sizes grow, the compute operations from GEMMs           throughput by slowing down compute-bound operations.
+tend to dominate compared to self-attention. Consequently,          To tackle these challenges and efficiently explore the large
+for many common workloads and LLMs, total compute oper-          search space, NanoFlow proposes auto-search to automati-
+ations dominate network and memory I/O.                          cally construct an intra-device pipeline. The auto-search pro-
+   However, in practice, we find that LLM serving engines are    cess reduces the search space by executing in two stages,
+far from optimal in terms of compute utilization when mea-       which approximates the optimal solution balancing efficiency
+sured end-to-end and compared to the hardware FLOPs. This        and accuracy. In the first stage, NanoFlow determines the
+is because LLMs use heterogeneous operations. For example,       initial pipeline schedule, including the number, size, and or-
+the self-attention is memory-bound during the decode phase.      dering of nano-operations, assuming no interference between
+Also, when models are larger than a single GPU’s memory          kernels. In the second stage, NanoFlow refines the pipeline
+capacity, GEMM is often split across multiple GPUs when          by profiling actual kernel interference and re-planning accord-
+using tensor parallelism, and thus requires network communi-     ingly. NanoFlow also provides a runtime system to execute
+cation in addition to compute. We find that in current LLM       the optimized pipeline by efficiently forming nano-batches,
+serving engines, individual operations have high utilization     allocating GPU resources, and managing the KV-cache.
+of their bottlenecked resource (∼ 80%). However, because            We provide a detailed evaluation of NanoFlow on the
+each operation is executed one at a time, and different opera-   LLaMA-2-70B model [49] using one NVIDIA 8×A100 DGX
+tions have different resource bottlenecks, the total compute     node [24]. For practical workloads including ShareGPT [1],
+utilization is only 40%, as shown in Section 6.2.                LMSys [56] and Splitwise [32], NanoFlow achieves on av-
+   To address this gap, we present NanoFlow, a serving frame-    erage 1.91× greater throughput than state-of-the-art serving
+work that aims to maximize utilization of the workload’s         frameworks including vLLM [17], DeepSpeed-FastGen [13]
+resource bottleneck, when considered as a whole. The key         and TensorRT-LLM [26], which is 68.5% of the theoreti-
+insight is to leverage intra-device parallelism for heteroge-    cally optimal throughput we derive in §3. NanoFlow achieves
+neous operations. In particular, NanoFlow splits each input      similar latency compared with the best baseline TensorRT-
+batch into nano-batches and duplicates operations across         LLM at a low request rate, while handling up to 1.64×
+nano-operations, with each nano-operation processing a single    higher request rates within SLO constraints. We also demon-
+nano-batch. Since nano-operations operate on separate nano-      strate NanoFlow’s ability to automatically generate efficient
+batches without dependencies, heterogeneous operations—          pipelines for other models and architectures such as Mixture-
+such as memory-bound and compute-bound operations—can            of-Experts (MoE), by evaluating popular LLMs (LLaMA-3-
+execute simultaneously rather than sequentially. This ap-        70B, LLaMA-3-8B, QWen2-72B, Deepseek-67B, and Mixtral
+proach facilitates fine-grained pipelining across compute,       8×7B). NanoFlow-generated serving pipelines achieve 50%-
+memory, and network resources within a single device. As         72% of optimal throughput, which on average reaches 2.66×
+nano-operations duplicate each operation, this method in-        throughput gain compared with vLLM.
+creases memory I/O for weight loading. However, when the            In summary, we contribute the following:
+workload is compute-bound as a whole, the additional mem-           • A detailed analysis and empirical validation of the work-
+ory I/O can be hidden via pipelining.                                  load characteristics and theoretically optimal throughput
+   To achieve efficient pipelining, NanoFlow executes nano-            of LLM serving systems that shows modern LLMs oper-
+operations with a fraction of the GPU’s resources. For in-             ate in a compute-bound regime.
+stance, while most of the GPU resources can be assigned to          • NanoFlow, that comprises (1) an auto-search engine that
+a compute-heavy operation for high compute utilization, a              automatically computes a pipeline for nano-batches to
+memory-bound operation can still achieve considerable mem-             improve LLM serving throughput, (2) an end-to-end
+ory bandwidth usage using the remaining GPU resources.                 LLM serving runtime.
+
+
+
+750   19th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+                                                                  Attention                                                     FFN
+
+                                              W_Q
+
+
+
+
+                                                                    Softmax
+                                                         Vector
+       Prefill                                           Matrix                                                        Up
+
+
+
+
+                     Embedding
+
+
+
+
+                                  LayerNorm
+
+
+
+
+                                                                                                          LayerNorm
+      Requests                                            Mul                 Vector
+
+
+
+
+                                                                                                                                      Multiply
+                                                                                                   AG
+                                              W_K                             Matrix
+
+
+
+
+                                                                                       AG
+                                                                                            W_O
+
+
+
+
+                                                                                                                                                         AR
+                                                                                                                                                  Down
+                                                                                                                                                     /
+                                                                               Mul
+       Decode                                                                                                          Gate    Act
+      Requests
+                                              W_V
+
+
+
+
+                                                    Weight                                             KV cache
+                                                                                                                                                          All Gather
+
+
+
+
+                                                                                                                                                 AG
+                                              (shared by batches)                                 (unique per-batch)
+                                              @                                               @
+                                                                                                                                                          All Reduce
+
+
+
+
+                                                                                                                                                 AR
+                                 Compute-bound operation                         Memory-bound operation                       Network-bound operation
+
+
+Figure 1: Transformer architecture. The operations in the yellow boxes have large batch sizes and share model weight parameters
+across requests; hence, they are compute-bound. Operations in green boxes require loading a unique KV cache for each request;
+hence, they are memory-bound. The blue box represents network operations that perform synchronization between operations.
+
+
+    • A comprehensive evaluation of NanoFlow that achieves                                        2.2    Operation Characteristics
+      1.91× throughput gain compared to baselines and 68.5%
+                                                                                                  According to the characteristics of the operations during in-
+      of theoretical maximum throughput.
+                                                                                                  ference, we can classify them into four categories.
+                                                                                                     Dense operations. The KQV generation, O projection,
+2      Background
+                                                                                                  Up, Gate, and Down projection compute the multiplication
+2.1     LLM Inference Workflow                                                                    of activations and model weights, which we define as dense
+                                                                                                  operations. In the prefill phase, all tokens of new requests
+Recent LLMs like GPT-4, LLaMA, and Mistral [16, 29, 49]                                           form a large batch for these dense operations. In the decode
+are based on the decoder-only transformer [51]. The inference                                     phase, batched decoding aggregates the activations from all
+process of these LLMs has two phases [53]: (1) prefill, which                                     the decode requests for dense operations [53]. Moreover, as
+processes the input prompt all at once, and (2) decode, which                                     the prefill phase and decode phase share weight matrices,
+generates output tokens one at a time autoregressively. The                                       the activations from both phases can be combined to further
+prefill phase initializes the KV-cache [34], which keeps the                                      exploit the batching effect by amortizing the weight loading
+per-request state to speed up the decode phase.                                                   cost [3]. As a result, dense operations are compute-bound.
+   Both the prefill and decode phases utilize the same in-                                           Attention operations. Transformers capture token rela-
+ference workflow in Figure 1. Upon receiving an inference                                         tions through attention [51]. The prefill phase processes all
+request, the input traverses identical transformer layers to                                      input tokens simultaneously, making it compute-bound, while
+produce the subsequent tokens. In each transformer layer,                                         the decode phase generates one token per iteration, load-
+during the attention stage, the input is multiplied by weight                                     ing cached K and V vectors from the KV-cache, making it
+matrices WQ , WK , and WV to form Query, Key, and Value, with                                     memory-bound.
+Key and Value concatenated into the existing KV-cache. The                                           Network operations. Collective communication opera-
+Query is then multiplied with the existing Keys and normal-                                       tions including AllGather (AG) and AllReduce (AR) are
+ized to assess the similarity between the current token and                                       network-bound and call for high bandwidth interconnection
+all previous tokens. This similarity is employed to compute                                       between nodes like NVLink [25].
+the weighted average of the Value, aggregating the context                                           Other operations. We classify the rest of the operations
+information. The outcome undergoes O-projection through a                                         in transformer architecture, e.g., layer norms, positional em-
+linear transformation using WO followed by a layer normal-                                        beddings, etc., as other operations, due to their short runtime
+ization operation [6]. Subsequently, during the feed-forward                                      compared to dense, attention or network operations.
+network stage, the activation is multiplied by Wup and Wgate
+                                                                                                  2.3    Serving LLMs at Scale
+separately to generate ou and og . Next, og passes through an
+activation function (e.g., SiLU [10]), followed by an element-                                    With large models, multiple GPUs are required to provide
+wise multiplication with ou . Finally, Wdown is applied as the                                    enough resources, including both memory and compute, for
+Down-projection to generate the output, which serves as the                                       efficient LLM serving [18]. Existing works [12, 38, 57] have
+input to the next layer.                                                                          comprehensive evaluations of different inter-device paral-
+
+
+
+USENIX Association                                      19th USENIX Symposium on Operating Systems Design and Implementation                                           751
+lelism paradigms:                                                           • p: average number of tokens in prompts to be prefilled
+   Tensor Parallelism [38, 57] splits each weight matrix onto               • d: average number of tokens in output to be decoded
+different GPUs and executes each operation collectively,                   Therefore, a serving request from a user corresponds to p
+avoiding weight duplication, thereby scaling compute capac-             prefill tokens and d decode tokens on average, for a total of
+ity. However, frequent collective communications after opera-           p+d tokens that we use when calculating the total throughput.
+tions are required to synchronize each operation’s results, as          Using user query statistics, total throughput (tokens gener-
+shown in Figure 1.                                                      ated per second) can be easily converted to other throughput
+   Pipeline Parallelism [14] splits the model into stages by            metrics, for example, decoding throughput (decode output per
+                                                                                      d
+layers so that each GPU only needs to hold part of the weights.         second) is p+d   × Throughputtotal , and request per second is
+While all devices with tensor parallelism execute on the same             1
+                                                                         p+d × Throughputtotal .
+batch of data, devices with pipeline parallelism operate on                Batch size. An optimal throughput-oriented serving sys-
+different micro-batches of data split by stages.                        tem needs to process large batches. For compute-bound dense
+   In practice, these parallelism paradigms are typically used          operations, e.g., GEMMs, a larger batch amortizes the weight
+in combination. Tensor parallelism is commonly applied                  loading overhead and increases execution unit occupancy,
+across GPUs within a single node, where high-bandwidth                  which provides higher compute utilization. For memory-
+interconnects are available, to support larger batch sizes.             and network-bound operations, all requests share the same
+Pipeline parallelism, on the other hand, is employed across             warmup cost (e.g., kernel launching overhead, pipeline setup
+nodes to further scale the system.                                      overhead, network synchronization overhead, etc.), so a larger
+3     Analysis                                                          batch size leads to higher throughput. Therefore, when con-
+                                                                        sidering the optimal system throughput, we assume that the
+We now introduce the factors determining the throughput of              system always operates at the largest batch size at which the
+LLM serving (§3.1) and model the cost of LLM serving (§3.2).            total available memory can hold the model weights and all
+We then classify modern LLM serving workloads according                 the KV caches for the requests. 2
+to our model (§3.3) and empirically validate this classification
+(§3.4), showing that popular workloads are compute-bound.               3.2    Cost Model of LLM Serving
+Then, for the compute-bound scenarios, we determine opti-               Under the assumption of maximum batch size, we derive the
+mal serving throughput (§3.5), explain why existing systems             latency of an LLM serving iteration (where a batch of user re-
+fall short of the optimal (§3.6), and how this motivates our            quests are being processed by all the transformer layers) from
+proposed approach, intra-device parallelism (§3.7).                     the perspectives of required memory, compute, and network
+3.1    Key Factors of Serving Throughput                                resources.
+                                                                        Memory. From the memory perspective, latency is:
+We define throughput as the total throughput of serving, which
+is the number of tokens processed per second by both pre-                                                   MemSize
+                                                                                                  Tmem =                                      (1)
+fill and decode phases. Throughput is affected by hardware                                                  MemBW
+properties, model configuration, user queries, and batch size.             This is because the entire device memory content needs to
+    Hardware specification. The following factors determine             be loaded into the GPU caches and registers once for each
+the available GPU hardware resources:                                   iteration (typical in modern serving systems [17]) when using
+    • NGPU : number of GPUs                                             the largest batch size. Although the model weights are shared
+    • MemBW (GB/s): aggregate GPU memory bandwidth                      between iterations, due to the long reuse distance, it is infea-
+    • MemSize (GB): aggregate GPU memory capacity                       sible to cache the model weights and avoid loading from the
+    • Compute (GFLOP/s): aggregate GPU compute capacity                 device memory.
+    • NetBW (GB/s): aggregate GPU interconnect bandwidth                Compute. In LLM serving, all operations contribute to the
+    Model configuration. The following factors regarding the            total compute, while Dense operations produce the vast ma-
+model architecture determine the computation, memory, and               jority of computations for typical workloads (as we validate
+network demand when serving LLMs:                                       in §3.4). Therefore, we model the compute latency of dense
+    • Dmodel : hidden dimension size                                    operations below.
+    • L: number of layers                                                  For every GEMM in dense operations, 2BDense Nw Kw com-
+    • PModel : number of parameters                                     putations need to be performed on weights and activations,
+    • RGQA : group size of GQA 1                                        where Nw and Kw are dimensions of the weight matrices, and
+    • Stype (Bytes): number of bytes (size) of the data type for        BDense is the batch size for dense operations, which includes
+      model parameters (e.g., 2 for FP16)                               decode tokens from hundreds of requests and the prefill to-
+    User query statistics. The following user input statistics          kens from one or a few requests. Thus, the total compute for
+also affect the system throughput:
+                                                                           2 Activations occupy negligible (less than 5%) of the memory [17], thus
+    1 The number of Query attention heads that share one KV head [5].   we omit them for simplicity.
+
+
+
+
+752     19th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+                                                                                                                                                                   Network
+                                                                                                                                                                    Bound
+                                                                                                                                                                        1.8
+      Mistral
+       8x7B           0.243     0.303      0.303      0.640      0.640     0.583         0.728    0.264      0.744     0.744     0.971     0.874      1.657
+      8xGPU                                                                                                                                                               1.6
+
+
+    LLaMA-2                                                                                                                                                               1.4
+        70B           0.218     0.273      0.273      0.576      0.576     0.524         0.655    0.237      0.669     0.669     0.874     0.786      1.491
+      8xGPU
+                                                                                                                                                                          1.2
+    LLaMA-3
+        70B           0.218     0.273      0.273      0.576      0.576     0.524         0.655    0.237      0.669     0.669     0.874     0.786      1.491               1.0
+      8xGPU
+                                                                                                                                                                          0.8
+      Qwen2
+        72B           0.212     0.265      0.265      0.560      0.560     0.510         0.637    0.231      0.651     0.651     0.850     0.765      1.450               0.6
+      8xGPU
+                                                                                                                                                                          0.4
+  LLaMA-3
+     405B             0.119     0.148      0.148      0.314      0.314     0.285         0.357    0.129      0.364     0.364     0.476     0.428      0.812               0.2
+8xGPUx2PP
+                                                                                                                                                                        0.0
+                      V100       A100       A100        H100      H200     B100          B200      MI250     MI300    MI325X Gaudi2 Gaudi3 Ada6000
+                                                                                                                                                                   Compute
+                                (40GB)     (80GB)                                                                                           (PCIE)
+                                                                                                                                                                    Bound
+
+
+Figure 2: Comparison of network time and compute time. The closer to yellow, the more compute-bound the workload is,
+whereas the closer to blue indicates the workload is more network-bound.
+
+                                                                            Memory
+                                                                             Bound               port tensor parallelism, two AGs and one AR (or 2 ARs) are
+LLaMA-3
+      8B       0.23      0.31       0.37       0.61       0.68      1.09           1.4
+                                                                                                 required [39]. An AR requires gathering outputs from other
+  1xGPU
+                                                                                                 GPUs, performing local summation, and broadcasting results,
+  Mistral
+   8x7B        0.12      0.17       0.20       0.32       0.36      0.58           1.2           thus it needs to transfer the activations twice, while an AG
+  8xGPU
+LLaMA-2                                                                                          transfers activations once. Therefore, in both cases, we can
+    70B        0.07      0.09       0.11       0.18       0.20      0.32           1.0
+  8xGPU                                                                                          estimate the total data movement for one GPU in bytes as
+                                                                                   0.8
+LLaMA-3                                                                                          4 · BDense Dmodel Stype · L. Thus, the latency from the network
+    70B        0.07      0.09       0.11       0.18       0.20      0.32           0.6
+  8xGPU                                                                                          perspective is:
+                                                                                   0.4
+ Qwen2
+    72B        0.07      0.09       0.11       0.18       0.20      0.31           0.2
+  8xGPU
+                                                                                   0.0                                     (NGPU − 1)BDense Dmodel Stype L
+            LMSYS-Chat Splitwise ShareGPT     512-512    1024-512 512-1024 Compute                            Tnet ≈ 4 ·                                                   (3)
+                                                                             Bound                                                   NetBW
+
+Figure 3: Comparison of compute time and memory time.                                            3.3    Classification of LLM Serving Workloads
+The closer to yellow, the more compute-bound the workload                                        We classify LLM serving workloads by comparing the la-
+is, whereas the closer to green the more memory-bound it                                         tency of an iteration derived based on memory, compute, and
+becomes.                                                                                         network requirements.
+                                                                                                    First, we compare Equation 3 (network time) with Equa-
+                                                                                                 tion 2 (compute time). Their ratio can be calculated as
+dense operations is 2BDense ∑ Nw Kw . Note that the ∑ Nw Kw
+term is the number of weight elements in all layers, which can                                                TNet     2Dmodel L (NGPU − 1)Compute
+be approximated using PModel (the parameters in the model),                                                          =
+                                                                                                            TCompute    Pmodel      NetBW /Stype
+thus, we simplify the expression as 2BDense PModel . Therefore,
+latency from the compute perspective is:                                                           Note that Pmodel ≈ 12D2model L3 , thus 2DPmodel   model L
+                                                                                                                                                             ≈
+                                           2BDense · PModel                                      1/(6Dmodel ). For models that need multiple GPUs
+                         TCompute ≈                                               (2)            (where TNet is relevant), Dmodel is typically larger than
+                                             Compute
+                                                                                                 4096 [9, 16, 22, 48], making the term 2DPmodel
+                                                                                                                                          model L
+                                                                                                                                                  smaller than
+Network. Finally, for tensor parallelism, collective network                                           −5
+                                                                                                 1 × 10 . Due to the high bandwidth interconnect between
+communication primitives are needed to synchronize the re-                                       data center GPUs (e.g., NVLink [25], Infinity Fabric [54]),
+sults after performing operations in multiple GPUs over dif-                                        3P
+                                                                                                       model = ((WK +WQ +WV ) +WO +WU +WG +WD )L ≈ ((1/RGQA + 1 +
+ferent shards of data. The size of the data transmitted with                                     1/RGQA )D2model + D2model + Dmodel Imodel + Dmodel Imodel + Imodel Dmodel )L) ≈
+collective communication equals the size of inputs for dense                                     (1 + 1 + 3.5 + 3.5 + 3.5)D2model L ≈ 12D2model L, where Imodel is intermediate
+operations, which have dimensions [Bdense , Dmodel ]. To sup-                                    dimension, which is typically 3.5x of Dmodel [16, 22].
+
+
+
+
+USENIX Association                                               19th USENIX Symposium on Operating Systems Design and Implementation                                     753
+                        Table 1: Characteristics of accelerator models across various vendors and release years.
+
+                                     Release   MemSize   MemBW          NetBW         Compute         MemSize     Compute     NetBW
+               Vendor      Model
+                                      Year      (GB)      (GB/s)        (GB/s)     (FP16 GFLOP/s)     MemBW       MemBW       MemBW
+             NVIDIA        V100       2017        16       900           300           125,000          0.018        139            0.33
+             NVIDIA        A100       2020        40      1,555          600           312,000          0.026        200            0.39
+             NVIDIA        A100       2021        80      2,000          600           312,000          0.040        156            0.30
+             NVIDIA        H100       2023        80      3,352          900           989,000          0.024        295           0.268
+             NVIDIA        H200       2024       141      4,800          900           989,000          0.020        206            0.19
+             NVIDIA        B100       2024       192      8,000         1,800         1,800,000         0.015        225            0.23
+             NVIDIA        B200       2024       192      8,000         1,800         2,250,000         0.015        281            0.23
+              AMD          MI250      2021       128      3,352          800           362,000          0.038        107           0.24
+              AMD          MI300      2023       192      5,300         1,024         1,307,000         0.036        246           0.19
+              AMD         MI325X      2024       256      6,000         1,024         1,307,000         0.043        218           0.17
+              Intel       Gaudi 2     2022        96      2,400          600          1,000,000         0.040        417           0.25
+              Intel       Gaudi 3     2024       128      3,700         1,200         1,800,000         0.035        486           0.32
+             NVIDIA       Ada 6000    2022       48        960           64            182,000          0.050        190           0.067
+
+
+NGPU Compute                   4         5
+NetBW /Stype ranges from 1 × 10 to 1 × 10 . Therefore, this                     meaning the workload characteristics also remain largely un-
+ratio is typically less than 1, indicating that the network is not              changed.
+the bottleneck. We illustrate this ratio in Figure 2. For large                    To summarize, our cost model suggests that modern LLM
+models and data center GPUs, the compute takes more time                        serving workloads operate in a compute-bound regime, which
+than network.                                                                   we validate empirically in the next section.
+   We then compare Equation 1 (memory time) and Equation                        3.4   Validation of the Cost Model
+2 (compute time) to finally determine the characteristics of
+the workload, namely, the following value                                       We validated our cost model on LLaMA-2 70B serving with
+                                                                                8 NVIDIA A100 GPUs and a dense batch size of 2048
+                 TMem          Compute MemSize 1                                requests. We computed the GFLOPs, memory movement,
+        TR =               ≈                                      (4)
+               TCompute        MemBW Pmodel 2Bdense                             and network traffic for each operation (Table 2) and used
+   Modern models widely adopt Grouped Query Attention                           these with our model to calculate Tcompute , Tmem , and Tnet
+(GQA) as seen in LLaMA-3 [48], NeMo [4], and Qwen2 [9].                         based on hardware specifications4 . The longest estimated
+In GQA, multiple attention heads share a KV-cache, which ef-                    time Top = max(Tcompute , Tmem , Tnet ) indicates the most con-
+fectively means that given the same memory capacity, batches                    strained resource. To validate these results, we measure the
+can contain more requests. Consequently, Bdense tends to be                     running time of different operations. For most operations, Top
+larger. For example, when serving LLaMA-2 70B on 8×A100                         aligns with profiling results. An exception is prefill attention,
+GPUs, the maximum batch size of decode requests is on the                       where the real measured time is larger due to the launching
+order of 1024. Combined with the prefill tokens in the batch,                   overhead of the associated kernels dominating the total time.
+Bdense can reach 2048 while a non-GQA model with the same                       The sums of all operations’ Tcompute , Tmem , and Tnet values
+size can only have Bdense = 256. Thus, the ratio TR is less than                show that compute is the most constrained resource, which
+1, and compute becomes the main bottleneck. Additionally,                       aligns with our model’s finding.
+modern models tend to have increasingly large model sizes                       3.5   Optimal Serving Throughput
+Pmodel (whereas the rest of the terms in TR are constants given
+                                                                                Optimal throughput (measured in token/s/GPU) is achieved
+a hardware specification), further causing TR to drop below 1.
+                                                                                when the most limited resource, i.e. compute, is fully utilized.
+   Figure 3 shows the values of TR with five representative
+                                                                                By applying Equation 2, the system’s optimal throughput is:
+models: LLaMA-3 8B [22] with 1×A100, Mistral 8 × 7B [16]
+with 8×A100, LLaMA-2 70B [49] with 8×A100s, LLaMA-3
+70B with 8×A100s, Qwen-2 72B [9] with 8×A100s. As the                                                               BDense    Compute
+                                                                                          Throughputoptimal =               =                (5)
+heatmap figure shows, many of the workloads (Splitwise [32],                                                       TCompute    2PModel
+LMSYS-Chat-1M [56], ShareGPT [1] as well as constant
+                                                                                   In the compute-bound regime, the optimal throughput de-
+length inputs and outputs), are uniformly compute-bound,
+                                                                                pends solely on the aggregate computational capacity of the
+except in the case of the long decode (512-1024) workload
+                                                                                GPUs for the specific data type and the number of parame-
+on LLaMA-3 8B model, where the ratio TR is around 1.
+                                                                                ters in the model. Notably, other factors, including the GPU
+   While the analysis is mainly conducted on an NVIDIA
+                                                                                memory size, bandwidth, model data type, or the length of
+A100, the result remains similar for other accelerators.
+                                                                                prefill and decode phases, do not have a significant impact on
+As shown in Table 1, compute/memory ratio and com-
+pute/network ratio are stable across vendors and generations,                      4 One-way network bandwidth was used for T
+                                                                                                                             net
+
+
+
+
+754   19th USENIX Symposium on Operating Systems Design and Implementation                                                    USENIX Association
+Table 2: Comparison of operation runtimes between cost                       operate on finer-grained batches that we call nano-batches.
+model estimation and real-world measurements.                                For example, for the original Up projection operating on
+                                                                             a batch size of 2048, NanoFlow could create two nano-
+                        Mem      Net       Est.     Est.    Est.     Real
+ Operation
+             Compute
+                        Load    Usage     Tcomp    Tmem     Tnet     Time    operations UP1 and UP2, operating on batches in ranges
+             (GFLOP)
+                        (GB)    (GB)      (ms)     (ms)    (ms)      (ms)    0-768 and 768-2048, respectively, while performing the ex-
+ KQV          27487.8    19.5        0    11.01     1.22         0   16.08
+ O            21990.2    16.1        0      8.81    1.01         0   16.01   act same projection. Different nano-batches do not have data
+ UG          153931.6    96.6        0    61.67     6.04         0   69.92   dependencies. Therefore, nano-operations that use different
+ D            76965.8    49.7        0    30.84     3.11         0   34.96
+ DecAttn       3665.9   462.2        0      1.47   28.89         0   35.60   resources—compute, memory, network—can operate on dif-
+ PfAttn         916.3     2.1        0      0.37    0.13         0    4.56   ferent nano-batches in parallel within a device to maximize
+ Net             18.8    75.2    75.2       0.01    4.70   31.33     47.92
+ Total                                   114.17    45.09   31.33             the utilization of the most constrained resource, compute. De-
+                                                                             spite requiring repeated loading of model weights, we demon-
+                                                                             strate that NanoFlow provides significantly more throughput
+the theoretical optimal throughput, as long as the workload                  than existing frameworks (1.91× on average), further closing
+is overall compute-bound. We measure the GPU compute                         the gap to optimal serving throughput (§6).
+capacity by profiling the state-of-the-art GEMM vendor li-
+                                                                             4     Design
+brary, CUTLASS [46]. For example, when serving LLaMA-2
+70B on 8×A100 GPUs, the profiled peak Compute is 280                         We introduce NanoFlow’s key components: the auto-search
+TFLOPS for FP16, and the PModel is 70B. Substituting these                   engine for automatic nano-batch pipeline computation (§4.1)
+into Equation 5, yields an optimal throughput of 1857 to-                    and the LLM serving runtime for pipeline execution (§4.2).
+kens/s/GPU.                                                                  4.1     Automated Pipeline Search
+3.6   Gap to Optimal Throughput                                              Deciding number of nano-operations, kernels, scheduling with
+                                                                             intra-device parallelism, and resource allocation is challeng-
+As shown in Figure 7, existing serving systems fall far short of
+                                                                             ing due to model and hardware diversity. To address this,
+achieving optimal throughput. When serving offline requests,
+                                                                             NanoFlow proposes auto-search, which uses Mixed Integer
+vLLM, DeepSpeed-FastGen, and TensorRT-LLM achieve
+                                                                             Linear Programming (MILP) to obtain the nano-batch over-
+only 22.0%, 22.9%, and 37.8% of the optimal throughput,
+                                                                             lapping strategy, with a two-stage approximation for reducing
+respectively.
+                                                                             the search space. We first outline auto-search prerequisites
+   The main reason why existing serving systems fall signifi-
+                                                                             including kernel profiling and interference modeling (§4.1.1),
+cantly short of achieving optimal throughput is poor utiliza-
+                                                                             then detail its two stages: pipeline structure search (§4.1.2)
+tion of GPU resources. Figure 4 shows the execution flow
+                                                                             and GPU resource allocation (§4.1.3). Finally, we provide
+of transformer operations within a GPU, using existing serv-
+                                                                             example pipelines for popular models (§4.1.4).
+ing frameworks like SGLang [58], vLLM [17], DeepSpeed-
+FastGen [13]. These frameworks execute compute-, memory-,                    4.1.1    Kernel Profiling and Interference Modeling
+and network-bound operations sequentially on a single large                  Understanding the performance characteristics of different
+batch in a device. This sequential execution flow forms mul-                 operations is key to automated pipeline search. For this,
+tiple pipeline bubbles (denoted as "WASTED" in Figure 4),                    NanoFlow profiles GEMM kernels (used for compute-bound
+which cause the most constrained resource, compute, to be                    operations such as KQV generation), GEMV kernels (used
+underutilized.                                                               in memory-bound operations as in decode-attention), and net-
+3.7   Intra-device Parallelism                                               work kernels (used in network-bound operations such as AR
+                                                                             and AG).
+Ostensibly, the advantage of existing serving frameworks                        Determining the maximum dense batch size Given a
+when using a single large batch in a GPU is that they need to                specific model architecture and user input statistics (as de-
+load model weights fewer times than if there were multiple                   scribed in §3.1), NanoFlow calculates the maximum dense
+smaller batches and corresponding operations.                                batch size that can fit into the GPU memory (e.g., around
+   However, the cost model and its validation that we outlined               2048 for 8 × A100 serving LLaMA-2 70B). This dense batch
+earlier in this section provides a valuable insight: Since mod-              size serves as an input to auto-search, which sets an upper
+ern models are largely compute-bound (by a factor of more                    bound of shapes in profiling.
+than 2 as shown in Figure 3 and Table 2), creating and process-                 Profiling interference-free kernels NanoFlow then deter-
+ing smaller batches may be justified, especially if compute                  mines the interference-free execution time of kernels, where
+utilization can be increased.                                                each operation exclusively uses the GPU. NanoFlow profiles
+   These observations motivate intra-device parallelism                      kernels with discrete input batch sizes from 128 to the dense
+through nano-batching, which underlies the design of                         batch size in multiples of 128, as 128 is a hardware-friendly
+NanoFlow. NanoFlow creates multiple nano-operations,                         shape for GEMM tiling. NanoFlow explores all possible ker-
+which are the same operations as the original operations, but                nel implementations varying the number of thread blocks, the
+
+
+
+USENIX Association                                 19th USENIX Symposium on Operating Systems Design and Implementation               755
+                                                              Layer
+                  DecAttn
+
+      KQV          WASTED         PF WASTED      O   WASTED           Up, Gate, Down (UGD)                                          WASTED          KQV
+
+                   Prefill Attention   Attn.AG       O.AG                                                                           UGD.AR
+
+
+Figure 4: Execution pipeline of existing systems. The green, yellow, and blue operations correspond to memory-, compute-,
+and network-bound operations. Operations in the previous and next layer are denoted by dotted borders. "WASTED" shows the
+stages in the pipeline where the most constrained resource, compute, is underutilized. Small operations (i.e. layernorm, activation,
+etc.) are omitted for simplicity.
+
+
+number of warps, and tile size for GEMM, GEMV, and net-
+work kernels to identify the implementation that provides the
+                                                                                  1.2
+                                                                                               .     GEMM           -)E-   Non-optimal GEMV   .   GEMV
+
+
+
+
+                                                                        auueE
+                                                                                  1 064
+shortest execution time. The profiling outputs a mapping from
+(kernel, batch size) to its best implementation and execution
+                                                                                  08
+
+
+
+
+                                                                        」0七 ad
+time.
+   Profiling kernels with interference However, when two or
+                                                                                  0
+more kernels execute in parallel on a device, they slow down
+                                                                                                                ,'x' LL`,'
+                                                                        paz,1eE
+compared to running separately. We refer to this as kernel in-
+
+
+
+
+                                                                                                                             II'
+                                                                                                      1111
+                                                                                   o
+terference, which is attributed to kernels competing for GPU                                                    J
+
+
+
+
+                                                                                                                             头
+hardware resources such as execution units, caches, power,
+                                                                        」ON        o3 --------~        11111,x'
+                                                                                   o2
+                                                                                           ,, `'xi
+
+
+
+                                                                                                           寸f
+and memory controllers [43]. Ideally, we would like to inde-                                           -
+pendently assign each nano-operation a fractional allocation                               `,X GEM                                                GEMV
+                                                                                             Prioritized                                      Prioritized
+of a single GPU’s compute, memory, and network bandwidth.                         0 .0
+
+We call this fraction R physical . Unfortunately, kernel interfer-
+ence is unpredictable, as NVIDIA GPUs do not give explicit            Figure 5: Interference characteristics between GEMM and
+control over compute, memory, and network bandwidth. Thus,            GEMV kernels. The points on the x-axis correspond unique
+we cannot directly control R physical .                               GEMM-GEMV implementation pairs. The y-axis denotes the
+   Instead, we use GEMM performance as a proxy R for                  GEMM and GEMV kernels’ normalized performance P.
+R physical and model pairwise kernel interference. We define R
+in a GEMM-centric way since the compute-bound operations
+dominate and optimizing compute is the goal of NanoFlow.                 Nonetheless, profiling the mapping between R and P re-
+   In particular, we profile pairwise kernel interference pat-        mains challenging due to the vast number of possible kernel
+terns by measuring actual performance when overlapping                combinations. While each operation may have only a few hun-
+between a compute kernel A and another kernel B. For ex-              dred kernel implementations, the combinations between dif-
+ample, if when overlapped, GEMM kernel A achieves 40%                 ferent implementations of overlapping kernels exponentially
+performance compared to its best performance when run indi-           expand the profiling space, resulting in millions of possible
+vidually, then we say that RA =0.4. We then assume that the           configurations. This immense complexity makes exhaustive
+overlapped kernel is given the remaining resources, so we set         exploration infeasible.
+RB = 1 − RA =0.6.                                                        NanoFlow reduces the profiling space by limiting the thread
+   Then, we model the interference by measuring the perfor-           block numbers for GEMV and network kernels to values be-
+mance loss in the non-compute kernel B when RA resources              tween 8 and 128 (in steps of 8), as 128 blocks are sufficient
+are allocated to kernel A. When overlapping A and B, we               to saturate their performance. It also excludes less efficient
+normalize A and B’s performance to their peak performance             GEMM kernels, which have longer execution times while us-
+when run individually. We call this value P. For the compute          ing more thread blocks. NanoFlow focuses on pairwise inter-
+kernel A, PA is equivalent to RA by definition, while PB cap-         ference analysis—compute-memory and compute-network—
+tures the memory or network utilization when RA resources             rather than examining three kernel types simultaneously and
+are assigned to the compute kernel.                                   assumes that the R to P mapping profiled with pairwise inter-
+   Intuitively, this process establishes an exchange rate be-         ference holds when overlapping three kernels.
+tween compute utilization R and memory or network perfor-                Figure 5 shows NanoFlow’s profiling results of GEMM-
+mance P . The overall kernel interference model can then be           GEMV kernel pairs (∼ 100 pairs, after the aforementioned
+captured in a table such as Table 3, which maps R to P for            simplifications) on an A100 GPU with GEMM shape
+each kernel type.                                                     (M, N, K) = (384, 4096, 4096), GEMV batch size 384, and
+
+
+
+756   19th USENIX Symposium on Operating Systems Design and Implementation                                                              USENIX Association
+Table 3: Performance P of GEMV and network kernels with            lem to identify the batch size, execution time, and ordering
+different resource utilization R.                                  of the nano-operations. If the temporary best solution has
+                                                                   bubbles for compute, auto-search increases the number of
+                           Resource Utilization (R)                nano-operations for operations near the bubble to improve re-
+   Operations
+                   0    0.1 0.2 . . .     0.8     0.9      1       source utilization until MILP cannot produce better solutions.
+    GEMM                                                              Constraints on batch sizes and execution times. Auto-
+                   0    0.1   0.2    ...    0.8     0.9    1
+ (by definition)                                                   search forces the batch sizes to be chosen from 128 to dense
+    GEMV           0    0.2   0.3    ...   0.85    0.95    1       batch size and uses the interference-free execution time of a
+    Network        0    0.3   0.5    ...    0.9      1     1       nano-operation for a given batch size, as computed in §4.1.1.
+                                                                      Constraints on dependencies. The dependencies of nano-
+                                                                   operations are determined by their parent operations (present
+sequence length 1024. These pairs are then sorted by descend-
+                                                                   in baseline implementations, e.g., in pytorch) and their input
+ing GEMM performance, as shown in Figure 5. For instance,
+                                                                   batches. Two nano-operations are dependent if and only if
+a normalized performance of 0.8 means the kernel’s execution
+                                                                   their parent operations are dependent (e.g., an O-projection
+time is 1/0.8 times longer than the fastest implementation.
+                                                                   depends on an attention operation) and their input batches
+Pairs with higher interference on GEMM but worse GEMV
+                                                                   intersect (e.g., ranges 0–255 and 128–383).
+performance (grayed-out in Figure 5) are discarded. This pro-
+cess identifies the best-performing kernel combinations at            Constraints on overlapping. Overlapping kernels con-
+various GEMM-GEMV performance trade-off points.                    strained by the same resource (e.g., compute) are unhelpful
+   Using interference profiles, auto-search generates a re-        for utilization, so auto-search restricts the pipeline to overlap
+source mapping table (Table 3). This table quantifies GEMV         only operations constrained by different resources.
+and network kernel performance (P) as functions of resource           Constraints on operation transformations. Some net-
+utilization (R). For example, as depicted by the dotted red line   work collectives have equivalent transformations with differ-
+in Figure 5, achieving 0.3 GEMV performance requires sacri-        ent performance characteristics and dependencies. For exam-
+ficing 0.2 GEMM performance (from 1 to 0.8). This implies          ple, an AG can be converted into an AR with different weight
+a non-linear trade-off: 0.2 GEMM performance is exchanged          partitioning approaches [39, 57]. NanoFlow explores all of
+for 0.3 GEMV performance, indicating that RGEMV = 0.2              these alternative transformations for network nano-operations
+corresponds to PGEMV = 0.3.                                        and searches for the shortest pipeline design.
+   A sensitivity analysis of all GEMM shapes in the evaluated         Due to the large search space, searching for an optimal
+LLM models and 64 batch size combinations reveals that the         pipeline would take hours or even days. However, a practi-
+R to P mapping is consistent, with a standard deviation within     cal pipeline can be found in approximately 10 minutes by
+5% of the mean. Consequently, Table 3 can be used to map           prioritizing searching a feasible solution instead of finding a
+R to P for all GEMV and network kernel implementations in          provably-optimal solution.
+subsequent auto-search analysis.                                   4.1.3   Auto-search Stage II: Refining the Pipeline
+4.1.2   Auto-search Stage I: Pipeline Structure Search             The pipeline derived in the first stage does not factor in ker-
+In the first stage, auto-search takes as input the dense batch     nel interference, which is impractical for real deployment. In
+size, the operation dependencies (defined in the PyTorch im-       the second stage, auto-search refines this pipeline by con-
+plementation of a given model architecture), and the profiling     sidering kernel slowdown due to interference. This stage
+of interference-free kernels, and then produces as output, the     formulates a separate MILP problem, where the numbers,
+number, batch size, and order of each nano-operation using         batch sizes, and ordering constraints of nano-operations re-
+mixed integer linear programming (MILP). Stage I does not          main the same (i.e., outputs of the first stage). Auto-search
+factor in the interference between nano-operations to simplify     explores various resource utilization (R) allocations to individ-
+the problem, which is covered by Stage II. The MILP problem        ual nano-operations, and maps R to P using Table 3 derived in
+is subject to the constraints described below.                     interference profiling. A specific resource utilization value R
+   Optimization objective. The main objective of MILP is to        directly corresponds to kernel implementations as determined
+remove pipeline bubbles (denoted by wasted in Figure 4) for        in §4.1.1. The goal of the second stage is again to minimize
+compute operations to minimize execution time.                     pipeline execution time.
+   Constraints on the number of nano-operations. To over-             Constraints on GPU resource utilization. As discussed
+lap resources, each operation needs to be split into at least      in §4.1.1, concurrent kernels should compete for a total of 1.0
+two nano-operations, each operating on an independent nano-        of GPU resource utilization R. Thus, auto-search forces the
+batch. As splitting into nano-operations reduces the batching      sum of R at any given time to be less than or equal to 1.0.
+effect, the number of nano-operations should be minimized.            Constraints on execution times. Given the resource uti-
+Thus, auto-search begins its search by dividing all operations     lization R for a nano-operation, auto-search computes the
+into two nano-operations and formulating the MILP prob-            execution time of the operation using Dbest /P, where Dbest
+
+
+
+USENIX Association                           19th USENIX Symposium on Operating Systems Design and Implementation              757
+represents the best execution time without interference and P      prefill and decode tokens. Therefore, the request batch size
+is derived using Table 3.                                          (e.g., 1 prefill and 256 decode requests) is on the order of
+   The auto-search is performed only when the model archi-         hundreds, which is easy to attain in real-world large-scale
+tecture or workload (input length, output length) undergoes        serving.
+significant changes. Compared to the long-running deploy-             When forming a batch, NanoFlow prioritizes unfinished
+ment times, the search time is negligible.                         decode requests and chunks prefill requests at a token granu-
+4.1.4    Example Pipelines                                         larity following SarathiServe [3] to exactly fill the remaining
+                                                                   capacity of a pre-selected best-performing dense batch. This
+70B pipeline We apply auto-search to 70B-scale models, in-         effectively reduces the tail latency as dense operations are
+cluding LLaMA-2 70B, LLaMA-3 70B, Qwen2.5-72B, and                 performed over consistent batch sizes across iterations. Ini-
+Deepseek-67B. Compared to LLaMA-2 70B, LLaMA-3 70B                 tially, the global batch contains only prefill requests (requests
+features a larger vocabulary size of 128K, which increases the     in prefill stages). As these requests complete the prefill stage,
+sampling time; Deepseek-67B has a slightly different num-          they transition to decode requests within the batch, and new
+ber of layers and hidden dimension (Dmodel ), Qwen2.5-72B          prefill requests are introduced to maintain the fixed token
+introduces bias in KQV generation. However, none of these          batch size. As decode requests increase, the prefill token bud-
+adjustments significantly change the performance characteris-      get decreases, causing prefill requests to slow down. When
+tics, leading to similar schedules. We provide the NanoFlow-       decode requests begin completing, this frees space for more
+generated pipeline for LLaMA-2 70B as an example in Fig-           prefill tokens again, speeding up prefill. Thus, the number of
+ure 6. Since three resources (compute, memory, and network)        decode requests and prefill requests will be stabilized.
+overlap at the beginning of a decoding layer (i.e., KQV gener-        To optimize GPU memory usage and avoid running out
+ations), auto-search ends up using 4 nano-operations for this      of memory, NanoFlow predicts peak future memory usage
+part, to reduce pipeline bubbles. Here, the decode attention op-   based on the status of user requests. NanoFlow tracks decoded
+eration has resource utilization 0.4 (i.e. reduces 40% GEMM        tokens per request, estimates completion time using average
+performance) and reaches 80% of maximum decode atten-              decode length, and prefills new requests only if predicted
+tion performance. For the remainder of the pipeline, GEMM          memory usage stays within GPU limits. If the GPU runs out
+operations are prioritized, and only two nano-operations are       of memory, NanoFlow move a request to the CPU and reloads
+used.                                                              it once memory is available without recomputation.
+   8B pipeline 8B models (e.g. Llama3-8B) do not require net-
+                                                                      Asynchronous scheduling Batch formation, including es-
+work operations as they fit in a single GPU. Thus auto-search
+                                                                   timating memory usage, scheduling new requests, retiring
+splits all operations into two nano-operations, with decode
+                                                                   finished requests, and adjusting the page table for PagedAt-
+attention overlapping with the Up Gate Down projection.
+                                                                   tention [17], consumes a non-negligible amount of time on the
+   MoE pipeline Compared to 70B models, MoE models
+                                                                   CPU side [42]. In most serving frameworks [17,58], only after
+have different hidden dimensions and number of layers. Due
+                                                                   the GPU executes one iteration, the scheduler on the CPU is
+to the imbalance between experts [16], NanoFlow uses tensor
+                                                                   able to detect EOS tokens, remove the finished request from
+parallelism for MoEs, in which FFN is implemented using
+                                                                   the batch, and refill the batch with new requests. However,
+grouped-GEMM. FFN also involves an additional gate routing
+                                                                   GPU is under-utilized during this time. To avoid this waste,
+operation. Auto-search works similarly for an MoE model
+                                                                   NanoFlow asynchronously schedules batch formation in par-
+and automatically produces an efficient pipeline (§6).
+                                                                   allel to the GPU executions. At any iteration i, NanoFlow
+4.2     NanoFlow Runtime                                           forms the batch for the next iteration before the end of the
+We now explain how NanoFlow executes the auto-generated            current iteration. This means that NanoFlow cannot detect the
+pipeline by asynchronous scheduling (§4.2.1), and KV-cache         EOS tokens generated at iteration i. After launching iteration
+SSD offloading for multi-round conversations (§4.2.2).             i + 1, NanoFlow forms the batch for cycle i + 2, detects the
+                                                                   EOS token from iteration i, and removes finished requests.
+4.2.1    Request Scheduling                                        Fortunately, since the average decode length surpasses 100
+Batch formation NanoFlow assumes that auto-scaling, work-          for typical workloads (See Table 4), the overhead of one extra
+load balancing, and priority-aware routing are managed by          decode token is negligible (< 1%), given the benefit of hiding
+the control plane externally [15,33,45]. A NanoFlow instance       the batch formation overhead.
+assumes an abundance of requests and treats each request with
+                                                                   4.2.2   KV-cache Management
+equal priority. When requests are not abundant, the control
+plane should reduce the number of NanoFlow instances to            To efficiently serve multi-round applications, NanoFlow of-
+maintain a sufficiently large per-instance batch size. Note that   floads the KV-cache of running requests to a hierarchical
+while the Bdense , i.e. the token batch size for GEMMs, is on      cache consisting of host CPU memory and SSDs, and loads a
+the order of thousands (e.g., 1 prefill request of 2048 tokens     prior round’s KV-cache when a new round arrives.
+and 256 decode tokens), this represents the combination of            Simultaneous offloading. Instead of waiting for requests’
+
+
+
+758     19th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+                                                                      Layer
+               DecAttn1 DecAttn2   DecAttn3 DecAttn4                                                                                       DecAttn1 DecAttn2
+                R=0.4    R=0.4      R=0.4    R=0.4                                                                                          R=0.4    R=0.4
+
+       KQV1     KQV2     KQV3       KQV4        PF1 O1      O2              Up,Gate,Down (UGD) 1       Up,Gate,Down (UGD) 2        KQV1     KQV2        KQV3
+       R=0.4    R=0.4    R=0.4      R=0.4      R=0.6 R=0.6 R=0.8                    R=0.9                      R=0.9               R=0.4    R=0.4       R=0.4
+
+         UGD.AR2        UGD.AR3 Attn.AG1                           O.AG1       O.AR2                 UGD.AR1                         UGD.AR2          UGD.AR3
+                                                        Attn.AG2
+          R=0.2          R=0.2   R=0.2                             R=0.2       R=0.1                  R=0.1                           R=0.2            R=0.2
+                                    Prefill Attention          AG to AR Transform
+
+
+Figure 6: Execution pipeline of LLaMA-2 70B, automatically generated by NanoFlow. The solid background and shaded
+background represents input batch 0-768 and 768-2048, respectively. R stands for resource utilization. By overlapping the
+compute-, memory-, and network-intensive operations, NanoFlow increases compute utilization and improves the serving
+throughput.
+
+
+completion, NanoFlow offloads the KV-cache of tokens di-                                         Dataset              Avg. Input (Std)              Avg. Output (Std)
+rectly after the KQV generation in each transformer layer                                     Splitwise [32]           1155 (1109)                     211 (163)
+before appending them to the KV-cache. The KV vectors                                        LMSYS-Chat [56]            102 (169)                      222 (210)
+output by KQV generation are naturally contiguous and the                                     ShareGPT [1]              246 (547)                      322 (244)
+data size of the offload is balanced across iterations by design
+as NanoFlow’s dense batches remain stable. As a result, the                                Table 4: The average and standard deviation of input and
+host and the GPU hold the same copy of on-the-fly requests’                                output lengths in the sampled datasets.
+KV-cache. To minimize the offloading overhead, NanoFlow
+performs the device-host copy— an operation that uses minor
+GPU resources—during compute-bound operations in FFN.                                         • How much NanoFlow improves serving throughput com-
+Moreover, NanoFlow reduces offloading time via NUMA-                                            pared to existing systems, and how does its throughput
+aware thread-binding.                                                                           compare to the optimal serving throughput? (§6.2)
+   Host KV-cache management. NanoFlow uses the LRU                                            • What is the average serving latency under NanoFlow for
+policy to manage the hierarchical cache of CPU memory                                           different request rates, and how is it distributed? (§6.3)
+and SSDs. For e.g., KV-cache are evicted to SSDs when the                                     • How do the various techniques proposed in NanoFlow
+CPU reaches its memory limit and retrieved from either CPU                                      contribute to the end-to-end throughput? (§6.4)
+or SSD to initiate the loading process when the next round                                    • What is the compute, memory and network resource
+conversation of a request comes in.                                                             usage pattern of NanoFlow? (§6.5)
+                                                                                              • How does NanoFlow improve performance when ap-
+   KV-cache loading and scattering. NanoFlow uses Page-
+                                                                                                plied to different popular LLMs? (§6.6)
+dAttention [17], therefore, the pages of the KV-cache reside in
+the GPU memory in a fragmented manner. In order to avoid                                   6.1     Experiment Setup
+copying to fragmented GPU page destinations, NanoFlow
+                                                                                           Hardware. We run our experiments on 8× A100 80GB SXM
+first copies the data to a contiguous space on GPU and then
+                                                                                           GPUs interconnected via NVLink.
+scatters the pages to their destinations. This achieves 7-10×
+                                                                                              Models. We provide a detailed evaluation of NanoFlow
+higher bandwidth for host-to-device copy.
+                                                                                           using the LLaMA-2-70B model, one of the most widely-used
+5   Implementation                                                                         open-source LLMs. We also demonstrate the applicability of
+                                                                                           NanoFlow by evaluating it on 5 other representative LLMs.
+We implemented NanoFlow for NVIDIA GPUs. NanoFlow
+                                                                                           We use FP16 weights and activations for all models, as this is
+consists of ∼10K lines of CUDA and ∼6K lines of Python.
+                                                                                           standard for data center-scale inference.
+   Given the GPU resource requirements determined by auto-
+                                                                                              Baselines. We consider three widely-used serving frame-
+search, NanoFlow knows which kernels to launch for each
+                                                                                           works as baselines.
+nano-batch to achieve a given utilization level, based on its
+                                                                                              vLLM5 [17, 52] is a state-of-the-art serving system deliver-
+profiling results. NanoFlow launches nano-operations, re-
+                                                                                           ing high throughput. vLLM implements pagedAttention for
+specting the ordering constraints from auto-search, on multi-
+                                                                                           increasing GPU memory utilization, as well as the chunked
+ple CUDA streams and enforces ordering dependencies using
+                                                                                           prefill for higher GPU compute utilization.
+CUDA events.
+                                                                                              DeepSpeed-FastGen6 [13, 23] is a serving framework de-
+6   Evaluation                                                                                5 v0.5.3.post1 (commit ID 38c4b7e)
+
+We now mainly answer the following questions:                                                 6 v0.2.3 (commit ID 429bc5c)
+
+
+
+
+USENIX Association                                          19th USENIX Symposium on Operating Systems Design and Implementation                                 759
+                                           vLLM          DeepSpeed-FastGen                       TensorRT-LLM                   NanoFlow (Ours)
+                                                                                                                                                  formance) to measure the total throughput defined as the total
+                                           2000
+                   Throughput (tokens/s)
+
+
+                                                                                 optimal=1857
+                                                                                                                                                  number of input and output tokens divided by the execution
+                            2000
+                 Token
+           (tokens/s)
+
+
+
+
+                             1500
+                                                                      1286             optimal=1857
+                                                                                              1263                            1212                time. We compare the performance of the NanoFlow instance
+   Per-GPU Token
+
+
+
+
+                             1000
+                            1500                                                                                                                  with optimal throughput derived using Equation 5, where we
+         Per-GPU
+
+
+
+
+                                                                                           817
+                                                                735     1286                           1263
+                                                                                                                        636                1212
+                                                                               552
+
+                            1000
+                                            500
+                                                  494    490                         513
+                                                                                                          410    372                              measure the peak compute capacity using the state-of-the-art
+Throughput
+
+
+
+
+                                                                                                 817
+
+                                              0
+                                                                  735
+                                                                                     552513
+                                                                                                                                     636          GEMM vendor library CUTLASS with a token batch size of
+                                                  494 Input
+                                                        490 512                  Input 1024                    Input410
+                                                                                                                     512 372
+                                           500                                                                                                    2048. Since the optimal throughput is independent of user
+                                                    Output 512                   Output 512                   Output 1024
+
+                                             0                                                                                                    query statistics, for all the experiments, the optimal through-
+                                                         Input 512                     Input 1024                        Input 512
+                                                        Output 512                     Output 512                       Output 1024               put is 1857 tokens/s/GPU as computed in §3.5.
+                 (a) LLaMA-2-70B, 8 GPU, TP=8, Constant Input & Output Length                                                                        Figure 7 shows the throughput of the NanoFlow instance
+                                                                                                                                                  compared to the baselines. NanoFlow has the highest through-
+                            2000                                                                                                                  put in all settings and is able to achieve 68.5% of the theoreti-
+Throughput (tokens/s)
+
+
+
+
+                                                                                       optimal=1857
+                                                                                                                                                  cal optimal throughput in the best case. For constant lengths,
+   Per-GPU Token
+
+
+
+
+                            1500                                        1305                           1306                                1324
+                                                                                                                                                  NanoFlow has on average 2.62× higher offline through-
+                            1000                                  831
+                                                                                                                                     639
+                                                                                                                                                  put than vLLM, 2.78× higher than DeepSpeed-FastGen and
+                                                          548                                    560
+                                           500
+                                                  484
+                                                                                           293                         255
+                                                                                                                              335
+                                                                                                                                                  1.73× higher than TensorRT-LLM. When input and output
+                                                                                     251
+                                                                                                                                                  lengths are drawn from the datasets, NanoFlow has on aver-
+                                             0
+                                                         Splitwise                     LMSYS-Chat                            ShareGPT             age 4.18× higher throughput than vLLM, 3.45× higher than
+      (b) LLaMA-2-70B, 8 GPU, TP=8, Input & Output Length from Dataset                                                                            DeepSpeed-FastGen and 1.91× higher than TensorRT-LLM.
+
+Figure 7: Offline throughput comparison. NanoFlow outper-                                                                                         6.3   Latency
+forms all baselines for all the workload settings. TP stands                                                                                      We evaluate the latency of the NanoFlow instance, for which
+for the number of GPUs used with tensor parallelism.                                                                                              we model the request arrival interval via an exponential dis-
+                                                                                                                                                  tribution, following prior work [17]. We generate 5 minutes
+                                                                                                                                                  of request traces from the datasets in Table 4 for various
+veloped by Microsoft. It dynamically composes prefill with                                                                                        request rates. We then measure normalized latency by first
+decode requests to ensure that the engine is operating in a high                                                                                  calculating the end-to-end request latency divided by output
+throughput regime. We vary the max-ragged-batch-size                                                                                              length in tokens, then taking the average for all requests. For
+to tune the batch size for highest throughput.                                                                                                    each framework, we gradually increase the request rate and
+   TensorRT-LLM7 [26, 27] is a high-performance LLM in-                                                                                           measure the normalized latency. We select the SLO for aver-
+ference engine built upon NVIDIA’s TensorRT SDK. We set                                                                                           age normalized latency as 200ms following prior works [59],
+max-num-tokens by calculating the maximum capacity for                                                                                            which is also the typical human reading speed [8].
+the KV-cache in the GPU memory. We also enable paged KV-
+                                                                                                                                                     Figure 8 demonstrates the normalized latency of the
+cache and dynamic batching optimizations when compiling.
+                                                                                                                                                  NanoFlow instance compared to baselines at various request
+   Datasets. Splitwise [32] is a conversation trace collected                                                                                     rates. At lower rates, the NanoFlow instance has compara-
+from a real production environment at Microsoft, with a total                                                                                     ble but slightly higher latency, because NanoFlow targets
+of around 20000 requests. LMSYS-Chat-1M [56] is a large-                                                                                          throughput-oriented scenarios and therefore employs a large
+scale dataset with 1 million real-world conversations from                                                                                        dense batch size.
+25 different LLMs. ShareGPT [1] is a dataset with conversa-
+                                                                                                                                                     The NanoFlow instance is able to sustain a higher request
+tions collected from the ShareGPT API. We use the full trace
+                                                                                                                                                  rate within 200ms latency SLO compared to all other base-
+from Splitwise and randomly sample 50, 000 requests from
+                                                                                                                                                  lines across all the datasets. For example, for LMSys-Chat-
+ShareGPT and LMSYS-Chat-1M for our evaluation. Table 4
+                                                                                                                                                  1M dataset, the NanoFlow instance can achieve 1.64× higher
+shows the average input length and output length in tokens
+                                                                                                                                                  request rate compared to TensorRT-LLM within 200ms nor-
+for the sampled datasets we use.
+                                                                                                                                                  malized latency constraint.
+6.2                                        Throughput                                                                                                Moreover, the NanoFlow instance’s 99th-percentile la-
+We first evaluate throughput to simulate use cases such as                                                                                        tency is only 1.07× of the average latency at near-maximum
+benchmarking, information extraction, data wrangling, and                                                                                         throughput, as NanoFlow uses a constant dense batch size,
+form processing [36]. We sample actual input (prompt tokens)                                                                                      helping it perform well even under tail latency SLOs.
+and output (generated tokens) lengths from the datasets and                                                                                       6.4   Ablation Study
+add additional experiments with constant length. We then de-
+ploy a NanoFlow instance (with a dense batch size of 2048 in                                                                                      To showcase the overhead and benefit of the techniques
+the case of Llama-2-70B, where NanoFlow delivers best per-                                                                                        that NanoFlow uses, including nano-batching, nano-operation
+                                                                                                                                                  overlapping, and KV-cache offloading, we compare the
+               7 v0.8.0 (commit ID 5955b8a)                                                                                                       NanoFlow instance with baselines that share the same asyn-
+
+
+
+760                                         19th USENIX Symposium on Operating Systems Design and Implementation                                                                            USENIX Association
+                                                                                              vLLM                                          DeepSpeed-FastGen                     TensorRT-LLM              NanoFlow (Ours)
+                                                                                                                          1000
+
+
+
+
+                                                                                                     Normalized latency
+                          1000                                                                                             800 1000                                                                                                   1000
+
+
+
+
+                                                                                                         (ms/token)
+     Normalized latency
+
+
+
+
+                                                                                                                                                                                                                 Normalized latency
+                                                                                                                           Normalized latency
+                           800                                                                                             600                  800                                                                                    800
+         (ms/token)
+
+
+
+
+                                                                                                                                                                                                                     (ms/token)
+                                                                                                                               (ms/token)
+                           600                                                                                             400                  600                                                                                    600
+
+                           400                                                                                             200                  400                                                                                    400
+
+                           200                                                                                                   0              200                                                                                    200
+                                                                                                                                            0              10           20        30         40        50
+                             0                                                                                                                    0                                                                                      0
+                                   2.5           5.0        7.5     10.0      12.5     15.0     17.5                                                   0           10        20         30        40        50                               0   5        10         15       20
+                                                       6.6    8.2
+                                                                                                                                                                   Request rate (req/s) 32.1
+                                                                                                                                                                        17.1                                                                              10.5         16.3
+                                                       Request rate (req/s)                                                                                              Request rate (req/s)                                                        Request rate (req/s)
+
+                                                 (a) Splitwise                                                                                                  (b) LMSYS-Chat-1M                                                                (c) ShareGPT
+
+Figure 8: Latency comparison. The x-axis shows the number of incoming requests per second, and the y-axis shows the
+normalized latency. NanoFlow handles higher request rates within 200ms SLO constraints.
+
+
+                                 Non-overlap                      Nanobatch-only                NanoFlow                                         NanoFlow-offload
+                                                                                                                                                                                  baseline sequentially executes operations, which mostly uses
+                                                                                                                                                                                  only one resource at a given time, the NanoFlow instance
+Throughput (tokens/s)
+
+
+
+
+                        1500                    1446 1402
+                                                                           1323 1290                  1291 1259
+                                  1273                                                                                                                 1277 1244
+                                                                                                                                                                                  can concurrently utilize multiple resources and achieves
+   Per-GPU Token
+
+
+
+
+                                         1171
+                                                              1106                      1092                                             1048
+                                                                     982
+                        1000                                                                   958                                               952
+                                                                                                                                                                                  68.5% average compute utilization. Due to kernel interfer-
+                                                                                                                                                                                  ence, NanoFlow provides lower than optimal compute usage.
+                          500
+
+                                                                                                                                                                                  6.6        Performance on Other LLMs
+                            0
+                                   Input 512                       Input 512            Input 1024                                        Input 512
+                                    Output 0                      Output 512            Output 512                                       Output 1024                              We evaluate the throughput of NanoFlow instances for other
+                                                                                                                                                                                  LLMs with a constant length of input 1024 and output 512.
+Figure 9: Ablation study results for NanoFlow. Nano-batching                                                                                                                      All evaluations are done on 8×A100 80GB SXM GPUs, ex-
+and overlapping improves NanoFlow’s performance.                                                                                                                                  cept for LLaMA-3-8B, which runs on a single A100 80GB
+                                                                                                                                                                                  SXM. The results are summarized in Figure 11. We find that
+                                                                                                                                                                                  NanoFlow improves throughput to between 50% and 72% of
+chronous request scheduling and kernel libraries.
+                                                                                                                                                                                  optimal throughput for these models, surpassing vLLM.
+   We created two baselines: a non-overlapping baseline pro-
+cessing inputs sequentially without nano-batches, and a nano-                                                                                                                     7      Related Work
+batch-only baseline that splits requests into nano-batches as
+in NanoFlow but executes them sequentially to assess nano-                                                                                                                        LLM serving optimizations. Prior works have investigated
+batching overhead. As shown in Figure 9, splitting into nano-                                                                                                                     optimizations for improving the serving throughput at differ-
+batches alone reduces performance by 13.2%.                                                                                                                                       ent granularities. Orca [53] proposes request-level continuous
+   To estimate the benefit of overlapping network- and                                                                                                                            batching, which refills the on-the-fly batch to maximize batch
+memory-bound kernels, we compare NanoFlow and baselines                                                                                                                           size at the granularity of an iteration. DistServe [59] and
+under various prefill-decode ratios, as shown in Figure 9. We                                                                                                                     Splitwise [32] explore phase-level scheduling, which disag-
+use prefill-only workloads (Input 512, Output 0) to demon-                                                                                                                        gregates the prefill and decode phases into different clusters.
+strate the benefit of overlapping network-bound and compute-                                                                                                                      DeepSpeed-FastGen [13] and Sarathi-Serve [2] propose a
+bound kernels. Additionally, we use decode heavy workloads                                                                                                                        chunked prefill policy, which splits a prefill request into mul-
+(Input 512, Output 1024) to evaluate the benefit of overlap-                                                                                                                      tiple smaller chunks and batches decode and prefill requests
+ping both network- and memory-bound kernels. NanoFlow                                                                                                                             together to improve overall utilization. However, these works
+achieves 1.07× speedup by overlapping network-bound ker-                                                                                                                          do not perform scheduling at the granularity of operations.
+nels and 1.17× speedup by overlapping both network- and                                                                                                                           NanoFlow exploits intra-device parallelism, which features
+memory-bound kernels compared with the non-overlapped                                                                                                                             fine-grained resource management. Other works tackle the in-
+baseline.                                                                                                                                                                         ference inefficiency by optimizing specific operations, includ-
+   Moreover, we quantify the performance degradation due to                                                                                                                       ing PageAttention [17], quantization approaches [19, 44, 55],
+offloading in Figure 9. Enabling offloading would slow down                                                                                                                       etc. NanoFlow can easily adopt new operation implementa-
+the pipeline by 3.0% due to kernel interference caused by KV-                                                                                                                     tions by profiling their performances and interference charac-
+cache movement. However, offloading can reduce compute                                                                                                                            teristics and integrating them into auto-search.
+by 3.02× for multi-round LMSYS-Chat workloads.                                                                                                                                       Operation-level parallelism. Some works focus on im-
+                                                                                                                                                                                  proving the efficiency of DNN workloads with operation-
+6.5                        Resource Usage                                                                                                                                         level optimizations. For example, Rammer [20] explores intra-
+We demonstrate NanoFlow’s effectiveness in terms of re-                                                                                                                           operation parallelism by remapping the operations into differ-
+source utilization in Figure 10. While the non-overlapping                                                                                                                        ent functional units. Unity [50] investigates the combination
+
+
+
+USENIX Association                                                                                                         19th USENIX Symposium on Operating Systems Design and Implementation                                                                                    761
+                                     100~------------------------~                                                                           100
+                           -
+                           ~
+                           -Q)        75
+                                            -       Compute                                                                      --
+                                                                                                                                 ~
+                                                                                                                                     Q)
+                                                                                                                                              75
+                                                                                                                                                   -       Compute                            I
+
+
+
+
+                               0)                                                                                                    0)
+                               2 50
+                               C
+                               Q)
+                               ~      25
+                                                                                                                                     ro
+                                                                                                                                     -1-J
+                                                                                                                                     C
+                                                                                                                                     Q)
+                                                                                                                                     u
+                                                                                                                                     I,...
+                                                                                                                                              50
+                                                                                                                                              25
+                                                                                                                                                       -,_                  -
+                               Q)                                                                                                    Q)
+                               a..
+                                      0 ....._____,..---------.----.--------.--------.------~---------1
+                                                                                                                                     a..
+                                                                                                                                               0             - - - -                    -                 -
+                                     100~------------------------~                                                                           100
+                           -
+                           ~
+                           ._. 75-
+                               Q)
+                                            -       Memory
+                                                              --                                                                 --
+                                                                                                                                 ~
+                                                                                                                                     Q)
+                                                                                                                                              75
+                                                                                                                                                   -       Memory
+
+                               0)                                                                                                    0)
+                               2 so-                                                                                                 ro
+                                                                                                                                     -1-J     50
+                               c
+                               Q)
+                               ~
+                               Q)
+                                      25-                               -                                                            C
+                                                                                                                                     Q)
+                                                                                                                                     u
+                                                                                                                                     I,...
+                                                                                                                                     Q)
+                                                                                                                                              25
+                               a..                                                 I   I                                  I
+                                                                                                                                     a..
+                                       Q-       I                                                                                              0
+                                     100~------------------------~
+                           -
+                           ~
+                           -Q)        75
+                                            -       Network                                                                      --
+                                                                                                                                 ~
+                                                                                                                                     Q)
+                                                                                                                                             100
+                                                                                                                                              75
+                                                                                                                                                   -       Network
+
+                               0)                                                                                                    0)
+                               2 50                                                                                                  ro
+                                                                                                                                     -1-J     50
+                               C                                                                                                     C
+
+
+
+                                                                                                                                                                 7 flJ
+                               Q)                                                                                                    Q)
+                               ~      25                                                                                             u        25             I
+                                                                                                                                                                                       I
+                                                                                                                                     I,...
+                               Q)
+                               a..
+                                       0 ....._____,..---------.----.--------.--------.------~---------1
+                                                                                                                                     Q)
+                                                                                                                                     a..
+                                                                                                                                               0       I                                           I I
+                                           0       500       1000       1500      2000       2500     3000                                             0             500        1000        1500   2000         2500   3000
+                                                                                       Time (us)                                                                                       Time (us)
+
+                                                         (a) Non-overlap pipeline resource usage                                                                           (b) NanoFlow resource usage
+
+Figure 10: The non-overlapping pipeline and NanoFlow’s resource usage during inference of a single layer. NanoFlow achieves
+high compute usage across the whole pipeline by simultaneously utilizing memory and network bandwidth.
+
+
+                                                                            vLLM             NanoFlow                                        erogeneous resource usage through intra-device parallelism.
+                     100                                                           Optimal
+                                                                                                                                             NanoFlow automatically constructs a pipeline that overlaps
+Normalized Per-GPU
+
+
+
+
+                      80                                                                                                 78.5%               nano-operations, with an auto-search that adapts to various
+  Throughput (%)
+
+
+
+
+                                                70.6%               67.4%
+                                                                                       59.1%                                                 LLM models. Our experiments show that NanoFlow achieves
+                      60
+                                                                                                          50.4%
+                                                                                                                                             1.91× throughput improvement over the state-of-the-art sys-
+                      40                                                                                               12756
+                                     32.0% 1306          30.8% 1213
+                                                                              27.4% 1147
+                                                                                                                  31.9%                      tems.
+                                                                                                          5188
+                      20              593                                                                         5187
+                                                              554              532                 9.7%
+                                                                                                   997
+                                                                                                                                             References
+                       0
+                                     Llama-3-70B          Qwen2-72B          Deepseek-67B Mixtral-8x7B            Llama-3-8B
+                                                                                                                                              [1] Sharegpt.   https://huggingface.co/datasets/
+Figure 11: Performance of NanoFlow instances in terms of                                                                                          anon8231489123/ShareGPT_Vicuna_unfiltered,
+tokens per second per GPU for other models. Compared                                                                                              2023.
+with vLLM, NanoFlow significantly increases throughput.
+                                                                                                                                              [2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree
+NanoFlow achieves up to 78.5% of optimal throughput.
+                                                                                                                                                  Mohan, Nipun Kwatra, Bhargav S Gulavani, Alexey Tu-
+of parallelism and equivalent algebraic transformation of op-                                                                                     manov, and Ramachandran Ramjee. Taming throughput-
+erations. However, these works do not consider the different                                                                                      latency tradeoff in llm inference with sarathi-serve.
+resource demands of operations. ASPEN [30] and Welder [37]                                                                                        arXiv preprint arXiv:2403.02310, 2024.
+break the boundary between operations by constructing and
+compiling a tile-level data graph. Since tiles follow sequen-                                                                                 [3] Amey Agrawal, Ashish Panwar, Jayashree Mohan,
+tial dependencies, parallelism is still limited. Moreover, prior                                                                                  Nipun Kwatra, Bhargav S Gulavani, and Ramachan-
+works require recompilation from scratch, which requires sig-                                                                                     dran Ramjee. Sarathi: Efficient llm inference by piggy-
+nificant manual work. Compared with them, NanoFlow cre-                                                                                           backing decodes with chunked prefills. arXiv preprint
+ates more overlapping opportunities through nano-batching.                                                                                        arXiv:2308.16369, 2023.
+
+8                    Conclusion                                                                                                               [4] Mistral AI. Mistral nemo. https://mistral.ai/
+                                                                                                                                                  news/mistral-nemo/, 2024.
+In this work, we analyzed the characteristics of different op-
+erations in LLM serving and revealed the compute-bound                                                                                        [5] Joshua Ainslie, James Lee-Thorp, Michiel de Jong,
+nature of modern LLM serving workloads. We identified that                                                                                        Yury Zemlyanskiy, Federico Lebron, and Sumit Sang-
+compute is underutilized within a single GPU due to the se-                                                                                       hai. GQA: Training generalized multi-query trans-
+quential execution of compute-bound, memory-bound, and                                                                                            former models from multi-head checkpoints.       In
+network-bound operations, leading to sub-optimal through-                                                                                         Houda Bouamor, Juan Pino, and Kalika Bali, editors,
+put. To address this, we proposed NanoFlow, a novel end-to-                                                                                       Proceedings of the 2023 Conference on Empirical
+end LLM serving system that overlaps operations with het-                                                                                         Methods in Natural Language Processing, pages 4895–
+
+
+
+762                    19th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                   USENIX Association
+     4901, Singapore, December 2023. Association for Com-            for llm workloads: Improving performance through
+     putational Linguistics.                                         workload-aware load balancing, 2025.
+ [6] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E. Hin-       [16] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-
+     ton. Layer normalization, 2016.                                 sch, Chris Bamford, Devendra Singh Chaplot, Diego
+                                                                     de las Casas, Florian Bressand, Gianna Lengyel, Guil-
+ [7] Tom Brown, Benjamin Mann, Nick Ryder, Melanie                   laume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+     Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind              Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,
+     Neelakantan, Pranav Shyam, Girish Sastry, Amanda                Thibaut Lavril, Thomas Wang, Timothée Lacroix, and
+     Askell, et al. Language models are few-shot learners.           William El Sayed. Mistral 7b, 2023.
+     Advances in neural information processing systems,
+     33:1877–1901, 2020.                                        [17] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+                                                                     Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez,
+ [8] Marc Brysbaert. How many words do we read per                   Hao Zhang, and Ion Stoica. Efficient memory man-
+     minute? a review and meta-analysis of reading rate.             agement for large language model serving with page-
+     Journal of Memory and Language, 109:104047, 2019.               dattention. In Proceedings of the 29th Symposium on
+ [9] Alibaba Cloud.     Alibaba cloud’s qwen2 with                   Operating Systems Principles, pages 611–626, 2023.
+     enhanced capabilities tops llm leaderboard.                [18] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent
+     https://www.alibabacloud.com/blog/alibaba-                      Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng Chen,
+     cloud’s-qwen2-with-enhanced-capabilities-                       Hao Zhang, Joseph E Gonzalez, et al. Alpaserve: Statis-
+     tops-llm-leaderboard_601268/, 2024.                             tical multiplexing with model parallelism for deep learn-
+[10] Stefan Elfwing, Eiji Uchibe, and Kenji Doya. Sigmoid-           ing serving. In 17th USENIX Symposium on Operating
+     weighted linear units for neural network function ap-           Systems Design and Implementation (OSDI 23), pages
+     proximation in reinforcement learning, 2017.                    663–679, 2023.
+
+[11] Erin Griffith. The desperate hunt for the a.i. boom’s      [19] Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang,
+     most indispensable prize. Technical report, The New             Guangxuan Xiao, Chuang Gan, and Song Han. Qserve:
+     York Times, 2023.                                               W4a8kv4 quantization and system co-design for effi-
+                                                                     cient llm serving, 2024.
+[12] Jiaao He, Jidong Zhai, Tiago Antunes, Haojie Wang,
+     Fuwen Luo, Shangfeng Shi, and Qin Li. Fastermoe:           [20] Lingxiao Ma, Zhiqiang Xie, Zhi Yang, Jilong Xue,
+     Modeling and optimizing training of large-scale dy-             Youshan Miao, Wei Cui, Wenxiang Hu, Fan Yang, Lin-
+     namic pre-trained models. In Proceedings of the                 tao Zhang, and Lidong Zhou. Rammer: Enabling holis-
+     27th ACM SIGPLAN Symposium on Principles and                    tic deep learning compiler optimizations with rTasks.
+     Practice of Parallel Programming, PPoPP ’22, page               In 14th USENIX Symposium on Operating Systems
+     120–134, New York, NY, USA, 2022. Association for               Design and Implementation (OSDI 20), pages 881–897.
+     Computing Machinery.                                            USENIX Association, November 2020.
+
+[13] Connor Holmes, Masahiro Tanaka, Michael Wyatt, Am-         [21] Yusuf Mehdi. Reinventing search with a new ai-powered
+     mar Ahmad Awan, Jeff Rasley, Samyam Rajbhan-                    microsoft bing and edge, your copilot for the web, May
+     dari, Reza Yazdani Aminabadi, Heyang Qin, Arash                 2023.
+     Bakhtiari, Lev Kurilenko, et al. Deepspeed-fastgen:        [22] Meta. Build the future of ai with meta llama 3. https:
+     High-throughput text generation for llms via mii and            //llama.meta.com/llama3/, 2024.
+     deepspeed-inference. arXiv preprint arXiv:2401.08671,
+     2024.                                                      [23] Microsoft.       Deepspeed: Fastgen.   https:
+                                                                     //github.com/microsoft/DeepSpeed/tree/
+[14] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan                429bc5c/blogs/deepspeed-fastgen, 2024. Com-
+     Firat, Mia Xu Chen, Dehao Chen, HyoukJoong Lee,                 mit ID: 429bc5c, Accessed: 2024-12-09.
+     Jiquan Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng
+     Chen. Gpipe: Efficient training of giant neural networks   [24] NVIDIA.       Nvidia dgx platform.    https:
+     using pipeline parallelism, 2019.                               //www.nvidia.com/en-us/data-center/dgx-
+                                                                     platform/, 2024.
+[15] Kunal Jain, Anjaly Parayil, Ankur Mallick, Esha
+     Choukse, Xiaoting Qin, Jue Zhang, Íñigo Goiri, Rujia       [25] NVIDIA.     Nvlink and nvlink switch. https:
+     Wang, Chetan Bansal, Victor Rühle, Anoop Kulkarni,              //www.nvidia.com/en-us/data-center/nvlink/,
+     Steve Kofsky, and Saravan Rajmohan. Intelligent router          2024.
+
+
+
+USENIX Association                         19th USENIX Symposium on Operating Systems Design and Implementation          763
+[26] NVIDIA.    Tensorrt-llm.   https://github.com/               [38] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,
+     NVIDIA/TensorRT-LLM, 2024.                                        Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+                                                                       Megatron-lm: Training multi-billion parameter language
+[27] NVIDIA.      Tensorrt-llm.   https://github.com/                  models using model parallelism, 2020.
+     NVIDIA/TensorRT-LLM/tree/5955b8a, 2024. Com-
+     mit ID: 5955b8a, Accessed: 2024-12-09.                       [39] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,
+                                                                       Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+[28] OpenAI. Introducing chatgpt, 2023.                                Megatron-lm: Training multi-billion parameter language
+                                                                       models using model parallelism, 2020.
+[29] OpenAI. Gpt-4 technical report, 2024.
+                                                                  [40] Shubham Singh. ChatGPT Statistics (AUG 2024)
+[30] Jongseok Park, Kyungmin Bin, Gibum Park, Sangtae Ha,              - Users Growth Data — demandsage.com. https:
+     and Kyunghan Lee. Aspen: Breaking operator barriers               //www.demandsage.com/chatgpt-statistics/,
+     for efficient parallelization of deep neural networks. In         2024. [Accessed 14-08-2024].
+     A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt,        [41] Jared Spataro. Introducing microsoft 365 copilot – your
+     and S. Levine, editors, Advances in Neural Information            copilot for work, May 2023.
+     Processing Systems, volume 36, pages 68625–68638.
+     Curran Associates, Inc., 2023.                               [42] Vikranth Srivatsa, Dongming Li, Yiying Zhang, and
+                                                                       Reyna Abhyankar.       MLSys @ WukLab - Can
+[31] Dylan Patel and Afzal Ahmad. The inference cost of                Scheduling Overhead Dominate LLM Inference Per-
+     search disruption – large language model cost analysis,           formance? A Study of CPU Scheduling Overhead
+     February 2023.                                                    on Two Popular LLM Inference Systems — ml-
+                                                                       sys.wuklab.io. https://mlsys.wuklab.io/posts/
+[32] Pratyush Patel, Esha Choukse, Chaojie Zhang, Íñigo                scheduling_overhead/, 2024.      [Accessed 25-10-
+     Goiri, Aashaka Shah, Saeed Maleki, and Ricardo Bian-              2024].
+     chini. Splitwise: Efficient generative llm inference using
+     phase splitting, 2023.                                       [43] Foteini Strati, Xianzhe Ma, and Ana Klimovic. Orion:
+                                                                       Interference-aware, fine-grained gpu sharing for ml ap-
+[33] Archit Patke, Dhemath Reddy, Saurabh Jha, Chan-                   plications. In Proceedings of the Nineteenth European
+     dra Narayanaswami, Zbigniew Kalbarczyk, and Ravis-                Conference on Computer Systems, EuroSys ’24, page
+     hankar Iyer. Hierarchical autoscaling for large language          1075–1092, New York, NY, USA, 2024. Association for
+     model serving with chiron, 2025.                                  Computing Machinery.
+
+[34] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery,            [44] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao,
+     Jacob Devlin, James Bradbury, Jonathan Heek, Kefan                Baris Kasikci, and Song Han. Quest: Query-aware spar-
+     Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scal-           sity for efficient long-context llm inference, 2024.
+     ing transformer inference. Proceedings of Machine            [45] The AIBrix Team, Jiaxin Shan, Varun Gupta, Le Xu,
+     Learning and Systems, 5, 2023.                                    Haiyang Shi, Jingyuan Zhang, Ning Wang, Linhui Xu,
+                                                                       Rong Kang, Tongping Liu, Yifei Zhang, Yiqing Zhu,
+[35] Emma Roth. Chatgpt’s weekly users have doubled in
+                                                                       Shuowei Jin, Gangmuk Lim, Binbin Chen, Zuzhi Chen,
+     less than a year, 2024. Accessed: 2024-12-03.
+                                                                       Xiao Liu, Xin Chen, Kante Yin, Chak-Pong Chung,
+[36] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan                  Chenyu Jiang, Yicheng Lu, Jianjun Chen, Caixue Lin,
+     Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher            Wu Xiang, Rui Shi, and Liguang Xie. Aibrix: Towards
+     Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput            scalable, cost-effective large language model inference
+     generative inference of large language models with a              infrastructure, 2025.
+     single gpu. In International Conference on Machine           [46] Vijay Thakkar, Pradeep Ramani, Cris Cecka, Aniket
+     Learning, pages 31094–31116. PMLR, 2023.                          Shivam, Honghao Lu, Ethan Yan, Jack Kosaian, Mark
+                                                                       Hoemmen, Haicheng Wu, Andrew Kerr, Matt Nicely,
+[37] Yining Shi, Zhi Yang, Jilong Xue, Lingxiao Ma, Yuqing             Duane Merrill, Dustyn Blasig, Fengqi Qiao, Piotr Ma-
+     Xia, Ziming Miao, Yuxiao Guo, Fan Yang, and Lidong                jcher, Paul Springer, Markus Hohnerbach, Jin Wang, and
+     Zhou. Welder: Scheduling deep learning memory ac-                 Manish Gupta. CUTLASS, January 2023.
+     cess via tile-graph. In 17th USENIX Symposium on
+     Operating Systems Design and Implementation (OSDI            [47] CHENG TING-FANG. Tsmc sees ai chip output con-
+     23), pages 701–718, Boston, MA, July 2023. USENIX                 straints lasting 1.5 years. Technical report, Nikkei Asia,
+     Association.                                                      2023.
+
+
+
+764   19th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+[48] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier          Ion Stoica, and Hao Zhang. Lmsys-chat-1m: A large-
+     Martinet, Marie-Anne Lachaux, Timothée Lacroix, Bap-           scale real-world llm conversation dataset, 2023.
+     tiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar,
+     Aurelien Rodriguez, Armand Joulin, Edouard Grave,         [57] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao
+     and Guillaume Lample. Llama: Open and efficient foun-          Zhuang, Zhifeng Chen, Yanping Huang, Yida Wang,
+     dation language models, 2023.                                  Yuanzhong Xu, Danyang Zhuo, Eric P Xing, et al. Alpa:
+                                                                    Automating inter-and {Intra-Operator} parallelism for
+[49] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert,         distributed deep learning. In 16th USENIX Symposium
+     Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov,            on Operating Systems Design and Implementation
+     Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al.        (OSDI 22), pages 559–578, 2022.
+     Llama 2: Open foundation and fine-tuned chat models.
+     arXiv preprint arXiv:2307.09288, 2023.                    [58] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue
+                                                                    Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos
+[50] Colin Unger, Zhihao Jia, Wei Wu, Sina Lin, Mandeep             Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Bar-
+     Baines, Carlos Efrain Quintero Narvaez, Vinay Ramakr-          rett, and Ying Sheng. Sglang: Efficient execution of
+     ishnaiah, Nirmal Prajapati, Pat McCormick, Jamaludin           structured language model programs, 2024.
+     Mohd-Yusof, Xi Luo, Dheevatsa Mudigere, Jongsoo
+     Park, Misha Smelyanskiy, and Alex Aiken. Unity: Ac-       [59] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu,
+     celerating DNN training through joint optimization of          Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang. Dist-
+     algebraic transformations and parallelization. In 16th         serve: Disaggregating prefill and decoding for goodput-
+     USENIX Symposium on Operating Systems Design                   optimized large language model serving. arXiv preprint
+     and Implementation (OSDI 22), pages 267–284, Carls-            arXiv:2401.09670, 2024.
+     bad, CA, July 2022. USENIX Association.
+
+[51] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+     Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser,
+     and Illia Polosukhin. Attention is all you need. In
+     Proceedings of the 31st International Conference on
+     Neural Information Processing Systems, NIPS’17, page
+     6000–6010, Red Hook, NY, USA, 2017. Curran Asso-
+     ciates Inc.
+
+[52] vllm project. vllm. https://github.com/vllm-
+     project/vllm/tree/38c4b7e, 2024. Commit ID:
+     38c4b7e, Accessed: 2024-12-09.
+
+[53] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soo-
+     jeong Kim, and Byung-Gon Chun. Orca: A distributed
+     serving system for {Transformer-Based} generative
+     models. In 16th USENIX Symposium on Operating
+     Systems Design and Implementation (OSDI 22), pages
+     521–538, 2022.
+
+[54] Liangyu Zhao, Saeed Maleki, Aashaka Shah, Ziyue
+     Yang, Hossein Pourreza, and Arvind Krishnamurthy.
+     Forestcoll: Efficient collective communications on het-
+     erogeneous network fabrics, 2024.
+
+[55] Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn
+     Chen, Size Zheng, Luis Ceze, Arvind Krishnamurthy,
+     Tianqi Chen, and Baris Kasikci. Atom: Low-bit quan-
+     tization for efficient and accurate llm serving. arXiv
+     preprint arXiv:2310.19102, 2023.
+
+[56] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle
+     Li, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+     Zhuohan Li, Zi Lin, Eric. P Xing, Joseph E. Gonzalez,
+
+
+
+USENIX Association                        19th USENIX Symposium on Operating Systems Design and Implementation        765
+

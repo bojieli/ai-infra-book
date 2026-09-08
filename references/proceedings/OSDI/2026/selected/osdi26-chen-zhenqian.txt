@@ -1,0 +1,1369 @@
+ RobustRL: Role-based Fault Tolerance System for
+                RL Post-Training
+ Zhenqian Chen and Baoquan Zhong, Zhejiang University; Xiang Li, unaffiliated;
+Qing Dai, Xinkui Zhao, and Miao Ye, Zhejiang University; Ren Cheng, unaffiliated;
+  Lufei Zhang, State Key Laboratory of Mathematical Engineering and Advanced
+               Computing, China; Jianwei Yin, Zhejiang University
+         https://www.usenix.org/conference/osdi26/presentation/chen-zhenqian
+
+
+
+
+  This paper is included in the Proceedings of the 20th USENIX
+ Symposium on Operating Systems Design and Implementation.
+                       July 13–15, 2026 • Seattle, WA, USA
+                               ISBN 978-1-939133-55-7
+
+
+           Open access to the Proceedings of the 20th USENIX Symposium on
+            Operating Systems Design and Implementation is sponsored by
+            RobustRL: Role-based Fault Tolerance System for RL Post-Training
+
+                    Zhenqian Chen1 , Baoquan Zhong1 , Xiang Li2 , Qing Dai1 , Xinkui Zhao1† ,
+                              Miao Ye1 , Ren Cheng2 , Lufei Zhang3 , Jianwei Yin1
+                                       1 Zhejiang University 2 Unaffiliated
+             3 State Key Laboratory of Mathematical Engineering and Advanced Computing, China
+
+
+
+                              Abstract
+   RL post-training for LLMs has been widely scaled to en-
+                                                                        (a)
+hance reasoning and tool-using capabilities. However, RL               sync
+                                                                                  Rollout, W0      Train, W0        Rollout, W1          Train, W1
+post-training interleaves training and inference workloads,
+exposing the system to faults from both sides. Existing fault          (b)
+                                                                                  Rollout, W0    Rollout, W0        Rollout, W1
+tolerance frameworks for LLMs target either training or infer-        async
+                                                                                                 Train, W0           Train, W1
+ence, leaving the optimization potential in the asynchronous
+execution unexplored for RL. Our key insight is role-based             (c)        Rollout, W0        Rollout, W1          Rollout, W2
+fault isolation so the failure in one machine does not affect         semi-
+the others. We treat trainer, rollout, and other management           sync       W0       W0        W1         W1         W2        W2
+
+roles in RL training as distinct distributed sub-tasks. Instead        GPU
+                                                                              Context   Weight                  Hybrid-                      Hybrid-
+                                                                                                    Rollout                    Trainer
+of restarting the entire task in pretrain robust system ByteRo-               switch    update                  Rollout                      Trainer
+
+bust, we recover only the failed role and reconnect it to living
+ones, thereby eliminating the full-restart overhead including      Figure 1: Different RL training architectures. The GPU role
+rollout replay and initialization delay.                           includes trainer, rollout and hybrid (colocate the both).
+   We present RobustRL, the first comprehensive robust sys-
+tem to handle GPU machine errors for RL post-training ETTR         Models) [2, 6, 32], where the week-level [24] and 200K
+(Effective Training Time Ratio) improvement via a Detect-          GPUs large-scale [80] RL training has been deployed to
+Restart-Reconnect paradigm. (1) Detect. We implement role-         enhance their reasoning and tool-using capabilities through
+aware monitoring to distinguish actual failures from role-         iterative policy optimization [57,59,85]. State-of-the-art mod-
+specific behaviors to avoid the false positive and delayed         els [7,24,52,63,64,80] all leverage RL post-training to achieve
+detection. (2) Restart. For trainers, we implement a non-          superior performance in complex tasks [91], such as mathe-
+disruptive recovery where rollouts persist state and continue      matics [50], code generation [30, 42], and search [31] et al..
+trajectory generation, while the trainer is rapidly restored          Unlike traditional LLM pre-training [19, 29, 73] or serv-
+via rollout warm standbys. For rollout, we perform isolated        ing [34,62,75,81] workloads, RL post-training comprises two
+machine replacement without interrupting the RL task. (3)          phases: rollout (generation and tool interaction) and training,
+Reconnect. We replace static collective communication with         where they contribute close to 100% and 70% post-training
+dynamic, UCX-based (Unified Communication X) point-to-             time in reasoning tasks and tool learning tasks [60]. To mit-
+point communication, enabling immediate weight synchro-            igate the long-tail latency inherent in the rollout phase, RL
+nization between recovered roles. In an RL training task on        training frameworks have evolved from synchronous archi-
+a 256-GPU cluster with Qwen3-8B-Math workload under                tectures that co-locate rollout and trainers [26, 43, 61, 84, 90]
+10% failure injection frequency, RobustRL can achieve an           in Figure 1(a) to asynchronous designs [16, 25, 60, 77, 89, 93]
+ETTR of over 80% compared with the 60% in ByteRobust               in Figure 1(b) and (c). These include async mode with dedi-
+and achieves 8.4%-17.4% faster in end-to-end training time.        cated standalone rollouts and trainers, as well as semi-sync
+                                                                   mode [7, 65] that combine co-located workers with additional
+                                                                   standalone rollouts.
+1    Introduction                                                     The efficiency of large-scale RL training is therefore criti-
+                                                                   cally dependent on the reliability of both the trainer and roll-
+Reinforcement Learning (RL) has emerged as a transfor-             out because they consume the majority of training time [60].
+mative paradigm for post-training LLMs (Large Language             When scaling to thousands of GPUs, machine failures be-
+    † Corresponding author.                                        come the dominant source of task interruption [11, 38, 73].
+
+
+
+USENIX Association                          20th USENIX Symposium on Operating Systems Design and Implementation                                1407
+                                                                     build the fixed communication group before transfer, so it
+                  Misjudge
+                                                                     cannot connect with the recovered role in the new machine
+           Generation    Tool               Generation               and does not support fault tolerance. Point-to-point communi-
+
+                 Train                   Train   x                   cation like UCX is available for dynamic reconnection, but
+                                                     Time waste!     needs asynchronous and parallel optimization to be efficient.
+    (a) Rank-level detection     (b) Cluster-level detection            To address these challenges, we designed RobustRL, the
+                                                                     first comprehensive role-based fault tolerance system for RL
+              GPU         Fault detect     x Error happens           post-training in the three RL modes of Figure 1. It mitigates
+                                                                     the impact of the machine failures for the rollout and trainer.
+Figure 2: Fault detection of pre-train applied in RL. (a) Rank-
+                                                                     Our contributions are as follows.
+level leads to false positive. (b) Cluster-level leads to delay.
+                                                                     1. Role-phase-aware fault detection. It decides which roles
+However, because rollout and training are tightly interleaved        should restart. We introduce a phase-aware and extensible de-
+in a single RL task, fault detection and recovery must han-          tection strategy for trainer and rollout. Faults in corresponding
+dle failures stemming from both phases. A naive solution             roles are handled using appropriate robust strategies. (§4).
+is applying different fault tolerance strategies to the specific     2. Role-based and resource-efficient restart. It decides how
+roles of the failed components. Unfortunately, they lack the         the roles restart. We propose a decoupled recovery strategy to
+fine-grained mechanisms required for the unique demands              avoid the RL task restart and preserve the rollout progress. In
+of RL. Existing fault tolerance solutions are tailored to pure       semi-sync and async mode, for trainer failures, we implement
+pre-training [4, 13, 17, 27, 36, 70, 71, 73] or pure inference       an efficient recovery that dynamically takes rollout as warm
+workloads [39, 46, 54]. In current RL systems, the failure of        standbys, bypassing gang-scheduling delays without requiring
+a single critical worker would trigger a RL task restart, dis-       extra idle resources. For rollout failures, the recovered rollout
+carding training progress and wasting computation resources.         would pull the latest weight from other rollouts for trajectory
+Ideally, a fault in a machine hosting one distributed RL role        generation immediately. (§5.1)
+should not disrupt the others. Only the detected failed role         3. Efficient and reliable reconnection. It decides how the
+should restart and subsequently reconnect with others while          roles reconnect. We implement UCX-based (Unified Com-
+the remaining roles continue to run. However, achieving this         munication X) dynamic communication to replace NCCL
+ideal state presents three significant challenges.                   for weight synchronization. It can achieve efficient weight
+Challenge #1: Accurate and efficient fault detection. The            update through asynchronous point-to-point communication
+rank-level detection for training in ByteRobust does not work        and relay server design. In addition, it can handle the different
+for RL. It flags a process as suspect when its behavior de-          failure cases during the recovery. (§5.2)
+viates from peers or it exhibits zero GPU or network activ-          4. End-to-end benefits. In the scenario with frequent failures
+ity [11,29,38,73] because each process runs identical forward-       where a trainer fault is injected every 10% steps, RobustRL
+backward passes. As shown in Figure 2(a), however, rollouts          still maintains an 80% ETTR on the Qwen3-8B-Math training
+can idle their GPUs while awaiting external tool responses,          task with 20% higher than ByteRobust. The RL training time
+causing false positives. Conversely, cluster-level detects the       is 8.4%-17.4% faster than ByteRobust. (§7)
+error when all ranks have no GPU activity. It masks these idle
+periods and introduces significant detection delays as shown
+                                                                     2     Background & Motivation
+in Figure 2. For instance, a trainer network failure might re-
+main undetected for hours until the long-tail rollout phase
+completes, wasting valuable cluster resources.
+                                                                     2.1    RL System for LLM Post-Training
+Challenge #2: Fine-grained and efficient restart. We need            Post-training using Reinforcement Learning (RL), which
+to guarantee both machine failures in trainer and rollout would      evolved from initial human feedback (RLHF) techniques
+not lose the trajectory due to the task restart. Furthermore, for    [5, 55], is now critical for enhancing the reasoning [24, 59, 85]
+the trainer, we need rollout to continue the generation during       and tool-using capabilities [14, 30] of LLMs. This process
+the recovery of the trainer. Besides, the gang-scheduling leads      consists of two phases, rollout and training.
+to the long blocking time until the new machine initializes,         Rollout. The rollout model generates trajectories based on
+while the extra warm standby machine leads to the resource           prompts and the results of environment interaction, a process
+waste. An efficient and resource-friendly system is needed           typically completed by an inference engine [35, 88]. For ex-
+for efficient trainer restart. For rollout, we want the recovered    ample, mathematical reasoning problems [50] can be solved
+rollout to soon get the latest weight for trajectories generation.   using chain-of-thought (CoT) [76]. The rollout model can fur-
+Challenge #3: Dynamic and efficient weight synchroniza-              ther achieve tool learning through multi-turn tool invocations.
+tion. The restart trainer or rollout needs to build reconnection     In software engineering [30] scenarios, trajectories include
+for subsequent weight update as shown in Figure 1(b) and             multi-turn interactions with a code sandbox to fix a bug or
+(c). Collective communication based on NCCL [1] needs to             implement a specific function. In search scenarios [31,33,83],
+
+
+
+1408    20th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+trajectories involve multi-turn interactions with a search en-               Project                                   verl [61]             Roll [21]                 OpenRLHF [20]                  Slime [93]
+gine to retrieve target answers.                                             Total issues                                   1830                  127                              719                    162
+Training. The actor updates its policy by trajectory rewards
+                                                                             CUDA error                                     189                   7                                 74                    14
+evaluated in the training engine [49, 87]. The score can be                  Timeout                                        152                   6                                 60                     9
+obtained via various reward sources such as rule-based func-                 OOM                                            117                   7                                 66                    12
+tions [24, 85] or learned reward models [5, 53]. Subsequently,               Job Hang                                       65                    2                                 20                    4
+the reference and critic models convert per-trajectory scores
+and advantages into training experience. Finally, the actor           Table 1: Issues of machine error and job hang in open source
+model consumes this experience through a specific policy              RL training framework.
+update strategy [3, 57, 59, 85] to complete this iteration.
+                                                                                                 [0,0.5k)         [1k,2k)         [4k,8k)          [16k,32k)
+RL training system. RL frameworks like verl [22] adopt a                                         [0.5k,1k)        [2k,4k)         [8k,16k)         [32k,64k)                   Rollout         Tool use        Train
+
+synchronous mode. After the rollout phase is completed, they                                     100
+
+
+
+
+                                                                       Length Distribution (%)
+                                                                                                                                                                    1000
+switch the inference engine to a training engine by resharding                                    80
+                                                                                                                                                                     800
+
+
+
+
+                                                                                                                                                      Latency (s)
+the model weights. However, the multi-turn interactions and                                       60                                                                 600
+decode latency in rollout leads to a significant long-tail latency.
+                                                                                                  40                                                                 400
+Therefore, existing async RL frameworks [16, 25, 60, 89, 93]
+                                                                                                  20                                                                 200
+allow the trainer to train within a certain range of offline
+                                                                                                                                                                       0
+steps without waiting for all rollout trajectories to complete.                                    0
+                                                                                                       0     10     20       30 40           50    60                      0     10      20    30 40      50    60
+It greatly improves training efficiency while maintaining an                                                                Step                                                              Step
+
+acceptable loss in precision. Compared to the hybrid deploy-          Figure 3: Trajectory length distribution (a) and time cost
+ment of the sync mode, the async paradigm independently               of each step (b) of Search R1 [31] training in HotPotQA
+deploys the trainer and standalone rollouts, with weight syn-         dataset [83] with Qwen2.5-7B [67].
+chronization through network pulling. The semi-sync [58, 65]
+mode replaces the async trainer with a hybrid one, thereby               For instance, the pre-train robust system ByteRobust [73]
+avoiding idle waiting caused by an improper ratio of trainer          achieves warm standby machines to enable fast recovery from
+to standalone rollouts as shown in Figure 1.                          a task restart. But it restarts the whole task whatever the error
+                                                                      happens, leading to the large progress loss especially in RL
+                                                                      training. A better solution is fine-gained restart by role and
+2.2    LLM Fault Tolerance System                                     rollout can be the warm standby for the trainer. We can apply
+Like pre-training, the RL post-training of large models can           ByteRobust only when the role-based robust strategy in RL
+last for several weeks or even months [80]. During this pe-           cannot handle the case like human-made code or configuration
+riod, machine failures inevitably occur, leading to a loss of         error. For the inference system, they mainly focus on keeping
+training progress. In RL, a GPU machine where a failure oc-           the service running [39,46] or avoid re-prefilling [18,54] when
+curs could be executing either a training or an inference task.       one inference machine fails. Current RL robust systems follow
+Prior works, ByteRobust [73] and EaaS [39], have respec-              the inference design [60, 79] to achieve the robust rollout
+tively discussed machine failure scenarios during training and        because it only needs to extra consider how to reconnect with
+inference. In the pre-training process, at the scale of a 100K        the trainer in async mode. However, the trainer process has
+GPU cluster, machine-induced failures (e.g., GPU, network,            much higher failure frequency compared with inference. The
+CPU, memory, disk) cause over 3,000 interruptions per week            robust trainer is important and the robust rollout should take
+on average (30/k-machine/week). For inference services, at            the trainer failure into consideration.
+the scale of a 4K GPU cluster, 8.8 failures also occur weekly
+(2.2/k-machines/week), with the main faults manifesting as            2.3                               Opportunity and Challenge
+GPU disconnection and ECC (Error-Correcting Code) errors.
+   On top of training and inference workload, RL introduces           RL robust benefits. Role-based fault tolerance in RL has two
+additional stages such as weight synchronization, Ray [48]            benefits. First, it ensures the failure isolation of different roles.
+management, and tool calls. It further increases the possibility      The task can continue to run, which guarantees that the current
+of machine failures. Furthermore, by analyzing issues from            rollout and agent environment states are maintained. This is
+open-source RL frameworks with keyword matching, we have              important under the long-tail phenomenon, where the rollout
+found the similar problems caused by the machine error as             phase constitutes the main overhead. In Figure 3 of search
+shown in Table 1. Unfortunately, there is no specific robust          agent training, rollout phase plays the major overhead in one
+system for the RL system as we know and the ByteRobust                step. Because the response length is long and the tool calling
+is applied since RL post-training is a kind of training task.         time contributes to the extra overhead. Second, it reduces the
+Restarting the task when an error happens in ByteRobust is            recovery time. We only need to restart the trainer instead of the
+not the best optimization in RL.                                      RL task. In the case of async training, the failure of a rollout
+
+
+
+USENIX Association                            20th USENIX Symposium on Operating Systems Design and Implementation                                                                                         1409
+does not affect the training task, as requests are forwarded
+to other rollouts. A trainer failure does not affect the rollouts                                                                                      Data plane
+                                                                                                    Global Workers
+from generating trajectories. To achieve so, we need to handle                                                                                                     Ray actors
+                                                                                                   3 query
+the following issues.                                                      Agent Worker                             Request Manager                                Shards
+                                                                                                 4 get response
+Per-step checkpoint. If weights are not saved each step, a                                                                                               Failure recover
+                                                                                                    2 submit task           dispatch
+weight inconsistency between the recovered trainer and the                                 5     get result                             update           GPU machines
+
+rollouts will occur when a failure happens. This leads to                  TaskRunner
+                                                                                                 1 invoke rollout
+                                                                                                                    Rollout Manager
+                                                                                                                                                          CPU machines
+
+trajectory deviations and affects the training results. In this         train the trajectories
+                                                                                                  6 get result
+                                                                                                                                  dispatch
+                                                                                                                                                            Data Flow
+                                                                                                                                                            Control Flow
+situation, it is necessary to roll back to the last checkpoint
+saved step to retrain and re-rollout. Per-step checkpoint can                                     Node n                                         §5.2 Robust Rollout
+                                                                                                   Node 2
+avoid the re-execution of the time consuming rollout phase.                                          Node 1                                          Node 1
+   We believe that a per-step checkpoint is available in the                                               Trainer workers                       Rollout workers
+                                                                                 ...
+RL scenario based on the following insights. First, in pre-                                               Actor        Reward
+
+training scenarios, checkpoints are typically saved every ten              3D-Parallel
+                                                                                                          Critic      Reference
+
+or hundred steps because a single training step takes only
+                                                                            §5.1                       RobustRL Runtime                      RobustRL Runtime
+seconds. In contrast, an RL step can last for minutes or even           Robust Trainer
+hours [91], which makes the checkpoint overhead ratio small.
+Second, in async RL training, the checkpoint process only
+blocks the trainer for a short time, while rollouts can con-               Control Plane              §4 Phase aware analyzer                      Runtime Controller
+tinue inference during this period. Third, to further reduce
+the overhead brought by a per-step checkpoint, we apply the                        Figure 4: System overview of RobustRL.
+ByteCheckpoint [72]. The blocking time for saving weights
+is mainly the GPU to memory time within 5 seconds.
+                                                                    responsible for machine scheduling, receives analysis results
+Efficient point-to-point communication. In asynchronous
+                                                                    from the analyzer and adopts the appropriate fault tolerance
+RL training, when trainer or rollout has faults, it needs to re-
+                                                                    and recovery strategy (§4).
+establish connections after recovery for later weight synchro-
+                                                                    Data Plane. The GPU machines are the primary failure
+nization shown in Figure 1(b) and (c). The existing collective
+                                                                    sources and they all have fault tolerance capabilities (§5)
+communication protocol NCCL only supports the static com-
+                                                                    for machine errors with RobustRL. All trainers would restart
+munication member so it cannot support robust cases. For
+                                                                    whenever any trainer machine fails, while rollouts would only
+example, the trainer would send its weight by layer to the
+                                                                    restart or replace the corresponding faulty machine.
+rank-0 of the rollout machine by NCCL. Then the rollout
+                                                                       The CPU machine includes management roles, such as the
+machine boards the weight to other ranks through NVLink.
+                                                                    AgentWorker for tool interaction, the RolloutManager, and
+When the number of communication members increases, the
+                                                                    the RequestManager for managing inference instances and
+transfer overhead would increase linearly.
+                                                                    requests. They are placed on CPU machines, and the number
+   We solve this by the UCX-based point-to-point commu-
+                                                                    of machines is determined by the workload. There can be mul-
+nication. It supports dynamic connection and asynchronous
+                                                                    tiple AgentWorkers, while the other roles default to one in-
+rank-level transmission from the trainer GPU to rollout GPU
+                                                                    stance each. The TaskRunner invokes the RolloutManager
+directly. It solves the traffic bottleneck of single NICs (Net-
+                                                                    to get the trajectories (➀). Then RolloutManager invokes
+work Interface Cards) in NCCL. In addition, the rollout which
+                                                                    the AgentWorker (➁) to call the inference engine and tools
+finishes the weight update can be the relay server for the out-
+                                                                    to store the result in the RequestManager (➂). This process
+dated or recovered rollout pulling. Finally, We further support
+                                                                    can be a multi-turn conversation and the AgentWorker get
+the fault tolerance case during weight synchronization.
+                                                                    the trajectories (➃ and ➄) to the trainer (➅).
+                                                                       A failure in these roles triggers a RL task restart [73]. We
+3   System Overview                                                 use affinity scheduling to ensure that management roles are
+                                                                    not scheduled on trainer or rollout machines. This eliminates
+The design goal of RobustRL is to ensure reliable RL training       RL task restarts that would otherwise be triggered by the
+by using a role-based fault detection mechanism and applying        termination of a management role when a trainer or rollout
+different fault recovery strategies to trainer and rollout. Ro-     machine is replaced after a failure.
+bustRL consists of two core components: control plane and
+data plane. The architecture overview is shown in Figure 4.
+Control Plane. It mainly consists of the phase aware analyzer       4   Role-based Fault Detection
+and the runtime controller. The analyzer is responsible for in-
+teracting with the RL robust runtime. It tailors fault-detection    We illustrate the semi-sync RL workflow in Figure 5 since
+strategies to each RL role and training stage. The controller,      both sync and async training are special cases of it. Our goal
+
+
+
+1410    20th USENIX Symposium on Operating Systems Design and Implementation                                                                     USENIX Association
+is to detect which trainer or rollout machine has failed fast                                                                                                x
+                                                                                       Byte-                                                        Train,
+and apply the corresponding robust mechanism in §5.                                   Robust
+                                                                                                      Rollout, W0       Train, W0   Rollout, W1
+                                                                                                                                                     W1                  Rollout, W1   Train, W1
+
+                                                                                      Robust-                                                       Train,
+                                                                                                                                                           x
+                                                                                                      Rollout, W0       Train, W0   Rollout, W1                   Train, W1
+                                                                                        RL                                                           W1                            Time Gap
+      Rollout Machine         1                    2
+                                                                       Robust                                  (a) Robust timeline in sync RL training                                 Timeline
+                     Generation                Tool
+                                                                       Rollout
+                                                                       Robust                             Rollout, W0       Rollout, W0                            Rollout, W0
+                Gen          Tool             Train                                    Byte-
+                                                                       Trainer        Robust                                            x
+                                                                                                                             Train, W0                       Train, W0        wait the rollout
+      Trainer Machine 1
+                                  2               3
+
+      1 TPS check       2 Heatbeat check if TPS = 0 3 Tensorcore activity check
+                                                                                                          Rollout, W0                       Rollout, W0                       Time Gap
+                                                                                      Robust-
+       Context switch or weight update        Fault detect      GPU                     RL                                               x
+                                                                                                                            Train, W0                  Train, W0
+
+
+Figure 5: Role-phase-aware fault detection in semi-sync RL                                                      (b) Robust timeline in async RL training                               Timeline
+
+training. Row 2 is the hybrid. TPS: Throughput Per Second.                                                                                                                    x
+                                                                                                Trainer              Hybrid- Hybrid- Block                        Waste Error GPU
+                                                                                                           Rollout                                    Restart
+                                                                                                                     Trainer Rollout time                        compute
+Trainer fault detection. As introduced in §2.1, the train-
+ing phase is divided into the forward-only computation of                         Figure 6: Timeline comparison between ByteRobust and Ro-
+the reference/critic/reward models and the forward-backward                       bustRL in (a) sync and (b) async mode when the trainer ma-
+computation of the actor/critic policy update. The detection                      chine error happens.
+strategy during this process is consistent with that of pre-
+training. Failures manifest as zero GPU TensorCore activity                       facilitates the integration of advanced fault detection methods.
+for a five-minute window in RobustRL. When this occurs, we                        By decoupling the execution contexts, our system becomes
+switch to the robust trainer workflow (§5.1.2).                                   inherently compatible with specialized detection strategies
+   Trainer detection is only applied during the training phase                    designed for complex issues like silent data corruption (SDC)
+on the trainer machines (Figure 5 ➂). Although phases such as                     [28,40,41] and stragglers [38,78] to further harden the system.
+context switching, weight updates, or advantage computation
+exhibit no GPU activity, their duration is short enough relative
+to the training phase. Thus, monitoring TensorCore activity is                    5      Role-based Fault Tolerance
+sufficient to detect failures without false positives from short
+GPU-idle phases. Users can also extend their own detection                        5.1       Robust Trainer
+strategy for this case. For example in large scale RL training,
+the advantage computation can be over 5 minutes and we                            This section illustrates the benefit of robust trainers in dif-
+can set a large GPU idle threshold. The trainer fault detection                   ferent RL architectures (§5.1.1), appropriate restart strategy
+method is orthogonal to both pre-training [10,11] and machine                     (§5.1.2) and reduction of restart overhead by rollout warm
+diagnostic methods [73].                                                          standbys (§5.1.3).
+Rollout fault detection. Rollout workloads comprise infer-
+ence, weight synchronization, and awaiting requests or tool                       5.1.1         Robust Trainer Timeline
+returns. TensorCore activity occurs solely during inference. In
+the other two stages, the worker exhibits no GPU activity yet                     Figure 6 illustrates the difference between the ByteRobust
+remains healthy. We first periodically collect the throughput of                  and the RobustRL in both sync and async training mode.
+each rollout from the RolloutManager (➀). If the rollout ex-                      The semi-sync mode is the special case of sync and async
+hibits zero throughput for a specified time interval (60 seconds                  mode because it contains both hybrid and standalone rollout.
+in our system), we mark it as suspect and trigger heartbeat de-                   The yellow part denotes the time that blocks the RL training,
+tection to further verify its status (➁). No response within the                  which includes weight synchronization, per-step checkpoint
+timeout confirms a rollout machine failure and we will handle                     and weight reshard between training and inference engine.
+it with a robust rollout strategy (§5.2). The Rollout detec-                      Robust trainer benefit. In sync training mode of Figure 6(a),
+tion adopts throughput detection prior to heartbeat, avoiding                     ByteRobust restarts the entire task, with the rollout progress of
+misjudgment caused by unprocessed heartbeat requests and                          the current iteration lost. RobustRL only restarts the affected
+excessively long TTFT (time-to-first-token) in high-load Roll-                    hybrid role and preserves the rollout progress. After recovery,
+out scenarios. For the hybrid-rollout of sync and semi-sync                       it simply resumes rollout and thus completes the iteration
+mode, this detection method can also be applied. Since the                        sooner than ByteRobust. In async training mode of Figure
+error happens at the trainer machine, we switch to the robust                     6(b), the extra benefit is that rollout can continue running
+trainer workflow (§5.1.2).                                                        during the trainer recovery. Under the same failure case, the
+Extensibility to complex faults. It is worth noting that the                      rollout in RobustRL ends earlier, it avoids the trainer to wait
+role separation architecture proposed in RobustRL naturally                       for the rollout to end in ByteRobust. In addition, compared
+
+
+
+USENIX Association                                           20th USENIX Symposium on Operating Systems Design and Implementation                                                                1411
+                                       Restart task         Restart task
+                 No                                                                                              No
+                                              Yes                 Yes
+                Check   Catch    Yes     1. First     No      2. Error     No                      Check     Restart            No        3. Restart      Yes
+    Iteration                                                                   Restart Trainer                                                                   Restart task
+                        Error?          Iteration              twice                                        success?                        twice?
+                                                      Yes
+
+
+Figure 7: Robust trainer workflow. The blue part is the operation in RL training. The red part is the judge for the robust case. The
+green part is the policy to handle the robust case.
+
+with restarting the RL task, we eliminate the overhead for                       the first step of training or on the first step after resuming
+container initialization, ray cluster initialization et al..                     training, this indicates an explicit machine or code error. 2
+Low blocking overhead. Due to the long-tail phenomenon of                        2. Repeated exception detected. If it is the second time
+rollout, one step in RL is long shown in Figure 3(b), making                     the fault has been detected in the current step, we indicate
+the blocking time relatively short. The efficiency of rollout                    a reproducible fault exists in this step. This situation is also
+weight update has been solved in §5.2.1. In addition, we intro-                  similar to a code error and we restart the task. For example,
+duce ByteCheckpoint [72] to improve the checkpoint saving                        developers introduce a code error in the validation process,
+efficiency. The blocking time is only the GPU-to-memory,                         which is executed each 5 steps.
+while the transfer from memory to disk or other persistent                       3. Repeated restart failure detected. The restart process
+storage is executed asynchronously.                                              itself may fail. For example, if resources are not fully released
+                                                                                 during the trainer restart or if connection establishment fails
+                                                                                 due to the restart. In such cases, one restart failure is per-
+5.1.2     Robust Trainer Workflow                                                mitted. If restart failure persists, we also consider it to be a
+Robust trainer targets restarts from machine failures and we                     reproducible machine or code error.
+must avoid an infinite loop of trainer restarts by the human-
+induced fault. When a human-induced fault occurs, we restart                     5.1.3       Trainer Warmup by Rollout
+the task and check the code or roll back the code version in-
+                                                                                 The trainer schedule follows the gang scheduling, meaning
+stead of trainer role restart as soon as possible. This operation
+                                                                                 the trainer’s initialization cannot begin until a new machine
+"Restart task" is similar to ByteRobust’s machine diagnostics
+                                                                                 is scheduled and the environment is initialized, which is time-
+and code rollback procedures. We present the robust trainer
+                                                                                 consuming as shown in Figure 8(a). ByteRobust prepares the
+workflow in Figure 7.
+                                                                                 extra warm standby machines to replace faulty ones, thereby
+Iteration. One iteration includes the step ➀ to ➅ in Figure 4.
+                                                                                 saving scheduling and container initialization time. However,
+The RL training is completed through the iteration of multiple
+                                                                                 using redundant machines leads to potential resource waste,
+steps. Robust trainer wraps the training step function with
+                                                                                 making this strategy limited to large-scale training.
+a try-catch block to capture exceptions during training.
+The sources of exceptions include both explicit and implicit
+failures, which are detected by the method in §4. When the                                              Gang          Independent      3. schedule a new machine
+                                                                                                                                         ~minute-level, no block
+exception happens it turns to the robust phase.                                                        Trainer        Rollout
+Trainer restart. First, TaskRunner terminates all trainer-
+related processes. Then, it re-executes the trainer’s initial-
+ization phase and finally reloads the weights from the last
+                                                                                                                                     2. kill rollout & join trainer 1. borrow
+saved model checkpoint. Since the model weights are saved                                                                              ~second-level block a rollout
+                                                                                                                                                                     machine
+each step, the reloaded weights are consistent with the rollout.                                                         x
+Information that binds rollouts to the trainer, such as commu-                          2. wait for env init     1. schedule a                             x
+nication addresses for pulling weights, is updated concurrently                        ~minute-level block       new machine
+
+with the trainer loading the weights.                                                                  Machine Pool                       Machine Pool
+   When we restart to iterate, we skip to rollout a new batch.
+                                                                                                  (a) ByteRobust schedule             (b) RobustRL schedule
+Instead, when the current batch finishes rollout, TaskRunner
+fetches the trajectories from the RequestManager to the                          Figure 8: Schedule without extra warmup machines when
+trainer. Otherwise, if we use the sync or semi-sync mode                         trainer fails. (a) ByteRobust scheduled a new one from the
+for RL training, we switch the context to the inference engine                   machine pool. (b) RobustRL borrows a machine from rollout
+to rollout the trajectories.                                                     and rollout schedules a new one from the pool.
+   In the following situations, we restart the RL task instead
+                                                                                     This design does not work for sync-mode training. In semi-
+of only the trainers shown in Figure 7.
+1. First-iteration exception detected. If the model fails on                          2 Code errors in rollout trigger this process as well.
+
+
+
+
+1412      20th USENIX Symposium on Operating Systems Design and Implementation                                                                    USENIX Association
+sync and async mode, we can use rollouts as warm standbys
+for the trainer as shown in Figure 8(b). When a failure occurs,                                                                      Trainer Replicas
+
+one rollout is killed, and it will join the trainer’s initialization.               DP Group, Machine 1                             Current weight version
+Since rollouts use independent scheduling, requests being                                                                            DP Group of TP = 4
+processed by the rollout on the replaced machine are handled
+through the robust rollout strategy (§5.2).
+                                                                                                      1                             Previous weight version
+   The prerequisite for warmup rollout is that rollouts and
+trainers are in the same data center and rollout and trainer
+                                                                                                                                    Recover rollout weight
+machines are homogeneous. In deployment, similar to ByteR-                                            2
+
+obust, one can reserve a quantity of max(DP, TP, PP, EP, CP)
+rollouts as homogeneous machines in the same data center, en-               weight updated as relay       weight updated as relay                Reshard
+
+abling hot-swapping when a failure or suspected fault occurs                                                                                     Pull weight
+
+in any parallel group. Since warmup rollouts have the same                                           3
+                                                                            Other outdated or recover rollouts
+environment as the trainer, they can be quickly substituted                           join as relay                                   Rollout Replicas
+when a trainer machine fails.
+   Our scheme is compatible with existing Trainer-Rollout                               Figure 9: UCX-based weight update.
+heterogeneous deployment [89]. For example, we can add an
+H800 warm Rollout in cluster A for heterogeneous training
+with cluster A (10×H800 Trainer) and cluster B (10×H20                  and weight shard management, and handle fault scenarios
+Rollout)). In addition, Rollout warmup requires no weight               throughout the RL training lifecycle. The weight synchroniza-
+resharding because one Rollout machine is corresponding to              tion includes three parts.
+one DP Group, which means recrimination only reduces in-                ➀ Reshard. As shown in Figure 9 step ➀, we reshard the
+ference concurrency. Trainer parallelism remains unchanged              model to align with the sharding of the rollout. The imple-
+after borrowing a machine.                                              mentation is based on verl [22], and this process takes under
+                                                                        ten seconds.
+                                                                        ➁ UCX weight synchronization. To ensure efficient weight
+5.2     Robust Rollout                                                  synchronization, we implement point-to-point communica-
+The design goals for robust rollout are to ensure that after a          tion from the trainer’s multiple data-parallel (DP) groups to
+rollout fails, the recovered rollout can 1) re-establish a con-         the rollout replicas based on their corresponding ranks shown
+nection with the trainer. 2) Achieve high pulling efficiency            in Figure 9 ➁. Each transfer initiates by placing the model
+for weight from the trainer or other relay rollouts. 3) Update          layer by layer into a buffer for transmission. We ensure the
+weights and resume inference as quickly as possible after               buffer size is large enough to saturate the RDMA bandwidth.
+recovery. To achieve these goals, we have introduced UCX-               Besides, we also prevent OOM error on the GPU by preserv-
+based weight synchronization (§5.2.1) and discuss the situa-            ing a buffer for transfer. The object pulling weights include
+tion of the failure handling during rollout recovery (§5.2.2).          both outdated and recovered rollouts awaiting weight updates.
+                                                                        We ensure that at any given time, each weight is pulled by
+                                                                        only one rollout to prevent network bandwidth contention.
+5.2.1   UCX-based Weight Update                                            Compared with current point-to-point communication de-
+The naive-UCX baseline transfers weights from GPU memory                sign [60], the entire weight synchronization process is exe-
+on machine 1 to host memory via PCIe, then across machines              cuted on the GPU. However, since torch tensors do not directly
+through a single network interface to machine 2’s host mem-             support UCX transfer, we convert them to cupy arrays [51],
+ory, and finally from machine 2’s memory to individual ranks            as cupy supports byte-level transfers. We use DLPack [12] to
+via PCIe. The path is: PCIe -> NIC -> PCIe.The NCCL base-               support a unified tensor memory layout, achieving zero-copy
+line uses RDMA GPU zero-copy (IB/RoCE v2) across nodes                  overhead for the conversion from torch tensors to cupy arrays.
+and intra-node NVLink for rank-to-rank communication. The               ➂ Relay transfer. A weight updated rollout will act as a relay
+path is: NIC -> NVLink. Compared to naive UCX, NCCL                     server, allowing other outdated and recovered rollouts to pull
+has a shorter data path and benefits from higher NVLink                 weights from it. Once weight pulling is complete, they join
+bandwidth than PCIe. Therefore, we need to shorten the com-             the relay-server set. The pulling process in this stage is the
+munication path and improve the concurrency of UCX so as                same as the one described in Figure 9 step ➂. If a rollout
+to combine the advantages both on the efficiency and elas-              recovers outside of a weight update stage, it directly pulls
+ticity. Previous work like Owl [15] discusses the data relay            weights from a relay server, as shown in step ➂.
+transfer mechanism to achieve the data-ready object send-                  The transfer efficiency between trainers and rollouts from
+ing to another object. But in RL weight synchronization, we             different DP groups can vary due to network fluctuations.
+need to further support GPU-to-GPU zero-copy transmission               We make the entire weight synchronization asynchronous. It
+
+
+
+USENIX Association                             20th USENIX Symposium on Operating Systems Design and Implementation                                          1413
+allows the outdated and recovered rollouts to immediately
+pull from any rollout having the latest weights. A more ex-                1. class ElasticRayWorkerGroup
+                                                                           2.     # init function
+treme asynchronous strategy would be to allow asynchronous                        def __init__(self, cls, args):
+                                                                           3.
+transfers at the tensor parallelism (TP) granularity, taking               4.     # support scale up/down for worker group
+into account that stragglers can exist among different NICs                5.     def create_worker(...): # and destroy worker
+                                                                           6.     # create RayClass with init_args
+[60]. However, the async DP transfer for a 235B model on                   7.     def scale_up(num_worker): # and scale down
+4×200Gbps NICs is under 10s. This overhead is sufficiently                 8.     # invoke the create_worker
+small compared to a single RL step in minutes or even hours                9.     def liveness_probe(...):
+                                                                           10. # detect the liveness of worker groups
+level. Therefore, to maintain the simplicity of the weight syn-            11. class ElasticPolicy:
+chronization design, we did not pursue further optimization.               12. # define when to scale up/down
+                                                                           13. def should_scale_up(...): # and scale down
+   In semi-sync RL training, the rollout phase does not be-                14. # define the scale up condition (recover phase)
+gin until all rollouts have finished updating. In this case, the           15. def _scaling_loop(...):
+hybrid-rollout in the trainer machine also acts as a relay. In             16. # scale up if reinit, scale down if error
+                                                                           17.
+async RL training, the trainer resumes its shard once the first            18. rollout_cls = RayClassWithInitArgs(RolloutClass, args)
+batch of relay rollouts finish their weight update, minimizing             19. - rollout = RayWorkerGroup(rollout_cls, ...)
+                                                                           19. + elastic_rollout = ElasticRayWorkerGroup(rollout_cls, ...)
+training stalls.                                                           20. + rollout_policy = ElasticPolicy(elastic_rollout, ...)
+
+
+5.2.2   Rollout Failure Cases
+                                                                       Figure 10: The replicated ray worker group and scaling policy
+Preserve the trajectories. We save the trajectories of the             for the robust and elastic ray worker in RobustRL.
+prompt of each tool iteration in the RequestManager to avoid
+the rollout progress lost when the rollout machine fails. Af-
+ter each tool iteration, the RolloutManager checks the live-           Robust API. In verl, the initialization of workers for the
+ness status of the corresponding rollouts. When a failure oc-          trainer or rollout roles uses the RayWorkerGroup (RWG) in
+curs on a rollout, the previous results are reassigned to other        line 19 of Figure 10. We further encapsulate this abstrac-
+living rollouts. If it is a rollout machine failure, such as an        tion to handle fault tolerance and recovery scenarios (line
+ECC error, the machine is replaced with a new one. Since               19-20). The ElasticRayWorkerGroup (ERWG) supports ex-
+the AgentWorker and the sandbox reside outside the rollout             pansion and destruction, while a ElasticPolicy determines
+machine, the rollout progress can be preserved.                        the timing for these actions. The ERWG supports moni-
+Relay server failure during pulling. When resuming the                 toring the liveness status of the RWG and defines the ini-
+weight pull, the rollout will first update its set of target ad-       tialization and destruction functions, create_worker and
+dresses to the living rollouts. If a weight pull fails, it will find   destroy_worker, along with their corresponding pre- and
+another relay server to pull from. The outdated or recovered           post-processing hooks. The scale_up is used to determine
+rollout records their successful pulling progress and pulls the        the number of workers to expand. For example, multiple
+remaining one from other living relay servers.                         rollouts fail or are taken to warm up the trainer (§5.1.3) or
+                                                                       scales [79]. The policy defines the conditions for elastic scal-
+Trainer failure during pulling. Failure may happen when
+                                                                       ing with a polling thread to check the liveness of the RWG.
+the trainer prepares to be pulled or being pulled by rollout. In
+                                                                       For instance, when the platform detects a machine failure
+the first case, rollouts close their established connections with
+                                                                       during training, it is captured by this policy and scales up the
+the trainer and wait for its recovery before re-establishing
+                                                                       failure worker. This abstraction avoids the need to repeatedly
+connections. In the case where a pull is in progress, the
+                                                                       implement creation and destruction logic for different RWGs.
+process is interrupted, and the partially updated weights are
+cleared. Finally, rollouts wait for the trainer to recover before
+re-initiating the weight pull.
+
+                                                                       7    Evaluation
+6    Implementation
+The implementation of the RL fault tolerance system at the             Our evaluation tries to answer the following questions.
+framework level is 8k LoCs of Python for the semi-sync sup-            Q1. What is the end-to-end training time and ETTR of Ro-
+port, fault detection, and robust roles. RobustRL is built on          bustRL in scenarios with training failures? (§7.2)
+verl [22] and its asynchronous RL extension [44]. We extend
+this foundation with a semi-sync training mode, which retains          Q2. What are the enhancements in RobustRL’s fault recovery
+the trainer’s resharding operation to the inference engine. The        in terms of restart efficiency and state preservation? (§7.3)
+implementation of the training scheduler that supports the             Q3. What is the extra overhead introduced by RobustRL to
+training architectures in Figure 1.                                    implement role-specific fault tolerance? (§7.4)
+
+
+
+1414    20th USENIX Symposium on Operating Systems Design and Implementation                                              USENIX Association
+                                        Baseline          ByteRobust         RobustRL           ByteRobust overhead           RobustRL overhead
+    Train Cost (hours)
+
+
+
+
+                                                                                                                                                          Overhead (hours)
+                         15                                                                                     60
+                                                                  3 20                                     3
+                                                                                                                50                                  5.0
+                         10                                       2 15                                     2
+                                                                       10                                       40                                  2.5
+                                                                  1                                        1
+                          5                                             5                                       30
+                                Async      Semi-sync      Sync              Async   Semi-sync     Sync                Async    Semi-sync    Sync
+              100                                                     100                                      100
+               90                                                      90                                       90
+ETTR (%)
+
+
+
+
+               80                                                      80                                       80
+               70                                                      70                                       70
+               60                                                      60                                       60
+               50                                                      50                                       50
+                                Async      Semi-sync      Sync              Async   Semi-sync     Sync                Async    Semi-sync    Sync
+                                      (a) Qwen3-8B-Math                         (b) Qwen3-32B-Math                        (c) Qwen3-32B-SWE
+Figure 11: End to end evaluation for RL post-training of Qwen3 models in math [85] and SWE-bench [30]. The first row is the
+job completion time and the second row is the ETTR. The overhead of the first row is the time gap with Baseline.
+7.1                           Setup                                                        async mode, the number of GPUs for the trainer and rollouts
+                                                                                           is equal. We do not compare with the current robust rollout RL
+Testbed. We deploy RobustRL on 32 GPU machines with                                        system [37, 60] because existing RL systems do not support
+256 GPUs. Each machine is equipped with eight NVIDIA                                       trainer fault tolerance. Under trainer failures, their behavior
+H20 96GB GPUs. The intra-machine and inter-machine                                         is equivalent to ByteRobust. For rollout fault tolerance, the
+bandwidths are configured with 900 GB/s NVLink and                                         failure or recovery of rollout would not lead to the training
+4×200Gbps NICs, respectively. Each machine has 2TB of                                      bottleneck with further evaluation. For the weight synchro-
+memory. Our software versions are CUDA 12.4, PyTorch                                       nization efficiency, we directly compare with the time of ideal
+2.4.1, and NCCL 2.21.5. We build our system on verl 0.5.x                                  network bandwidth.
+[22], using Pytorch FSDP2 [87] and vLLM [35] as the training                               Dataset. For reasoning tasks on math with "DAPO-Math-
+and inference backend. Our checkpointing uses ByteCheck-                                   17K" [85], we use a rule-based reward function to score the
+point [72] with HDFS as the storage backend. We selected                                   trajectories. For the multi-turn tool-learning task, we gen-
+Qwen3-8B, 32B, and 235B-A22B [82] to evaluate the per-                                     erate the trajectories by obtaining answers through multi-
+formance because they are the popular models for RL post-                                  turn interactions with a sandbox in SWE-bench [30]. We use
+training research in academia and industry. We use the 8B                                  GRPO [59] for both tasks. RbustRL is independent of the
+and 32B models to test training performance and provide re-                                specific RL algorithm and the effectiveness of RobustRL can
+sults from the 235B model to test weight saving and weight                                 generalize to the others. Our global batch size is set to 512,
+synchronization costs. The TP size of rollout is 8 to guarantee                            with 64 prompts per batch, and 8 responses generated for
+each rollout occupies a machine.                                                           each prompt following the previous research [60]. We set the
+Baselines. The methods we compare are ByteRobust and                                       maximum text length to 65536 and the maximum number of
+our RobustRL. The baseline system is RL training without                                   tool interaction turns to 50. We train for 100 steps by default.
+any injected faults. In ByteRobust and RobustRL, we inject                                 Metrics. Our primary evaluation metrics for fault tolerance
+a fault for the trainer at a random time within every 10%                                  are the end-to-end training time and the ETTR. We further
+interval steps. Since the trainer follows the gang-scheduling,                             evaluate the restart time overhead, additional fault tolerance
+it would trigger the TaskRunner to automatically restart all                               overhead, and the time saved due to fault tolerance for differ-
+the trainers. This failure frequency setting is higher than in                             ent methods.
+practical production environments if the machine error rate
+is i.i.d. For example, the 100K GPU training in Meta [56]
+the error frequency is 18min, corresponding to 117 hours in
+                                                                                           7.2       End to End Evaluation
+a 256 GPU cluster. Our experiments are designed as stress                                  We compare the end-to-end training time and ETTR for dif-
+tests to quantify the benefits of our fault-tolerant design under                          ferent training architectures under various GPU workloads on
+the extreme, large-scale training scenarios that will emerge in                            math and SWE post-training tasks on 128 GPUs.
+future workloads.                                                                          End-to-End Training Time. As shown in the first row of Fig-
+   For ByteRobust, we retain only the in-place restart part                                ure 11, the Qwen3-8B-Math takes the shortest time because
+of a failure, without machine rescheduling. The RL train-                                  the model is small and the post-training task is relatively
+ing includes the three architectures in Figure 1. Semi-sync                                simple. The SWE task takes the longest time because the
+switches from rollout mode to train mode when 50% of the                                   introduction of tool interaction significantly lengthens the
+prompts in a batch are completed and the sync mode is 100%.                                rollout time. Taking the Qwen3-8B-Math task as an example,
+Async is 0% with a one-step warmup. For semi-sync and                                      the training time varies for different training architectures,
+
+
+
+USENIX Association                                                20th USENIX Symposium on Operating Systems Design and Implementation               1415
+                            Baseline          Byterobust      RobustRL        its ETTR is better than ByteRobust’s, and the advantage is
+           100                                                                more pronounced in simpler tasks like Qwen3-8B-Math. The
+            80                                                                reason is that the longer training time is, the more negligible
+ETTR (%)
+
+
+
+
+            60
+                                                                              the restart time. In addition, although ByteRobust would lose
+                                                                              the progress during the restart, the re-execution of rollout is
+            40
+                                                                              also counted towards ETTR. So the gap of average ETTR
+            20                                                                between ByteRobust and RobustRL is not large.
+             0
+                 0          2          4                  6      8       10
+                                                                                 We further show the sliding ETTR for Qwen3-8B-Math in
+                                           Time (hours)                       Figure 12 with semi-sync training mode. We sample the train-
+Figure 12: Sliding ETTR of the training process Qwen3-8B-                     ing process every 5 minutes. We take the process of 0.8-2h
+Math. The sampling interval is 5 minutes.                                     as an example. Since ByteRobust restarts both the trainer and
+                                                                              rollouts when a fault occurs, its ETTR is significantly lower at
+where the async mode is faster than the sync one by miti-                     20%. During the same period, RobustRL’s rollouts continue
+gating long-tail overhead. Therefore, the end-to-end training                 to execute, so the influence of failure is less. Compared to
+time continuously increases from the async to the sync mode.                  ByteRobust, RobustRL improves ETTR by 18-24% on the
+   Since we inject a fault every 10 training steps, the end-to-               Qwen3-8B-Math task.
+end training times for ByteRobust and RobustRL are longer
+than the baseline. The overhead introduced by a fault restart is                                                 Baseline         ByteRobust       RobustRL
+                                                                                                  1.0
+mainly caused by the restart initialization and the loss of train-
+
+                                                                              Normalized Score
+ing progress, especially the loss of rollout progress (§5.1.1).                                   0.5
+
+In contrast, RobustRL can restart only the trainers, allowing                                     0.0
+
+the rollouts to continue executing inference and environment                                     −0.5
+interaction processes. Therefore, the overhead of RobustRL
+                                                                                                 −1.0
+is smaller than that of ByteRobust. As we shift from async to                                     1.0
+                                                                              Normalized Score
+
+
+
+
+sync training mode, the impact of the long-tail phenomenon                                        0.5
+becomes progressively more severe, thus the overhead of
+                                                                                                  0.0
+ByteRobust gradually increases. In sync mode, the rollout and
+                                                                                                 −0.5
+training phases are executed sequentially as shown in Figure
+1. By leveraging the role-based fault tolerance strategy, Ro-                                    −1.0
+                                                                                                        0   20              40           60          80       100
+bustRL explicitly preserves the rollout results. Consequently,                                                                   Step
+if a failure occurs during the training phase, the system can                 Figure 13: Training consistency in sync (row 1) and semi-
+resume directly from the training step, skipping the redundant                sync (row 2) mode. The reward of the answer is normalized.
+rollout phase as shown in Figure 6(a). This stands in contrast
+to approaches like ByteRobust, which necessitate restarting                   Training trend. We use the training trend of Qwen3-8B-Math
+the entire RL step. Lastly, the fault tolerance benefits of us-               with sync and semi-sync to verify the correctness of training
+ing RobustRL on complex tasks like SWE are greater than                       in the presence of failures. We execute 100 training steps
+on math reasoning, because the rollout phase is more time-                    and obtain curves with similar training trends and the result
+consuming. The benefit of preserving the rollout progress is                  is shown in Figure 13. In sync training, the three methods
+more obvious.                                                                 has the similar score tendency because we can make sure
+   In summary, under the extreme condition of a 10% failure                   the training order of the prompt by batch mode instead of
+rate, RobustRL can save 0.8-2.1h, 1.4-1.6h, and 3.5-4.5h in                   the streaming pipeline mode [89]3 . When the error happens,
+end-to-end training time compared to ByteRobust on the 8B-                    we can get the prompt and response from RequestManager
+Math, 32B-Math and 32B-SWE tasks respectively. The restart                    to continue the training in RobustRL. However, the result in
+overhead of RobustRL for fault tolerance accounts for less                    sync does not get fully alignment because we do not enable
+than 5% of the total time, while the ByteRobust introduces                    the deterministic inference [69] with FlashAttention [9] and
+20% overhead.                                                                 CUDA atomic operations in our evaluation. In semi-sync
+ETTR. As shown in the second row of Figure 11, compu-                         situation, the results are still not deterministic and the trend
+tation stages such as actor policy updates and rollout are                    difference is larger because the async schedule mode must
+all counted towards the effective training time in RL post-                   use the streaming schedule, which cannot guarantee the order
+training. In RobustRL, there is a phase where the trainer                     of the prompt. But generally, the three methods in semi-sync
+restarts for fault tolerance while the rollouts continue running.             training shows the similar tendency.
+During this process, the recovery ETTR is calculated with                         3 Batch mode is waiting for all the prompts in this batch to finish. Stream-
+                              #Rollout
+the ratio ET T Rratio = #Rollout+#Trainer . Since RobustRL sig-               ing mode is adding a new prompt to rollout if one prompt in this batch
+nificantly reduces restart overhead compared to ByteRobust,                   finishes.
+
+
+
+
+1416                 20th USENIX Symposium on Operating Systems Design and Implementation                                                      USENIX Association
+Comparison under different error injection frequency. We                                                                                Restart Instance                      Rollout Init                    Load Checkpoint                    Worker Init
+
+further evaluate the performance of RobustRL and ByteRo-                                                                 32B-RobustRL                   72.0                         110.6                    182.6
+
+bust under diverse fault frequencies shown in Figure 14. All
+                                                                                                                     32B-ByteRobust                49.0                 78.8                        71.8                         105.9                305.5
+experiments are conducted on a 64-GPU in semi-sync mode
+with the same number of trainers and rollout for Qwen3-8B-                                                                    8B-RobustRL           61.0                          112.0                    173.0
+
+Math workload and each experiment runs for 50 training steps.                                                           8B-ByteRobust            37.5               74.3                   63.0                          103.0               277.8
+Notably, ByteRobust adopts a fixed checkpoint interval of
+                                                                                                                                             0                 50           100              150                200              250           300             350
+one snapshot per 5 steps, and faults are uniformly injected
+throughout the entire training timeline.                                                                                  256-RobustRL                  87.0                       140.0                     227.0
+
+                                                                                                                      256-ByteRobust                    89.0                    104.7                        83.0                    126.0             402.7
+
+                                                  ByteRobust                    RobustRL                                  128-RobustRL              72.0                   105.0             177.0
+Train Cost (hours)
+
+
+
+
+                                                                          100                                                                      62.0                87.0                  74.7                    90.3          314.0
+                                                                                                                      128-ByteRobust
+                                                               ETTR (%)
+
+
+
+
+                     5
+                                                                           75                                                 64-RobustRL          66.0                 106.3              172.3
+                     4                                                                                                                           39.0           78.9               63.6              74.3            255.8
+                                                                                                                         64-ByteRobust
+                                                                           50
+                     3
+                         0      1          3         5                            0           1          3      5                            0           50         100           150          200             250           300       350           400       450
+                             Error Inject Steps                                            Error Inject Steps                                                                                 Latency (s)
+Figure 14: End-to-end training time and ETTR comparison                                                             Figure 15: Restart cost comparison of ByteRobust and Robus-
+of ByteRobust under different error injection frequency.                                                            tRL. Row 1 is the result with different model size and row 2
+   In the fault-free scenario, RobustRL and ByteRobust                                                              is the result of 8B with different number of GPUs.
+achieve comparable end-to-end training time and ETTR. Al-                                                                     100                                                               100
+                                                                                                                                        99th Percentile: 1050.8                                                             99th Percentile: 4433.3
+though RobustRL adopts a one-step checkpoint, the overall                                                                      80                                                                   80
+
+time for a small proportion of the full RL training §7.4. We                                                        CDF (%)    60                                                                   60
+                                                                                                                                         50th Percentile: 33.0                                                      50th Percentile: 260.0
+
+provide an in-depth breakdown of checkpoint overhead in                                                                        40                                                                   40
+                                                                                                                                                           99th Percentile: 1050.8                                                   99th Percentile: 4433.3
+the following overhead analysis section. As the injected fault                                                                 20
+                                                                                                                                                           50th Percentile: 33.0
+                                                                                                                                                                                                    20
+                                                                                                                                                                                                                                     50th Percentile: 260.0
+                                                                                                                                0                                                                    0
+frequency increases from 1 to 5 (2%-10% in 50 steps), Robus-                                                                        0     1000           2000          3000             4000             0            2000          4000        6000           8000
+                                                                                                                                           (a) Rollout Latency (s)                                                          (b) Output Length
+tRL outperforms ByteRobust by 2.2%–12.2% in end-to-end
+completion time reduction and 2.7%–15.7% in ETTR im-
+                                                                                                                    Figure 16: Benefit from preserving the rollout progress (a)
+provement because the time gain of RobustRL compared to
+                                                                                                                    Rollout cost CDF and (b) Rollout length CDF of all prompts
+ByteRobust is highly depends on the fault frequency. Con-
+                                                                                                                    in Qwen3-32B-SWE.
+sidering that the performance advantage of RobustRL ap-
+proaches saturation at a 2% fault rate, we omit additional
+evaluations for even lower fault frequencies.                                                                       mechanism in §5.1.3, we avoid the trainer’s gang scheduling
+                                                                                                                    process when the trainer has machine error because we can
+                                                                                                                    schedule the rollout machines to replace.
+7.3                      Robust Benefits Analysis                                                                      The second row of Figure 15 shows the results of restart
+Trainer restart benefit. Figure 15 shows a comparison of                                                            latency of ByteRobust and RobustRL as the number of GPUs
+restart time breakdown between ByteRobust and RobustRL                                                              increases, where the duration of all initialization stages in-
+for different model sizes and numbers of GPUs. We use the                                                           creases accordingly. The "worker init" overhead in Robus-
+semi-sync case as an example because its startup time is the                                                        tRL is larger than in ByteRobust. Compared to ByteRo-
+longest, as the trainer machines need both the training and                                                         bust’s startup, the trainer’s restart includes a destruction phase,
+inference engines, in addition to the rollout roles. The main                                                       which introduces additional overhead for destroying network
+bottlenecks in starting an RL training task consist of four                                                         connections. Overall, RobustRL improves restart efficiency
+stages: instance restart, rollout initialization, checkpoint load-                                                  by a factor of 1.5-1.7× compared to ByteRobust.
+ing, and worker initialization. The "restart instance" stage                                                        Preserving rollout progress benefit. In addition to the restart
+includes container startup, installation of third-party libraries                                                   benefit, RobustRL can preserve rollout progress compared to
+after startup, Kubernetes scheduling et al.. The "worker init"                                                      ByteRobust. We recorded the output time distribution and out-
+stage is primarily the initialization of the training engine.                                                       put length distribution for 50k prompts (batch size × steps =
+The "rollout init" stage is the initialization process for the                                                      512 × 100) on the Qwen3-32B-SWE task shown in Figure 16.
+standalone rollout inference engine, not including weight syn-                                                      The tail latency reaches 1050s, with an output length of over
+chronization. The "load checkpoint" is the stage to load from                                                       4k tokens. RobustRL can avoid the overhead of re-executing
+memory to the GPU. When we detect a model anomaly, we                                                               this inference. When we extend to larger RL training scenar-
+asynchronously load the corresponding shards from HDFS                                                              ios involving more conversation turns and more complex tool
+to the local memory. The overhead from "rollout init" and                                                           invocation logic, the benefit can be more significant.
+"restart instance" phases does not exist in RobustRL, making                                                        Rollout fault tolerance benefit. A machine failure on a roll-
+it faster than ByteRobust. Benefited by the warmup by rollout                                                       out or a machine being borrowed by the trainer does not
+
+
+
+USENIX Association                                                                         20th USENIX Symposium on Operating Systems Design and Implementation                                                                                            1417
+                                                                                                                                       235×2
+                                        Baseline        RobustRL-Trainer         RobustRL-Rollout        theoretical transfer cost is 4×200/8 = 4.7s. Our UCX-based
+Throughput (tokens/s)
+
+
+
+                        10000
+                                                                                                         weight synchronization cost is about 6s. The extra overhead
+                         8000
+                                                                                                         can be introduced by the network bandwidth fluctuations and
+                         6000
+                                                                                                         the async bubbles between NICs in one machine.
+                         4000
+
+                         2000                                                                                                  8B-UCX       8B-NCCL    32B-UCX    32B-NCCL          235B-UCX      235B-NCCL
+                                                                                                                       5                                                     10
+                            0
+                                0      5     10    15    20     25     30   35      40     45       50
+                                                                                                                       4                                                      8
+                                                               Step
+
+
+
+
+                                                                                                         Latency (s)
+                                                                                                                       3                                                      6
+Figure 17: Rollout token throughput of Qwen3-8B-Math with
+50 steps. We inject the error each five steps.                                                                         2                                                      4
+
+                                                                                                                       1                                                      2
+influence the RL task. There are multiple rollout instances,
+                                                                                                                       0                                                      0
+and in semi-sync mode, the trainer can also provide rollout                                                                    16          32          64        128                   64         128
+                                                                                                                                            #Rollout GPUs                             #Rollout GPUs
+capabilities. Compared to the over 300s required for a RL                                                                                (a) 8B & 32B Models                          (b) 235B Model
+task restart shown in Figure 15, the impact of a rollout restart
+would not influence the throughput of token decode as shown                                              Figure 18: Weight synchronization latency with different num-
+in Figure 17. In the event of a rollout machine failure in 32B                                           ber of GPUs and model size. The number of GPUs of trainer
+model, the time for a single rollout to start up and begin pro-                                          and rollout is equal. (a) 8B and 32B and (b) 235B.
+viding service includes machine scheduling (30s), container                                                 We further evaluate the pulling efficiency of our weight syn-
+startup (under 30s), inference engine startup (49s), and weight                                          chronization strategy in Figure 19. Our UCX-based transfer
+synchronization (10s), for a total of 119s.                                                              can achieve a linear increase in cost even when the number of
+Throughput under the trainer and rollout failure. We vi-                                                 rollouts grows exponentially. Benefit by the joining as relay
+sualize the rollout throughput of semi-sync training in Figure                                           design (§5.2.1), the outdated or recovered rollout can pull the
+17. The failure in trainer machines can lead to the throughput                                           weight from the relay server. On the contrary NCCL-based
+decrease because the error can happen when rollout phase fin-                                            weight synchronization strategy does not support dynamic
+ishes. In this phase, the trajectories wait for the consumption                                          connection with relay server and all the rollout must pull the
+by the trainer and continue the next step rollout. The token                                             weight from the trainer. When the number of rollouts is larger
+throughput of rollout failure is not affected because we have                                            than the trainer, its efficiency decreases.
+multiple rollout replicas.
+Detection benefit. ByteRobust [73] applies the 30 seconds                                                              12                                        12
+                                                                                                                                    UCX                                       UCX
+interval for network-related fault detection and 10 seconds
+                                                                                                         Latency (s)
+
+
+
+
+                                                                                                                           8        NCCL                                      NCCL
+for the GPU ones (setup in its Table 1). As discussed in §1, it                                                                                                   8
+would lead to endless restart of the task since the RL task can                                                            4                                      4
+have idle time waiting for the response from the tools. The
+                                                                                                                           0                                      0
+RobustRL can continue the running process. Compared with                                                                       16        32       64    128            16           32      64       128
+the cluster-level detection in Figure 2(b), it can save at most                                                                         #Rollout GPU                              #Rollout GPU
+                                                                                                                                        (a) 8B Model                              (b) 32B Model
+about 1000 seconds as shown in Figure 16(a) since we set the
+hang detection interval for rollout as 60 seconds.                                                       Figure 19: Weight synchronization latency with 16 trainer
+                                                                                                         GPUs and different number of rollout GPUs. (a) 8B and (b)
+7.4                             Robust Overhead Analysis                                                 32B models.
+7.4.1                               Weight Synchronization of Trainer and Rollout
+                                                                                                         7.4.2                 Per-step Checkpoint
+Weight synchronization efficiency. Figure 18 shows the
+weight synchronization efficiency for an equal number of                                                 Checkpoint efficiency. We evaluate the checkpoint overhead
+trainers and rollouts. The 235B model requires more than 64                                              of both FSDP2 and Megatron in Figure 20. It shows the GPU
+GPUs for the trainer to start as shown in Figure 18(b). The                                              to memory and memory to disk latency with different model
+NCCL communication method first gathers all weight to rank                                               size and number of GPUs for checkpoint. The GPU to mem-
+0 and then broadcasts the weight to all the rollouts. The UCX                                            ory and memory to disk are independent of the model size and
+uses point-to-point communication to the corresponding ranks                                             the number of GPUs because the saving process only needs
+in rollouts. Since UCX can fully utilize all the bandwidth of                                            to save the shard corresponding to each rank. The 3s blocking
+the NICs, it can have close performance to the NCCL. In ad-                                              time is 1% of the minutes or hours required for one step in
+dition, UCX allows for dynamic connections, providing fault                                              the RL task. It guarantees that a per-step GPU-to-memory
+tolerance capabilities. For a 235B model with FP16 precision,                                            checkpoint would not lead to the OOM during the process
+the model size is 470GB. With the 4 × 200Gbps NICs, the                                                  of checkpoint from GPU to memory because each step takes
+
+
+
+1418                                20th USENIX Symposium on Operating Systems Design and Implementation                                                                     USENIX Association
+                                           8B               32B                               235B                                          1.0
+
+
+
+
+                                                                                                                              mean reward
+                    3                                                  15                                                                             1-step-ckpt
+
+
+
+
+                                                                                                                              Normalized
+Latency (s)
+
+
+
+
+                    2                                                  10                                                                             3-step-ckpt
+                    1                                                            5                                                          0.5       5-step-ckpt
+                    0                                                            0
+                        64           128         256                                     64           128          256
+                        (a1) Megatron, GPU to Memory                                     (a2) Megatron, Memory to Disk
+                                                                                                                                            0.0
+                    3                                                  15
+                                                                                                                                                  0     10          20          30   40   50
+Latency (s)
+
+
+
+
+                    2                                                  10
+                                                                                                                                                                         Step
+                    1                                                            5
+                    0                                                            0
+                        64          128         256                                      64          128          256
+                                   #GPU                                                            #GPU
+                                                                                                                              Figure 22: Reward under different checkpoint frequency with
+                         (b1) FSDP, GPU to Memory                                         (b2) FSDP, Memory to Disk
+                                                                                                                              10-step-frequency failures.
+
+Figure 20: Checkpoint latency of ByteCheckpoint. (a) GPU                                                                      the Qwen3-8B-Base model. For a 3-step checkpoint interval,
+to memory and (b) memory to disk with different model size                                                                    if a failure occurs at the 10th step, the rollback checkpoint is
+and number of GPUs.                                                                                                           restored from the 9th step, resulting in 1 offline step. Simi-
+                                                                                                                              larly, a 5-step checkpoint interval introduces 5 offline steps
+over minutes. We have enough time to offload the checkpoint                                                                   when a failure happens at step 10. The experimental results
+from memory to the disk for about 10s. The disk writing stage                                                                 demonstrate that the number of offline steps directly affects
+is non-blocking, which further minimizes the overhead of                                                                      the upward trend of reward growth. Such degradation can be
+checkpoint for the RL training.                                                                                               more severe for large-scale, highly complex reinforcement
+                                                                                                                              learning training workloads like search [31] and coding [30].
+                                                                                 60
+GPU to Memory (s)
+
+
+
+
+                                                            Memory to Disk (s)
+
+
+
+
+                             32B                                                                                   32B        Given that the overhead of per-step checkpoint is negligi-
+                    4
+                             235B                                                40                                235B       ble, we prioritize preserving algorithmic fidelity and training
+                    2                                                                                                         effectiveness in our design.
+                                                                                 20
+
+
+                    0                                                                0
+                             5      10
+                                    Step
+                                           15          20                                     5      10
+                                                                                                     Step
+                                                                                                              15         20   8        Discussion and Limitation
+                                                                                                                              Limitation of Test Scaling. Frequent failures only emerge in
+Figure 21: Checkpoint overhead of each step in GPU to mem-
+                                                                                                                              large-scale training scenarios. Under small-scale settings with
+ory (left) and memory to HDFS (right).
+                                                                                                                              infrequent failures like 2%, RobustRL exhibits no substantial
+Continuous checkpoint. In Figure 21, we analyze the latency                                                                   performance gains over ByteRobust because the benefit is
+of GPU-to-memory and memory-to-disk across the first 20                                                                       highly dependent on the failure frequency and end-to-end
+training steps for the 32B model. For the 235B model, check-                                                                  training time. Even so, our experiments simulate large-scale
+point saving is executed at a consistent 10-minute interval.                                                                  frequent failure conditions via small-scale cluster testbeds,
+Consistent with the observations, the GPU-to-memory latency                                                                   which adequately demonstrates the inherent advantages of
+is independent of model scale and training steps. This is be-                                                                 RobustRL for future large-scale workloads.
+cause the GPU-to-memory address mapping in ByteCheck-                                                                         Limitations of Diagnosis Tools. Current fault diagnosis tools
+point [72] is pinned during the initialization phase.                                                                         are primarily designed for training [11, 38, 66, 73, 74], lacking
+   In contrast, for the memory-to-disk persistence phase in                                                                   specific capabilities for RL post-training scenarios. In RL,
+Bytecheckpoint, the first weight saving needs extra full traver-                                                              the presence of multiple roles and complex data and control
+sal of all model tensors, global shard metadata generation,                                                                   dependencies makes root cause localization challenging. For
+distributed execution planning. Larger models introduce more                                                                  instance, an OOM error in one role might be caused by a
+tensors, larger metadata footprints, and greater volumes of                                                                   memory leak in another co-located role in the same machine.
+data to be written, leading to a strong correlation between per-                                                              Similarly, a role hang event could be due to abnormal metrics
+sistence overhead and model scale. Starting from the second                                                                   from other roles. More precise RL training system diagnostic
+checkpoint, however, distributed planning and metadata are                                                                    tools would help developers pinpoint root causes faster during
+fully cached. Redundant operations including tensor traversal,                                                                failures, thereby further improving RL training efficiency.
+metadata parsing, cross-node communication, and structural                                                                    Role-based Hot Updates. Adjusting parameters during train-
+construction are eliminated, leaving only raw data copying                                                                    ing is a common requirement. For example, increasing the
+and disk I/O. This process is no longer affected by model size,                                                               batch size when GPU memory utilization is found to be low.
+but bounded by storage bandwidth for each shard.                                                                              ByteRobust [73] proposes a hot update mechanism that allows
+Checkpoint frequency > 1. We further evaluate the reward                                                                      instances to restart and update in-place, avoiding machine
+trends under different checkpoint frequencies with a failure in-                                                              rescheduling. Building upon role-based fault tolerance for
+jected every 10 steps shown in Figure 22. All experiments are                                                                 hot updates, it helps developers achieve faster role-specific
+conducted in semi-synchronous mode on the math task using                                                                     parameter updates. RobustRL reduces restart overhead and
+
+
+
+USENIX Association                                                                                20th USENIX Symposium on Operating Systems Design and Implementation                    1419
+prevents the loss of rollout.                                        10     Conclusion
+Elastic RL Training. Existing work supports elasticity for the
+rollout [79,89]. Since the rollout performs inference tasks and      We have implemented RobustRL, the first fault tolerance sys-
+uses independent scheduling, elastic scaling does not affect         tem for RL training that supports all GPU roles against ma-
+task execution. With the support of RobustRL, the trainer’s          chine failures. Through techniques in detect-restart-reconnect,
+elasticity in the data-parallel dimension can adopt a similar        RobustRL can detect the fault by roles quickly, isolate the fail-
+approach to previous work [8, 23, 36, 86], requiring only a          ure and minimize the restart overhead with rollout progress
+trainer restart, thus reducing the overhead of elastic scaling.      preserving. RobustRL can achieve 80% ETTR on the 8B-
+                                                                     Math training task with 20% higher than ByteRobust on the
+                                                                     Qwen3-8B-Math task in an extremely robust case.
+
+9   Related Work                                                     Acknowledgements
+
+Fault tolerance systems for LLM training. For training sys-          We thank OSDI anonymous shepherd and reviewers for their
+tems, their main goal is to locate system failures and recover as    insightful and constructive feedback. This work was sup-
+soon as possible through fault detection [10, 11, 29, 38, 73, 78],   ported in part by the National Science Foundation of China
+checkpoint [47, 72], and elastic recovery [8, 36] to ensure          under Grants (62472375, 62125206), and in part by Zhejiang
+the correctness of model training and reduce task restart            Provincial Natural Science Foundation of China under Grant
+overhead. Some works have further extended to elastic train-         No. LD24F020014 and No. LD25F020002, and in part by
+ing scenarios, focusing on reducing the overhead of scaling          the Zhejiang Pioneer (Jianbing) Project (2024C01032). The
+due to resource changes. Examples include pipeline redun-            corresponding author is Xinkui Zhao.
+dancy [27] and parallelism adjustment prediction [70] or in
+spot instance [4]. However, the fault detection strategies for       References
+pre-train are not incompatible in RL. For the trainer robust
+work like Torch-FT [45, 56], it is orthogonal to us since it          [1] Nvidia collective communications library (nccl), 2023.
+can accelerate the trainer restart efficiency. But it does not        [2] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge
+consider the recovery of the trainer from partial failures in con-        Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt,
+                                                                          Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv
+junction with rollouts, nor the design opportunities presented
+                                                                          preprint arXiv:2303.08774, 2023.
+by the asynchronous execution of rollout.
+                                                                      [3] Arash Ahmadian, Chris Cremer, Matthias Gallé, Marzieh Fadaee, Julia
+Fault tolerance systems for LLM inference Existing infer-                 Kreutzer, Olivier Pietquin, Ahmet Üstün, and Sara Hooker. Back to
+ence fault tolerance systems primarily operate at the token,              basics: Revisiting reinforce style optimization for learning from human
+and rank levels. The token level refers to utilizing the KV               feedback in llms, 2024.
+Cache [18, 34, 54] to avoid re-prefilling requests. The rank          [4] Sanjith Athlur, Nitika Saran, Muthian Sivathanu, Ramachandran Ram-
+level refers to scenarios with AF (attention-FFN) disaggrega-             jee, and Nipun Kwatra. Varuna: Scalable, low-cost training of massive
+                                                                          deep learning models. In Proceedings of the Seventeenth European
+tion [39, 68, 92], where the failure of a sub-ranks is prevented          Conference on Computer Systems, EuroSys ’22, page 472–487, New
+from causing a full service crash. For example, EaaS consid-              York, NY, USA, 2022. Association for Computing Machinery.
+ers fault tolerance and recovery after an expert machine fails.       [5] Yuntao Bai, Andy Jones, Kamal Ndousse, Amanda Askell, Anna Chen,
+However, async RL training scenarios also need to consider                Nova DasSarma, Dawn Drain, Stanislav Fort, Deep Ganguli, Tom
+the interaction between rollouts and the trainer. Addition-               Henighan, et al. Training a helpful and harmless assistant with reinforce-
+ally, as an offline training task, we just need to guarantee the          ment learning from human feedback. arXiv preprint arXiv:2204.05862,
+                                                                          2022.
+prompt can be generated.
+                                                                      [6] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D
+RL Systems and Fault Tolerance. RL involves both training                 Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish
+and inference stages. Considering the long-tail phenomenon                Sastry, Amanda Askell, et al. Language models are few-shot learners.
+of rollout, RL training paradigms have shifted from sync                  Advances in neural information processing systems, 33:1877–1901,
+                                                                          2020.
+[43, 61, 90] to async mode [16, 60, 89, 93] to improve training
+efficiency. Some RL training works have considered the fault          [7] ByteDance Seed. Technical Introduction to the Seed1.6 Model Series.
+                                                                          https://seed.bytedance.com/en/seed1_6, 2025.
+tolerance and elasticity of rollouts [60, 79]. However, the
+probability of failure in the rollout phase is much lower than        [8] Zhenqian Chen, Xinkui Zhao, Chen Zhi, and Jianwei Yin. Deepboot:
+                                                                          Dynamic scheduling system for training and inference deep learn-
+in the training ones because the communication management                 ing tasks in GPU cluster. IEEE Trans. Parallel Distributed Syst.,
+of training is more complex. RobustRL further considers                   34(9):2553–2567, 2023.
+the case of trainer fault tolerance, utilizing rollouts as warm       [9] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher
+standbys and allowing them to continue inference during a                 Ré. Flashattention: Fast and memory-efficient exact attention with
+trainer failure.                                                          io-awareness. In Sanmi Koyejo, S. Mohamed, A. Agarwal, Danielle
+
+
+
+
+1420    20th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+     Belgrave, K. Cho, and A. Oh, editors, Advances in Neural Informa-           [24] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Ruoyu Zhang,
+     tion Processing Systems 35: Annual Conference on Neural Informa-                 Runxin Xu, Qihao Zhu, Shirong Ma, Peiyi Wang, Xiao Bi, et al.
+     tion Processing Systems 2022, NeurIPS 2022, New Orleans, LA, USA,                Deepseek-r1: Incentivizing reasoning capability in llms via reinforce-
+     November 28 - December 9, 2022, 2022.                                            ment learning. arXiv preprint arXiv:2501.12948, 2025.
+[10] Yangtao Deng, Xiang Shi, Zhuo Jiang, Xingjian Zhang, Lei Zhang,             [25] Zhenyu Han, Ansheng You, Haibo Wang, Kui Luo, Guang Yang, Wenqi
+     Zhang Zhang, Bo Li, Zuquan Song, Hang Zhu, Gaohong Liu, Fuliang                  Shi, Menglong Chen, Sicheng Zhang, Zeshun Lan, Chunshi Deng,
+     Li, Shuguang Wang, Haibin Lin, Jianxi Ye, and Minlan Yu. Minder:                 Huazhong Ji, Wenjie Liu, Yu Huang, Yixiang Zhang, Chenyi Pan, Jing
+     Faulty machine detection for large-scale distributed model training. In          Wang, Xin Huang, Chunsheng Li, and Jianping Wu. Asyncflow: An
+     22nd USENIX Symposium on Networked Systems Design and Imple-                     asynchronous streaming rl framework for efficient llm post-training,
+     mentation (NSDI 25), pages 505–521, Philadelphia, PA, April 2025.                2025.
+     USENIX Association.                                                         [26] Jian Hu, Xibin Wu, Zilin Zhu, Xianyu, Weixun Wang, Dehao Zhang,
+[11] Yangtao Deng, Lei Zhang, Qinlong Wang, Xiaoyun Zhi, Xinlei Zhang,                and Yu Cao. Openrlhf: An easy-to-use, scalable and high-performance
+     Zhuo Jiang, Haohan Xu, Lei Wang, Zuquan Song, Gaohong Liu, et al.                rlhf framework, 2024.
+     Mycroft: Tracing dependencies in collective communication towards           [27] Insu Jang, Zhenning Yang, Zhen Zhang, Xin Jin, and Mosharaf Chowd-
+     reliable llm training. arXiv preprint arXiv:2509.03018, 2025.                    hury. Oobleck: Resilient distributed training of large models using
+[12] DLPack. DLPack: Open In Memory Tensor Structure. https://                        pipeline templates. In Proceedings of the 29th Symposium on Operat-
+     github.com/dmlc/dlpack, 2024.                                                    ing Systems Principles, pages 382–395, 2023.
+[13] Jiangfei Duan, Ziang Song, Xupeng Miao, Xiaoli Xi, Dahua Lin, Harry         [28] Yuxuan Jiang, Ziming Zhou, Boyu Xu, Beijie Liu, Runhui Xu, and
+     Xu, Minjia Zhang, and Zhihao Jia. Parcae: Proactive, liveput-optimized           Peng Huang. Training with confidence: Catching silent errors in deep
+     dnn training on preemptible instances. In 21st USENIX Symposium                  learning training with automated proactive checks. In Lidong Zhou
+     on Networked Systems Design and Implementation (NSDI 24), pages                  and Yuanyuan Zhou, editors, 19th USENIX Symposium on Operating
+     1121–1139, 2024.                                                                 Systems Design and Implementation, OSDI 2025, Boston, MA, USA,
+                                                                                      July 7-9, 2025, pages 313–329. USENIX Association, 2025.
+[14] Jiazhan Feng, Shijue Huang, Xingwei Qu, Ge Zhang, Yujia Qin, Bao-
+     quan Zhong, Chengquan Jiang, Jinxin Chi, and Wanjun Zhong. Retool:          [29] Ziheng Jiang, Haibin Lin, Yinmin Zhong, Qi Huang, Yangrui Chen, Zhi
+     Reinforcement learning for strategic tool use in llms. arXiv preprint            Zhang, Yanghua Peng, Xiang Li, Cong Xie, Shibiao Nong, Yulu Jia,
+     arXiv: 2504.11536, 2025.                                                         Sun He, Hongmin Chen, Zhihao Bai, Qi Hou, Shipeng Yan, Ding Zhou,
+                                                                                      Yiyao Sheng, Zhuo Jiang, Haohan Xu, Haoran Wei, Zhang Zhang,
+[15] Jason Flinn, Xianzheng Dou, Arushi Aggarwal, Alex Boyko, Francois                Pengfei Nie, Leqi Zou, Sida Zhao, Liang Xiang, Zherui Liu, Zhe Li,
+     Richard, Eric Sun, Wendy Tobagus, Nick Wolchko, and Fang Zhou.                   Xiaoying Jia, Jianxi Ye, Xin Jin, and Xin Liu. MegaScale: Scaling
+     Owl: Scale and flexibility in distribution of hot content. In 16th USENIX        large language model training to more than 10,000 GPUs. In 21st
+     Symposium on Operating Systems Design and Implementation (OSDI                   USENIX Symposium on Networked Systems Design and Implementation
+     22), pages 1–15, Carlsbad, CA, July 2022. USENIX Association.                    (NSDI 24), pages 745–760, Santa Clara, CA, April 2024. USENIX
+[16] Wei Fu, Jiaxuan Gao, Xujie Shen, Chen Zhu, Zhiyu Mei, Chuyi He,                  Association.
+     Shusheng Xu, Guo Wei, Jun Mei, Jiashu Wang, Tongkai Yang, Binhang           [30] Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin
+     Yuan, and Yi Wu. AReaL: A Large-Scale Asynchronous Reinforcement                 Pei, Ofir Press, and Karthik Narasimhan. Swe-bench: Can language
+     Learning System for Language Reasoning, June 2025.                               models resolve real-world github issues? arXiv preprint arXiv:
+[17] Swapnil Gandhi, Mark Zhao, Athinagoras Skiadopoulos, and Christos                2310.06770, 2023.
+     Kozyrakis. Recycle: Resilient training of large dnns using pipeline         [31] Bowen Jin, Hansi Zeng, Zhenrui Yue, Jinsung Yoon, Sercan Arik, Dong
+     adaptation. In Proceedings of the ACM SIGOPS 30th Symposium on                   Wang, Hamed Zamani, and Jiawei Han. Search-r1: Training llms to
+     Operating Systems Principles, pages 211–228, 2024.                               reason and leverage search engines with reinforcement learning. arXiv
+[18] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic,                preprint arXiv:2503.09516, 2025.
+     Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. Cost-efficient          [32] Komal Kumar, Tajamul Ashraf, Omkar Thawakar, Rao Muhammad An-
+     large language model serving for multi-turn conversations with cache-            wer, Hisham Cholakkal, Mubarak Shah, Ming-Hsuan Yang, Phillip HS
+     dattention. In Saurabh Bagchi and Yiying Zhang, editors, Proceedings             Torr, Fahad Shahbaz Khan, and Salman Khan. Llm post-training:
+     of the 2024 USENIX Annual Technical Conference, USENIX ATC 2024,                 A deep dive into reasoning large language models. arXiv preprint
+     Santa Clara, CA, USA, July 10-12, 2024, pages 111–126. USENIX                    arXiv:2502.21321, 2025.
+     Association, 2024.                                                          [33] Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael
+[19] Hao Ge, Junda Feng, Qi Huang, Fangcheng Fu, Xiaonan Nie, Lei Zuo,                Collins, Ankur Parikh, Chris Alberti, Danielle Epstein, Illia Polosukhin,
+     Haibin Lin, Bin Cui, and Xin Liu. Bytescale: Efficient scaling of llm            Jacob Devlin, Kenton Lee, Kristina Toutanova, Llion Jones, Matthew
+     training with a 2048k context length on more than 12,000 gpus. arXiv             Kelcey, Ming-Wei Chang, Andrew M. Dai, Jakob Uszkoreit, Quoc Le,
+     preprint arXiv:2502.21231, 2025.                                                 and Slav Petrov. Natural questions: A benchmark for question an-
+                                                                                      swering research. Transactions of the Association for Computational
+[20] Github. OpenRLHF: An Easy-to-use, Scalable and High-performance
+                                                                                      Linguistics, 7:452–466, 2019.
+     RLHF Framework. https://github.com/OpenRLHF/OpenRLHF,
+     2022.                                                                       [34] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+                                                                                      Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+[21] Github. ROLL: Reinforcement Learning Optimization for Large-Scale
+                                                                                      Efficient memory management for large language model serving with
+     Learning. https://github.com/alibaba/ROLL, 2022.
+                                                                                      pagedattention. In Jason Flinn, Margo I. Seltzer, Peter Druschel, An-
+[22] Github. verl: Volcano Engine Reinforcement Learning for LLMs.                    toine Kaufmann, and Jonathan Mace, editors, Proceedings of the 29th
+     https://github.com/volcengine/verl, 2022.                                        Symposium on Operating Systems Principles, SOSP 2023, Koblenz,
+[23] Diandian Gu, Yihao Zhao, Yinmin Zhong, Yifan Xiong, Zhenhua Han,                 Germany, October 23-26, 2023, pages 611–626. ACM, 2023.
+     Peng Cheng, Fan Yang, Gang Huang, Xin Jin, and Xuanzhe Liu. Elas-           [35] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+     ticflow: An elastic serverless training platform for distributed deep            Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+     learning. In Proceedings of the 28th ACM International Conference                Efficient memory management for large language model serving with
+     on Architectural Support for Programming Languages and Operating                 pagedattention. In Proceedings of the 29th Symposium on Operating
+     Systems, Volume 2, pages 266–280, 2023.                                          Systems Principles, pages 611–626, 2023.
+
+
+
+
+USENIX Association                                    20th USENIX Symposium on Operating Systems Design and Implementation                              1421
+[36] Mingzhen Li, Wencong Xiao, Hailong Yang, Biao Sun, Hanyu Zhao,                Michael I Jordan, et al. Ray: A distributed framework for emerging
+     Shiru Ren, Zhongzhi Luan, Xianyan Jia, Yi Liu, Yong Li, et al.                {AI} applications. In 13th USENIX symposium on operating systems
+     Easyscale: Elastic training with consistent accuracy and improved uti-        design and implementation (OSDI 18), pages 561–577, 2018.
+     lization on gpus. In Proceedings of the International Conference         [49] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGres-
+     for High Performance Computing, Networking, Storage and Analysis,             ley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi
+     pages 1–14, 2023.                                                             Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efficient large-
+[37] Nándor Licker, Kevin Hu, Vladimir Zaytsev, and Lequn Chen.                    scale language model training on gpu clusters using megatron-lm. In
+     RDMA point-to-point communication for LLM systems. CoRR,                      Proceedings of the International Conference for High Performance
+     abs/2510.27656, 2025.                                                         Computing, Networking, Storage and Analysis, pages 1–15, 2021.
+[38] Jinkun Lin, Ziheng Jiang, Zuquan Song, Sida Zhao, Menghan Yu,            [50] Mathematical Association of America. Aime 2024, 2024.
+     Zhanghan Wang, Chenyuan Wang, Zuocheng Shi, Xiang Shi, Wei Jia,          [51] Ryosuke Okuta, Yuya Unno, Daisuke Nishino, Shohei Hido, and Criss-
+     Zherui Liu, Shuguang Wang, Haibin Lin, Xin Liu, Aurojit Panda, and            man Loomis. Cupy: A numpy-compatible library for nvidia gpu cal-
+     Jinyang Li. Understanding stragglers in large model training using            culations. In Proceedings of Workshop on Machine Learning Systems
+     what-if analysis. In Lidong Zhou and Yuanyuan Zhou, editors, 19th             (LearningSys) in The Thirty-first Annual Conference on Neural Infor-
+     USENIX Symposium on Operating Systems Design and Implementa-                  mation Processing Systems (NIPS), 2017.
+     tion, OSDI 2025, Boston, MA, USA, July 7-9, 2025, pages 483–498.         [52] OpenAI. Introducing OpenAI o1. https://openai.com/o1/, 2024.
+     USENIX Association, 2025.
+                                                                              [53] Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wain-
+[39] Ziming Liu, Boyu Tian, Guoteng Wang, Zhen Jiang, Peng Sun, Zhenhua            wright, Pamela Mishkin, Chong Zhang, Sandhini Agarwal, Katarina
+     Han, Tian Tang, Xiaohe Hu, Yanmin Jia, Yan Zhang, He Liu, Mingjun             Slama, Alex Ray, et al. Training language models to follow instructions
+     Zhang, Yiqi Zhang, Qiaoling Chen, Shenggan Cheng, Mingyu Gao,                 with human feedback. Advances in Neural Information Processing
+     Yang You, and Siyuan Feng. Expert-as-a-service: Towards efficient,            Systems, 35:27730–27744, 2022.
+     scalable, and robust large-scale moe serving. CoRR, abs/2509.17863,
+                                                                              [54] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing
+     2025.
+                                                                                   Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. Mooncake:
+[40] Chang Lou, Dimas Shidqi Parikesit, Yujin Huang, Zhewen Yang, Sena-            Trading more storage for less computation—a {KVCache-centric}
+     pati Diwangkara, Yuzhuo Jing, Achmad Imam Kistijantoro, Ding Yuan,            architecture for serving {LLM} chatbot. In 23rd USENIX Conference
+     Suman Nath, and Peng Huang. Deriving semantic checkers from tests             on File and Storage Technologies (FAST 25), pages 155–170, 2025.
+     to detect silent failures in production distributed systems. In Lidong   [55] Scott Reed, Konrad Zolna, Emilio Parisotto, Sergio Gomez Col-
+     Zhou and Yuanyuan Zhou, editors, 19th USENIX Symposium on Op-                 menarejo, Alexander Novikov, Gabriel Barth-Maron, Mai Gimenez,
+     erating Systems Design and Implementation, OSDI 2025, Boston, MA,             Yury Sulsky, Jackie Kay, Jost Tobias Springenberg, Tom Eccles, Jake
+     USA, July 7-9, 2025, pages 19–38. USENIX Association, 2025.                   Bruce, Ali Razavi, Ashley Edwards, Nicolas Heess, Yutian Chen, Raia
+[41] Yunchi Lu, Youshan Miao, Cheng Tan, Peng Huang, Yi Zhu, Xian                  Hadsell, Oriol Vinyals, Mahyar Bordbar, and Nando de Freitas. A
+     Zhang, and Fan Yang. Trainverify: Equivalence-based verification for          Generalist Agent, November 2022.
+     distributed LLM training. In Youjip Won, Youngjin Kwon, Ding Yuan,       [56] Omkar Salpekar, Rohan Varma, Kenny Yu, Vladimir Ivanov, Yang
+     and Rebecca Isaacs, editors, Proceedings of the ACM SIGOPS 31st               Wang, Ahmed Sharif, Min Si, Shawn Xu, Feng Tian, Shengbao Zheng,
+     Symposium on Operating Systems Principles, SOSP 2025, Lotte Hotel             Tristan Rice, Ankush Garg, Shangfu Peng, Shreyas Siravara, Wenyin Fu,
+     World, Seoul, Republic of Korea, October 13-16, 2025, pages 237–253.          Rodrigo de Castro, Adithya Gangidi, Andrey Obraztsov, Sharan Narang,
+     ACM, 2025.                                                                    Sergey Edunov, Maxim Naumov, Chunqiang Tang, and Mathew Old-
+[42] Michael Luo, Sijun Tan, Roy Huang, Ameen Patel, Alpay Ariyak,                 ham. Training llms with fault tolerant HSDP on 100,000 gpus. CoRR,
+     Qingyang Wu, Xiaoxiang Shi, Rachel Xin, Colin Cai, Maurice We-                abs/2602.00277, 2026.
+     ber, Ce Zhang, Li Erran Li, Raluca Ada Popa, and Ion Stoica. Deep-       [57] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and
+     coder: A fully open-source 14b coder at o3-mini level. https:                 Oleg Klimov. Proximal policy optimization algorithms. arXiv preprint
+     //www.together.ai/blog/deepcoder, 2025. Notion Blog.                          arXiv:1707.06347, 2017.
+[43] Zhiyu Mei, Wei Fu, Kaiwei Li, Guangju Wang, Huanchen Zhang, and          [58] ByteDance Seed, Jiaze Chen, Tiantian Fan, Xin Liu, Lingjun Liu, Zhiqi
+     Yi Wu. Real: Efficient rlhf training of large language models with            Lin, Mingxuan Wang, Chengyi Wang, Xiangpeng Wei, Wenyuan Xu,
+     parameter reallocation. arXiv preprint arXiv: 2406.14088, 2024.               et al. Seed1. 5-thinking: Advancing superb reasoning models with
+                                                                                   reinforcement learning. arXiv preprint arXiv:2504.13914, 2025.
+[44] Meituan search. Recipe: Fully Async Policy Trainer. https://verl.
+     readthedocs.io/en/latest/advance/fully_async.html, 2024.                 [59] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao
+                                                                                   Bi, Haowei Zhang, Mingchuan Zhang, YK Li, Y Wu, et al. Deepseek-
+[45] Meta.   Easy per step fault tolerance for pytorch.         https://           math: Pushing the limits of mathematical reasoning in open language
+     meta-pytorch.org/torchft, 2026.                                               models. arXiv preprint arXiv:2402.03300, 2024.
+[46] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi, Dahua Lin, Bin        [60] Guangming Sheng, Yuxuan Tong, Borui Wan, Wang Zhang, Chaobo
+     Cui, and Zhihao Jia. Spotserve: Serving generative large language mod-        Jia, Xibin Wu, Yuqi Wu, Xiang Li, Chi Zhang, Yanghua Peng, Haibin
+     els on preemptible instances. In Rajiv Gupta, Nael B. Abu-Ghazaleh,           Lin, Xin Liu, and Chuan Wu. Laminar: A scalable asynchronous RL
+     Madan Musuvathi, and Dan Tsafrir, editors, Proceedings of the 29th            post-training framework. CoRR, abs/2510.12633, 2025.
+     ACM International Conference on Architectural Support for Program-
+     ming Languages and Operating Systems, Volume 2, ASPLOS 2024, La          [61] Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu, Wang Zhang,
+     Jolla, CA, USA, 27 April 2024- 1 May 2024, pages 1112–1127. ACM,              Ru Zhang, Yanghua Peng, Haibin Lin, and Chuan Wu. Hybridflow:
+     2024.                                                                         A flexible and efficient rlhf framework. In Proceedings of the Twen-
+                                                                                   tieth European Conference on Computer Systems, EuroSys ’25, page
+[47] Jayashree Mohan, Amar Phanishayee, and Vijay Chidambaram. Check-              1279–1297, New York, NY, USA, 2025. Association for Computing
+     Freq: Frequent, Fine-Grained DNN checkpointing. In 19th USENIX                Machinery.
+     Conference on File and Storage Technologies (FAST 21), pages 203–
+                                                                              [62] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang,
+     216. USENIX Association, February 2021.
+                                                                                   Yong Li, and Wei Lin. Llumnix: Dynamic scheduling for large language
+[48] Philipp Moritz, Robert Nishihara, Stephanie Wang, Alexey Tumanov,             model serving. In 18th USENIX symposium on operating systems
+     Richard Liaw, Eric Liang, Melih Elibol, Zongheng Yang, William Paul,          design and implementation (OSDI 24), pages 173–191, 2024.
+
+
+
+
+1422     20th USENIX Symposium on Operating Systems Design and Implementation                                                  USENIX Association
+[63] Gemini Team, Petko Georgiev, Ving Ian Lei, Ryan Burnell, Libin Bai,        [78] Tianyuan Wu, Wei Wang, Yinghao Yu, Siran Yang, Wenchao Wu,
+     Anmol Gulati, Garrett Tanzer, Damien Vincent, Zhufeng Pan, Shibo                Qinkai Duan, Guodong Yang, Jiamang Wang, Lin Qu, and Liping
+     Wang, et al. Gemini 1.5: Unlocking multimodal understanding across              Zhang. GREYHOUND: hunting fail-slows in hybrid-parallel training
+     millions of tokens of context. arXiv preprint arXiv:2403.05530, 2024.           at scale. In Deniz Altinbüken and Ryan Stutsman, editors, Proceedings
+[64] Kimi Team, Angang Du, Bofei Gao, Bowei Xing, Changjiu Jiang,                    of the 2025 USENIX Annual Technical Conference, USENIX ATC 2025,
+     Cheng Chen, Cheng Li, Chenjun Xiao, Chenzhuang Du, Chonghua                     Boston, MA, USA, July 7-9, 2025, pages 731–747. USENIX Associa-
+     Liao, et al. Kimi k1. 5: Scaling reinforcement learning with llms. arXiv        tion, 2025.
+     preprint arXiv:2501.12599, 2025.                                           [79] Yongji Wu, Xueshen Liu, Haizhong Zheng, Juncheng Gu, Beidi Chen,
+[65] Meituan LongCat Team. Longcat-flash-thinking technical report.                  Z. Morley Mao, Arvind Krishnamurthy, and Ion Stoica. Rlboost: Har-
+     CoRR, abs/2509.18883, 2025.                                                     vesting preemptible resources for cost-efficient reinforcement learning
+                                                                                     on llms. CoRR, abs/2510.19225, 2025.
+[66] NVIDIA Team. NVIDIA DCGM. https://developer.nvidia.
+     com/dcgm, 2021.                                                            [80] xAI. Grok 4. https://x.ai/news/grok-4, 2025.
+[67] Qwen Team, An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui,              [81] Yuxing Xiang, Xue Li, Kun Qian, Wenyuan Yu, Ennan Zhai, and Xin Jin.
+     Bo Zheng, Bowen Yu, Chengyuan Li, Dayiheng Liu, Fei Huang, Haoran               Servegen: Workload characterization and generation of large language
+     Wei, Huan Lin, Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang,             model serving in production. arXiv preprint arXiv:2505.09999, 2025.
+     Jiaxi Yang, Jingren Zhou, Junyang Lin, Kai Dang, Keming Lu, Keqin          [82] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui,
+     Bao, Kexin Yang, Le Yu, Mei Li, Mingfeng Xue, Pei Zhang, Qin Zhu,               Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al.
+     Rui Men, Runji Lin, Tianhao Li, Tianyi Tang, Tingyu Xia, Xingzhang              Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025.
+     Ren, Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang, Yu Wan,
+     Yuqiong Liu, Zeyu Cui, Zhenru Zhang, and Zihan Qiu. Qwen2.5                [83] Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William W.
+     technical report. arXiv preprint arXiv: 2412.15115, 2024.                       Cohen, Ruslan Salakhutdinov, and Christopher D. Manning. Hotpotqa:
+                                                                                     A dataset for diverse, explainable multi-hop question answering. CoRR,
+[68] Stepfun Team. Step-3 is large yet affordable: Model-system co-design
+                                                                                     abs/1809.09600, 2018.
+     for cost-effective decoding. CoRR, abs/2507.19427, 2025.
+[69] Thinking Machines.         Defeating Nondeterminism in                     [84] Zhewei Yao, Reza Yazdani Aminabadi, Olatunji Ruwase, Samyam
+     LLM Inference.        https://thinkingmachines.ai/blog/                         Rajbhandari, Xiaoxia Wu, Ammar Ahmad Awan, Jeff Rasley, Minjia
+     defeating-nondeterminism-in-llm-inference/, 2025.                               Zhang, Conglong Li, Connor Holmes, Zhongzhu Zhou, Michael Wyatt,
+                                                                                     Molly Smith, Lev Kurilenko, Heyang Qin, Masahiro Tanaka, Shuai
+[70] John Thorpe, Pengzhan Zhao, Jonathan Eyolfson, Yifan Qiao, Zhihao               Che, Shuaiwen Leon Song, and Yuxiong He. Deepspeed-chat: Easy,
+     Jia, Minjia Zhang, Ravi Netravali, and Guoqing Harry Xu. Bamboo:                fast and affordable rlhf training of chatgpt-like models at all scales,
+     Making preemptible instances resilient for affordable training of large         2023.
+     dnns. In 20th USENIX Symposium on Networked Systems Design and
+     Implementation (NSDI 23), pages 497–513, 2023.                             [85] Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo,
+                                                                                     Yu Yue, Weinan Dai, Tiantian Fan, Gaohong Liu, Lingjun Liu, Xin Liu,
+[71] Marcel Wagenländer, Guo Li, Bo Zhao, Luo Mai, and Peter Pietzuch.               Haibin Lin, Zhiqi Lin, Bole Ma, Guangming Sheng, Yuxuan Tong, Chi
+     Tenplex: Dynamic parallelism for deep learning using parallelizable             Zhang, Mofan Zhang, Wang Zhang, Hang Zhu, Jinhua Zhu, Jiaze Chen,
+     tensor collections. In Proceedings of the ACM SIGOPS 30th Symposium             Jiangjie Chen, Chengyi Wang, Hongli Yu, Yuxuan Song, Xiangpeng
+     on Operating Systems Principles, pages 195–210, 2024.                           Wei, Hao Zhou, Jingjing Liu, Wei-Ying Ma, Ya-Qin Zhang, Lin Yan,
+[72] Borui Wan, Mingji Han, Yiyao Sheng, Yanghua Peng, Haibin Lin, Mo-               Mu Qiao, Yonghui Wu, and Mingxuan Wang. Dapo: An open-source
+     fan Zhang, Zhichao Lai, Menghan Yu, Junda Zhang, Zuquan Song, Xin               llm reinforcement learning system at scale, 2025.
+     Liu, and Chuan Wu. ByteCheckpoint: A unified checkpointing system
+                                                                                [86] Xinyi Zhang, Hanyu Zhao, Wencong Xiao, Xianyan Jia, Fei Xu, Yong
+     for large foundation model development. In 22nd USENIX Symposium
+                                                                                     Li, Wei Lin, and Fangming Liu. Rubick: Exploiting job reconfigura-
+     on Networked Systems Design and Implementation (NSDI 25), pages
+                                                                                     bility for deep learning cluster scheduling. Proceedings of Machine
+     559–578, Philadelphia, PA, April 2025. USENIX Association.
+                                                                                     Learning and Systems, 7, 2025.
+[73] Borui Wan, Gaohong Liu, Zuquan Song, Jun Wang, Yun Zhang, Guang-
+     ming Sheng, Shuguang Wang, Houmin Wei, Chenyuan Wang, Weiqiang             [87] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang,
+     Lou, Xi Yang, Mofan Zhang, Kaihua Jiang, Cheng Ren, Xiaoyun Zhi,                Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, et al.
+     Menghan Yu, Zhe Nan, Zhuolin Zheng, Baoquan Zhong, Qinlong Wang,                Pytorch fsdp: Experiences on scaling fully sharded data parallel. arXiv
+     Huan Yu, Jinxin Chi, Wang Zhang, Yuhan Li, Zixian Du, Sida Zhao,                preprint arXiv:2304.11277, 2023.
+     Yongqiang Zhang, Jingzhe Tang, Zherui Liu, Chuan Wu, Yanghua Peng,         [88] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Jeff Huang, Chuyue
+     Haibin Lin, Wencong Xiao, Xin Liu, and Liang Xiang. Robust llm                  Sun, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E.
+     training infrastructure at bytedance, 2025.                                     Gonzalez, Clark Barrett, and Ying Sheng. Efficiently programming
+[74] Wandb Team. AI is Easy to Productionize. https://wandb.ai/                      large language models using sglang. arXiv preprint arXiv: 2312.07104,
+     site/, 2025.                                                                    2023.
+[75] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen, Dingyan Zhang,             [89] Yinmin Zhong, Zili Zhang, Xiaoniu Song, Hanpeng Hu, Chao Jin,
+     Chenguang Fang, Rong Chen, Wenyuan Yu, and Haibo Chen. Kvcache                  Bingyang Wu, Nuo Chen, Yukun Chen, Yu Zhou, Changyi Wan,
+     cache in the wild: Characterizing and optimizing kvcache cache at a             Hongyu Zhou, Yimin Jiang, Yibo Zhu, and Daxin Jiang. StreamRL:
+     large cloud provider. arXiv preprint arXiv:2506.02634, 2025.                    Scalable, Heterogeneous, and Elastic RL for LLMs with Disaggregated
+                                                                                     Stream Generation, April 2025.
+[76] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia,
+     Ed Chi, Quoc V Le, Denny Zhou, et al. Chain-of-thought prompt-             [90] Yinmin Zhong, Zili Zhang, Bingyang Wu, Shengyu Liu, Yukun Chen,
+     ing elicits reasoning in large language models. Advances in neural              Changyi Wan, Hanpeng Hu, Lei Xia, Ranchen Ming, Yibo Zhu, et al.
+     information processing systems, 35:24824–24837, 2022.                           Rlhfuse: Efficient rlhf training for large language models with inter-and
+[77] Bo Wu, Sid Wang, Yunhao Tang, Jia Ding, Eryk Helenowski, Liang Tan,             intra-stage fusion. arXiv preprint arXiv:2409.13221, 2024.
+     Tengyu Xu, Tushar Gowda, Zhengxing Chen, Chen Zhu, Xiaocheng               [91] Jiecheng Zhou, Qinghao Hu, Yuyang Jin, Zerui Wang, Peng Sun, Yuzhe
+     Tang, Yundi Qian, Beibei Zhu, and Rui Hou. LlamaRL: A Distributed               Gu, Wenwei Zhang, Mingshu Zhai, Xingcheng Zhang, and Weiming
+     Asynchronous Reinforcement Learning Framework for Efficient Large-              Zhang. RL in the wild: Characterizing RLVR training in LLM deploy-
+     scale LLM Training, June 2025.                                                  ment. CoRR, abs/2509.25279, 2025.
+
+
+
+
+USENIX Association                                   20th USENIX Symposium on Operating Systems Design and Implementation                              1423
+[92] Ruidong Zhu, Ziheng Jiang, Chao Jin, Peng Wu, Cesar A Stuardo,
+     Dongyang Wang, Xinlei Zhang, Huaping Zhou, Haoran Wei, Yang
+     Cheng, et al. Megascale-infer: Serving mixture-of-experts at scale with
+     disaggregated expert parallelism. arXiv preprint arXiv:2504.02263,
+     2025.
+[93] Zilin Zhu, Chengxing Xie, Xin Lv, and slime Contributors. slime: An
+     llm post-training framework for rl scaling. https://github.com/
+     THUDM/slime, 2025. GitHub repository. Corresponding author: Xin
+     Lv.
+
+
+
+
+1424     20th USENIX Symposium on Operating Systems Design and Implementation   USENIX Association
+
