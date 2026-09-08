@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 47 份代表 PDF／811 页、完成 48 篇原始完整摘要筛选，八篇有声明范围的正文阅读；其余 136 篇摘要未读。此前增加十三篇摘要并选读 PICACHU；本轮补读 Apophenia 物理页 2–12、16–17，共十三页与六张实际查看图页，接现有图执行案例。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 47 份代表 PDF／811 页、完成 48 篇原始完整摘要筛选，九篇有声明范围的正文阅读；其余 136 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -36,7 +36,7 @@
 | 44. [Automatic Tracing in Task-Based Runtime Systems](../../references/proceedings/ASPLOS/2025/public/paper-044.pdf) | 重点阅读并整合 | 物理页 2–12、16–17 已读；身份、匹配等待与准备成本接 5.4.4／实验 5-8。Legion 工件与固定 vLLM 图封装分开；历史 DP 训练结果不外推当前模型。 |
 | 46. [Rethinking Java Performance Analysis](../../references/proceedings/ASPLOS/2025/public/paper-046.pdf) | 备查 | DaCapo 负载更新和用户延迟方法支持测量取舍；已有 AI 调优案例，保留方法参照而不添加 Java 专节。 |
 | 48. [Cinnamon: A Framework for Scale-Out Encrypted AI](../../references/proceedings/ASPLOS/2025/public/paper-048.pdf) | 备查 | FHE 的多层并行与芯片资源配比，任务语义与普通推理不同；不能将加密 CPU 基线倍数并入常规 GPU 比较。 |
-| 49. [PipeLLM: Fast and Confidential Large Language Model Services with Speculative Pipelined Encryption](../../references/proceedings/ASPLOS/2025/public/paper-049.pdf) | 候选待读 | H100 机密计算下交换与加密流水，候选连接 5／8／11 的主机工作和依赖；需核预测失误与当前引擎版本。 |
+| 49. [PipeLLM: Fast and Confidential Large Language Model Services with Speculative Pipelined Encryption](../../references/proceedings/ASPLOS/2025/pipellm/author-final.pdf) | 重点阅读并整合 | 正式格式作者稿物理页 1–13 已读；提前准备、额外复制与有用工作接 5.2.3。历史换出、工件限制与 V1 抢占／connector 分开。 |
 | 55. [Don't Repeat Yourself! Coarse-Grained Circuit Deduplication to Accelerate RTL Simulation](../../references/proceedings/ASPLOS/2025/public/paper-055-author.pdf) | 排除 | RTL 仿真的共享指令代码与 LLC 瓶颈；本书已有 AI 复用和争用例子，不展开 EDA 仿真系统。 |
 | 60. [FleetIO: Managing Multi-Tenant Cloud Storage with Multi-Agent Reinforcement Learning](../../references/proceedings/ASPLOS/2025/public/paper-060.pdf) | 备查 | 虚拟 SSD 的隔离、利用率与 RL 奖励取舍；不是模型 RL 训练调度，暂不扩展存储控制器专题。 |
 | 79. [MVQ: Towards Efficient DNN Compression and Acceleration with Masked Vector Quantization](../../references/proceedings/ASPLOS/2025/public/paper-079.pdf) | 备查 | N:M 剪枝、向量码本和阵列协同，实验主要是视觉 CNN；已有模型量化主线，暂不增算法小节。 |
@@ -93,6 +93,10 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 
 [公开工件与 vLLM 对照](../../references/framework-history/2026-09-09/trace-identification/README.md)保存三份原始响应、精确 ZIP 成员和九个读取范围。附录的未公开依赖、所读 hash 的省略字段、固定图封装对外部缓冲的要求分别保留。现有 Qwen3 案例只补地址绑定和收齐片段后的流水推算；不展开字符串算法、不移植论文总加速比，也不声称当前引擎采用该自动识别系统。
 
+**PipeLLM**：新增十五页正式格式作者稿，物理页 1–13 与六页图像已读，原十四页 v1 及摘要保留，见[页级记录](../../references/proceedings/ASPLOS/2025/pipellm-reading.json)。采用的是多一次复制允许更早准备，以及错误准备仍耗资源的判断；同一 64 MiB 张量分别核算等待、服务量与三类缓冲。正文的零顺序预测成功率仍能复用已准备密文，不解释成零有用工作也没有代价。
+
+其单 H100-SXM 评估并未启用 CPU TDX，旧 vLLM 测的是 OPT 模型的并行采样。公开工件需要修改 CUDA／OpenSSL 集成，所读失配分支进入断言；源码与论文的保护、回退设计尚未逐项对应，不能宣称完整复现。[三期 vLLM 对照](../../references/framework-history/2026-09-09/pipellm-swap/README.md)区分旧单／多序列抢占、V1 重计算与 connector 缓存，未发现直接集成该研究的证据。图注与 52.8% 指标歧义留在记录，正文不移植性能倍数；只补 5.2.3／实验 5-2／图 5-2 的选做变体，接回第 8→9 章已有缓存计算。
+
 ## 尚缺的材料
 
 - 首个 session 中 Mosaic、DynaX、RASSM 的原始摘要／正文仍有缺口；DynaX 的作者 README 不能代替论文。TFHE 作者页面的 PDF 按钮仍指向 ACM。
@@ -105,4 +109,4 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 
 Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正式 DOI 的 Crossref 记录列五位，未列该名字。题名与其余五位作者一致，按较早作者版本归档；此处仅记录元数据差异，不推断正式 PDF 的作者名单已经变更。
 
-前一批十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。首轮将 StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，Apophenia 随后完成上述选读，其余三篇仍为正文候选；该批其他论文备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。
+前一批十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。首轮将 StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，Apophenia、PipeLLM 随后完成上述选读，其余两篇仍为正文候选；该批其他论文备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。

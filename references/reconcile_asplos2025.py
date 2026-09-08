@@ -64,7 +64,7 @@ def main():
                    full_text_status='not_archived')
         if not row['title_matches_normalized']:
             row['title_note'] = 'Matched by the exact DOI linked in the official program; title variant retained.'
-        for key in ['screening', 'reading_status', 'selected_reading', 'full_text_status', 'pdf', 'text', 'pages', 'public_version_note', 'public_abstract', 'source_followup']:
+        for key in ['screening', 'reading_status', 'selected_reading', 'selected_reading_pdf', 'full_text_status', 'pdf', 'text', 'pages', 'public_version_note', 'public_abstract', 'source_followup']:
             if key in previous.get(doi, {}):
                 row[key] = previous[doi][key]
         papers.append(row)
