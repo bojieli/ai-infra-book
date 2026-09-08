@@ -40,6 +40,7 @@ files.append(ROOT/'case-studies/chunking-and-state-transfer.md')
 files.append(ROOT/'case-studies/tensor-codec-and-transfer.md')
 files.append(ROOT/'case-studies/parallel-switching-and-state.md')
 files.append(ROOT/'case-studies/component-utilization-and-overlap.md')
+files.append(ROOT/'case-studies/snapshot-residency-and-first-use.md')
 files.append(ROOT/'case-studies/stream-order-and-buffer.md')
 files.append(ROOT/'references/proceedings/ISCA/2024/closing/README.md')
 files.append(ROOT/'case-studies/resource-sharing-and-placement.md')
@@ -774,6 +775,8 @@ from verify_asplos2025_public import verify as verify_asplos2025_public
 asplos2025_public=verify_asplos2025_public()
 from verify_ascend_components import verify as verify_ascend_components
 ascend_components=verify_ascend_components()
+from verify_snapshot_residency import verify as verify_snapshot_residency
+snapshot_residency=verify_snapshot_residency()
 from verify_isca2024 import verify as verify_isca2024
 isca2024=verify_isca2024()
 from verify_isca2025 import verify as verify_isca2025
@@ -801,4 +804,5 @@ report['asplos2026']=asplos2026
 report['kv_quantization']=kv_quantization
 report['hybrid_state']=hybrid_state
 report['ascend_components']=ascend_components
+report['snapshot_residency']=snapshot_residency
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors

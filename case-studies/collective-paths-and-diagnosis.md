@@ -28,6 +28,10 @@ vLLM v0.6.0（2024-09）与 v0.9.2（2025-07）选读源码都使用同节点 cu
 
 在第 5 章片内融合之后，第 6 章用真实框架解释跨卡边界：归约结果还要加残差、做 RMSNorm，可能继续量化。融合有机会减少中间张量搬运和 kernel 启动，但必须覆盖原有参与者，并保留后续需要的残差。
 
+2026-09-09 补读 [Diffuse 正文](../references/proceedings/ASPLOS/2025/diffuse-reading.json)，进一步区分三个判断：任务是否可以合并、内部循环是否可以融合、中间存储是否可以删除。论文在已并行化的 cuPyNumeric／Legate 任务上，以分片和访问权限排除跨处理器依赖；临时数组还必须没有后续任务或应用引用。其科学计算实验中只做任务融合没有加速，不能由任务数减少推断 HBM 流量下降。论文使用 A100 集群的弱扩展实验，稳态吞吐与 JIT 预热分开，不是 Qwen3 或推理服务成绩。
+
+沿本章 Qwen3 的 TP 例子，局部投影结果必须先完成所需归约，再做依赖完整输出的归一化。用两维教学向量就能反证错误移动：忽略 epsilon、令缩放权重为 1，`RMSNorm([1,0]+[0,1])=[1,1]`，而先分别归一化再相加得到 `[√2,√2]`。真实带 epsilon 的输入也须保持原语义。带通信的专用融合 kernel 可以在同一次启动中完成归约与归一化，所需通信依赖仍然存在；Diffuse 保守分析不允许跨越的边界，不等于所有通信计算融合都不可能。当前框架的实际条件继续按下述固定源码判断，本轮没有建立它们与 Diffuse 的直接实现继承关系。
+
 vLLM 当前融合文档将小 token 数的 AllReduce＋RMSNorm 与大 token 数的 SP／AsyncTP 分开；后者先改变布局，再让 GEMM 与 AG／RS 重叠。文档的 TP＋DP／PP 问题、架构条件和自动阈值须在实验提交重核，不当作永恒限制；特别不能假设 Qwen3-8B 自动进入文档所述 `hidden_size >= 8192` 的 SP 路径。[固定文档对应原件](../references/framework-history/2026-09-08/collective-paths/vllm-current-fusions.md)
 
 SGLang 当前选读实现也检查硬件、token 数、DP attention、散布布局和是否最后一层。MoE 的 EP 与专家内 TP 同时大于 1 时，不能用只覆盖一个通信组的融合替掉原来两个组的归约；代码因此关闭这一跨层融合。此例直接接回第 6.3 节的分组与数据所有权。[固定层间实现](https://github.com/sgl-project/sglang/blob/c99d906effa8bd05573995127f0d4a0984c5a96a/python/sglang/srt/layers/communicator.py)

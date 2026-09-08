@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 34 份代表 PDF、完成 35 篇原始完整摘要筛选，三篇有声明范围的正文阅读；其余 149 篇摘要未读。本轮新增 11 篇摘要／11 份 PDF，共 180 页，不按连续日程范围冒充已读。只选昇腾单元分析进入现有扩写；Diffuse、CXLfork、PICACHU、DarwinGame 保留正文候选，其余备查或排除。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 34 份代表 PDF、完成 35 篇原始完整摘要筛选，五篇有声明范围的正文阅读；其余 149 篇摘要未读。本轮选读 Diffuse 的物理页 2–13 与 CXLfork 的物理页 2–14，共 25 页，八页图表已查看；未新增摘要或 PDF。各补现有融合与环境恢复的设计判断，不增论文专题。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -18,8 +18,8 @@
 | 15. [Fat-Tree QRAM: A High-Bandwidth Shared Quantum Random Access Memory for Parallel Queries](../../references/proceedings/ASPLOS/2025/public/paper-015.pdf) | 排除 | 量子 QRAM 的叠加态查询与量子比特资源，不能用名称相似替代第 7 章的数据中心 Fat-tree。 |
 | 18. [Earth+: On-Board Satellite Imagery Compression Leveraging Historical Earth Observations](../../references/proceedings/ASPLOS/2025/public/paper-018.pdf) | 备查 | 跨卫星共享历史影像、以有限上行改善差分压缩；第 12 章已有截图／图像案例，暂不增加卫星系统。 |
 | 20. [Nazar: Monitoring and Adapting ML Models on Mobile Devices](../../references/proceedings/ASPLOS/2025/public/paper-020.pdf) | 备查 | 端侧视觉模型的漂移监测与适应，作为第 12／13 章质量反馈备查，不从摘要移植准确率或系统性能。 |
-| 21. [Composing Distributed Computations Through Task and Kernel Fusion](../../references/proceedings/ASPLOS/2025/public/paper-021.pdf) | 候选待读 | Diffuse 跨任务与内核融合可补第 5→6 章接口边界；先核 cuPyNumeric／Legate 的分区与依赖，不能直接称 vLLM 已采用。 |
-| 22. [CXLfork: Fast Remote Fork over CXL Fabrics](../../references/proceedings/ASPLOS/2025/public/paper-022.pdf) | 候选待读 | CXLfork 以共享状态实现远端进程克隆，候选对应第 6／11 章池化与冷启动；需核 CXL 原型、CoW 与服务负载。 |
+| 21. [Composing Distributed Computations Through Task and Kernel Fusion](../../references/proceedings/ASPLOS/2025/public/paper-021.pdf) | 重点阅读并整合 | 物理页 2–13 已读；任务合并、临时存储与跨分片依赖接回 5.3.1／6.4.4。科学计算和固定推理框架分别取证。 |
+| 22. [CXLfork: Fast Remote Fork over CXL Fabrics](../../references/proceedings/ASPLOS/2025/public/paper-022.pdf) | 重点阅读并整合 | 物理页 2–14 已读；共享只读页、写时复制和分层读取接回 11.2／实验 11-2。CPU 进程原型、E2B microVM 和教学预算分开。 |
 | 26. [Enhancing CGRA Efficiency Through Aligned Compute and Communication Provisioning](../../references/proceedings/ASPLOS/2025/public/paper-026.pdf) | 备查 | CGRA 的计算与互联按子图 motif 配比，可作 4／13 的结构取舍备选；先与已有 GPU／昇腾代际案例比较。 |
 | 27. [Squeezing Operator Performance Potential for the Ascend Architecture](../../references/proceedings/ASPLOS/2025/public/paper-027.pdf) | 重点阅读并整合 | 正文物理页 2–14 已读；用单元活动时间和忙时效率补 5.2.3／5.3.5。历史 MindSpore 工作负载、论文算子库声明与当前 vLLM Ascend 分派分开。 |
 | 28. [PICACHU: Plug-In CGRA Handling Upcoming Nonlinear Operations in LLMs](../../references/proceedings/ASPLOS/2025/public/paper-028.pdf) | 候选待读 | PICACHU 以可重构单元加速非线性操作，候选对应第 4／13 章资源配比；需核模型、精度、仿真和实际接口，不从摘要采用加速比。 |
@@ -59,6 +59,14 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 实验以 MindSpore 的 MobileNetV3、100B PanGu-α／128 NPU、7B Llama2／8 NPU 等为对象；正文仅用训练／推理芯片区分，不能替代完整芯片型号、软件版本与输入形状锁定。第 8 页阈值不等式的分子分母与 U=E×R 不一致；第 9／11 页的搬运方向与所归因的 MTE 名称有疑点；第 13 页 59.59 s／83.57% 与后述 72.31 s 分母不同。原稿保留，案例用独立算式；不由排版或文字问题推断作者执行代码一定错误。论文对 GPU 缓存、手工管理和相邻层搬运的概括也不适用于全部现代 GPU。
 
 论文的“41 个算子进入 Ascend 库”保留为作者声明。[固定 vLLM Ascend](../../references/framework-history/2026-09-09/ascend-components/README.md)的六份响应、八个范围覆盖激活入口、310P 条件、profiler 迁移及三段发行说明；尚未验证这些入口与论文优化的一一对应。发行说明中的模型限定、Triton 硬件范围与撤回旧融合提醒实验必须固定组合，不将当前源码存在写成全模型支持。
+
+**Diffuse**：物理页 2–13 共十二页已读，包含设计、评估、相关工作和参考文献起始；14–16 页参考文献未读。图 4、8、9、12／13 所在四页已查看，见[阅读记录](../../references/proceedings/ASPLOS/2025/diffuse-reading.json)。采用的是先检查分片和依赖，再检查内部循环与临时数据生命周期的顺序。它针对已经并行化的 cuPyNumeric／Legate 任务，并不自动为任意程序选择 TP／PP；库开发者需提供 MLIR 生成接口。任务融合单独未在所测负载上加速，临时数据消除和缓存分析缺少独立消融，不能据任务数下降分配各项收益。
+
+论文使用 A100 DGX 节点、科学计算负载与最多 128 GPU 的弱扩展；稳态吞吐排除预热，部分应用需要 25–119 轮摊销编译。CFD 在多卡下因分片别名依赖失去部分融合机会，适合连接第五章与第六章。图 8(d) 算得最终 `%4` 却写回 `%2`，保留原图而不复制为可执行样例；不由排版问题推断作者运行代码错误。以[现有 Qwen3 归约案例](../../case-studies/collective-paths-and-diagnosis.md)的两维归一化反例说明为什么不能越过全局归约；带通信的专用融合仍可合法，不能把该保守分析的拒绝条件扩大成一般不可能性。没有验证 Diffuse 工件与 vLLM／SGLang 的直接实现继承。
+
+**CXLfork**：物理页 2–14 共十三页已读，包含设计、评估、讨论和参考文献起始；15–17 页未读。图 4／5、方法页与图 8／9 所在四页已查看，见[阅读记录](../../references/proceedings/ASPLOS/2025/cxlfork-reading.json)。检查点制作会把数据复制到 CXL，恢复时只读映射与写时复制改变的是后续成本；全局 OS 状态仍需重建。所谓 ghost container 在正文中仍占约 512 KB；只报本地内存减少会漏掉共享池容量。
+
+作者原型为 Linux 6.6、一台双路主机上的两个 VM 和 FPGA CXL 装置，Mitosis-CXL 比较在单 VM 内替代 RDMA。独立函数恢复不含容器和检查点制作；服务突发结果又包含 ghost container 条件差异。正文明确未验证大规模节点和共享带宽，延迟敏感性由校准模拟获得。这些条件不等于生产 E2B microVM 的部署或 GPU 状态恢复。[固定 E2B 缺页调用链](../../references/framework-history/2026-09-09/snapshot-residency/README.md)提供六份响应、十个选读范围：模板读取后安装虚拟机内存，与直接映射共享只读页分开。[同一模板推算](../../case-studies/snapshot-residency-and-first-use.md)独立算并发驻留、共享读取、首次访问粒度，接入 11.2、实验 11-2 与原图 11-3，不采用论文加速比作为当前结果。
 
 ## 尚缺的材料
 

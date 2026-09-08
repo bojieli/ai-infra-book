@@ -744,3 +744,7 @@
 | `asplos25-ascend-components-body` | [昇腾单元分析正文范围](../references/proceedings/ASPLOS/2025/ascend-components-reading.json) | 4、5 | 补充／版本参照 | 历史 MindSpore 与芯片条件、十三页正文和五张实际查看图页 |
 | `ascend-components-framework` | [激活分支与性能采集](../references/framework-history/2026-09-09/ascend-components/README.md) | 5、8、9 | 补充／版本参照 | 固定普通／310P 入口、三段发行说明及 PD 采集；不把接口当作论文工件 |
 | `ascend-components-qwen3-case` | [同一 Qwen3 的单元与流水推算](../case-studies/component-utilization-and-overlap.md) | 4、5 | 扩写 5 | 5.2.3／5.3.5、实验 5-6、图 5-5；R×E、缓冲和资源共享 |
+| `asplos25-diffuse-body` | [Diffuse 正文范围](../references/proceedings/ASPLOS/2025/diffuse-reading.json) | 5、6 | 补充／版本参照 | 十二页正文与四张图页；任务、内核和临时存储的不同边界 |
+| `asplos25-cxlfork-body` | [CXLfork 正文范围](../references/proceedings/ASPLOS/2025/cxlfork-reading.json) | 6、11 | 补充／版本参照 | 十三页正文与四张图页；进程原型、共享页和分层限制 |
+| `snapshot-residency-e2b` | [E2B 模板读取与内存安装](../references/framework-history/2026-09-09/snapshot-residency/README.md) | 11 | 补充／版本参照 | 固定提交、六份响应／十个范围；不将原型当作云服务实现 |
+| `snapshot-residency-case` | [快照恢复与首次访问预算](../case-studies/snapshot-residency-and-first-use.md) | 11 | 扩写 11 | 实验 11-2／图 11-3 的容量、共享带宽与粒度变体 |
