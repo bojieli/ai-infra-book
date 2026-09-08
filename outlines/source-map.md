@@ -735,3 +735,6 @@
 | `asplos26-morphlux-body` | [Morphlux 正文范围](../references/proceedings/ASPLOS/2026/morphlux-reading.json) | 6、7、11 | 补充／版本参照 | 6.4→7.5／7.6→11.3；公开 v3 与正式版本、三种验证层次分开 |
 | `torus-allocation-fixed-artifact` | [资源分配与固定工件](../references/framework-history/2026-09-09/torus-allocation/README.md) | 6、7、11 | 补充／版本参照 | 形状、端口、容量与恢复；NCCL 接口不等于端口收益保证 |
 | `torus-allocation-arithmetic` | [Qwen3 消息与位置枚举](../research/2026-infra-survey/torus-allocation-arithmetic.json) | 6、7、11 | 补充／版本参照 | 现有实验 6-4、7-8、11-3；计算示例不替代物理系统实测 |
+| `asplos26-m2xfp-body` | [M²XFP 正文范围](../references/proceedings/ASPLOS/2026/m2xfp-reading.json) | 4、5、8 | 补充／版本参照 | 4.2.5→5.3→8.4；静态与动态编码、元数据及专用架构条件 |
+| `metadata-quantization-implementations` | [格式与实际实现](../references/framework-history/2026-09-09/metadata-quantization/README.md) | 4、5、8 | 补充／版本参照 | 伪量化、vLLM v0.12.0 与固定当前路径；质量与执行分别核对 |
+| `metadata-quantization-qwen3-case` | [同一 Qwen3 权重的表示](../case-studies/kernel-orchestration-and-quantization.md) | 4、5、8 | 补充／版本参照 | 现有实验 4-2／5-4 与图 4-3；容量、搜索与缓冲推算，不新增编号 |
