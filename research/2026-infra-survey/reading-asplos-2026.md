@@ -2,7 +2,15 @@
 
 编写依据是[当前章节清单](../../outlines/chapters.json)和[草案 22 的依赖](../../outlines/structure.md)。第 8–12 章依次为单实例推理、分布式推理、训练系统、资源调度与运行环境、端边云协同；下面按问题定位，不沿用历史章号。
 
-沿日程逐批筛读，当前 **100 篇完整原始摘要已读，39 篇正文候选、37 篇备查、24 篇排除；68 篇摘要待补。** Shift、SuperOffload、AttenIO、RedFuser、RhymeRL、LOOPRAG 与远端排序论文已完成下述声明范围，其余三十二篇候选正文待读。96 份代表 PDF 共 1,653 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整 PDF 或抽取出来的两页都不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+沿日程逐批筛读，当前 **106 篇完整原始摘要已读，40 篇正文候选、39 篇备查、27 篇排除；62 篇摘要待补。** 八篇候选已完成各自声明的正文范围，另三十二篇待读。102 份代表 PDF 共 1,755 页，包含两份复用原件；另有四页旧 STRAW 与十四页 2022 COGENT 稿单列，不计入会议覆盖。完整下载不自动算成正文已读。[逐项决定](screening-asplos-2026.tsv)、[摘要范围与版本](../../references/proceedings/ASPLOS/2026/public-abstracts.json)和[目录](../../references/proceedings/ASPLOS/2026/README.md)分别保存。
+
+## 配置开销：从 Roofline 回到执行时间线
+
+沿第 131–155 项取得六份作者／机构公开稿，读完六篇完整摘要；另十八项尚缺完整摘要，二十四份出版商 403 响应只记录失败。[本批记录](../../references/proceedings/ASPLOS/2026/program131-screening-notes.json)保留来源和缺口。SQLancer++、RTOSUnit 与 Lobster 暂不纳入主线，Canon 和 CounterPoint 作备查；后者是 Haswell MMU 的计数器研究，不能直接回答 GPU 指标语义。
+
+Configuration Wall 已选读物理页 3–11 及页 12 的 §6.2.1，三个公式／评估页面实际查看；跨栏摘要另核对首页。它把配置字节、参数准备、计算和数据搬移分开，适合补充已有[图执行案例](../../case-studies/graph-execution-tradeoffs.md)。100 段工作在声明条件下从串行 4,000 μs 变成流水 2,020 μs，仅将设备执行加快四倍却只降到 2,005 μs；推导的是瓶颈位置，不能据此宣称真实模型获得同样速度。
+
+论文与框架的距离在于执行接口和验证范围：accfg 需要明确设备状态、副作用及并发配置能力；这不自动证明 vLLM／SGLang 已实现对应 pass。Gemmini 用指令计数与周期假设近似性能，OpenGeMM 用周期模型并关闭内部数据拷贝。原页还同时印有两个运算数，按矩阵形状重新计算的结果与原值分别登记。[页级记录](../../references/proceedings/ASPLOS/2026/configuration-wall-reading.json)保留这些限制。补充只进入现有案例与实验 5-8 的扩写依据，本批不改章节和 skeleton，也不增加编号。
 
 ## 远端排序：等待放在哪里
 
