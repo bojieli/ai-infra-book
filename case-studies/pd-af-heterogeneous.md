@@ -1,6 +1,6 @@
 # 异构推理的两种切分：A100／H20 与 KTransformers
 
-核对日期：2026-09-06。第 10 章分别用 **A100 做 prefill、H20 做 decode** 和 **RTX 4090＋双路 Xeon Gold 6454S 的 KTransformers** 讲解 PD 与 AF 分离。第 4 章先建立设备供给，第 5 章解释具体内核和异步执行，第 9 章给出同实例基线。
+核对日期：2026-09-06。第 9 章分别用 **A100 做 prefill、H20 做 decode** 和 **RTX 4090＋双路 Xeon Gold 6454S 的 KTransformers** 讲解 PD 与 AF 分离。第 4 章先建立设备供给，第 5 章解释具体内核和异步执行，第 8 章给出同实例基线。
 
 ## 首先明确切分的对象
 
@@ -15,7 +15,7 @@
 
 prefill 和 decode 都属于推理。A100 的角色不能只写成“计算”，H20 的角色也不能写成涵盖整个推理的“推理卡”。PD 与 AF 可以组合，组合后仍须逐一核算两类边界的状态和流量。
 
-## 第 10.2 节：A100 prefill＋H20 decode
+## 第 9.2 节：A100 prefill＋H20 decode
 
 ```mermaid
 flowchart LR
@@ -68,7 +68,7 @@ A100 和 H20 上的模型／adapter 身份、token 位置、KV 数据类型、�
 
 机制材料采用 [DistServe](../references/files/papers/distserve.pdf)、[Splitwise](../references/files/papers/splitwise.pdf)、[Mooncake](../references/files/papers/mooncake.pdf)；异构交接的表示与所有权问题参考[固定 v1 研究](../references/files/papers/heterogeneous-pd.pdf)。该研究的生产例是 C600＋Hopper，不把它标作 A100＋H20 的测量。另用 [Bullet](../references/files/papers/bullet.pdf)中 A100／H20 的微基准及同卡协作，检验“必须分离才高效”的假设；其图 8a 是 memory-copy 微基准，不是异构 PD 吞吐。
 
-## 第 10.3 节：4090＋双路 Xeon，以 KTransformers 展开 AF
+## 第 9.3 节：4090＋双路 Xeon，以 KTransformers 展开 AF
 
 KTransformers 适合作为 MoE 异构执行的具体起点。先在图上标明 attention、路由、共享专家、routed experts、其他 dense 层以及 KV 分别放在哪里，再讨论 AF。不能将它概括为“所有 attention 在 GPU、所有 FFN 永远在 CPU”：版本和配置可以让热点专家留在 GPU，也可在 prefill／decode 选择不同执行方式。
 

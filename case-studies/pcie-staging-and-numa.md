@@ -34,7 +34,7 @@ TCCL 是 ASPLOS 2024 的历史研究系统，针对依赖 PCIe 的 GPU 集群搜
 
 第 6 章先按 vLLM／SGLang 的实际分派辨认 custom AllReduce 或 NCCL，再核 NCCL 的实际 transport。NCCL 2.31.2 源码中的 `SHM/direct` 是 GPU 直接访问主机共享缓冲的路径描述，不能见到 `direct` 就判为 GPU 间 P2P。CPU 参与控制、数据经主机内存、CPU 核执行复制，是三个分别核对的问题。
 
-NCCL 官方文档给出共享内存机制的版本边界：2.23 加入 cuMem host allocations；2.24 在 CUDA driver ≥ 12.6、runtime ≥ 12.2 时默认启用；2.26.5 增加可用性检查与回退。固定 2.31.2 分配函数根据当前 GPU 的 HOST_NUMA_ID 选择物理主机内存位置，条件不满足时仍有传统路径。环境、CPU／内存亲和性与实际日志一起决定本次实验如何解释。[官方说明](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/troubleshooting/runtime_and_mpi_issues.html)
+NCCL 官方文档给出共享内存机制的版本边界：2.23 加入 cuMem host allocations；2.24 在 CUDA driver ≥ 12.6、runtime ≥ 11.3 时默认启用；2.26.5 增加可用性检查与回退。固定 2.31.2 分配函数根据当前 GPU 的 HOST_NUMA_ID 选择物理主机内存位置，条件不满足时仍有传统路径。环境、CPU／内存亲和性与实际日志一起决定本次实验如何解释。[官方说明](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/troubleshooting/runtime_and_mpi_issues.html)
 
 这段演进只补充底层通信实现。它没有为三个推理框架各增加一项同名功能，也没有证明新版 NCCL 能消除所有 NUMA 拥塞。
 

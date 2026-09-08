@@ -14,13 +14,13 @@
 | TC-08 | [4.2.5](../../outlines/04-加速器架构.md) | [quantization](report.md#quantization) | 让低精度峰值与可用推理收益建立联系。 |
 | TC-09 | [5.2.2](../../outlines/05-算子与运行时.md) | [quantization](report.md#quantization) | 沿现有 FlashAttention 推导补历史背景。 |
 | TC-10 | [5.4.3](../../outlines/05-算子与运行时.md) | [runtime](report.md#runtime) | 作为主机开销暴露的具体例子，不把全部收益归给 GIL。 |
-| TC-11 | [9.2.1](../../outlines/09-单实例推理.md) | [runtime](report.md#runtime) | 与已有连续批处理互相回指，不重复讲分页机制。 |
-| TC-12 | [9.3.4](../../outlines/09-单实例推理.md) | [speculation](report.md#speculation) | 用已有推测解码收支位置承接模型章。 |
-| TC-13 | [9.5.1](../../outlines/09-单实例推理.md) | [measurement](report.md#measurement) | 作为引擎与设备比较的统一口径。 |
-| TC-14 | [10.2.3](../../outlines/10-分布式推理.md) | [serving](report.md#serving) | 沿现有收益边界计算解释跨层优化。 |
-| TC-15 | [10.5.3](../../outlines/10-分布式推理.md) | [serving](report.md#serving) | 结合已有 PD／AF／内存池组合讨论。 |
-| TC-16 | [12.3.5](../../outlines/12-资源调度与运行环境.md) | [economics](report.md#economics) | 将服务选择与底层成本分开核算。 |
-| TC-17 | [12.5.2](../../outlines/12-资源调度与运行环境.md) | [economics](report.md#economics) | 沿现有任务费用汇总，回收章首的成本问题。 |
+| TC-11 | [9.2.1](../../outlines/08-单实例推理.md) | [runtime](report.md#runtime) | 与已有连续批处理互相回指，不重复讲分页机制。 |
+| TC-12 | [9.3.4](../../outlines/08-单实例推理.md) | [speculation](report.md#speculation) | 用已有推测解码收支位置承接模型章。 |
+| TC-13 | [9.5.1](../../outlines/08-单实例推理.md) | [measurement](report.md#measurement) | 作为引擎与设备比较的统一口径。 |
+| TC-14 | [10.2.3](../../outlines/09-分布式推理.md) | [serving](report.md#serving) | 沿现有收益边界计算解释跨层优化。 |
+| TC-15 | [10.5.3](../../outlines/09-分布式推理.md) | [serving](report.md#serving) | 结合已有 PD／AF／内存池组合讨论。 |
+| TC-16 | [12.3.5](../../outlines/11-资源调度与运行环境.md) | [economics](report.md#economics) | 将服务选择与底层成本分开核算。 |
+| TC-17 | [12.5.2](../../outlines/11-资源调度与运行环境.md) | [economics](report.md#economics) | 沿现有任务费用汇总，回收章首的成本问题。 |
 | TC-18 | [13.2.2](../../outlines/13-架构协同设计.md) | [attribution](report.md#attribution) | 用完整系统解释各项倍率为何不能任意相乘。 |
 
 第 1 章 1.1.3 是引子；第 13 章 13.2.2 回收全线。模型、芯片、运行时与服务各自只承接适合自身的问题。第 6、7 章已有并行和通信推算，第 8 章已有端侧案例，第 11 章已有训练系统，本轮不为覆盖章号而添加重复占位。

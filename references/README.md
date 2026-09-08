@@ -1,6 +1,6 @@
 # 本地参考资料库
 
-对应当前三部分、十三章蓝图。收录原始论文、作者报告、芯片与系统规格、协议以及官方软件文档。资料选取以章节中的具体论证为依据；历史论文与近期报告同时保留。
+对应草案 22 的十三章顺序：方法与需求、硬件与协作、推理训练、任务环境与端边云、综合设计。收录原始论文、作者报告、芯片与系统规格、协议及官方软件文档，按具体论证选用。原件快照保留历史版本；本索引章号采用当前目录。
 
 当前清单 230 项：已保存正文 226 项，其中 PDF 136 份。其余项目的获取状态见文末。
 
@@ -28,7 +28,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 
 写作时先查本地资料，引用具体页码、节号、版本及适用条件。规格、实现和测量分别取证；新证据改变参数时新增或明确更新快照，保留变更原因。
 
-## 第 1 章 认识 AI 基础设施
+## 第 1 章 初识 AI Infra
 
 | 资料 | 本地文件 | 用途 |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388v1) | [原件](files/papers/qwen3.pdf) · [文本](text/qwen3.txt) | Alibaba 公司技术报告；稠密／MoE 配置与 thinking budget，不代填 Qwen3.5 参数 |
 | [Mixtral of Experts](https://arxiv.org/abs/2401.04088v1) | [原件](files/papers/mixtral.pdf) · [文本](text/mixtral.txt) | Mistral 公司模型报告；稀疏激活、专家路由与驻留参数的区别 |
 
-## 第 3 章 训练与推理负载
+## 第 3 章 推理与训练负载
 
 | 资料 | 本地文件 | 用途 |
 | --- | --- | --- |
@@ -359,29 +359,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [昇腾 950 NPU 架构白皮书（官方下载原件）](https://public-download.obs.cn-east-2.myhuaweicloud.com/ascend/%E6%98%87%E8%85%BE950%20NPU%E6%9E%B6%E6%9E%84%E7%99%BD%E7%9A%AE%E4%B9%A6.pdf) | [原件](files/specs/ascend-950-official.pdf) · [文本](text/ascend-950-official.txt) | 作者提供官方 OBS 下载地址；与先前作者提供版本分别保留，差异核对见 UB-ASCEND-NOTES.md |
 | [基于可编程网卡的高性能数据中心系统](https://01.me/files/pubs/bojieli-phd-thesis.pdf) | [原件](files/papers/bojieli-phd-thesis.pdf) · [文本](text/bojieli-phd-thesis.txt)（user_provided） | 李博杰博士论文，2019-05-26；ClickNP 核数预算、KV-Direct PCIe 并发与数据通路；论文测量按原配置引用 |
 
-## 第 8 章 端边云协同
-
-| 资料 | 本地文件 | 用途 |
-| --- | --- | --- |
-| [Deploying Transformers on the Apple Neural Engine](https://machinelearning.apple.com/research/neural-engine-transformers) | [原件](files/documents/apple-ane.html) · [文本](text/apple-ane.txt) | 保留文章年代与实验设备 |
-| [MLX official README](https://github.com/ml-explore/mlx) | [原件](files/documents/mlx.md) · [文本](text/mlx.txt) | Apple Silicon 软件栈 |
-| [Unsloth official README](https://github.com/unslothai/unsloth) | [原件](files/documents/unsloth.md) · [文本](text/unsloth.txt) | 本地训练、运行、量化与导出 |
-| [RFC 9293: Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293) | [原件](files/standards/rfc9293.txt) · [文本](text/rfc9293.txt) | TCP |
-| [RFC 9000: QUIC Transport](https://www.rfc-editor.org/rfc/rfc9000) | [原件](files/standards/rfc9000.txt) · [文本](text/rfc9000.txt) | QUIC 传输 |
-| [RFC 9002: QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002) | [原件](files/standards/rfc9002.txt) · [文本](text/rfc9002.txt) | 丢包与拥塞 |
-| [RFC 3550: RTP](https://www.rfc-editor.org/rfc/rfc3550) | [原件](files/standards/rfc3550.txt) · [文本](text/rfc3550.txt) | 实时媒体 |
-| [RFC 8831: WebRTC Data Channels](https://www.rfc-editor.org/rfc/rfc8831) | [原件](files/standards/rfc8831.txt) · [文本](text/rfc8831.txt) | DataChannel 与 SCTP |
-| [RFC 8836: Congestion Control Requirements for Interactive Real-Time Media](https://www.rfc-editor.org/rfc/rfc8836) | [原件](files/standards/rfc8836.txt) · [文本](text/rfc8836.txt) | 交互媒体目标 |
-| [Robust Speech Recognition via Large-Scale Weak Supervision](https://arxiv.org/abs/2212.04356) | [原件](files/papers/whisper.pdf) · [文本](text/whisper.txt) | ASR 计算与数据流 |
-| [Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech](https://arxiv.org/abs/2106.06103) | [原件](files/papers/vits.pdf) · [文本](text/vits.txt) | TTS 结构；不预设为流式系统 |
-| [计算机网络的新黄金时代（二）](https://01.me/2023/05/new-golden-age-for-network-2/) | [原件](files/documents/network-golden-2.html) · [文本](text/network-golden-2.txt) | 作者素材；广域 |
-| [计算机网络的新黄金时代（三）](https://01.me/2023/06/new-golden-age-for-network-3/) | [原件](files/documents/network-golden-3.html) · [文本](text/network-golden-3.txt) | 作者素材；无线与端侧 |
-| [FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU](https://arxiv.org/abs/2303.06865) | [原件](files/papers/flexgen.pdf) · [文本](text/flexgen.txt) | 卸载与数据移动 |
-| [Snapdragon X Elite Product Brief](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/images/company/news-media/media-center/press-kits/snapdragon-summit-2023/documents/SnapdragonXEliteProductBrief.pdf) | [原件](files/specs/qualcomm-xelite.pdf) · [文本](text/qualcomm-xelite.txt) | 端侧 CPU、GPU、Hexagon 与共享内存；2023 年产品代际 |
-| [MacBook Pro (14-inch, M5) Technical Specifications](https://support.apple.com/en-mide/125405) | [原件](files/specs/apple-m5-macbook.html) · [文本](text/apple-m5-macbook.txt) | 2025 年具体端侧产品；CPU、GPU、Neural Engine 与统一内存，非完整微架构手册 |
-| [Apple M2 Pro and M2 Max launch specifications](https://www.apple.com/newsroom/2023/01/apple-unveils-m2-pro-and-m2-max-next-generation-chips-for-next-level-workflows/) | [原件](files/specs/apple-m2-pro-max.html) · [文本](text/apple-m2-pro-max.txt) | 2023-01-17；M2 Pro 200 GB/s，M2 Max 400 GB/s；本书实机为 M2 Max 38 核 GPU、96 GB |
-
-## 第 9 章 单实例推理
+## 第 8 章 单实例推理
 
 | 资料 | 本地文件 | 用途 |
 | --- | --- | --- |
@@ -434,7 +412,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale](https://arxiv.org/abs/2208.07339v2) | [原件](files/papers/llm-int8.pdf) · [文本](text/llm-int8.txt) | 大模型激活异常值与混合精度分解；低比特存储不等于端到端加速 |
 | [TensorRT LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html) | [原件](files/documents/tensorrt-llm-architecture.html) · [文本](text/tensorrt-llm-architecture.txt) | 官方架构文档快照；作为开源项目实现资料，不标为学术论文 |
 
-## 第 10 章 分布式推理
+## 第 9 章 分布式推理
 
 | 资料 | 本地文件 | 用途 |
 | --- | --- | --- |
@@ -475,7 +453,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale](https://developer.nvidia.com/blog/?p=113961) | [原件](files/documents/dynamo-production.html) · [文本](text/dynamo-production.txt) | 2026 官方技术文章；编排、KV 路由与恢复；厂商比较须保留原条件 |
 | [TensorRT LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html) | [原件](files/documents/tensorrt-llm-architecture.html) · [文本](text/tensorrt-llm-architecture.txt) | 官方架构文档快照；作为开源项目实现资料，不标为学术论文 |
 
-## 第 11 章 训练系统
+## 第 10 章 训练系统
 
 | 资料 | 本地文件 | 用途 |
 | --- | --- | --- |
@@ -506,7 +484,7 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [CUDA Graph Best Practice for PyTorch: CUDA Graph](https://docs.nvidia.com/dl-cuda-graph/cuda-graph-basics/cuda-graph.html) | [原件](files/documents/cuda-graphs.html) · [文本](text/cuda-graphs.txt) | 定义、实例化与执行；区分主机提交和设备启动成本 |
 | [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948v2) | [原件](files/papers/deepseek-r1.pdf) · [文本](text/deepseek-r1.txt) | 公司技术报告；RL 推理模型、长输出与采样负载；不视为 serving 性能报告 |
 
-## 第 12 章 任务调度与运行
+## 第 11 章 资源调度与运行环境
 
 | 资料 | 本地文件 | 用途 |
 | --- | --- | --- |
@@ -537,6 +515,28 @@ PDF 原件位于 `files/`，可搜索文本位于 `text/`；官方网页同时�
 | [AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving](https://arxiv.org/abs/2302.11665v2) | [原件](files/papers/alpaserve.pdf) · [文本](text/alpaserve.txt) | 多模型服务的统计复用；模型并行、放置与 SLO 联合优化 |
 | [Fast Distributed Inference Serving for Large Language Models](https://arxiv.org/abs/2305.05920v3) | [原件](files/papers/fastserve.pdf) · [文本](text/fastserve.txt) | FastServe；输出长度未知下的抢占式调度与 KV 交换 |
 | [How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale](https://developer.nvidia.com/blog/?p=113961) | [原件](files/documents/dynamo-production.html) · [文本](text/dynamo-production.txt) | 2026 官方技术文章；编排、KV 路由与恢复；厂商比较须保留原条件 |
+
+## 第 12 章 端边云协同
+
+| 资料 | 本地文件 | 用途 |
+| --- | --- | --- |
+| [Deploying Transformers on the Apple Neural Engine](https://machinelearning.apple.com/research/neural-engine-transformers) | [原件](files/documents/apple-ane.html) · [文本](text/apple-ane.txt) | 保留文章年代与实验设备 |
+| [MLX official README](https://github.com/ml-explore/mlx) | [原件](files/documents/mlx.md) · [文本](text/mlx.txt) | Apple Silicon 软件栈 |
+| [Unsloth official README](https://github.com/unslothai/unsloth) | [原件](files/documents/unsloth.md) · [文本](text/unsloth.txt) | 本地训练、运行、量化与导出 |
+| [RFC 9293: Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293) | [原件](files/standards/rfc9293.txt) · [文本](text/rfc9293.txt) | TCP |
+| [RFC 9000: QUIC Transport](https://www.rfc-editor.org/rfc/rfc9000) | [原件](files/standards/rfc9000.txt) · [文本](text/rfc9000.txt) | QUIC 传输 |
+| [RFC 9002: QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002) | [原件](files/standards/rfc9002.txt) · [文本](text/rfc9002.txt) | 丢包与拥塞 |
+| [RFC 3550: RTP](https://www.rfc-editor.org/rfc/rfc3550) | [原件](files/standards/rfc3550.txt) · [文本](text/rfc3550.txt) | 实时媒体 |
+| [RFC 8831: WebRTC Data Channels](https://www.rfc-editor.org/rfc/rfc8831) | [原件](files/standards/rfc8831.txt) · [文本](text/rfc8831.txt) | DataChannel 与 SCTP |
+| [RFC 8836: Congestion Control Requirements for Interactive Real-Time Media](https://www.rfc-editor.org/rfc/rfc8836) | [原件](files/standards/rfc8836.txt) · [文本](text/rfc8836.txt) | 交互媒体目标 |
+| [Robust Speech Recognition via Large-Scale Weak Supervision](https://arxiv.org/abs/2212.04356) | [原件](files/papers/whisper.pdf) · [文本](text/whisper.txt) | ASR 计算与数据流 |
+| [Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech](https://arxiv.org/abs/2106.06103) | [原件](files/papers/vits.pdf) · [文本](text/vits.txt) | TTS 结构；不预设为流式系统 |
+| [计算机网络的新黄金时代（二）](https://01.me/2023/05/new-golden-age-for-network-2/) | [原件](files/documents/network-golden-2.html) · [文本](text/network-golden-2.txt) | 作者素材；广域 |
+| [计算机网络的新黄金时代（三）](https://01.me/2023/06/new-golden-age-for-network-3/) | [原件](files/documents/network-golden-3.html) · [文本](text/network-golden-3.txt) | 作者素材；无线与端侧 |
+| [FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU](https://arxiv.org/abs/2303.06865) | [原件](files/papers/flexgen.pdf) · [文本](text/flexgen.txt) | 卸载与数据移动 |
+| [Snapdragon X Elite Product Brief](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/images/company/news-media/media-center/press-kits/snapdragon-summit-2023/documents/SnapdragonXEliteProductBrief.pdf) | [原件](files/specs/qualcomm-xelite.pdf) · [文本](text/qualcomm-xelite.txt) | 端侧 CPU、GPU、Hexagon 与共享内存；2023 年产品代际 |
+| [MacBook Pro (14-inch, M5) Technical Specifications](https://support.apple.com/en-mide/125405) | [原件](files/specs/apple-m5-macbook.html) · [文本](text/apple-m5-macbook.txt) | 2025 年具体端侧产品；CPU、GPU、Neural Engine 与统一内存，非完整微架构手册 |
+| [Apple M2 Pro and M2 Max launch specifications](https://www.apple.com/newsroom/2023/01/apple-unveils-m2-pro-and-m2-max-next-generation-chips-for-next-level-workflows/) | [原件](files/specs/apple-m2-pro-max.html) · [文本](text/apple-m2-pro-max.txt) | 2023-01-17；M2 Pro 200 GB/s，M2 Max 400 GB/s；本书实机为 M2 Max 38 核 GPU、96 GB |
 
 ## 第 13 章 架构协同设计
 

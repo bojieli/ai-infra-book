@@ -1,6 +1,6 @@
 # 从性能反馈到推理、训练优化
 
-2026-09-07 阅读与扩写笔记。对应第 5、9、10、11、12 章，保存问题、证据范围与实验入口，不是已完成的性能报告。[原件与校验值](../references/outline-checks/2026-09-07/execution-feedback/sources.json)。
+2026-09-07 阅读与扩写笔记。对应第 5、8、9、10、11 章，保存问题、证据范围与实验入口，不是已完成的性能报告。[原件与校验值](../references/outline-checks/2026-09-07/execution-feedback/sources.json)。
 
 ## 编译模型与实测反馈
 
@@ -47,14 +47,14 @@ NeMo RL 当前归档文档明确支持 Megatron MoE policy＋vLLM rollout，传�
 
 | 角色 | 本书采用的系统 | 对应位置 |
 |---|---|---|
-| 单实例请求、批处理、KV 和服务入口 | vLLM、SGLang | 9.1–9.3 |
-| 本地模型加载、管理与后端选择 | Ollama，区分具体 runner；MLX／llama.cpp 等按版本核对 | 5.5、9.4 |
-| NVIDIA LLM 执行与服务优化 | TensorRT-LLM，当前公开实现包含 PyTorch 原生路径 | 9.1、9.5 |
-| 通用网络优化与执行 | TensorRT，用于相应图像编码等网络 | 8.1；不是 TensorRT-LLM 的简称 |
+| 单实例请求、批处理、KV 和服务入口 | vLLM、SGLang | 8.1–8.3 |
+| 本地模型加载、管理与后端选择 | Ollama，区分具体 runner；MLX／llama.cpp 等按版本核对 | 5.5、8.4 |
+| NVIDIA LLM 执行与服务优化 | TensorRT-LLM，当前公开实现包含 PyTorch 原生路径 | 8.1、8.5 |
+| 通用网络优化与执行 | TensorRT，用于相应图像编码等网络 | 12.1；不是 TensorRT-LLM 的简称 |
 | 算子与通信库 | FlashInfer、DeepGEMM、DeepEP、NCCL | 5、6、10；不作为完整推理服务 |
-| 多级与共享 KV | SGLang HiCache、LMCache、Mooncake | 10.5 |
-| 训练状态与并行 | FSDP、DeepSpeed、Megatron Core | 11.1–11.4 |
-| RL 流程、rollout 与更新协同 | verl、AReaL、NeMo RL | 11.5；推理后端和训练后端另行注明 |
+| 多级与共享 KV | SGLang HiCache、LMCache、Mooncake | 9.5 |
+| 训练状态与并行 | FSDP、DeepSpeed、Megatron Core | 10.1–10.4 |
+| RL 流程、rollout 与更新协同 | verl、AReaL、NeMo RL | 10.5；推理后端和训练后端另行注明 |
 
 角色依据：[TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/overview.html)、[TensorRT](https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/quick-start-guide.html)、[verl](https://verl.readthedocs.io/en/latest/)。这些是制作备注中的对应表；正文随问题引入系统，不新增产品介绍章。
 
