@@ -35,8 +35,12 @@ for manifest in [*ROOT.glob('references/interviews/*/**/sources.json'),*ROOT.glo
    t=p['derived_text'];b=(ROOT/t['file']).read_bytes();assert len(b)==t['bytes'] and hashlib.sha256(b).hexdigest()==t['sha256']
   if isinstance(p.get('initial_fetch'),dict):
    t=p['initial_fetch'];b=(ROOT/t['file']).read_bytes();assert len(b)==t['bytes'] and hashlib.sha256(b).hexdigest()==t['sha256']
-files=[ROOT/'README.md',ROOT/'references/README.md',*ROOT.glob('research/2026-infra-survey/*.md'),ROOT/'case-studies/multi-lora-serving.md',ROOT/'case-studies/cache-and-reconfiguration.md',ROOT/'case-studies/moe-and-startup.md',ROOT/'case-studies/kernel-and-fleet-efficiency.md',ROOT/'case-studies/framework-evolution.md',ROOT/'references/proceedings/README.md',*ROOT.glob('references/proceedings/*/*/README.md'),*ROOT.glob('references/interviews/*/**/README.md'),*ROOT.glob('references/framework-history/*/*/README.md')]
+files=[ROOT/'case-studies/memory-bandwidth-and-concurrency.md',ROOT/'README.md',ROOT/'references/README.md',*ROOT.glob('research/2026-infra-survey/*.md'),ROOT/'case-studies/multi-lora-serving.md',ROOT/'case-studies/cache-and-reconfiguration.md',ROOT/'case-studies/moe-and-startup.md',ROOT/'case-studies/kernel-and-fleet-efficiency.md',ROOT/'case-studies/framework-evolution.md',ROOT/'references/proceedings/README.md',*ROOT.glob('references/proceedings/*/*/README.md'),*ROOT.glob('references/interviews/*/**/README.md'),*ROOT.glob('references/framework-history/*/*/README.md')]
 files.append(ROOT/'case-studies/chunking-and-state-transfer.md')
+files.append(ROOT/'case-studies/tensor-codec-and-transfer.md')
+files.append(ROOT/'case-studies/parallel-switching-and-state.md')
+files.append(ROOT/'case-studies/stream-order-and-buffer.md')
+files.append(ROOT/'references/proceedings/ISCA/2024/closing/README.md')
 files.append(ROOT/'case-studies/resource-sharing-and-placement.md')
 files.append(ROOT/'case-studies/rl-state-and-reproducibility.md')
 files.append(ROOT/'case-studies/rl-scheduling-and-recovery.md')
@@ -60,6 +64,10 @@ files.append(ROOT/'case-studies/expert-dispatch-and-resizing.md')
 files.append(ROOT/'case-studies/cache-events-and-routing.md')
 files.append(ROOT/'case-studies/weight-handoff.md')
 files.append(ROOT/'case-studies/buffer-capacity-and-data-movement.md')
+files.append(ROOT/'case-studies/host-transfer-and-buffer-lifetime.md')
+files.append(ROOT/'case-studies/kv-quantization-and-execution.md')
+files.append(ROOT/'case-studies/training-offload-and-casting.md')
+files.append(ROOT/'references/framework-history/2026-09-08/training-superchip/README.md')
 links=0
 for p in files:
  for url in re.findall(r'\]\(([^)]+)\)',p.read_text()):
@@ -68,6 +76,57 @@ for p in files:
   if not path.exists():errors.append(['missing link',str(p.relative_to(ROOT)),url])
 ids=re.findall(r'^\| `([^`]+)`',(ROOT/'outlines/source-map.md').read_text(),re.M);assert len(ids)==len(set(ids))
 a=json.loads((ROOT/'research/2026-infra-survey/arithmetic.json').read_text());assert a['adapter_mib']==36*16*(4096+4096+4096+1024)*2/2**20==14.625;assert a['independent_100_requests_kv_gib']==100*8192*147456/2**30==112.5
+# Check transfer times, finite buffer lifetimes and independent resource lanes.
+c=a['host_transfer_teaching'];cfg=json.loads((ROOT/c['config']).read_text())
+assert c['block_bytes']==c['tokens']*cfg['hidden_size']*c['element_bytes']==64*2**20
+for item in c['cases']:
+ t=c['block_bytes']/item['effective_Bps']*1000;assert math.isclose(t,item['copy_ms'])
+ assert math.isclose(item['serial_ms'],c['blocks']*(c['prepare_ms']+t+c['compute_ms']))
+ rows=item['timeline'];assert len(rows)==c['blocks']
+ expected=c['prepare_ms']+c['blocks']*(t+c['compute_ms']) if item['device_slots']==1 else c['prepare_ms']+t+c['compute_ms']+(c['blocks']-1)*max(c['prepare_ms'],t,c['compute_ms'])
+ assert math.isclose(item['pipeline_ms'],expected) and math.isclose(rows[-1]['compute'][1],expected)
+ assert item['host_pool_bytes']==c['host_slots']*c['block_bytes'] and item['device_pool_bytes']==item['device_slots']*c['block_bytes']
+ for i,row in enumerate(rows):
+  assert row['block']==i and row['host_slot']==i%c['host_slots'] and row['device_slot']==i%item['device_slots']
+  for stage,duration in [('prepare',c['prepare_ms']),('copy',t),('compute',c['compute_ms'])]:
+   assert math.isclose(row[stage][1]-row[stage][0],duration)
+   if i:assert row[stage][0]>=rows[i-1][stage][1]-1e-9
+  assert row['copy'][0]>=row['prepare'][1] and row['compute'][0]>=row['copy'][1]
+  if i>=c['host_slots']:assert row['prepare'][0]>=rows[i-c['host_slots']]['copy'][1]-1e-9
+  if i>=item['device_slots']:assert row['copy'][0]>=rows[i-item['device_slots']]['compute'][1]-1e-9
+# Independent per-bank request service: queue drain versus modular-address count.
+bank=a['bank_layout_teaching'];cfg=json.loads((ROOT/bank['config']).read_text())
+assert bank['output_payload_bytes']==bank['tokens']*cfg['intermediate_size']*bank['output_element_bytes']==24*2**20
+assert bank['separate_reorder_extra_bytes']==2*bank['output_payload_bytes']==48*2**20
+assert bank['tile_rows']==bank['tile_cols']==bank['banks']==32
+assert bank['scalar_bytes']==4 and bank['words_per_bank_per_cycle']==1
+for item in bank['cases']:
+ pitch=item['row_pitch_words'];assert item['allocated_bytes']==bank['tile_rows']*pitch*bank['scalar_bytes']
+ for axis in ['row','column']:
+  for fixed in range(32):
+   addresses=[fixed*pitch+lane if axis=='row' else lane*pitch+fixed for lane in range(32)]
+   assert len(set(addresses))==32
+   queues=[[] for _ in range(32)]
+   for address in addresses:queues[address%32].append(address)
+   rounds=0
+   while any(queues):
+    rounds+=1
+    for queue in queues:
+     if queue:queue.pop(0)
+   assert rounds==item[axis+'_service_rounds']
+   assert rounds==(1 if axis=='row' else math.gcd(pitch,32))
+assert bank['padding_extra_bytes']==bank['cases'][1]['allocated_bytes']-bank['cases'][0]['allocated_bytes']==128
+assert bank['padding_extra_fraction']==bank['padding_extra_bytes']/bank['cases'][0]['allocated_bytes']==0.03125
+# Main-post provenance: do not recursively match recommended posts or subject dates.
+fifth=json.loads((ROOT/'references/interviews/2026-09-08/fifth-pass/reading-proof.json').read_text())
+for report in fifth['reports']:
+ soup=BeautifulSoup((ROOT/report['file']).read_bytes(),'html.parser')
+ raw=next(x.get_text() for x in soup.find_all('script') if x.get_text().startswith('window.__INITIAL_STATE__='))
+ data=json.JSONDecoder().raw_decode(raw.split('=',1)[1])[0]['prefetchData']['2']['ssrCommonData']['contentData']
+ assert (data['uuid'],data['title'],data['userBrief']['nickname'],data[report['time_field']])==(report['uuid'],report['title'],report['author'],report['time_value'])
+ expected=data['title']+'\n'+BeautifulSoup(data['content'],'html.parser').get_text('\n',strip=True)+'\n'
+ assert (ROOT/report['body_text']['file']).read_text()==expected
+assert fifth['screening_summary']['usable_full_main_posts']==3
 # Enumerate the tile traversal, independently of the closed-form traffic formula.
 c=a['buffer_capacity_teaching'];cfg=json.loads((ROOT/c['config']).read_text())
 M,K,N=c['tokens'],cfg['hidden_size'],cfg['intermediate_size']
@@ -362,7 +421,9 @@ assert math.isclose(e['drain_seconds'],e['backlog_bytes']/e['net_drain_bytes_per
 assert math.isclose(e['no_new_arrivals_drain_seconds'],e['backlog_bytes']/e['restored_departure_bytes_per_second'])
 assert e['sampled_expected_bytes_per_second']==arrival*e['sample_fraction']
 questions=re.findall(r'^\| (I\d+) ',(ROOT/'research/2026-infra-survey/interview-directions.md').read_text(),re.M)
-assert questions==[f'I{i:02}' for i in range(1,20)]
+assert questions==[f'I{i:02}' for i in range(1,22)]
+from verify_interview_sixth import verify as verify_interview_sixth
+verify_interview_sixth()
 c=a['kv_compression_teaching'];assert c['baseline_seconds']==c['assumed_ttft_seconds']+c['baseline_tokens']/c['baseline_tokens_per_second'];assert c['compressed_seconds']==c['assumed_ttft_seconds']+c['compressed_tokens']/c['compressed_tokens_per_second']
 c=a['reconfiguration_teaching'];assert math.isclose(c['break_even_remaining_steps'],c['transition_seconds']/(c['old_step_seconds']-c['new_step_seconds']));assert c['old_total_seconds']==c['remaining_steps']*c['old_step_seconds'];assert c['new_total_seconds']==c['transition_seconds']+c['remaining_steps']*c['new_step_seconds']
 c=a['plan_reuse_teaching'];assert c['per_layer_total_microseconds']==c['layers']*c['assumed_plan_microseconds'];assert c['shared_plan_microseconds']==c['assumed_plan_microseconds']
@@ -705,8 +766,28 @@ from verify_asplos2025_public import verify as verify_asplos2025_public
 asplos2025_public=verify_asplos2025_public()
 from verify_isca2024 import verify as verify_isca2024
 isca2024=verify_isca2024()
-abstracts_screened_total=sum(p['abstracts_screened'] for p in stats)+sum(p['abstracts_screened'] for p in usenix_reading)+catalog_review['asplos2024']['abstracts_screened']+asplos2025_public['primary_abstracts_screened']+isca2024['primary_abstracts_screened']
-selected_reading_total=sum(p['selected_sections_read'] for p in stats)+sum(p['selected_sections_read'] for p in usenix_reading)+catalog_review['asplos2024']['selected_sections_read']+asplos2025_public['selected_sections_read']+isca2024['selected_sections_read']
+from verify_isca2025 import verify as verify_isca2025
+isca2025=verify_isca2025()
+from verify_kv_quantization import verify as verify_kv_quantization
+kv_quantization=verify_kv_quantization()
+from verify_hybrid_state import verify as verify_hybrid_state
+hybrid_state=verify_hybrid_state()
+from verify_micro2024 import verify as verify_micro2024
+micro2024=verify_micro2024()
+from verify_micro2025 import verify as verify_micro2025
+micro2025=verify_micro2025()
+from verify_asplos2026 import verify as verify_asplos2026
+asplos2026=verify_asplos2026()
+abstracts_screened_total=sum(p['abstracts_screened'] for p in stats)+sum(p['abstracts_screened'] for p in usenix_reading)+catalog_review['asplos2024']['abstracts_screened']+asplos2025_public['primary_abstracts_screened']+isca2024['primary_abstracts_screened']+isca2025['primary_abstracts_screened']+micro2024['primary_abstracts_screened']+micro2025['primary_abstracts_screened']
+selected_reading_total=sum(p['selected_sections_read'] for p in stats)+sum(p['selected_sections_read'] for p in usenix_reading)+catalog_review['asplos2024']['selected_sections_read']+asplos2025_public['selected_sections_read']+isca2024['selected_sections_read']+isca2025['selected_sections_read']+micro2024['selected_sections_read']+micro2025['selected_sections_read']
+abstracts_screened_total+=asplos2026['primary_abstracts_screened']
+selected_reading_total+=asplos2026['selected_sections_read']
 report={'verified_at':datetime.now(timezone.utc).isoformat(),'scope':'Archived and screened phases only; long-running goal remains active. USENIX full physical-volume audit is separate; selected pages checked here.','mlsys':stats,'usenix_reading':usenix_reading,'usenix_catalog_totals':{'papers':usenix_catalog_papers,'volume_pages':usenix_volume_pages,'summary_prose_matches':True},'pdf_bytes':totalbytes,'new_document_local_links':links,'source_map_rows':len(ids),'arithmetic':'passed','pagination_notes':pagination_notes,'conference_entry_discovery':discovery,'catalog_review':catalog_review,'asplos2025_metadata':asplos2025_metadata,'asplos2025_public':asplos2025_public,'abstracts_screened_total':abstracts_screened_total,'selected_reading_total':selected_reading_total,'errors':errors}
 report['isca2024']=isca2024
+report['isca2025']=isca2025
+report['micro2024']=micro2024
+report['micro2025']=micro2025
+report['asplos2026']=asplos2026
+report['kv_quantization']=kv_quantization
+report['hybrid_state']=hybrid_state
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors
