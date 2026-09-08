@@ -1,0 +1,1215 @@
+    O PTIMIZING D EPLOYMENT C ONFIGURATIONS FOR LLM I NFERENCE :
+                      C HALLENGES AND I NSIGHTS
+
+
+                                                  Meta Inference Team 1
+
+
+                                                    A BSTRACT
+     Meta’s Large Language Models (LLMs)—the Llama model family—serve nearly one billion monthly ac-
+     tive users. Deploying these models for inference involves navigating a complex design space that spans di-
+     verse hardware options (e.g., H100, H200, MI300X), multiple parallelism strategies (tensor, pipeline, expert,
+     context, and data parallelism), and nuanced runtime choices (e.g., continuous batching versus prefill-decode
+     disaggregation)—all while leveraging workload-specific characteristics and meeting stringent service level ob-
+     jectives (SLOs). This paper presents insights we gained from developing and applying a systematic approach
+     to analyze millions of deployment configurations and identify those that maximize throughput while meeting
+     latency SLOs. We share lessons learned from our experience operating Llama inference at scale, including
+     trade-offs among runtime designs, the phase-specific nature of parallelism strategies, opportunities for leverag-
+     ing hardware heterogeneity, platform scaling behaviors, and system-level implications of model architectures
+     such as Mixture-of-Experts (MoE). We hope our production experience offers practical insights for the broader
+     LLM inference community.
+
+1   I NTRODUCTION                                               Metrics per query         Llama3 70B            Recommendation
+                                                                                    (2K Input, 150 Output, 64    (Rank 4K Items)
+Large Language Models (LLMs), such as Llama (Touvron                                        Batched)
+et al., 2023; Dubey et al., 2024), GPTs (Radford et al.,        FLOPs                     8 EFLOPs+              < 2.5 TFLOPs
+2018; 2019; Brown et al., 2020; Achiam et al., 2023), and       Memory traffic              10TB+                  < 400GB
+                                                                System time               Few seconds             < 100 ms
+Gemini (Comanici et al., 2025), have demonstrated excep-
+tional capabilities across diverse tasks, transforming natu-
+                                                                Table 1: Workload characteristics of Llama3 70B and pro-
+ral language processing (Yang et al., 2023; Wei et al., 2022;
+                                                                duction recommendation models.
+Chen et al., 2021; Liu et al., 2021; Zhang et al., 2019).
+Multi-modal models (Alayrac et al., 2022; Achiam et al.,        active users across various product surfaces (lla, 2025).
+2023) extend these capabilities to understanding and gen-       Through optimizing LLM inference systems for use cases
+erating content across audio, images, and video.                ranging from interactive agents to offline data processing,
+With the availability of powerful open-source                   we accumulated insights that we retrospectively document
+LLMs (Yan, 2024) such as Llama (Dubey et al., 2024),            in this paper. We share the challenges of navigating a vast
+DeepSeek (DeepSeek-AI, 2024), Qwen (Qwen Team,                  design space, the exploration methodology we developed
+2024), and Grok (Grok, 2024), organizations are inte-           to systematically evaluate design options, and the core in-
+grating LLM inference into their products. However,             sights gained throughout the optimization process.
+operating such systems is a high-risk, business-critical task   The challenge. The complexity of building LLM inference
+due to substantial costs. As shown in Table 1, serving a        systems arises from the interaction of three factors.
+single request with Llama3 70B is orders of magnitude           (1) Diverse application requirements: Systems must sup-
+more expensive than deploying a typical recommendation          port a wide range of workload characteristics (input/output
+model (Naumov et al., 2019), necessitating efficient system     lengths, context accumulation, multi-modality) and Ser-
+designs.                                                        vice Level Objectives (SLOs), such as Time-To-First-
+At Meta, Llama empowers nearly one billion monthly              Token (TTFT) and Time-To-Incremental-Token (TTIT) la-
+   The full list of authors is in the Appendix. 1 Meta Plat-    tencies, and throughput. For instance, optimizing for
+forms, Inc.. Correspondence to: Sungmin Cho <sungmin-           low-latency chatbots requires different configurations than
+cho@meta.com>, Jaewon Lee <jaewon@meta.com>.                    high-throughput offline data scoring.
+                                                                (2) Combinatorial design space parameters: Deploying
+Proceedings of the 9 th MLSys Conference (Industry Track),
+                                                                LLMs involves a wide range of decisions: selecting
+Bellevue, WA, USA, 2026. Copyright 2026 by the author(s).
+                                                                hardware accelerators (e.g., NVIDIA H100/H200 (Cho-
+                                 Optimizing Deployment Configurations for LLM Inference
+
+quette, 2023; NVIDIA Corporation, 2024b), AMD
+MI300X (Smith & Alla, 2025)) with different com-
+pute/memory profiles and costs, choosing parallelism
+strategies (Tensor, Pipeline, Expert, Context, Data, or hy-
+brids), designing the runtime and scheduling system (e.g.,
+continuous batching vs. disaggregating prefill and decode                  Figure 1: Lifecycle of an LLM query.
+phases), and selecting model and system optimization tech-      2.1.1 Lifecycle of an LLM Query
+niques trading off quality and speed. Finding the right         Figure 1 shows the LLM inference lifecycle with prefill and
+combination balancing SLO, cost, and quality is extremely       decode phases. Their different computational characteris-
+challenging.                                                    tics necessitate distinct optimization strategies across hard-
+(3) Rapid pace of innovation: LLMs evolve rapidly with          ware, parallelism, and runtime design.
+new model architectures (e.g., MoE, multi-head latent at-       Prefill processes potentially long input sequences, which
+tention (Liu et al., 2024a; DeepSeek-AI et al., 2024)) and      makes it a compute-bound operation, demanding high com-
+optimization techniques. These innovations require re-          pute throughput and dictating TTFT. Decode generates to-
+evaluation of optimal system configurations, making man-        kens one-by-one, making it memory-bandwidth bound due
+ual or heuristic approaches unsustainable.                      to repeated weight and KV cache access. Low TTIT re-
+The exploration. While specific optimizations (Section 5),      quires sophisticated batching to amortize memory costs,
+simulations (Agrawal et al., 2024a; Cho et al., 2024), and      introducing scheduling trade-offs (Section 4.2). Context
+analyses (Yuan et al., 2024) offer valuable insights, sys-      accumulation in interactive sessions grows KV cache size,
+tematically exploring the vast configuration space to opti-     increasing costs for both phases, which requires techniques
+mize large-scale LLM inference remains challenging. To          like Persistent KV cache (Gim et al., 2024) to deduplicate
+address this, we developed a lightweight performance sim-       computation.
+ulator for systematic design space exploration (Section 3).
+Built on empirical operator benchmarks, our simulator           2.1.2 Attributes Defining LLM Applications
+rapidly projects end-to-end performance (latency, through-      Systematically addressing the diverse landscape of LLM
+put) across millions of deployment configurations (hard-        use cases requires defining key workload attributes (Ta-
+ware, parallelism, runtime). This enables data-driven selec-    ble 2).      The variability and interplay of these at-
+tion of cost-effective systems tailored to production work-     tributes present significant system design challenges: In-
+loads and SLOs.                                                 put/output/context length dictate computational load for
+The insights. Our experience yielded key insights (Sec-         prefill and decode. Their extreme variability in production
+tion 4) for optimizing LLM inference system deployments,        (Figure 2), coupled with hidden costs like system prompts
+with throughput improvements up to ∼ 2.5×.                      and multi-generation, pose significant challenges for re-
+Specifically, we discuss 1) runtime design trade-offs, 2) the   source allocation and parallelism selection. Latency SLOs
+importance of parallelism strategy, 3) cost-saving oppor-       (TTFT/TTIT) need to be met while minimizing inference
+tunities through heterogeneous hardware, 4) system-level        costs, which becomes a prohibitively expensive task given
+implications of new model architectures such as Mixture-        different products operate with different SLOs. Model size
+of-Experts (MoE), and 5) the impact of hardware infras-         trades quality vs. cost; larger models may deliver higher
+tructure scaling options.                                       quality but require complex parallelization and multi-host
+                                                                infrastructure (Section 4.3). Session-based context accu-
+2   C HALLENGES OF C ONSTRUCTING LLM                            mulation benefits from persistent KV caching, but intro-
+    I NFERENCE S YSTEMS                                         duces significant system complexity involving cache man-
+Designing LLM inference systems requires navigating             agement. Additional factors like multi-modality, real-time
+challenges from the interplay between workload charac-          patterns, output constraints further differentiate workloads.
+teristics, infrastructure choices, and optimization options.    2.1.3 Representative Applications
+This section categorizes challenges into workload (Sec-         Agents: Interactive agents demand strict TTFT/TTIT
+tion 2.1), infrastructure (Section 2.2), and optimization       SLOs, crucial for user engagement. However, they of-
+(Section 2.3) dimensions.                                       ten exhibit a wide range of input/output lengths. Multi-
+2.1 Workload Challenges                                         modal agents add extra complexity via large media inputs,
+                                                                though upload overhead may relax TTFT constraint. Real-
+Production workloads exhibit extreme variability, with
+                                                                time agents (e.g., voice) must meet extremely tight latency
+each use case dictating different optimization goals based
+                                                                SLOs and potentially undefined input boundaries (e.g. con-
+on distinct computational patterns.
+                                                                tinuous voice stream). Helper models: Background tasks
+                                                                like content safety checking or query rewriting use smaller
+                                                                models. Input lengths can vary widely due to variety of
+                                           Optimizing Deployment Configurations for LLM Inference
+
+↓ Service | Attribute →     Input length      Output          Context     TTFT         TTIT        Model size     Multi-          Session-
+                                              length          length                                            Generation         based
+Text agent                    500-2K          100-500         <128K     200-500ms      <40ms       10-500B          Y                Y
+Multi-modal agent            MM/Text          100-500         <128K     300-800ms      <40ms       10-500B          Y                Y
+                              500-2K
+Real-time agent                 <50           50-100           <32K      <200ms        <30ms       10-100B          N                Y
+Safety                          <8K             Few       =Input         <200ms         N/A           10B           N                N
+Query generation                <8K           100-500     =Input         <200ms        <10ms          10B           N                N
+Data augmentation               <8K             <1K            <32K      Few sec      <300ms      100B-500B         Y                Y
+Data scoring                   <32K             Few       =Input           N/A          N/A       100B-500B         N                N
+
+
+Table 2: Characterization of diverse production LLM application scenarios and their typical attribute ranges. These varia-
+tions significantly impact optimal LLM inference system design.
+
+
+
+
+               (a) 1-minute average input tokens over time.
+                                                                                                (b) Strong scale-
+                                                                            (a) Weak scale-out. out.                    (c) Scale-up.
+
+                                                                          Figure 3: Hardware platform architectures with different
+                                                                          trade-offs.
+
+             (b) Histogram of input and output token length.              2.2 Infrastructure Challenges
+                                                                          Infrastructure choices span hardware platforms, runtime
+Figure 2: Input/Output token lengths from production,                     systems, and parallelization strategies.
+showing high variability.
+                                                                          2.2.1 Hardware Platform
+                                                                          Hardware accelerators differ in compute, memory, and
+                                                                          interconnect characteristics. Production datacenters host
+                                                                          multiple platform types (Figure 3): Weak scale-out (PCIe-
+applications, but output lengths are typically more con-                  connected) suits smaller models cost-effectively. Strong
+strained and deterministic (e.g., classification, structured              scale-out uses high intra-host bandwidth (e.g., NVLink)
+generation, etc). Their SLOs are very tight since they sit in             with moderate inter-host links, balancing scalability and
+the critical path between primary LLMs and external enti-                 cost. Scale-up employs custom high-bandwidth inter-
+ties. Offline processing such as data generation, augmen-                 connects (e.g., TPU pods (Jouppi et al., 2023), NVLink
+tation, and scoring (Dubey et al., 2024; Xu et al., 2024;                 Switch (Tirumala & Wong, 2024)) for peak performance
+Ouyang et al., 2022) are typically latency-tolerant, allow-               at higher cost. Wrong platform choice may cause 2 − 3×
+ing the use of large, high-quality models along with bigger               cost inefficiency or SLO failures (Section 4.6).
+batches mostly optimized for throughput.
+                                                                          2.2.2 LLM Inference Runtime Design
+2.1.4 Production Characterization Challenges                              Runtime complexity stems from managing concurrent re-
+Real-world LLM workloads exhibit high variability beyond                  quests. Figure 4 shows two approaches. Continuous batch-
+those already laid out in Table 2. Figure 2 illustrates that,             ing (Yu et al., 2022; Daniel et al., 2023) executes mixed pre-
+while we can consider a text agent to have about ∼2K input                fill/decode tasks in unified iterations, maximizing utiliza-
+tokens based on 1-minute average (Figure 2a), the actual                  tion but coupling phases; large prefills can delay decode,
+distribution (Figure 2b) spans from brief queries to lengthy              violating TTIT SLOs. Disaggregated approaches (Zhong
+documents. This variability, multiplied across all attributes             et al., 2024; Qin et al., 2024) use separate prefill/decode
+in Section 2.1.2, creates unpredictable patterns, requiring               pools for phase-specific optimization and better SLO pre-
+robust systems built with precise performance modeling                    dictability (Section 4.2), but add complexity: pool sizing,
+and systematic exploration (Section 3).                                   KV cache transfer, and potential underutilization.
+                                  Optimizing Deployment Configurations for LLM Inference
+
+
+
+
+                                                                       (a) Persistent KV cache reducing prefill costs.
+
+
+
+
+Figure 4: Runtime handling concurrent queries via contin-
+uous batching or disaggregation.
+                                                                     (b) Rooflines for tiered accelerator memory setups.
+
+                                                                 Figure 6: Performance impact of LLM optimizations.
+
+                                                               2.3.1 Model-level Optimizations
+      (a) 5D parallelism of LLM inference & trade-offs.        Architectural innovations like MLA (Liu et al., 2024a) or
+                                                               Mamba (Gu & Dao, 2023) alter compute profiles, requiring
+                                                               architecture-system co-design iterations. Model compres-
+                                                               sion reduces computational/memory demands via pruning,
+                                                               distillation (Blog, 2024), or quantization (FP8/INT8) (Xiao
+                                                               et al., 2023a). Quantization strongly impacts performance-
+                                                               cost tradeoffs by leveraging hardware acceleration and
+                                                               reducing memory bandwidth requirements; emerging 4-
+                                                               bit formats (NVIDIA Corporation, 2024a) promise further
+                                                               gains. Each compression technique trades compression ra-
+     (b) Example prefill parallelization scenario, using       tio, quality, and hardware efficiency, potentially enabling
+     TP2DP2CP2 (Attention) and TP2EP4 (FFN).                   larger batches or reduced parallelism, necessitating system
+                                                               re-optimization.
+Figure 5: Types of LLM parallelism and an example sce-
+                                                               2.3.2 System-level Optimizations
+nario.
+                                                               KV cache management: KV cache memory grows with
+2.2.3 Parallelization Strategies                               context length. Persistent caches (Gim et al., 2024) reuse
+Figure 5 shows five parallelism types with trade-offs: Ten-    stored KV for repeated prompts (Figure 6a), reducing
+sor Parallelism (TP) (Shoeybi et al., 2019) shards pa-         prefill costs but adding memory management complexity.
+rameters across devices, improving latency/throughput but      Paged caches (Kwon et al., 2023) reduce fragmentation via
+requiring high-bandwidth interconnects. Pipeline Par-          non-contiguous blocks with page management overhead.
+allelism (PP) (Lepikhin et al., 2020; Shoeybi et al.,          Eviction/compression (Li et al., 2024b; Zhang et al., 2023;
+2019) chunks layers sequentially, improving throughput         Xiao et al., 2023b; Hooper et al., 2024) trade quality for
+with manageable communication. Expert Parallelism              memory efficiency.
+(EP) (Lepikhin et al., 2020; Du et al., 2022) distributes      Tiered memory: Modern platforms offer host DRAM (via
+MoE experts using All2All, but may suffer load imbalance.      NVLink C2C (nvg) or PCIe) beyond HBM. This enables
+Context Parallelism (CP) (Liu et al., 2023; Yang et al.,       hosting much larger models via weight/KV cache offload-
+2024) partitions sequences, beneficial for long-context pre-   ing techniques. However, its effectiveness depends on
+fill. Data Parallelism (DP) (Rajbhandari et al., 2020)         achieving sufficient arithmetic intensity. Figure 6b shows
+replicates weights for independent batch processing when       NVLink C2C links need ∼2K tokens to amortize offload-
+other schemes incur excessive communication.                   ing costs; PCIe needs up to 64K tokens.
+                                                               Speculative decoding (Leviathan et al., 2023; Miao et al.,
+2.3 Optimization Challenges                                    2023b) uses draft models for candidate proposals, trading
+Optimization techniques alter performance but introduce        draft accuracy and validation overhead for latency reduc-
+trade-offs requiring systematic evaluation.                    tion.
+                                           Optimizing Deployment Configurations for LLM Inference
+
+   Notation     Meaning                                                          Operator Performance Model F builds interpola-
+   M            LLM model as a computational graph.                              tor/extrapolator F(op, H, shape) from measurements.
+   D            Request distribution specifying input/output lengths, max        Multi-dimensional piecewise-linear interpolation provides
+                context length, and session behavior.                            superior accuracy to analytical models.
+   H            Hardware setup: Choice of accelerators, platforms, and           Model Assembly instantiates operators with shapes from
+                networks.                                                        P and D, queries F for latencies, sums along critical paths
+   P            Parallelization choices (PP, TP, CP, EP, and DP), e.g.,          including communication and runtime overheads, yielding
+                PP2-DP2TP4-TP8 means PP=2, Attention=DP2+TP4,
+                FFN=TP8.                                                         end-to-end latencies for prefill and decode.
+   R            Runtime config: continuous batching, prefill-decode disag-       3.3 End-to-End Performance Exploration
+                gregation, max batch size, KV-cache policies (e.g., paged,
+                persistent).                                                     Runtime-Specific Metrics calculates SLO metrics based
+   L            Latency SLOs (LT T F T , LT T IT ).                              on R. Continuous batching couples prefill/decode on
+   TTFT(·)      Estimated TTFT given M, D, H, P, R.
+                                                                                 shared resources; TTFT depends on prefill, TTIT on mixed
+                                                                                 prefill/decode latency. Disaggregated inference uses inde-
+   TTIT(·)      Estimated TTIT given M, D, H, P, R.
+                                                                                 pendent pools; TTFT/TTIT determined by respective pool
+   QPS(·)       Estimated throughput, i.e., queries per second (QPS), given
+                M, D, H, P, R. QPScluster represents normalized
+                                                                                 performance. QPScluster is derived by finding optimal pre-
+                throughput for a certain cluster size, e.g., 256 accelerators.   fill and decode configurations independently, then comput-
+                                                                                 ing the accelerator ratio that balances their processing rates.
+      Table 3: Variables used in problem formulation.                            Search Space Pruning. To handle millions of configu-
+3 E XPLORING I NFERENCE S YSTEM                                                  rations, we prune early: configurations violating hard-
+     D ESIGNS                                                                    ware constraints (memory capacity) or SLO targets are
+A systematic approach was essential for addressing the                           discarded, and we focus on power-of-two parallelism de-
+complex, multi-faceted optimization problem described in                         grees matching standard 8-GPU topologies. The frame-
+Section 2. We now describe how we navigated multi-                               work supports arbitrary counts for non-standard topologies
+million design choices to identify optimal configurations.                       (e.g., GB200 NVL72).
+                                                                                 Systematic Search iterates through the pruned (H, P, R)
+3.1 Formal Problem Formulation                                                   combinations, generating a ”performance landscape” map-
+We formalize LLM inference optimization (symbols in Ta-                          ping configurations to TTFT, TTIT, QPScluster .
+ble 3) maximizing throughput subject to latency SLOs as:                         Dynamic and Extended Modeling. Beyond static config-
+                                                                                 urations, the framework models speculative decoding (scal-
+            max         QPScluster (M, D, H, P, R)
+       M,D,H,P,R                                                                 ing batch sizes by draft tokens and acceptance rates; incor-
+       subject to    TTFT(M, D, H, P, R) ≤ LT T F T                              porating empirically observed acceptance rates) and MoE
+                                                                                 expert routing (using empirical token distributions to cap-
+                     TTIT(M, D, H, P, R) ≤ LT T IT
+                                                                                 ture load imbalance, see Section 4.5). Energy optimization
+For each service scenario (D), we typically examine sev-                         is supported by modeling power-capped accelerators as dis-
+eral models and hardware platforms (M, H) with dozens                            tinct hardware types; TCO incorporates hardware costs,
+to hundreds of total runtime configurations (R; dozens of                        power, and operational factors.
+batch sizes × several optimization technique combinations                        SLO-Aware Ranking: Configurations violating the la-
+× prefill and decode), already yielding 1000+ combina-                           tency SLOs (LT T F T , LT T IT ) are filtered out. The remain-
+tions. On top of that, for parallelization (P), we set PP                        ing valid configurations are ranked based on the optimiza-
+first and explore the rest of 5D parallelism (TP, DP, EP, CP)                    tion objective (e.g., highest QPScluster ). This allows iden-
+for Attn and FFN each (Figure 5b) for 128–256 accelerator                        tification of Pareto-optimal frontiers and the corresponding
+cards, leading to another ∼1000 combinations. The total                          best configuration under given constraints (e.g., hardware
+number of combinations therefore often reaches the order                         availability and cost budgets).
+of millions.
+                                                                                 3.4 Evaluation of the Simulator
+3.2 Operator and Block Modeling                                                  Accuracy: Figure 8 compares estimated latency against
+Solving the problem formulation above requires accurately                        real hardware measurements. The estimated latencies
+estimating the performance metrics for any configuration                         across diverse operators and parallelism setups align
+(M, D, H, P, R). We developed a lightweight perfor-                              closely with measured values, typically within a ±5% er-
+mance simulation framework illustrated in Figure 7, which                        ror margin. Such high accuracy stems from the simulator’s
+achieves this via a bottom-up modeling approach.                                 benchmark-driven nature; the majority of performance es-
+Micro-benchmarking profiles operators (GEMM, atten-                              timations are minor interpolations of real hardware mea-
+tion, AllReduce, AlltoAll) on hardware H across input                            surement results. While non-deterministic factors like net-
+shapes, keeping 100K+ results per hardware.                                      work jitter can affect P99 tail latencies, our approach reli-
+                                              Optimizing Deployment Configurations for LLM Inference
+
+          Input Configurations                   Performance Database        Model Performance Estimator             Model Performance Estimator
+
+              Model ℳ            Requests 𝒟             Micro                                                             QPS/TTFT/TTIT
+                                                                               Model Partition
+                                                     Benchmarks                                                           estimation on
+                                                                                  (ℳ, 𝒫)
+                                                                                                                              (ℛ, 𝒟)
+            Hardwares ℋ      Parallelisms 𝒫          Production
+                                                    Performance                 Perf model ℱ                               Constraints     Maximize
+                                                                                                      Execution                           Throughput
+             Runtimes ℛ           SLOs ℒ              Samples           DB                                                   (ℒ, ℋ)
+                                                                                                        Graph
+
+
+
+                                           Figure 7: Lightweight LLM inference performance simulator.
+
+
+                                                                                Hardware          TF/s      TB/s     GB       Topology (intra/inter-host bandwidth)
+                                                                                GPU-A             1000      2.4      90       Scale-out (450GB/s, 50GB/s)
+                                                                                GPU-B             1000      4.8      141      Scale-out (450GB/s, 50GB/s)
+                                                                                GPU-C             850       5.2      192      Scale-out (448GB/s, 50GB/s)
+                                                                                                  1800      7.7      189      Scale-out (900GB/s, 50GB/s)
+                                                                                NextGen
+                                                                                                                              Scale-up (900GB/s, 100GB/s)
+
+
+                                                                              Table 4: Hardware Platforms (H) used in the case studies.
+Figure 8: Comparison of simulation (S) and measurement                          Variable         Values Explored
+(M) results for various parallelism scenarios.                                  M                Llama3 (70B, 405B), MoE variants (405B, 1.8T hypothetical). All
+                                                                                                 assumed FP8 precision for FFN weights unless stated.
+                                                                                D                Varied per scenario (Online: 2K input, 150 output, 8K context;
+ably predicts median and mean performance for production                                         Offline: 2K input, 1K output, 8K context; etc.).
+
+deployment decisions.                                                           H                GPU-A, GPU-B, GPU-C (Current Gen Scale-out, 8 cards/host),
+                                                                                                 Next-Gen (Scale-out 8 cards/host, Scale-up 64 cards/pod). Projec-
+                                                                                                 tions for Next-Gen.
+
+Speed: Our lightweight benchmark-powered simulator is                                            Up to 256 cards. Powers-of-2 parallelism degrees.
+                                                                                P
+                                                                                                 Combinations of PP, TP, DP (for Attention/FFN), EP (for FFN).
+extremely fast in exploring the design space, leveraging
+                                                                                                 Run Types: Continuous batching (cont.batch) or Disaggre-
+caches and multiprocesses to reduce runtime to several                          R
+                                                                                                 gated inference (disagg).
+minutes, which is much faster than cycle-level, analytical,                                      Batch Sizes: Prefill=1 (typical for online); Decode=1 to 4096.
+                                                                                                 KV cache: Persistent KV for session-based workloads.
+or ML-based simulators (Yuan et al., 2024; Agrawal et al.,
+2024a; Qi et al., 2017).
+                                                                                    Table 5: LLM inference scopes for the case studies.
+                                                                             4.2      Runtime Design Trade-offs (Latency vs. QPS)
+Emulating Future Hardware: For future hardware that
+                                                                               Insight: Disaggregated runtimes excel for online scenarios with
+we cannot benchmark, we upload simulation-based oper-                          strict latency constraints, while continuous batching suffices for
+ator performance estimations to our database. This pro-                        offline throughput-oriented workloads.
+vides decent fidelity given LLMs have limited operator
+types (typically dozens) and minimal caching effects be-                       Impact: Meta migrated the majority of online services to disag-
+tween operators.                                                               gregated runtime to gain around 30% capacity savings, while still
+                                                                               leveraging continuous batching for offline services.
+4   K EY I NSIGHTS FROM C ASE S TUDIES                                       The choice of runtime architecture (R), specifically con-
+We now present the five key insights previewed in Sec-                       tinuous batching (cont.batch) versus disaggregated in-
+tion 1, which we derived from our experience and believe                     ference (disagg), significantly impacts performance de-
+provide guidance for designing efficient LLM inference                       pending on the target SLOs (L). To quantify these
+systems.                                                                     trade-offs, we used our simulator (Section 3) to identify
+                                                                             the optimal configurations for online inference targeting
+4.1 Experimental Setup                                                       representative strict latency SLOs (LT T F T , LT T IT ) for
+Target hardware is detailed in Table 4, covering scale-                      both Llama3 70B and 405B models across various hard-
+out platforms (Figure 3b) and next-gen scale-up platforms                    ware platforms (H). Table 6 summarizes these results,
+(Figure 3c). The target models and inference scenar-                         showing the best achievable throughput (QPScluster ) for
+ios are described in Table 5. Our discussions reflect the                    both disaggregated (disagg) and continuous batching
+models and setups we worked with during this deploy-                         (cont.batch) runtimes (R) while meeting the latency
+ment period. All results are from our simulation frame-                      constraints.
+work (Section 3). We evaluate configurations meeting la-                     As shown in Table 6, for online inference with strict latency
+tency SLOs (LT T F T , LT T IT ) while maximizing through-                   targets, disagg consistently achieves higher throughput
+put (QPScluster , normalized per 256 accelerators).                          while meeting SLOs. For 70B, disagg is 1.5-1.8x higher
+                                                     Optimizing Deployment Configurations for LLM Inference
+
+  Hw       Runtype                Setup                 Dec. BS    TTFT        Prefill    QPS
+                                                                  / TTIT   / Decode QPS
+                                          70B Llama3
+            Disagg      Prefill PP4-TP2 Decode TP8       112      205/29     625/826      356
+ GPU-A
+           Cont.Batch               TP8                   28       95/30        -         198
+            Disagg      Prefill PP4-TP2 Decode TP8       128      205/28     625/974      381
+ GPU-B
+           Cont.Batch             PP2-TP4                 16      134/27        -         246
+            Disagg      Prefill PP4-TP2 Decode TP8       128      233/29     549/927      345
+ GPU-C
+           Cont.Batch             PP2-TP4                 16      143/27        -         248
+            Disagg        Prefill PP8 Decode TP8         224      214/29    1198/1660     696
+                                                                                                (a) Prefill performance for various parallelism setups (70B, 2K
+Next-Gen
+           Cont.Batch             PP2-TP4                 32       86/29        -         469   Tokens, GPU-A).
+                                          405B Llama3
+            Disagg        Prefill TP8 Decode TP8          16      365/44      88/77       41
+ GPU-A
+           Cont.Batch               TP8                    4      367/42        -         19
+            Disagg        Prefill TP8 Decode TP8          56      365/43      88/276      67
+ GPU-B
+           Cont.Batch               TP8                    8      369/43         -        37
+            Disagg        Prefill TP8 Decode TP8          56      375/43      85/277      65
+ GPU-C
+           Cont.Batch               TP8                    8      380/41         -        39
+            Disagg      Prefill PP2-TP4 Decode TP8       128      349/43     183/638      142
+Next-Gen
+           Cont.Batch               TP8                   16      226/42        -          78
+                                                                                                (b) Decode performance for various parallelism setups (70B, 8K
+Table 6: Optimal online inference setups for Llama3 70B                                         Context 150 Outputs, GPU-C, BS=64).
+and 405B under strict latency targets. Each QPS denotes
+QPScluster .
+than cont.batch; for 405B, the gap widens to 1.8-2.2x.
+This stems from two factors: (1) independent optimiza-
+tion of prefill/decode resources and parallelism (P), avoid-
+ing cont.batch compromises (Section 4.3); (2) signifi-                                             (c) Decode performance for various batch sizes (70B, 8K
+cantly larger decode batch sizes (e.g., 112 vs 28 for 70B on                                       Context 150 Outputs, GPU-C, TP=8).
+GPU-A; 56 vs 8 for 405B on GPU-B) without impacting
+TTIT.                                                                                           Figure 9: Online Inference Latency. QPScluster is shown.
+Conversely, for offline generation (Table 7), where                                                            RmsNorm        Attn       Eltwise     FFN      PP Comm.
+
+                                                                                                            Prefill PP8
+throughput is the sole objective, the gap diminishes.                                                      (QPS=134)
+
+Both converge to deep PP with very large batches. For                                                    Decode PP32
+                                                                                                    (BS=1280, QPS=87)
+70B on GPU-C, cont.batch even slightly outperforms                                                                        0          1,000         2,000        3,000
+disagg. Given disagg’s operational complexity, con-                                                                                            Latency (ms)
+
+tinuous batching often becomes more practical for latency-
+insensitive tasks.                                                                              Figure 10: Offline inference Prefill and Decode perfor-
+                                                                                                mance (405B on GPU-A, at ideal setup, QPScluster ).
+4.3      Actively Leveraging Parallelism Strategy                                               Parallelism (CP) becomes relevant for extremely long se-
+Insight: Parallelism has a huge impact on overall service                                       quences, not shown here).
+throughput due to nontrivial communication overheads. If SLO
+                                                                                                Decode Parallelism: For online decode (70B, 8K context,
+is easy to meet, setups incurring lower communication overhead
+help recoup throughput. Disaggregated runtime can further lever-                                GPU-C), performance hinges on both parallelism (P) and
+age distinct parallelism setups for prefill and decode.                                         batch size (R). Figure 9b shows that increasing TP (e.g.,
+                                                                                                TP8 vs. TP4) improves latency and throughput by lever-
+Impact: Meta actively adopted per-service-tuned parallelization                                 aging more aggregate memory bandwidth, crucial for the
+setups to maximize the throughput at given SLO.
+                                                                                                memory-bound decode phase. Figure 9c demonstrates that
+Optimal parallelism (P) must be tailored to prefill/decode                                      increasing batch size boosts QPS initially, but with di-
+computational demands and target SLOs.                                                          minishing returns as computation becomes relatively more
+Prefill Parallelism: As shown in Figure 9a for online pre-                                      dominant. The optimal setup identified (e.g., TP8 with
+fill (70B, 2K tokens, GPU-A), increasing TP degree re-                                          Batch Size 128 for 70B on GPU-C in Table 6) maximizes
+duces latency. However, the throughput gains (QPScluster )                                      the throughput within the LT T IT constraint. Note that the
+are sub-linear because operators tend to scale sub-linearly                                     optimal point found often differs from the optimal prefill
+and also because of higher communication overheads (i.e.                                        strategy (e.g., PP4-TP2) or what might have been chosen
+AllReduce). For example, TP4PP2 achieves lower latency                                          heuristically, stressing the importance of our systematic ap-
+than TP2PP4 but yields 20% lower QPS. Therefore, the                                            proach.
+optimal prefill strategy, as seen in the disaggregated se-                                      Phase-Specific Optimization: The ability of disaggre-
+tups in Table 6 (e.g., PP4-TP2 for 70B on GPU-A), aims                                          gated runtimes to employ distinct parallelism strategies
+to efficiently utilize the available LT T F T headroom, rather                                  for prefill and decode (e.g., PP4-TP2 for prefill, TP8
+than minimizing latency at any cost. Different hardware                                         for decode in the 70B GPU-A online case from Ta-
+or workloads might favor different strategies (e.g., Context                                    ble 6) is a primary reason for their superior efficiency in
+                                                   Optimizing Deployment Configurations for LLM Inference
+
+  Hw       Runtype               Setup             Dec. BS     TTFT      Prefill QPS/   QPS                   RmsNorm             Attn        Eltwise        FFN         AllReduce         PP Comm
+                                                              / TTIT     Decode QPS
+                                                                                                         GPU-A-TP8
+                                         70B Llama3                                                        (QPS 88)
+                                                                                                    NextGen-PP2TP4
+            Disagg      Prefill PP8 Decode PP32        896   353/1254      724/179      143
+ GPU-A                                                                                                    (QPS 183)
+           Cont.Batch             PP16                 512   1071/894         -         143
+            Disagg       Prefill PP8 Decode PP8        256    353/323      724/198      155                           0                   100                      200                 300
+ GPU-B                                                                                                                                                  Latency (ms)
+           Cont.Batch              PP8                 256    711/420         -         152
+            Disagg      Prefill PP8 Decode PP64       2560   407/2300      629/278      193
+ GPU-C
+           Cont.Batch             PP16                1024   1301/1300        -         197
+                                                                                                                                  (a) Prefill (2K Tokens).
+            Disagg       Prefill PP8 Decode PP8        256    214/211     1198/303      242
+Next-Gen
+           Cont.Batch              PP8                 256    436/267        -          239                                   RmsNorm     Attn          Eltwise     FFN        AllReduce
+
+                                         405B Llama3                                                        GPU-A-TP8
+                                                                                                       (BS 16, QPS 77)
+            Disagg      Prefill PP8 Decode PP64       1280   1918/3675     134/87       53
+ GPU-A                                                                                                    NextGen-TP8
+           Cont.Batch             PP32                 640   3777/3050       -          52
+                                                                                                     (BS 128, QPS 638)
+            Disagg      Prefill PP8 Decode PP16        256   1918/643      134/100      57
+ GPU-B
+           Cont.Batch             PP16                 256   2660/1145        -         56                                0              10                 20               30              40        50
+                                                                                                                                                            Latency (ms)
+            Disagg      Prefill PP8 Decode PP128      4096   2008/8420     127/122      62
+ GPU-C
+           Cont.Batch              PP32               1024   4060/4058        -         63
+
+Next-Gen
+            Disagg       Prefill PP8 Decode PP8        256   1134/418      226/153      91                       (b) Decode (8K Context, 150 Output)
+           Cont.Batch              PP8                 256   1588/709         -         90
+
+
+Table 7: Optimal offline inference (generation) setups for                                    Figure 11: 405B online performance comparison for GPU-
+Llama3 70B and 405B. Each QPS denotes QPScluster .                                            A and Next-gen at their optimal setups. QPScluster is
+                                                                                              shown.
+latency-constrained online scenarios compared to continu-
+ous batching. For offline tasks (Table 7), where latency is                                    Prefill HW   Decode HW             Prefill QPS       Decode QPS             Prefill:Decode     End-to-end QPS
+not critical, the optimal strategy often converges to deep                                     GPU-A        GPU-A                             88                   77                0.88                   41
+PP for both phases, combined with very large batch sizes                                       GPU-B
+                                                                                               GPU-C
+                                                                                                            GPU-B
+                                                                                                            GPU-C
+                                                                                                                                              88
+                                                                                                                                              85
+                                                                                                                                                                  276
+                                                                                                                                                                  277
+                                                                                                                                                                                     3.14
+                                                                                                                                                                                     3.26
+                                                                                                                                                                                                            67
+                                                                                                                                                                                                            65
+to maximize throughput (Figure 10).                                                            GPU-A        GPU-B                             88                  276                3.14                   67
+                                                                                               GPU-A        GPU-C                             88                  277                3.16                   67
+Interaction with Hardware Topology and Capability:
+The effectiveness of parallelism strategies is also modu-                                     Table 8: Heterogeneous inference for 405B model. Each
+lated by the hardware topology and capability. TP de-                                         QPS denotes QPScluster .
+mands strong interconnects (e.g., intra-host NVLink or
+scale-up fabrics), whereas PP and EP (Expert Parallelism,
+                                                                                              mogeneous setups show good potential; GPU-A excels at
+see Section 4.5) are more tolerant of weaker inter-host
+                                                                                              prefill (88 QPS) but struggles with decode (77 QPS); GPU-
+links. The models in Table 6 fit within a single host (8
+                                                                                              B/C are weaker at prefill (88/85 QPS) but much stronger
+GPUs) capacity-wise and also seem to prefer not going be-
+                                                                                              at decode (276/277 QPS). In our production deployments,
+yond a single host to avoid costly inter-host communica-
+                                                                                              the heterogeneity may come from either different vendors
+tions. Larger models going beyond a single host’s capac-
+                                                                                              or different products from the identical vendor. Heteroge-
+ity necessitate multi-host deployments which we explore in
+                                                                                              neous configurations, specifically using GPU-A for prefill
+Section 4.6 and Section 4.5. The impact of hardware capa-
+                                                                                              and GPU-B or GPU-C for decode, achieve end-to-end QPS
+bilities on the optimal strategy is also evident in Figure 11,
+                                                                                              (QPScluster = 67) comparable to the best homogeneous se-
+where the Next-Gen platform with faster speed meets SLO
+                                                                                              tups (GPU-B/B or GPU-C/C). This implies potential cost
+with less aggressive prefill (PP2-TP4) and decode (TP8
+                                                                                              savings – if the combined cost of GPU-A (for prefill) and
+with larger batch size) setups, compared to GPU-A which
+                                                                                              GPU-B/C (for decode) resources needed to achieve 67 QPS
+is forced to use TP8 to meet SLO.
+                                                                                              is lower than the cost of GPU-B/C resources alone for the
+4.4      Hardware Heterogeneity Opportunities                                                 same throughput, heterogeneity wins. Based on the perfor-
+Insight: For disaggregated systems, strategically mapping com-
+                                                                                              mance characteristics and actual cost structures, our perfor-
+pute (prefill) and memory bandwidth (decode) intensive phases                                 mance modeling estimates suggest potential TCO improve-
+to accelerators of different strengths can improve the overall cost                           ments of 15-25%. Note that the optimal ratio of prefill-to-
+efficiency by 15-25% compared to homogeneous deployments.                                     decode accelerators also varies significantly depending on
+                                                                                              the hardware combination (e.g., 0.88 for A/A vs. 3.14 for
+Impact: Meta deployed services to platforms that best fit the char-
+acteristics to maximize the accelerator fleet efficiency.
+                                                                                              A/B).
+Prefill tends to be compute-bound, favoring high FLOP/s
+accelerators (GPU-A). Decode is memory-bandwidth                                              Practical Considerations: While promising for cost effi-
+bound, benefiting from high HBM bandwidth (GPU-B/C).                                          ciency, implementing heterogeneous inference introduces
+Homogeneous clusters may be suboptimal as no single type                                      operational complexities in capacity planning, scheduling
+suits both phases. Disaggregated runtimes (Section 4.2) en-                                   across distinct hardware pools among geographically dis-
+able leveraging heterogeneity.                                                                tributed datacenters of Meta. However, exploiting these
+Table 8 explores heterogeneous configurations for the 405B                                    differences via disaggregation remains valuable, as data-
+online inference scenario using disaggregation. First, ho-                                    centers naturally incorporate diverse hardware generations.
+                                                      Optimizing Deployment Configurations for LLM Inference
+
+                          RmsNorm   Attn   Eltwise        FFN        AR         A2A                                           40                                                               A2A
+
+                                                                                                                                                                                               AR
+
+               TP8                                                                          QPS 96
+Dense
+
+
+
+
+                                                                                                                                                                                               Eltwise
+                                                                                                                              30                                                               FFN
+              TP16                                                    QPS 65                                                                                                                   Attn
+
+                                             QPS 213
+
+
+
+
+                                                                                                               Latency (ms)
+               TP8                                                                                                                                                                             RmsNorm
+                                                                                                                              20
+
+                                      QPS 150
+MoE
+
+
+
+
+              TP16
+
+        TP16-TP8EP2                  QPS 170                                                                                  10
+
+                      0       50    100     150       200            250         300        350       400
+
+                                                                                                                               0
+               (a) Prefill performance breakdown (2K tokens).                                                                      TP8 (8 GPUs)   TP16 (16 GPUs) TP8DP2-TP8EP2 TP4DP4-TP4EP4
+                                                                                                                                                                   (16 GPUs)     (16 GPUs)
+                          RmsNorm   Attn   Eltwise        FFN        AR         A2A
+
+                  TP8                                                             QPS 210                   Figure 13: Llama 4 Maverick decode performance under
+Dense
+
+
+
+
+                 TP16                                                                              QPS 84
+                                                                                                            different parallelism strategies on GPU-A (BS=64, 8K con-
+                  TP8                                QPS 344
+                                                                                                            text). EP-based scaling preserves throughput across hosts,
+MoE
+
+
+
+
+                 TP16                               QPS 181
+        TP8DP2-TP8EP2                             QPS 400                                                   unlike pure TP which suffers from AllReduce overhead.
+                          0    10    20    30        40         50         60          70     80       90   QPScluster is shown.
+        (b) Decode performance breakdown (BS=64, 8K context).                                               to prefill. Specifically, for MoE model with large enough
+                                                                                                            decode batch size far exceeding the number of experts, to-
+Figure 12: Performance of 405B Dense and iso-sized MoE                                                      kens will likely trigger all experts, necessitating accesses
+(125B x 4 Experts, Top 2 triggered per token) on GPU-A.                                                     to the full set of expert weights, thus eliminating the ben-
+QPScluster is shown.                                                                                        efits of sparse FFN activation (vs. Dense). However, in
+4.5        MoE vs. Dense Performance and Parallelism                                                        our specific comparison using an iso-parameter MoE con-
+                                                                                                            struction, we still observe a notable decode speedup; for
+Insight: Mixture-of-Experts (MoE) models achieve higher com-                                                example, TP8 MoE achieves much better latency and QPS
+putational efficiency than dense counterparts of equivalent total
+parameter counts by activating only a subset of parameters per                                              vs. Dense counterpart (i.e., 344 vs. 210). This is largely
+token. However, unlocking this potential, particularly when scal-                                           attributable to the smaller non-expert parameters, particu-
+ing across multiple hosts, hinges critically on adopting appropri-                                          larly the attention layers, in our hypothetical MoE model
+ate parallelism strategies, primarily Expert Parallelism (EP) over                                          compared to its dense counterpart, which significantly re-
+Tensor Parallelism (TP) for FFN layers, especially on scale-out                                             duces the memory footprint and computation required for
+infrastructure.
+                                                                                                            the attention part of the model.
+Impact: This exploration added great confidence for Meta to mi-                                             Parallelism Strategy and MoE: Realizing MoE’s bene-
+grate the majority of models to MoE-based architectures. We are
+also leveraging the parallelism related lessons in our fleet.
+                                                                                                            fits at scale, especially across multiple hosts, necessitates
+                                                                                                            choosing the right parallelism strategy (P). While TP is
+Computational Efficiency: The fundamental advantage                                                         effective for dense models within tightly-connected nodes
+of MoE models stems from their sparse activation pattern.                                                   (e.g., NVLink within a host), its reliance on costly AllRe-
+By processing each token through only a subset of FFN                                                       duce collectives makes it scale poorly across standard inter-
+”experts”, MoE models significantly reduce the per-token                                                    host networks (Section 4.6). MoE architectures enable Ex-
+FLOP count compared to dense models where every token                                                       pert Parallelism (EP), where different experts are placed
+passes through the entire FFN layer. This benefit is most                                                   on different devices/hosts. EP typically requires AlltoAll
+pronounced in compute-bound phases like prefill.                                                            communication to route tokens to their assigned experts
+We compare a 405B dense Llama3 model with a hypo-                                                           and gather results, which is often significantly more effi-
+thetical iso-parameter MoE variant (125B base x 4 ex-                                                       cient than AllReduce over weaker interconnects.
+perts, activating top 2 experts per token) on GPU-A.                                                        Figure 12b (Decode) best illustrates the benefit of EP. For
+We advise to compare MoE and dense with the identi-                                                         Dense model, TP8 to TP16 actually degrades both the
+cal parallelism setup for fair assessment. Note that we                                                     QPS (210→84) and the latency due to big AllReduce over-
+assume this hypothetical MoE model architecture mainly                                                      heads. Similar behavior is observed for MoE model try-
+for performance/efficiency study; it does not represent a                                                   ing to utilize TP16. In contrast, with EP, MoE model
+sound/effective expansion of the Llama3 405B model.                                                         improves both the throughput (344→400) and the latency
+As shown in Figure 12a, the MoE model achieves signifi-                                                     thanks to EP’s lower communication costs. We validate
+cantly lower prefill latency and higher throughput than the                                                 this on Llama 4 Maverick (128 routed experts, top-1), part
+dense model using the same TP8 parallelism (i.e., QPS 96                                                    of a growing trend toward many-expert MoE architectures
+vs. 213) within a single 8-card host, directly reflecting the                                               (e.g., DeepSeek-V3 (DeepSeek-AI et al., 2024) with 256
+reduced FFN computation.                                                                                    experts) where EP becomes essential (Figure 13). Scaling
+For the memory-bandwidth-bound decode phase (Fig-                                                           from TP8 (single host) to TP16 (two hosts) nearly halves
+ure 12b), the advantage of MoE should diminish compared                                                     decode QPScluster (618→329) because AllReduce costs
+                                 Optimizing Deployment Configurations for LLM Inference
+                                                                                          8000                                             Load balanced
+triple. In contrast, TP8DP2-TP8EP2 preserves through-
+
+
+
+
+                                                                                                                                                             Routed FFN latency (ms)
+                                                                                                                                           Naive placement                             2.2
+
+
+
+
+                                                                Tokens per EP rank
+                                                                                          6000                                             Hot-cold mix                                2.0
+put (608, −2%) by replacing inter-host FFN AllReduce
+                                                                                                                                                                                       1.8
+with cheaper All2All for expert routing. Going further,                                   4000
+                                                                                                                                                                                       1.6
+TP4DP4-TP4EP4 actually achieves the highest throughput                                    2000                                                                                         1.4
+(899, +45% over TP8 baseline) by minimizing the commu-                                                                                                                                 1.2
+                                                                                                0
+nication overheads while maximizing the number of tokens                                                0      1         2        3    4     5     6     7                                   2000 3000 4000 5000 6000 7000 8000
+                                                                                                               EP rank (sorted by load)                                                               Tokens per EP domain
+being handled per iteration (i.e., large DP).
+For prefill (Figure 12a), TP16-TP8EP2 benefits MoE                   (a) EP-rank load under differ-                                                               (b) Routed FFN latency vs. EP-
+via reduced FFN AllReduce costs. However, multi-host                 ent placements.                                                                              domain load.
+
+
+
+
+                                                                Routed FFN latency (ms)
+                                                                                                            Skewed                                                                     125            Load balanced
+doesn’t improve compute-bound prefill throughput due                                      1.0               Even split                                                                                Probabilistic
+                                                                                                                                                                                       100
+
+
+
+
+                                                                                                                                                                  Active Experts
+to communication overhead. Memory-bound tasks bene-                                       0.8                                                                                                         Log-linear (prod.)
+                                                                                          0.6                                                                                           75
+fit from multi-host as token count scales with hosts and
+                                                                                          0.4
+                                                                                                                                                                                        50
+weight-reading distributes across devices.                                                                                                                                              25
+                                                                                          0.2
+System Implications: When deployed with appropriate                                                                                                                                      0
+                                                                                                    0          25            50       75     100       125                                       21        23       25     27   29
+parallelism strategies, MoE models offer a compelling path                                                   Number of active experts                                                                    Decode Batch Size
+towards higher performance-per-cost, especially on stan-             (c) Decode routed FFN cost vs.                                                               (d) Expert activation models
+dard scale-out infrastructure with relatively weak inter-host        active experts.                                                                              (decode).
+bandwidths. Our findings hold across both our controlled
+iso-parameter study (Figure 12) and production architec-             Figure 14: Expert load imbalance sensitivity (Llama 4
+tures like Llama 4 Maverick (Figure 13): EP-based par-               Maverick, 128 experts, GPU-A). Prefill (top): (a) Per-
+allelism consistently outperforms pure TP for cross-host             EP-rank token load under three expert placement strate-
+MoE scaling. Thorough inference space exploration (Sec-              gies (T=32K, EP8, 16 experts/domain). (b) Routed expert
+tion 3) is essential for identifying the optimal parallelism         FFN latency vs. EP-domain token load (EP8). Decode
+setup (e.g., TP within a host combined with EP/DP across             (bottom): (c) Routed expert FFN latency vs. active expert
+hosts) and striking the right balance of efficiency and la-          count, with balanced and imbalanced token distributions
+tency.                                                               among active experts (TP8, T=256). (d) Predicted active
+Expert Load Imbalance: MoE performance modeling re-                  expert count vs. decode batch size under three activation
+quires accurately estimating how many tokens each expert             models.
+gets. For prefill, with many tokens routed across experts,           dom (each token independently picks an expert), and log-
+most or all experts are typically activated. The key concern         linear (calibrated from production traffic). As shown in
+is the distribution of tokens among experts: in practice, a          Figure 14d, the models diverge significantly at moderate
+few “hot” experts receive disproportionately many tokens             batch sizes, leading to up to 3.5× difference in predicted
+(e.g., in one representative Llama 4 Maverick workload, the          cost; we default to log-linear, which best matches produc-
+busiest expert received ∼7% of all routed tokens out of 128          tion traffic.
+experts). Since per-EP-domain routed FFN latency grows
+with token load (Figure 14b), the most-loaded EP domain              4.6                            Scale-out vs. Scale-up platform tradeoffs
+becomes the latency bottleneck. This can be mitigated by                     Insight: Scale-out platforms offer cost efficiency for models ser-
+mixing hot and cold experts within the same EP domain                        viceable within a single or few hosts. Decode of MoE models
+                                                                             scales particularly well on scale-out platforms too. Scale-up plat-
+(Figure 14a), bringing per-domain load closer to the load-                   forms become necessary for extremely large dense models or extra
+balanced ideal, i.e., an even split of tokens across experts.                low latency inference of MoE or Dense models. Their order-of-
+Our framework models prefill using this load-balanced as-                    magnitude higher bandwidth and lower latency vs. scale-out fa-
+sumption, which provides a lower bound on cost.                              cilitates enabling wider parallelism domain sizes with tolerable
+For decode, the dominant cost driver is different. Because                   communication overheads.
+decode processes few tokens per expert, routed FFN la-                       Impact: Meta proactively assessed the potential deployment
+tency is memory-bandwidth bound and dominated by ex-                         scenarios of scale-up platforms and the corresponding bene-
+pert weight reads, scaling linearly with the number of active                fits/challenges using the lightweight performance simulation and
+experts (Figure 14c). Imbalance has a dual effect: when                      design space exploration methodology.
+not all experts are triggered, skewed routing leaves some            We evaluate whether expensive scale-up infrastructure
+experts inactive, reducing cost by avoiding weight reads.            (high-bandwidth, low-latency interconnects within large
+Once most experts are active, uneven token counts within             accelerator pods) justifies its cost versus conventional
+them add modest overhead (scatter points above the bal-              scale-out systems (smaller hosts with standard network fab-
+anced line in Figure 14c). To predict the number of active           rics) for extremely large LLMs. Using our simulator, we
+experts, our framework supports three activation models              evaluated hypothetical 1.8T Dense and MoE models on
+(Figure 14d): load balanced (as in prefill), uniform ran-            Next-Gen platforms: scale-out (8 cards/host, 50 GB/s inter-
+                                                                                                                                                           Optimizing Deployment Configurations for LLM Inference
+
+                 RmsNorm            Attn             Eltwise                     FFN         AR              A2A                                             RmsNorm          Attn                Eltwise                        FFN      AR                   A2A
+                                                                                                                                                           700
+                                                                                                                                                                                                                                                                                                  Basic Inference Systems and Runtime Concepts. Prior
+               1400                                                                                                                                                                                             QPS
+
+               1200             QPS
+                                                  QPS             QPS
+                                                                   4
+                                                                                                                                                           600                                                   3                                                                                work includes general optimizations (NVIDIA, 2017; Am-
+                                                   7
+                                                                                                                                                           500
+               1000    QPS       16                                              QPS                                                                                    QPS QPS                                                                                                                   inabadi et al., 2022), continuous batching (Yu et al., 2022),
+Latency (ms)
+
+
+
+
+                                                                                                                                            Latency (ms)
+                        40                                                        40                                                                       400           20  10
+                800                                                                       QPS
+                                                                                           26                QPS             QPS                           300
+                                                                                                                                                                                                                                                                                                  KV cache management (Kwon et al., 2023; Lin et al.,
+                600                                                                                           15              8                                  QPS                                                             QPS
+                                                                                                                                                                                                                                     QPS QPS QPS
+                400                                                                                                                                        200    80                                                              80
+                                                                                                                                                                                                                                      49  27  14
+                                                                                                                                                                                                                                                                                                  2024; Liu et al., 2024b; Hooper et al., 2024), and spe-
+                200                                                                                                                                        100                                                                                                                                    cialized runtimes (ModelTC, 2024; Vaidya et al., 2023).
+                  0                                                                                                                                          0
+                       TP8     TP16 TP32 TP64                                     TP8     TP16 TP32 TP64                                                         TP8    TP16 TP32 TP64                                           TP8    TP16 TP32 TP64                                            Distinct prefill/decode profiles motivated disaggregated ar-
+                                    Scale-out                                                  Scale-up                                                                   Scale-out                                                       Scale-up
+                                                                                                                                                                                                                                                                                                  chitectures (Zhong et al., 2024; Patel et al., 2024; Qin
+                             (a) Dense model Prefill (Left) and Decode (Right).                                                                                                                                                                                                                   et al., 2024; Agrawal et al., 2023; 2024b) and offload-
+                      RmsNorm               Attn                  Eltwise              FFN          AR                                                       RmsNorm          Attn                Eltwise                        FFN      AR                   A2A                                ing (Sheng et al., 2023; Jiang et al., 2024). Our methodol-
+               160                                                                                                                                         100
+                                                                                                                                                            90QPS                 QPS
+               140    QPS QPS                                                    QPS                                                                        80214
+                                                                                                                                                                  QPS
+                                                                                                                                                                                  214                                                                                                             ogy systematically evaluates these choices (cont.batch
+                                                                                                                                            Latency (ms)
+
+
+               120    308 157                                                    308 QPS                                                                    70    125 QPS             QPS QPS
+Latency (ms)
+
+
+
+
+                                     QPS QPS                                                                                                               60
+               100                           QPS                                        217 QPS                                                                       339 QPS QPS     177 356 QPS QPS
+                80                   226 127
+                                              69                                            281 QPS QPS
+                                                                                                                                                           50
+                                                                                                                                                           40
+                                                                                                                                                           30
+                                                                                                                                                                          461 488             533 655                                                                                             vs. disagg), quantifying trade-offs for specific work-
+                60                                                                              194 120                                                    20
+                40
+                20
+                                                                                                                                                           10
+                                                                                                                                                            0                                                                                                                                     loads, hardware, and SLOs (Sections 4.2 and 4.4), validat-
+                 0
+                                                                                                                                                                       TP16
+
+
+
+                                                                                                                                                                                               TP8DP4-TP2EP16
+
+                                                                                                                                                                                                                TP8DP8-TP4EP16
+
+
+
+                                                                                                                                                                                                                                       TP16
+
+
+
+                                                                                                                                                                                                                                                                TP8DP4-TP2EP16
+
+                                                                                                                                                                                                                                                                                 TP8DP8-TP4EP16
+                                                                                                                                                                 TP8
+
+
+
+                                                                                                                                                                               TP8DP2-TP2EP8
+
+
+
+
+                                                                                                                                                                                                                                 TP8
+
+
+
+                                                                                                                                                                                                                                               TP8DP2-TP2EP8
+                                                                                                                                                                                                                                                                                                  ing disaggregation’s benefits for latency-critical tasks.
+                             TP16
+
+                                      TP16-EP16
+
+                                                   TP32-TP2EP16
+
+                                                                  TP64-TP4EP16
+
+
+
+                                                                                        TP16
+
+                                                                                                 TP16-EP16
+
+                                                                                                              TP32-TP2EP16
+
+                                                                                                                             TP64-TP4EP16
+                      TP8
+
+
+
+
+                                                                                 TP8
+
+
+
+
+                                                                                                                                                                                                                                                                                                  Advanced Serving Systems. Open-source systems like
+                                Scale-out                                                  Scale-up                                                                       Scale-out                                                       Scale-up
+                                                                                                                                                                                                                                                                                                  vLLM (Kwon et al., 2023) and TensorRT-LLM (Vaidya
+                                                                                                                                                                                                                                                                                                  et al., 2023) continue to provide optimizations on kernels,
+                              (b) MoE model Prefill (Left) and Decode (Right)
+                                                                                                                                                                                                                                                                                                  memory management, and scheduling for LLM deploy-
+Figure 15: 1.8T dense/MoE model performance on scale-                                                                                                                                                                                                                                             ment. Recent work includes Sarathi-Serve (Agrawal et al.,
+out and scale-up next-gen platforms. QPScluster is shown.                                                                                                                                                                                                                                         2024b) (chunked-prefills) and Niyama (Kamahori et al.,
+                                                                                                                                                                                                                                                                                                  2025) (disaggregated scheduling). Our work complements
+host) and scale-up (64 cards/pod, 900 GB/s intra-pod). Re-                                                                                                                                                                                                                                        these: while they optimize how to execute inference, we
+sults are shown in Figure 15.                                                                                                                                                                                                                                                                     address what configuration to deploy—parallelism strate-
+Dense Model Scaling Challenges: Large dense models                                                                                                                                                                                                                                                gies, hardware selection, and runtime architecture choices
+require high TP degrees, relying on expensive AllReduce.                                                                                                                                                                                                                                          that apply across serving systems.
+Figure 15a shows scale-out TP scaling severely hampered                                                                                                                                                                                                                                           Parallelism Strategies. Scaling LLMs leverages TP,
+beyond single host due to AllReduce costs, yielding no la-                                                                                                                                                                                                                                        PP (Shoeybi et al., 2019; Narayanan et al., 2021), EP for
+tency/throughput gains. Scale-up handles multi-node TP                                                                                                                                                                                                                                            MoE (Lepikhin et al., 2020; Shazeer et al., 2016; Fedus
+effectively with high-speed fabric, although returns dimin-                                                                                                                                                                                                                                       et al., 2022; Liu et al., 2024a; DeepSeek-AI et al., 2024;
+ish at high TP degrees (32-64 cards) as communication                                                                                                                                                                                                                                             Rajbhandari et al., 2022; Hwang et al., 2023), CP for long
+dominates.                                                                                                                                                                                                                                                                                        contexts (Li et al., 2021; Korthikanti et al., 2023; Jacobs
+                                                                                                                                                                                                                                                                                                  et al., 2023; Liu et al., 2023; Brandon et al., 2023; Yang
+MoE Model Scaling Advantages: MoE models offer an                                                                                                                                                                                                                                                 et al., 2024), and DP (Rajbhandari et al., 2020; Ren et al.,
+alternative scaling path via Expert Parallelism (EP), dis-                                                                                                                                                                                                                                        2021; Zhao et al., 2023). Our contribution (Sections 4.3,
+tributing FFN experts across devices and primarily rely-                                                                                                                                                                                                                                          4.5 and 4.6) empirically demonstrates that optimal paral-
+ing on AlltoAll communication, often less demanding than                                                                                                                                                                                                                                          lelism depends critically on inference phase, model archi-
+TP’s AllReduce. Figure 15b shows MoE scales grace-                                                                                                                                                                                                                                                tecture (Dense vs. MoE), and hardware platform (scale-out
+fully with EP on scale-out, especially for Decode (Sec-                                                                                                                                                                                                                                           vs. scale-up). We showed MoE models with EP scale ef-
+tion 4.5). Prefill throughput scaling remains limited. Multi-                                                                                                                                                                                                                                     fectively on scale-out systems and identified optimal hybrid
+host scale-out becomes viable for MoE unlike dense mod-                                                                                                                                                                                                                                           strategies.
+els suffering from communication overheads.
+                                                                                                                                                                                                                                                                                                  Performance Modeling and Optimization. Performance
+Scale-up yields superior MoE performance via faster All-
+                                                                                                                                                                                                                                                                                                  prediction via analytical models (Yuan et al., 2024; Bamb-
+toAll and hybrid parallelism (EP across nodes, TP within),
+                                                                                                                                                                                                                                                                                                  haniya et al., 2024), simulators (Agrawal et al., 2024a),
+achieving the best latency and throughput at large scales.
+                                                                                                                                                                                                                                                                                                  or performance models (Qi et al., 2017) enables design
+System Implications: Optimal setup choice involves com-                                                                                                                                                                                                                                           space exploration alongside optimizations like quantiza-
+plex tradeoffs between model size, architecture (Dense                                                                                                                                                                                                                                            tion (Li et al., 2024a; Xiao et al., 2023a), pruning (Frantar
+vs. MoE), SLOs, parallelism, and platform TCO. Scale-                                                                                                                                                                                                                                             & Alistarh, 2023; Ma et al., 2024), and speculative decod-
+up is necessary for latency-critical large dense models or                                                                                                                                                                                                                                        ing (Leviathan et al., 2023; Miao et al., 2023b; Xia et al.,
+extremely low-latency MoE; scale-out remains viable for                                                                                                                                                                                                                                           2024) (surveys: (Zhou et al., 2024; Miao et al., 2023a; Wan
+MoE, avoiding high TCO and larger failure domains.                                                                                                                                                                                                                                                et al., 2023)). Our lightweight simulator (Section 3) inte-
+                                                                                                                                                                                                                                                                                                  grates empirically-grounded operator models with system-
+5 D ISCUSSION AND R ELATED W ORK                                                                                                                                                                                                                                                                  level configurations (runtime, parallelism) for rapid, com-
+Our work builds on prior research in LLM inference sys-                                                                                                                                                                                                                                           prehensive exploration, providing practical guidance (Sec-
+tems, parallelism, and performance modeling.                                                                                                                                                                                                                                                      tion 4).
+                                 Optimizing Deployment Configurations for LLM Inference
+
+Applicability of Insights on Other Inference Scenarios.          man, S., Anadkat, S., et al. Gpt-4 technical report. arXiv
+The general tradeoffs we identify—TP vs. PP for dif-             preprint arXiv:2303.08774, 2023.
+ferent phases, EP benefits for MoE on scale-out, disag-
+gregation for SLO-sensitive workloads—stem from funda-         Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gula-
+mental compute and communication characteristics. The            vani, B., and Ramjee, R. Sarathi: Efficient llm inference
+magnitude varies with context: parallelism matters less          by piggybacking decodes with chunked prefills. arXiv
+for smaller models on fewer accelerators, while latency-         preprint arXiv:2308.16369, 2023.
+sensitive applications require optimizations that are op-      Agrawal, A., Kedia, N., Mohan, J., Panwar, A., Kwatra,
+tional for throughput-focused workloads. Our insights            N., Gulavani, B., Ramjee, R., and Tumanov, A. Vidur:
+provide directional guidance; practitioners should validate      A large-scale simulation framework for llm inference,
+configurations in their specific environments.                   2024a. URL https://arxiv.org/abs/2405.
+Future Directions. The drive for efficiency fuels inno-          05465.
+vations toward novel architectures (Gu & Dao, 2023;
+Peng et al., 2023) and optimizations (context reuse, spar-     Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N.,
+sity), with prefill/decode management (Section 2.1.1) re-        Gulavani, B. S., Tumanov, A., , and Ramjee, R. Taming
+maining central. The compute (prefill) vs. memory                throughput-latency tradeoff in llm inference with sarathi-
+bandwidth (decode) tension may favor specialized hard-           serve. arXiv preprint arXiv:2403.02310, 2024b.
+ware, though fungibility concerns persist. Future acceler-     Alayrac, J.-B., Donahue, J., Luc, P., Miech, A., Barr,
+ators (Firoozshahian et al., 2023; Jouppi et al., 2023) with     I., Hasson, Y., Lenc, K., Mensch, A., Millican, K.,
+balanced performance and fine-grained partitioning could         Reynolds, M., et al. Flamingo: a visual language model
+enable better co-scheduling, improving upon current dis-         for few-shot learning. Advances in neural information
+aggregation approaches.                                          processing systems, 35:23716–23736, 2022.
+6 C ONCLUSION                                                  Aminabadi, R. Y., Rajbhandari, S., Awan, A. A., Li, C., Li,
+This paper documented the real-world challenges we en-          D., Zheng, E., Ruwase, O., Smith, S., Zhang, M., Rasley,
+countered optimizing LLM inference systems at scale. We         J., et al. Deepspeed-inference: enabling efficient infer-
+systematically defined the optimization space and devel-        ence of transformer models at unprecedented scale. In
+oped an effective design space exploration methodology          SC22: International Conference for High Performance
+based on lightweight simulations, yielding five critical in-    Computing, Networking, Storage and Analysis, pp. 1–
+sights that helped Meta optimize production LLM infer-          15. IEEE, 2022.
+ence services. We hope our lessons—encompassing online
+and offline inference, dense and MoE models, and various       Bambhaniya, A., Raj, R., Jeong, G., Kundu, S., Srinivasan,
+accelerator platforms with different capabilities—help oth-      S., Subramanian, S., Elavazhagan, M., Kumar, M., and
+ers construct efficient LLM serving systems.                     Krishna, T. Demystifying ai platform design for dis-
+                                                                 tributed inference of next-generation llm models. arXiv
+ACKNOWLEDGMENTS                                                  preprint arXiv:2406.01698, 2024.
+We would like to acknowledge all the contributors who          Blog,  N.  T.,  2024.       URL  https:
+made this work possible. Special thanks to Mahesh Bal-           //developer.nvidia.com/blog/
+asubramanian for thoroughly reviewing the manuscript and         how-to-prune-and-distill-llama-3-1-8b-to-an-nvidi
+providing valuable feedback.
+                                                               Brandon, W., Nrusimha, A., Qian, K., Ankner, Z., Jin, T.,
+R EFERENCES                                                      Song, Z., and Ragan-Kelley, J. Striped attention: Faster
+Nvidia GH200 grace hopper superchip. https:                      ring attention for causal transformers. arXiv preprint
+  //www.nvidia.com/en-us/data-center/                            arXiv:2311.09431, 2023.
+  grace-hopper-superchip/. Accessed: 2025-01-
+                                                               Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan,
+  01.
+                                                                 J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sas-
+                                                                 try, G., Askell, A., et al. Language models are few-shot
+Interview with Mark Zuckerberg—AI Will Write
+                                                                 learners. Advances in neural information processing sys-
+   Most Meta Code in 18 Months, 2025.  URL
+                                                                 tems, 33:1877–1901, 2020.
+   https://www.youtube.com/watch?v=
+   rYXeQbTuVl0&ab_channel=DwarkeshPatel.                       Chen, M., Tworek, J., Jun, H., Yuan, Q., Pinto, H. P. d. O.,
+                                                                 Kaplan, J., Edwards, H., Burda, Y., Joseph, N., Brock-
+Achiam, J., Adler, S., Agarwal, S., Ahmad, L., Akkaya,           man, G., et al. Evaluating large language models trained
+  I., Aleman, F. L., Almeida, D., Altenschmidt, J., Alt-         on code. arXiv preprint arXiv:2107.03374, 2021.
+                                  Optimizing Deployment Configurations for LLM Inference
+
+Cho, J., Kim, M., Choi, H., Heo, G., and Park, J. Llmserv-         Gao, Z., and Pan, Z. Deepseek-v3 technical report, 2024.
+  ingsim: A hw/sw co-simulation infrastructure for llm             URL https://arxiv.org/abs/2412.19437.
+  inference serving at scale. In 2024 IEEE International
+  Symposium on Workload Characterization (IISWC), pp.            Du, N., Huang, Y., Dai, A. M., Tong, S., Lepikhin, D.,
+  15–29. IEEE, 2024.                                               Xu, Y., Krikun, M., Zhou, Y., Yu, A. W., Firat, O.,
+                                                                   et al. Glam: Efficient scaling of language models with
+Choquette, J. Nvidia hopper h100 gpu: Scaling perfor-              mixture-of-experts. In International Conference on Ma-
+  mance. IEEE Micro, 43(3):9–17, 2023.                             chine Learning, pp. 5547–5569. PMLR, 2022.
+Comanici, G., Bieber, E., Schaekermann, M., Pasupat, I.,
+                                                                 Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+  Sachdeva, N., Dhillon, I., Blistein, M., Ram, O., Zhang,
+                                                                   A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+  D., Rosen, E., et al. Gemini 2.5: Pushing the frontier
+                                                                   A., et al. The llama 3 herd of models. arXiv preprint
+  with advanced reasoning, multimodality, long context,
+                                                                   arXiv:2407.21783, 2024.
+  and next generation agentic capabilities. arXiv preprint
+  arXiv:2507.06261, 2025.                                        Fedus, W., Zoph, B., and Shazeer, N. Switch transformers:
+Daniel, C., Shen, C., Liang, E., and Liaw, R. How contin-          Scaling to trillion parameter models with simple and ef-
+  uous batching enables 23x throughput in llm inference            ficient sparsity. The Journal of Machine Learning Re-
+  while reducing p50 latency, 2023.                                search, 23(1):5232–5270, 2022.
+
+DeepSeek-AI. DeepSeek-V3 Technical Report.              arXiv    Firoozshahian, A., Coburn, J., Levenstein, R., Nattoji,
+  preprint arXiv:2412.19437, 2024.                                 R., Kamath, A., Wu, O., Grewal, G., Aepala, H.,
+                                                                   Jakka, B., Dreyer, B., Hutchin, A., Diril, U., Nair,
+DeepSeek-AI, Liu, A., Feng, B., Xue, B., Wang, B., Wu,             K., Aredestani, E. K., Schatz, M., Hao, Y., Komurav-
+  B., Lu, C., Zhao, C., Deng, C., Zhang, C., Ruan, C., Dai,        elli, R., Ho, K., Abu Asal, S., Shajrawi, J., Quinn,
+  D., Guo, D., Yang, D., Chen, D., Ji, D., Li, E., Lin, F.,        K., Sreedhara, N., Kansal, P., Wei, W., Jayaraman,
+  Dai, F., Luo, F., Hao, G., Chen, G., Li, G., Zhang, H.,          D., Cheng, L., Chopda, P., Wang, E., Bikumandla, A.,
+  Bao, H., Xu, H., Wang, H., Zhang, H., Ding, H., Xin,             Karthik Sengottuvel, A., Thottempudi, K., Narasimha,
+  H., Gao, H., Li, H., Qu, H., Cai, J. L., Liang, J., Guo, J.,     A., Dodds, B., Gao, C., Zhang, J., Al-Sanabani, M.,
+  Ni, J., Li, J., Wang, J., Chen, J., Chen, J., Yuan, J., Qiu,     Zehtabioskuie, A., Fix, J., Yu, H., Li, R., Gondkar,
+  J., Li, J., Song, J., Dong, K., Hu, K., Gao, K., Guan, K.,       K., Montgomery, J., Tsai, M., Dwarakapuram, S., De-
+  Huang, K., Yu, K., Wang, L., Zhang, L., Xu, L., Xia, L.,         sai, S., Avidan, N., Ramani, P., Narayanan, K., Math-
+  Zhao, L., Wang, L., Zhang, L., Li, M., Wang, M., Zhang,          ews, A., Gopal, S., Naumov, M., Rao, V., Noru, K.,
+  M., Zhang, M., Tang, M., Li, M., Tian, N., Huang, P.,            Reddy, H., Venkatapuram, P., and Bjorlin, A. Mtia:
+  Wang, P., Zhang, P., Wang, Q., Zhu, Q., Chen, Q., Du,            First generation silicon targeting meta’s recommenda-
+  Q., Chen, R. J., Jin, R. L., Ge, R., Zhang, R., Pan, R.,         tion systems. In Proceedings of the 50th Annual In-
+  Wang, R., Xu, R., Zhang, R., Chen, R., Li, S. S., Lu,            ternational Symposium on Computer Architecture, ISCA
+  S., Zhou, S., Chen, S., Wu, S., Ye, S., Ye, S., Ma, S.,          ’23, New York, NY, USA, 2023. Association for Com-
+  Wang, S., Zhou, S., Yu, S., Zhou, S., Pan, S., Wang, T.,         puting Machinery. ISBN 9798400700958. doi: 10.
+  Yun, T., Pei, T., Sun, T., Xiao, W. L., Zeng, W., Zhao,          1145/3579371.3589348. URL https://doi.org/
+  W., An, W., Liu, W., Liang, W., Gao, W., Yu, W., Zhang,          10.1145/3579371.3589348.
+  W., Li, X. Q., Jin, X., Wang, X., Bi, X., Liu, X., Wang,
+  X., Shen, X., Chen, X., Zhang, X., Chen, X., Nie, X.,          Frantar, E. and Alistarh, D. Sparsegpt: Massive language
+  Sun, X., Wang, X., Cheng, X., Liu, X., Xie, X., Liu, X.,         models can be accurately pruned in one-shot. 2023.
+  Yu, X., Song, X., Shan, X., Zhou, X., Yang, X., Li, X.,
+  Su, X., Lin, X., Li, Y. K., Wang, Y. Q., Wei, Y. X., Zhu,      Gim, I., Chen, G., Lee, S.-s., Sarda, N., Khandelwal,
+  Y. X., Zhang, Y., Xu, Y., Xu, Y., Huang, Y., Li, Y., Zhao,       A., and Zhong, L. Prompt cache: Modular attention
+  Y., Sun, Y., Li, Y., Wang, Y., Yu, Y., Zheng, Y., Zhang,         reuse for low-latency inference. Proceedings of Machine
+  Y., Shi, Y., Xiong, Y., He, Y., Tang, Y., Piao, Y., Wang,        Learning and Systems, 6:325–338, 2024.
+  Y., Tan, Y., Ma, Y., Liu, Y., Guo, Y., Wu, Y., Ou, Y., Zhu,
+  Y., Wang, Y., Gong, Y., Zou, Y., He, Y., Zha, Y., Xiong,       Grok, 2024. URL https://github.com/xai-org/
+  Y., Ma, Y., Yan, Y., Luo, Y., You, Y., Liu, Y., Zhou, Y.,        grok-1.
+  Wu, Z. F., Ren, Z. Z., Ren, Z., Sha, Z., Fu, Z., Xu, Z.,
+  Huang, Z., Zhang, Z., Xie, Z., Zhang, Z., Hao, Z., Gou,        Gu, A. and Dao, T. Mamba: Linear-time sequence
+  Z., Ma, Z., Yan, Z., Shao, Z., Xu, Z., Wu, Z., Zhang, Z.,        modeling with selective state spaces. arXiv preprint
+  Li, Z., Gu, Z., Zhu, Z., Liu, Z., Li, Z., Xie, Z., Song, Z.,     arXiv:2312.00752, 2023.
+                                 Optimizing Deployment Configurations for LLM Inference
+
+Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,               Li, S., Ning, X., Wang, L., Liu, T., Shi, X., Yan, S., Dai, G.,
+  M. W., Shao, Y. S., Keutzer, K., and Gholami, A.               Yang, H., and Wang, Y. Evaluating quantized large lan-
+  Kvquant: Towards 10 million context length llm in-             guage models. arXiv preprint arXiv:2402.18158, 2024a.
+  ference with kv cache quantization. arXiv preprint
+  arXiv:2401.18079, 2024.                                      Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A.,
+                                                                 Ye, H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm
+Hwang, C., Cui, W., Xiong, Y., Yang, Z., Liu, Z., Hu, H.,        knows what you are looking for before generation. Ad-
+ Wang, Z., Salas, R., Jose, J., Ram, P., et al. Tutel: Adap-     vances in Neural Information Processing Systems, 37:
+ tive mixture-of-experts at scale. Proceedings of Machine        22947–22970, 2024b.
+ Learning and Systems, 5, 2023.
+                                                               Lin, B., Peng, T., Zhang, C., Sun, M., Li, L., Zhao, H.,
+Jacobs, S. A., Tanaka, M., Zhang, C., Zhang, M., Song,           Xiao, W., Xu, Q., Qiu, X., Li, S., Ji, Z., Li, Y., and
+  L., Rajbhandari, S., and He, Y. Deepspeed ulysses:             Lin, W. Infinite-llm: Efficient llm service for long con-
+  System optimizations for enabling training of extreme          text with distattention and distributed kvcache. arXiv
+  long sequence transformer models. arXiv preprint               preprint arXiv:2401.02669, 2024.
+  arXiv:2309.14509, 2023.
+                                                               Liu, A., Feng, B., Wang, B., Wang, B., Liu, B.,
+Jiang, Y., Yan, R., and Yuan, B. Hexgen-2: Disaggre-             Zhao, C., Dengr, C., Ruan, C., Dai, D., Guo, D.,
+   gated generative inference of LLMs in heterogeneous           et al. Deepseek-v2: A strong, economical, and effi-
+   environment, 2024. URL https://openreview.                    cient mixture-of-experts language model. arXiv preprint
+   net/forum?id=Cs6MrbFuMq.                                      arXiv:2405.04434, 2024a.
+Jouppi, N., Kurian, G., Li, S., Ma, P., Nagarajan, R., Nai,
+                                                               Liu, H., Zaharia, M., and Abbeel, P. Ring attention with
+  L., Patil, N., Subramanian, S., Swing, A., Towles, B.,
+                                                                 blockwise transformers for near-infinite context. arXiv
+  et al. Tpu v4: An optically reconfigurable supercomputer
+                                                                 preprint arXiv:2310.01889, 2023.
+  for machine learning with hardware support for embed-
+  dings. In Proceedings of the 50th Annual International       Liu, J., Shen, D., Zhang, Y., Dolan, B., Carin, L., and Chen,
+  Symposium on Computer Architecture, pp. 1–14, 2023.            W. What makes good in-context examples for gpt-3?
+Kamahori, K., Zhuang, Y., Hu, X., Kasikci, B., and Chowd-        arXiv preprint arXiv:2101.06804, 2021.
+  hery, A. Niyama: Breaking the silos of llm inference         Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman,
+  serving. arXiv preprint arXiv:2503.22562, 2025.                V., Chen, B., and Hu, X. Kivi: A tuning-free asym-
+Korthikanti, V. A., Casper, J., Lym, S., McAfee, L., Ander-      metric 2bit quantization for kv cache. arXiv preprint
+  sch, M., Shoeybi, M., and Catanzaro, B. Reducing acti-         arXiv:2402.02750, 2024b.
+  vation recomputation in large transformer models. Pro-
+                                                               Ma, X., Fang, G., and Wang, X. Llm-pruner: On the struc-
+  ceedings of Machine Learning and Systems, 5:341–353,
+                                                                tural pruning of large language models. Advances in neu-
+  2023.
+                                                                ral information processing systems, 36, 2024.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+ C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient      Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Jin, H., Chen,
+ memory management for large language model serving             T., and Jia, Z. Towards efficient generative large lan-
+ with pagedattention. In Proceedings of the 29th Sym-           guage model serving: A survey from algorithms to sys-
+ posium on Operating Systems Principles, pp. 611–626,           tems. arXiv preprint arXiv:2312.15234, 2023a.
+ 2023.                                                         Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z.,
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang,      Wong, R. Y. Y., Chen, Z., Arfeen, D., Abhyankar, R.,
+  Y., Krikun, M., Shazeer, N., and Chen, Z. Gshard: Scal-       and Jia, Z. Specinfer: Accelerating generative llm serv-
+  ing giant models with conditional computation and auto-       ing with speculative inference and token tree verifica-
+  matic sharding. arXiv preprint arXiv:2006.16668, 2020.        tion. arXiv preprint arXiv:2305.09781, 2023b.
+
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference       ModelTC. Lightllm, February 2024. URL https://
+  from transformers via speculative decoding. In Inter-         github.com/ModelTC/lightllm/.
+  national Conference on Machine Learning, pp. 19274–
+                                                               Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Pat-
+  19286. PMLR, 2023.
+                                                                 wary, M., Korthikanti, V., Vainbrand, D., Kashinkunti,
+Li, S., Xue, F., Baranwal, C., Li, Y., and You, Y. Sequence      P., Bernauer, J., Catanzaro, B., et al. Efficient large-scale
+  parallelism: Long sequence training from system per-           language model training on gpu clusters using megatron-
+  spective. arXiv preprint arXiv:2105.13120, 2021.               lm. In Proceedings of the International Conference for
+                                Optimizing Deployment Configurations for LLM Inference
+
+  High Performance Computing, Networking, Storage and        Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. Zero:
+  Analysis, pp. 1–15, 2021.                                    Memory optimizations toward training trillion param-
+                                                               eter models. In SC20: International Conference for
+Naumov, M., Mudigere, D., Shi, H.-J. M., Huang, J., Sun-       High Performance Computing, Networking, Storage and
+  daraman, N., Park, J., Wang, X., Gupta, U., Wu, C.-J.,       Analysis, pp. 1–16. IEEE, 2020.
+  Azzolini, A. G., et al. Deep learning recommendation
+  model for personalization and recommendation systems.      Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi,
+  arXiv preprint arXiv:1906.00091, 2019.                       R. Y., Awan, A. A., Rasley, J., and He, Y. Deepspeed-
+                                                               moe: Advancing mixture-of-experts inference and train-
+NVIDIA. Fastertransformer: About transformer related op-       ing to power next-generation ai scale. In Interna-
+ timization, including bert, gpt. [Online], 2017. https:       tional conference on machine learning, pp. 18332–
+ //github.com/NVIDIA/FasterTransformer.                        18346. PMLR, 2022.
+NVIDIA Corporation.    Nvidia blackwell architec-            Ren, J., Rajbhandari, S., Aminabadi, R. Y., Ruwase, O.,
+ ture technical brief.  https://www.nvidia.                    Yang, S., Zhang, M., Li, D., and He, Y. {Zero-offload}:
+ com/en-us/data-center/technologies/                           Democratizing {billion-scale} model training. In 2021
+ blackwell-architecture/, 2024a.                               USENIX Annual Technical Conference (USENIX ATC
+NVIDIA Corporation.  Nvidia h200 tensor core                   21), pp. 551–564, 2021.
+ gpu, 2024b. URL https://www.nvidia.com/                     Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q.,
+ en-us/data-center/h200/. Accessed: 2025-05-                   Hinton, G., and Dean, J. Outrageously large neural net-
+ 05.                                                           works: The sparsely-gated mixture-of-experts layer. In
+                                                               International Conference on Learning Representations,
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright,
+                                                               2016.
+  C. L., Mishkin, P., Zhang, C., Agarwal, S., Slama,
+  K., Ray, A., et al. Training language models to fol-       Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,
+  low instructions with human feedback, 2022. URL              B., Liang, P., Re, C., Stoica, I., and Zhang, C. Flexgen:
+  https://arxiv. org/abs/2203.02155, 13, 2022.                 High-throughput generative inference of large language
+                                                               models with a single gpu. 2023.
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í.,
+  Maleki, S., and Bianchini, R. Splitwise: Efficient         Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,
+  generative llm inference using phase splitting. In           J., and Catanzaro, B. Megatron-lm: Training multi-
+  2024 ACM/IEEE 51st Annual International Symposium            billion parameter language models using model paral-
+  on Computer Architecture (ISCA), pp. 118–132. IEEE,          lelism. arXiv preprint arXiv:1909.08053, 2019.
+  2024.
+                                                             Smith, A. and Alla, V. K. Amd instinct™ mi300x: A gen-
+Peng, B., Alcaide, E., Anthony, Q., Albalak, A., Arcad-        erative ai accelerator and platform architecture. IEEE
+  inho, S., Cao, H., Cheng, X., Chung, M., Grella, M., GV,     Micro, 2025.
+  K. K., et al. Rwkv: Reinventing rnns for the transformer
+                                                             Tirumala, A. and Wong, R. Nvidia blackwell platform:
+  era. arXiv preprint arXiv:2305.13048, 2023.
+                                                               Advancing generative ai and accelerated computing. In
+Qi, H., Sparks, E. R., and Talwalkar, A. Paleo: A perfor-      2024 IEEE Hot Chips 36 Symposium (HCS), pp. 1–33.
+  mance model for deep neural networks. In International       IEEE Computer Society, 2024.
+  Conference on Learning Representations, 2017.              Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., and     M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+  Xu, X. Mooncake: Kimi’s kvcache-centric architecture         Azhar, F., et al. Llama: Open and efficient founda-
+  for llm serving. arXiv preprint arXiv:2407.00079, 2024.      tion language models. arXiv preprint arXiv:2302.13971,
+                                                               2023.
+Qwen Team. Qwen2.5 Technical Report. arXiv preprint
+ arXiv:2412.15115, 2024.                                     Vaidya, N., Oh, F., and Comly, N. Optimizing infer-
+                                                               ence on large language models with nvidia tensorrt-
+Radford, A., Narasimhan, K., Salimans, T., Sutskever, I.,      llm, now publicly available. [Online], 2023. https:
+  et al. Improving language understanding by generative        //github.com/NVIDIA/TensorRT-LLM.
+  pre-training. 2018.
+                                                             Wan, Z., Wang, X., Liu, C., Alam, S., Zheng, Y., Qu, Z.,
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D.,         Yan, S., Zhu, Y., Zhang, Q., Chowdhury, M., et al. Ef-
+  Sutskever, I., et al. Language models are unsupervised      ficient large language models: A survey. arXiv preprint
+  multitask learners. OpenAI blog, 1(8):9, 2019.              arXiv:2312.03863, 1, 2023.
+                                 Optimizing Deployment Configurations for LLM Inference
+
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Xia, F.,          Zhao, Y., Gu, A., Varma, R., Luo, L., Huang, C.-C., Xu,
+ Chi, E., Le, Q. V., Zhou, D., et al. Chain-of-thought            M., Wright, L., Shojanazeri, H., Ott, M., Shleifer, S.,
+ prompting elicits reasoning in large language models.            et al. Pytorch fsdp: experiences on scaling fully sharded
+ Advances in Neural Information Processing Systems, 35:           data parallel. arXiv preprint arXiv:2304.11277, 2023.
+ 24824–24837, 2022.
+                                                                Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin,
+Xia, H. et al. Unlocking efficiency in large language model       X., and Zhang, H. Distserve: Disaggregating prefill and
+  inference: A comprehensive survey of speculative de-            decoding for goodput-optimized large language model
+  coding. arXiv preprint arXiv:2401.07851, 2024.                  serving. arXiv preprint arXiv:2401.09670, 2024.
+
+Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and         Zhou, Z., Ning, X., Hong, K., Fu, T., Xu, J., Li, S., Lou,
+  Han, S. Smoothquant: Accurate and efficient post-               Y., Wang, L., Yuan, Z., Li, X., et al. A survey on effi-
+  training quantization for large language models. In Inter-      cient inference for large language models. arXiv preprint
+  national Conference on Machine Learning, pp. 38087–             arXiv:2404.14294, 2024.
+  38099. PMLR, 2023a.
+
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-        A F ULL AUTHOR L IST
+  ficient streaming language models with attention sinks.       Below are the contributors to this paper, alphabetically or-
+  arXiv preprint arXiv:2309.17453, 2023b.                       dered by last name:
+                                                                Anca Agape, Scott Batura, Vincent Boivin, Stephen Chen,
+Xu, T., Helenowski, E., Sankararaman, K. A., Jin, D., Peng,     Renfei Chen, Sijia Chen, Sungmin Cho* , Timothy Chou,
+  K., Han, E., Nie, S., Zhu, C., Zhang, H., Zhou, W.,           Dhruv Choudhary, Yan Cui, Bradley Davis, Zhaoxia (Sum-
+  et al. The perfect blend: Redefining rlhf with mixture        mer) Deng, Nick Egebo, Emad El-Haraty, Sebastien Esti-
+  of judges. arXiv preprint arXiv:2409.20370, 2024.             enne, Lu Fang, Lu Fang, Josh Fromm, Raj Ganapathy,
+Yan, E. Open LLMs, 2024. URL https://github.                    Vedanuj Goswami, Naman Goyal, Leo Guo, Xingwen Guo,
+  com/eugeneyan/open-llms.                                      Ye Hu, Chenheli Hua, Jianyu Huang, Aya Ibrahim, Ni-
+                                                                ranjan Jagannath, Geonhwa Jeong, Hongyi Jia, Changkyu
+Yang, A. J., Yang, J., Ibrahim, A., Xie, X., Tang, B., Sizov,   Kim, Fei Kou, Jaewon Lee* , Yejin Lee, Shikai Li, Bran-
+  G., Reizenstein, J., Park, J., and Huang, J. Context          don Liu, Tony Liu, Jiawen Liu, Kai Londenberg, Kshitiz
+  parallelism for scalable million-token inference. arXiv       Malik, Ajit Mathews, Xiaozhu Meng, Vlad Mihailescu,
+  preprint arXiv:2411.01783, 2024.                              Amit Nagpal, Maxim Naumov, Michal Ostrowski, Jialin
+                                                                Ouyang, Jason Park, Sarunya Pumma, Ye (Charlotte) Qi,
+Yang, J., Jin, H., Tang, R., Han, X., Feng, Q., Jiang, H.,      Zixi Qi, Jeremy Reizenstein, Rajasi Saha, Nandhini San-
+  Zhong, S., Yin, B., and Hu, X. Harnessing the power of        thanam, Zhan Shu, Ruan Silva, Grigory Sizov, Jon Maltiel
+  llms in practice: A survey on chatgpt and beyond. ACM         Swenson, Chunqiang Tang, Brandon Taylor, Chris Thi,
+  Transactions on Knowledge Discovery from Data, 2023.          Keyun Tong, Chip Turner, Ria Verma, Adolfo Victoria,
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-     Sheng Wang, Yunfan Wang, Pengchao Wang, Wenchen
+  G. Orca: A distributed serving system for transformer-        Wang, Xiaodong Wang, Bram Wasti, Qinfan Wu, Wei Xu,
+  based generative models. In Proceedings of the 16th           Qirui Yang, Jingyi Yang, Hector Yuen, Zhengyuan Zhang,
+  USENIX Symposium on Operating Systems Design and              Ying Zhang, Jing Zhang, Zhiwei Zhao, Jenny Zhen, Yanjun
+  Implementation, pp. 521–538, 2022.                            Zhou.
+                                                                *
+Yuan, Z., Shang, Y., Zhou, Y., Dong, Z., Xue, C., Wu, B.,        Corresponding authors:                  Sungmin       Cho
+  Li, Z., Gu, Q., Lee, Y. J., Yan, Y., et al. Llm infer-        (sungmincho@meta.com)              and     Jaewon      Lee
+  ence unveiled: Survey and roofline model insights. arXiv      (jaewon@meta.com).
+  preprint arXiv:2402.16363, 2024.
+
+Zhang, H., Xu, J., and Wang, J. Pretraining-based natu-
+  ral language generation for text summarization. arXiv
+  preprint arXiv:1902.09243, 2019.
+
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+  R., Song, Z., Tian, Y., Ré, C., Barrett, C., et al. H2o:
+  Heavy-hitter oracle for efficient generative inference of
+  large language models. Advances in Neural Information
+  Processing Systems, 36:34661–34710, 2023.
+

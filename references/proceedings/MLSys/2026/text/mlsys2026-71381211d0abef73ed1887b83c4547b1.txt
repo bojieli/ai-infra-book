@@ -1,0 +1,1241 @@
+    OPKV: A HIGH-THROUGHPUT PLUGIN-DRIVEN FRAMEWORK
+    FOR RECALLABLE SPARSITY IN PAGED KV CACHE SYSTEMS
+
+
+                   Huazheng Lao 1 Xiaofeng Li 1 Rui Xu 1 Long Chen 1 Xia Zhu 1 Jinquan Zhang 2
+
+
+                                                           A BSTRACT
+        Long-context large language model (LLM) inference faces severe KV cache inflation, making GPU memory a key
+        bottleneck. Existing recallable sparsity methods mitigate memory pressure by offloading non-critical key-value
+        (KV) pairs to CPU memory and recalling them on demand, but they are intrusive to KV cache management in the
+        existing inference frameworks and fail to cope with the linearly increasing recall overhead under high batches.
+        To address these limitations, we propose OPKV, a high-throughput plugin-driven framework that seamlessly
+        integrates recallable sparsity into paged KV cache systems and performs unified recall optimization. OPKV
+        introduces a plugin interface that decouples sparsity logic from model and cache management, and applies object
+        reaggregation and hot page hit algorithms to reduce the recall overhead based on the observation of spatial
+        discreteness and temporal locality in critical KV selection. In addition, a local intra-iteration metadata manager is
+        implemented to perform millisecond-level page retrieval and cache eviction. The experimental results show that
+        OPKV helps the SoTA methods attain 1.3 - 1.8x higher decoding throughput under different batches.
+
+1       I NTRODUCTION                                               Quantization-based approaches (Liu et al., 2024; Hooper
+                                                                    et al., 2024) reduce the size of KV tensors by lowering nu-
+Large Language Models (LLMs) (Touvron et al., 2023;                 merical precision (e.g., from FP16 to INT4/8), achieving
+Kocoń et al., 2023) have achieved remarkable progress in           linear memory savings with minimal accuracy loss. In con-
+natural language processing, with their capabilities tightly        trast, sparsity-based approaches improve memory efficiency
+tied to the context window length. Longer contexts enable           not by compressing all vectors but by retaining only crit-
+more complex tasks, such as long document understanding             ical KVs. Early works in this space (Xiao et al., 2024b;
+(Bai et al., 2024), retrieval augmented generation (RAG)            Zhang et al., 2023) relied on heuristic rules to discard non-
+(Arslan et al., 2024), and multi-turn dialog (Wu et al., 2018).     critical KVs, while more recent cutting-edge works (Lee
+However, this trend exacerbates a severe system bottleneck:         et al., 2024; Liu et al., 2025; Hao et al., 2025) have shifted to
+KV cache inflation (Hooper et al., 2024). As the KV cache           a speculative recall paradigm: they offload non-critical KVs
+stores intermediate key and value vectors to avoid redundant        to CPU memory and speculatively prefetch tokens that may
+computations in attention layers, it scales linearly with con-      be needed in future layers. Although this paradigm offers
+text length. For a request with 10k context tokens, the KV          excellent memory-accuracy trade-offs, current implementa-
+cache alone can occupy up to 8 GB of GPU memory (e.g.,              tions remain algorithmic prototypes rather than deployable
+for 13B-parameter models with multi-head attention and              systems.
+FP16 precision), yet dedicated inference GPUs (Choquette
+& Gandhi, 2020) typically have less than 48 GB of memory,           Unfortunately, recallable sparsity is fundamentally incom-
+most of which is reserved for loading model weights. This           patible with page-based KV cache systems such as Page-
+mismatch between KV cache demand and GPU memory                     dAttention (Kwon et al., 2023). Production frameworks
+capacity has become a primary barrier to deploying long-            manage KV memory at the page level, where each page
+context LLM inference efficiently at scale.                         groups tens of tokens to reduce fragmentation; by contrast,
+                                                                    sparsity algorithms operate at the token level. This granular-
+To address this bottleneck, previous work explores two direc-       ity mismatch leads to heavy I/O amplification and metadata
+tions: quantization-based and sparsity-based compression.           synchronization overhead, degrading throughput when spar-
+    1
+    Southeast University, Nanjing, China 2 Guangdong University     sity is applied directly. As a result, researchers face an
+of Technology, Guangdong, China. Correspondence to: Long            undesirable trade-off: adopting recallable sparsity improves
+Chen <chen long@seu.edu.cn>.                                        memory efficiency but sacrifices system throughput, while
+                                                                    staying within framework constraints limits achievable spar-
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,
+2026. Copyright 2026 by the author(s).
+                                                                    sity.
+          OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+
+
+
+                                                                                                             Server
+                                                                                                                      Scheduler       Block Manager
+
+
+
+
+                                                                     Server
+                                                                              Scheduler     Block Manager
+
+
+
+
+                                                                                                             Worker
+                                     Modified                                                                               Sub BM      Cache Engine
+
+
+
+
+                                                                     Worker
+       Model             KV Cache             Sel      KV Cache                               Cache Engine
+                                      Model
+                                                                                                                        Model            KV Cache
+                                                        Recalled                Model          KV Cache
+                                                          KVs                                                               Plugin
+                                                                                      Block Table
+               Attn Backend                  Attn Backend                                                                       Block Table
+
+                                                                                    Attn Backend
+                                                                                                                            Attn Backend
+
+
+
+
+        (a) Base Model              (b) Recallable Sparsity                   (c) PagedAttention                             (d) Ours
+
+                                     Figure 1. Comparison of different inference frameworks.
+
+
+Core Insight. These observations raise a central question:         reserving extension points at each stage of the model oper-
+Is there a way to enable recallable KV sparsity methods to         ation, it decouples these components to enable clear data
+align with inference frameworks? If such a method exists,          flows: the model requests critical KV indices by sparsity
+it would first facilitate rapid application and validation for     plugins, and the KV cache manager uses these indices to
+algorithm researchers, which would eliminate the need for          recall the required vectors.
+them to rebuild or modify the core inference infrastructure
+                                                                   Challenge 2: Spatial mismatch between token-level spar-
+when testing new sparsity logistics. Second, it would enable
+                                                                   sity operations and page-level memory organization.
+the decoupling of the accuracy of the sparsity algorithms
+                                                                   PagedAttention manages KV cache at the page level, which
+themselves from the efficiency of their system implemen-
+                                                                   groups dozens of tokens into a single block to minimize
+tations. Consequently, an algorithm-agnostic KV cache
+                                                                   fragmentation. However, sparsity methods usually select in-
+prefetch framework could independently optimize inference
+                                                                   dividual critical KVs at the token level. And this mismatch
+throughput and latency.
+                                                                   makes integrating sparsity into PagedAttention non-trivial.
+In the paper, we introduce OPKV, a high-throughput                 Based on the observation of spatial discreteness and tempo-
+plugin-driven framework for Object-level recallable spar-          ral locality in KV selection, OPKV proposes a duplicated
+sity methods in Page-level KV cache management (Figure             page cache technique, which combines critical object aggre-
+1d). OPKV implements a model-sparsity-cache inference              gation and hot page loading. By aggregating the selected
+paradigm that can be seamlessly integrated into existing           tokens into pages, it can adapt to the KV cache management
+inference frameworks. Through carefully designed exten-            of PagedAttention.
+sion points, it enables the injection of recallable sparsity
+                                                                   Challenge 3: Temporal mismatch between per-layer KV
+methods without altering the original operation of the infer-
+                                                                   recalls and per-iteration metadata updates. Continu-
+ence framework. In addition, OPKV designs an algorithm-
+                                                                   ous batching (Yu et al., 2022) improves scheduling from
+agnostic recall optimization strategy, which enables fine-
+                                                                   the request level to the iteration level and inference frame-
+grained, intra-iteration KV recall through adaptive page co-
+                                                                   works manage KV metadata between iterations. However,
+ordination and low-latency metadata handling. Specifically,
+                                                                   recallable sparsity methods recall critical KVs between at-
+OPKV addresses three key challenges and we elaborate
+                                                                   tention layers, and thus an inter-iteration metadata manage-
+them as follows:
+                                                                   ment is not enough. Furthermore, the computing time of
+Challenge 1: Structural coupling between model, spar-              an attention layer is in the millisecond range. Simply mov-
+sity and KV cache management. Existing sparsity pro-               ing metadata management between layers would lead to
+totypes integrate three core components into a monolithic          significant overhead, including inter-process communica-
+block: model modifications to support KV sparsity, logic for       tion overhead and CPU computing overhead. To minimize
+identifying critical KVs, and mechanisms for recalling of-         the overhead from KV metadata management, OPKV im-
+floaded KVs. This coupling creates severe scalability issues:      plements an intra-iteration KV cache management system,
+adapting to a new model requires rewriting or duplicating          including an efficient page hit algorithm and a fast cache
+large portions of code (e.g., embedding critical KV recall         eviction strategy. By overlapping CPU and GPU computing,
+into transformer attention layers), leading to poor maintain-      the latency caused by metadata management can be reduced.
+ability and slow iteration. To address the challenge, OPKV
+proposes a plugin solution and provides a clear interface
+for customized recallable KV sparsity methods. Through
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+2    BACKGROUND AND M OTIVATION                                                        300                                                                            10
+                                                                                                       Selected Token Num
+                                                                                       250             Hit Page Num                                                   8
+KV sparsity is a critical technique for long-context LLM                               200             I/O Amplification                                              6
+
+
+
+
+                                                                  Count
+
+
+
+
+                                                                                                                                                                       Times
+inference, as it ensures a stable KV budget and keeps the                              150                                                                            4
+GPU memory footprint nearly constant even for extremely                                100                                                                            2
+                                                                                        50                                                                            0
+long contexts. Compared to the base model (Figure 1a), the                                      0            20             40          60          80          100
+recallable sparsity method (Figure 1b) introduces a selec-                                                           Decoding Iteration (Layer 7)
+tion module (Sel) to recall key-value pairs (recalled KVs),
+which collaborates with the KV cache within the Attention         Figure 2. Number of selected tokens (left) and possible I/O ampli-
+Backend.                                                          fication (right) during multiple iterations in layer 7 of InfiniGen.
+
+Unlike the simple control logic of the base model, Page-
+dAttention (Figure 1c) adopts a server-worker architecture         plification, assuming a page contains 16 tokens. We found
+and achieves efficient memory sharing by separating the            that compared with merely recalling selected tokens, recall-
+physical operations of the KV cache from logical block             ing all the pages containing any one selected tokens would
+management. Unfortunately, the invasiveness of the sparsity        result in a stable I/O amplification of approximately four
+methods to the KV cache makes it impossible to simply              times. As shown in Figure 4a, selected token shows spatial
+integrate them into PagedAttention. And transforming the           discreteness in both InfiniGen and OmniKV. The key KVs
+sparsity methods into an efficient, scalable, and reliable         are hardly concentrated together but are relatively evenly
+implementation requires addressing practical challenges at         distributed across different pages. A simple approach is to
+both the algorithmic and system levels with collaborative de-      aggregate the recalled tokens into blocks and discard them
+signs. Our work is motivated by three critical observations        after computation, but it lacks efficiency. Figure 3 indicates
+as follows:                                                        temporal locality in selected tokens, and implies that aggre-
+Model-Cache Coupling Limits Reusability. As shown in               gated pages are likely to be reused in the short term, so they
+Figure 1b, typical sparsity methods consist of three compo-        can be maintained on the GPU.
+nents, but their tight integration creates barriers: (1) model    Linearly Increasing Recall Overhead Suppresses
+modification, which is often limited to a small set of LLMs       Throughput. A larger batch is usually beneficial for
+with custom logic embedded in the compute path; (2) criti-        throughput growth, but it is often overlooked by recallable
+cal KV selection, the core algorithmic component that spans       sparsity methods. For example, open-source implementa-
+prefill preprocessing and decoding-time identification; and       tions of Quest and ClusterKV are restricted to a batch size
+(3) KV recall, a performance-critical step (for recallable
+methods) optimized across algorithm and system levels.
+However, only the second part is inherently algorithmic, and                                    1.00
+tight coupling makes the other parts hard to reuse. This tight                                  0.95
+
+
+
+
+                                                                                                                                                                      InfniGen
+                                                                 Ratio of Reusable Tokens (%)
+
+
+
+
+coupling leads to critical pain points in practical use. De-                                    0.90
+velopers must rewrite the transformer attention layer code,
+                                                                                                0.85
+and only a small part of the sparsity-related code can be
+                                                                                                0.80
+reused across different inference frameworks. As a result,                                                        20             40          60          80      100
+a unified modular design is therefore necessary. Such a
+                                                                                                1.00
+design would involve two key steps: explicitly decoupling
+                                                                                                0.75
+                                                                                                                                                                      OminiKV
+the three components into a model-sparsity-cache tiered
+structure; and packaging sparsity as a standalone plugin that                                   0.50
+interfaces with both base models and the KV cache manager.                                      0.25
+This approach would substantially lower adaptation costs                                        0.00
+across different LLM architectures and facilitate efficient                                                       20             40          60          80      100
+KV recall, which is critical for maintaining low latency in                                                                 Decoding Iteration
+long-context decoding.                                                                                        window=1            window=5          window=10
+
+Token-Page Mismatch Causes I/O Amplification. We ob-
+                                                                  Figure 3. The ratio of the reusable tokens in the past sliding win-
+served that page-level management is the de facto standard
+                                                                  dow to the selected tokens in each iteration with different window
+in modern inference systems, whereas most sparsification
+                                                                  sizes. In layer 7 of InfiniGen, there is a very strong similarity
+operates at the token-level. Mapping token-level methods          between iterations, so tokens of the last iteration can be reused
+directly to pages is inefficient, which leads to severe I/O       very well. While in layer 2 of OmniKV, a large window size of 10
+amplification. Figure 2 shows the number of tokens selected       is helpful in parts of iterations. Even so, the last iteration can still
+by InfiniGen over 100 iterations and the possible I/O am-         meet most of the reuse requirements.
+                         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+          1.0                                                          100                              face and a per-worker Sub Block Manager (Sub BM) which
+          0.8                                                           80                              supports request forwarding, KV recall, and cache metadata
+                                                                                                        management. The design co-optimizes the recall path and
+          0.6                                                           60
+
+
+
+
+                                                            Time (%)
+                                                                                                        cache layout to reduce potential communication latency and
+CDF (%)
+
+
+
+
+          0.4                                                           40                              I/O amplification.
+
+                                                                        20                    Recall
+          0.2                                                                                 Compute
+                                           InfiniGen                                                    3.1   System Overview
+                                           OmniKV                                             Others
+          0.0                                                            0
+                1       4        8        12           16                    1   2       4        8     Figure 1d illustrates an overview of OPKV. OPKV is similar
+                    Selected Token Num in Hit Page                               Batch Size
+                                                                                                        to PagedAttention. The server is deployed on the host, with
+(a) CDF of selected token num- (b) The proportion of overheads                                          one worker instance running on each GPU. They are con-
+ber in each hit page.          given various batch sizes in In-                                         nected through Remote Procedure Call (RPC). The server is
+                               finiGen.                                                                 responsible for request scheduling and KV metadata man-
+                                                                                                        agement. For the model runner in the worker, it receives
+           Figure 4. Analysis of token selection and recall overheads.                                  request tasks from the scheduler and performs computations
+                                                                                                        using a highly optimized attention backend. The model
+                                                                                                        runner does not directly manage the KV cache. Instead, the
+of 1, severely limiting parallelism. Although InfiniGen re-                                             block table provided by Block Manager (BM) located in
+ports reasonable latency at a batch size of 20 (compared to                                             the server retrieves the required KV cache from the cache
+UVM (Allen & Ge, 2021) and FlexGen (Sheng et al., 2023)),                                               engine.
+our experiments (Figure 9) show its decoding throughput
+plateaus as the batch size increases, indicating a fundamen-                                            Unlike PagedAttention, when the request is scheduled to
+tal bottleneck in scalability.                                                                          be processed by recallable sparsity methods, the scheduler
+                                                                                                        lets the model runner apply the requested plugin, which
+The reason is that as the batch size increases, the recall                                              selects the critical KVs that needs to participate in the atten-
+overhead also increases linearly. Figure 4b shows the time                                              tion calculation layer by layer through the extension points
+proportions of each part in InfiniGen. When the batch size is                                           provided by the model. Sub BM located in the worker is
+1, the overheads of computation and recall are approximately                                            activated to manage the KV cache metadata changed by KV
+the same, so they can be well overlapped through prefetch-                                              recall within the process, thereby eliminating the communi-
+ing. However, under a high batch size, even with optimized                                              cation overhead caused by RPC calls. Through Sub BM, a
+transmission technology and prefetching mechanism, the                                                  block table based on token selection is updated in real time
+recall overhead still inevitably becomes a bottleneck.                                                  to replace the original block table from BM.
+Additional GPU memory is required to reduce CPU-to-GPU
+transfers, but managing them is risky due to two possible                                               3.2   Plugin Interface
+overheads: communication overhead. As shown in Fig-
+                                                                                                        To address these challenges of decoupling model logic from
+ure 1c, PagedAttention manages the block metadata at the
+                                                                                                        strategy implementation and enabling flexible integration
+granularity of the iteration, typically via a centralized server
+                                                                                                        of diverse KV cache optimizations, we designed a standard-
+that coordinates multiple workers on RPC and sends block
+                                                                                                        ized plugin interface. The following subsection details the
+tables in each iteration, and this centralized coarse-grained
+                                                                                                        interface design (Figure 5) of OPKV, including its five core
+metadata handling proves prohibitively costly for layer-level
+                                                                                                        callbacks and their roles in the attention workflow:
+token selection, inspiring us to build fine-grained and local-
+ized metadata management. retrieval overhead. Despite
+the strong temporal locality, the retrieval of recallable pages                                           1. register is invoked during the initialization of the
+is still time-consuming. The computation of each attention                                                   attention layer. The plugin retrieves the configuration
+layer is at the millisecond level, and matching of the selected                                              information of the layer and is initialized itself. It also
+token with hot pages is a complex set-coverage problem.                                                      provides supplementary information to the Sub BM to
+Therefore, we must select the appropriate pages as soon as                                                   facilitate cache management. For example, indicate
+possible, even if this solution is sub-optimal.                                                              whether the KV cache of a certain layer must remain
+                                                                                                             in the GPU memory or whether the same token will be
+                                                                                                             recalled for several consecutive layers.
+3               OPKV D ESIGN
+                                                                                                          2. preprocess is executed during prefill and decoding
+In this section, we introduce the design of OPKV. To sup-                                                    iterations. The forward pass of the attention layer is di-
+port diverse sparsify methods and recall strategies without                                                  vided into multiple stages, and the plugin can perform
+modifying the core inference pipeline, OPKV decouples                                                        preprocessing operations between these stages, such as
+algorithms from the system via a standardized plugin inter-                                                  Singular Value Decomposition (SVD), index construc-
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+class RecallableSparsityPlugin:
+
+
+
+
+                                                                                                                                          Recall
+                                                                            Init
+    def register(self, attn_layer):
+        layer_id = self._register(attn_layer)
+
+
+
+
+                                                                                   Register
+
+
+
+
+                                                                                                                Preprocess
+        return layer_id
+
+
+
+
+                                                                                                                                                                        Recall Exection
+                                                                                                                                                    Layer k+1                             Actual execution
+
+
+
+
+                                                                                                                                           Select
+                                                                                                                                                      …
+
+
+
+
+                                                                                                                                                                Fetch
+                                                                                                                                                                                          after async
+                                                                                                                                                     Layer n
+                                                                                                                                                                                          function invocation
+    def preprocess(self, layer_id, stage, context):                         Extensible API
+
+
+
+
+                                                                                                 Stage #Start
+
+                                                                                                                             Stage #End
+        if stage == Stage.Start:
+
+
+
+
+                                                                                                     …
+                                                                             Internal API
+            return self._process_start(layer_id, context)
+                                                                                                                                                      Layer Cycle
+                                                                            Original API
+        if stage == Stage.End:
+            return self._process_end(layer_id, context)
+        ...                                                                                   Figure 6. Plugin Workflow
+
+    def select(self, layer_id, context):
+        sel_token_idx_by_layer = self._select(
+            layer_id, context)
+                                                                 via fetch. Meanwhile, before the attention computation,
+        return sel_token_idx_by_layer                            recall retrieves the previously prefetched KVs. This en-
+                                                                 ables overlap between GPU kernel computation and KV
+    def fetch(self, sel_token_idx_by_layer, context):
+                                                                 recall. Together, these interface functions form a modular
+        requests = self._build(
+            sel_token_idx_by_layer, context)                     and extensible framework, providing a foundational layer
+        outputs = [                                              to advance KV cache sparsity research, balancing flexibility
+            sub_block_manager.async_fetch(requests)              for innovation with robustness for practical deployment.
+            for sub_block_manager in context.block_manager
+        ]
+        err_code = self._handle_err(outputs)                     3.3    KV Recall
+        return err_code
+                                                                 To address the challenge of mismatched granularity between
+    def recall(self, layer_id, context):                         token-level KV recall and page-level memory organization,
+        outputs = [
+            sub_block_manager.recall(layer_id)
+                                                                 we design a hot-page-based aggregation and retrieval algo-
+            for sub_block_manager in context.block_manager       rithm.
+        ]
+        err_code = self._handle_err(outputs)                     We denote the original KV block, sequentially generated in
+        block_table = self._handle_result(outputs)               prefill and decode phase, as Ordered Block and introduce
+        return err_code, block_table                             the OP Block based on the temporal locality of critical KVs,
+                                                                 which is aggregated by critical KVs for efficient caching
+                  Figure 5. Plugin Interface                     and retrieval. Under this design, KV recall is decomposed
+                                                                 into two coordinated stages: (1) page retrieval and (2) object
+                                                                 aggregation. The majority of critical KVs are first retrieved
+     tion, or setup of other sophisticated data structures. In   directly from OP Blocks and the missing KVs are then gath-
+     addition, it returns a flag indicating whether prepro-      ered from the Ordered Blocks and aggregated into newly
+     cessing is fully completed; Once ready, the selection       formed OP Blocks, which are subsequently recalled to com-
+     operation can proceed.                                      plete the retrieval process.
+ 3. select is processed during decoding iterations. The
+    plugin can select tokens to be recalled for the current      Algorithm 1 OP Block Retrieval
+    and/or subsequent layers, supporting cross-layer joint        1: Input: selected token idx S, recalled token idx R, OP
+    decision-making.                                                   block list O, page hit ratio ρ, block size ξ
+ 4. fetch submits requests to the Sub BM. It constructs           2: B ← {}, M ← {}
+    requests based on the token IDs selected by select            3: θ ← ⌈ρ · ξ⌉
+    and submits them to the Sub BM for processing                 4: candidate C ← O.filter(S, < θ)
+ 5. recall checks with the Sub BM to confirm if the re-           5: for b ∈ C do
+    call is complete, when the recalled tokens are required       6:   if |S ∩ Tb | ≥ θ then
+    for computation; if not yet completed, it blocks until        7:       B.append(b)
+    the operation finishes.                                       8:       M.append(b.repeat in(R))
+                                                                  9:       S ← S − Tb , R ← R ∪ T b
+                                                                 10:   end if
+Figure 6 illustrates the collaborative workflow among plug-
+                                                                 11: end for
+ins. In each registered layer, the preprocess step obtains
+                                                                 12: return S, R, B, M
+the required context and passes it to select, which com-
+putes the critical KVs for the next one or more layers; these
+are then uniformly submitted to the sub block manager            The ideal goal of KV recall process is to cover all the critical
+                    OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+                             selected token idx
+    Plugin                                                                                        Request
+                         Sub Block Manager                                              Scheduler                                               Block Manager
+     Cache Engine
+
+
+                                   aggr block                                Worker N
+                                                                            Worker 1
+                                                        Filter             Worker 0                                        transfer
+                             Ordered Block            OP Block                    Model
+
+
+
+
+                                                                                                       Sub Block Manager
+                                                                    GPU                                                               realloc                   GPU
+                                                                                        Plugin
+                                                                                                                             free
+                                                                                   Cache Engine
+     Attn
+
+
+
+
+                                                        Filter
+                                                                                   Attn                                               realloc
+                             Ordered Block            OP Block                                                                         Block Tables   Block Pool CPU
+                                                                    CPU
+
+                    KV Recall               Load
+                                                            evict
+                    Aggregation             Offload
+
+
+                        Figure 7. Workflow of KV Recall                                          Figure 8. Request Forwarding
+
+
+
+
+KVs with the minimum number of Ordered Blocks, which
+is similar to the classic set cover problem (SCP) (Feige,                 We traverse the candidate set C to determine whether each
+1998) but only requires covering a subset. However, the                   block is hit; If hit, the recalled page is added to the set B
+critical KVs are sparsely distributed across different Ordered            (lines 6-7). To avoid duplicate tokens affecting the attention
+Blocks and the KV recall is inefficient and results in severe             output, a variable op mask is designed, which records the
+I/O amplification. OPKV introduces the extra aggregation                  indices of the current tokens that are duplicated with the
+process to copy these KVs into a new page, so we only need                already recalled tokens R, and then helps to mask them
+to cover approximately the subset as much as possible.                    during attention computation (line 8). If it is necessary to
+                                                                          maintain the consistency of the sparsity methods, all the
+Let S be the set of selected token indices and O the set
+                                                                          tokens that are not selected can be masked. Even so, the
+of existing OP Blocks (re-aggregated duplicates), where
+                                                                          recall of more KVs is usually beneficial to accuracy. After
+Tb ⊆ N denotes tokens in block b ∈ O. Our retrieval
+                                                                          this step, sets S and R are updated (line 9).
+process isSa constrained variant: find the smallest B ⊆ O
+such that b∈B Tb ⊇ S (full coverage of selected tokens)                   For Ordered Blocks, since they are arranged in sequence in
+and ∀b ∈ B, |Tb ∩ S| ≥ θ (threshold constraint). This                     the block table, it is easy to determine which pages can be
+variant remains NP-hard, considering the trade-off between                recalled through the indices of remaining tokens. Let the
+I/O amplification and search speed, we have designed a                    numbers of Ordered Blocks be O′ . Retrieval traverses all
+greedy retrieval algorithm for OP Blocks, with detailed                   blocks at most once, giving a time complexity of O(O +O′ ).
+descriptions provided in Algorithm 1.                                     If GPU/CPU memory usage not be constrained, O can be
+                                                                          much larger than O′ , which would hurt retrieval efficiency.
+To control I/O amplification, a variable page hit ratio ρ is
+                                                                          We limit the memory usage to make O and O′ close, and
+introduced. A page will only be hit and retained in memory
+                                                                          the time complexity of retrieval could be O(N ).
+if the number of tokens to be retrieved in that page exceeds
+ρ · ξ, where ξ is the block size (line 3). For example, as-               After page retrieval, a small amount of selected tokens are
+suming ξ = 16 and given 256 token indexes, a minimum                      still not recalled. They will be copied from Ordered Blocks
+of 16 blocks are required. When ρ = 80%, a maximum                        and aggregated into one or more new OP Block(s). Ob-
+of 19 blocks will be hit (containing ≥ 12.8 tokens to be re-              ject aggregation process selects k missed tokens from N
+retrieved) and 1 new page will be retrieved, with 4 additional            Ordered Blocks according to their indices and then copies
+pages in the worst case.                                                  them to GPU memory, with a cost of O(k + k/block size),
+                                                                          where k is a small fraction of total tokens. Hence the overall
+Since the number of OP Blocks to be filtered may be large
+                                                                          time complexity of page retrieval and object aggregation
+(related to cache budget and running time), full sequential
+                                                                          remains O(N).
+traversal is time-consuming. We adopt a simple filtering
+algorithm that judges whether each block has the possibility              Figure 7 shows the complete workflow of KV recall. When
+of being hit and filters out blocks where the size of the                 Sub BM receives the selected token indexes from the plugin,
+intersection with the tokens to be retrieved is less than the             it performs page retrieval in the order of OP Block → Or-
+threshold (line 4). This algorithm is implemented through                 dered Block and GPU → CPU; tokens that are not covered
+vectorization, resulting in an extremely low overhead.                    will be aggregated into new OP Blocks for recalling.
+          OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+3.4     Sub Block Manager                                               be discarded or used for prefix caching subsequently.
+                                                                        Sub BM will directly destroy OP Blocks, but not return
+Due to the significant communication overhead and latency
+                                                                        the part of GPU memory proactively, which will be
+in the inference engine designed for iterative-level schedul-
+                                                                        immediately allocated to other requests.
+ing, it is impossible to perform metadata updates for the
+per-layer recall. To address the challenge of mismatched
+granularity between per-layer KV recall and per-iteration       3.4.2     Cache Metadata Management
+metadata updates, we implement a local Sub Block Manager        In Sub BM, local cache metadata is divided into one GPU
+(Sub BM). Its core responsibilities include: (1) receiving      cache pool and two CPU cache pools, and the actual physical
+and forwarding requests; (2) handling KV recall; (3) man-       block operations are still performed by the cache Engine.
+aging private cache metadata.                                   The GPU cache pool is shared by both types of blocks
+                                                                with different requests, while the CPU cache pools hold
+3.4.1    Request Forwarding                                     Ordered Block and OP Block, respectively. When each
+For regular requests, the Cache Engine receives coarse-         request arrives, it creates an independent evictor, which
+grained instructions from BM, including swap in/                continuously adds the aggregated or hit blocks and evicts
+swap out/ copy operations, which only take effect on            the blocks when called. When the request is finished or
+all blocks of a request. Therefore, for requests that need to   aborted, Sub BM will just clear the evictor and flag the
+be processed by sparsify methods, they will be forwarded        corresponding blocks as expired. During OP Block retrieval,
+by BM to Sub BM to support more fine-grained operations.        it skips and deletes these expired blocks.
+BM will first transfer control of the request to Sub BM, and    Some standard eviction policies have been integrated, in-
+decide whether to allocate more GPU and CPU memory to           cluding First-In-First-Out (FIFO), Least Recently Used
+Sub BM. After obtaining control, Sub BM can directly initi-     (LRU), and S3FIFO (Yang et al., 2023). In Section 5.3.2,
+ate operations to the cache engine to modify these blocks.      we evaluate the effectiveness of these three eviction policies.
+As shown in Figure 8, the interaction between BM and Sub        Surprisingly, due to the specific characteristics of this work-
+BM exposes three management primitives:                         load, LRU does not perform well; FIFO is more suitable
+                                                                because most cache reuse comes from adjacent critical KVs.
+   • transfer binds the request to Sub BM, enabling Sub         S3FIFO turns out to be the best, as its fast demotion strategy
+     BM to gain control over the request block table. During    can additionally retain a small number of reusable KVs,
+     each iteration, BM retains only the last block and sends   making it more appropriate for this kind of one-hit wonders
+     the addresses of the remaining blocks to Sub BM. At        workload.
+     the same time, BM locks these addresses to avoid re-
+                                                                For the GPU cache pool, while per-request eviction can
+     occupancy. After obtaining control of the block table,
+                                                                follow these standard policies with isolated cache parti-
+     Sub BM will map each block into multiple blocks,
+                                                                tions, heterogeneity in request content and variability in hot-
+     with the maximum being the same as the number of
+                                                                page counts render such partitioning suboptimal. We there-
+     attention layers. Each block is bound to 1 to multiple
+                                                                fore adopt unified cache management across the GPU pool,
+     layers of physical blocks, depending on the registration
+                                                                jointly covering Ordered Blocks and OP Blocks. Specifi-
+     information of the plugin, with a default of 1. For
+                                                                cally, we track per-request page hit counts and total page
+     example, if the plugin always recalls the same token
+                                                                counts. When admitting new pages or when a CPU-resident
+     for layers 3 to 8, then we will not retain a copy of
+                                                                page is hit, pages with the requests exhibiting the lowest hit
+     metadata for each layer.
+                                                                rates will be preferentially evicted. Additionally, a relatively
+   • realloc reallocates GPU and CPU memory for Sub             loose fairness threshold is implemented to prevent starvation
+     BM, which is used to store the sequentially generated      of requests with low hit rates.
+     KV Blocks (Ordered Blocks) during iteration and the
+                                                                Regarding the CPU cache pools, OP Blocks may be thor-
+     re-aggregated duplicate Blocks (OP Blocks). BM allo-
+                                                                oughly evicted, whereas Ordered Blocks are permanently
+     cates a small GPU cache and a relatively ample CPU
+                                                                retained until the request is finished or aborted to ensure
+     cache to each Sub BM based on request number and
+                                                                uninterrupted token accessibility, which is an essential re-
+     prompt length. Although CPU memory is inexpen-
+                                                                quirement for decoding processes. Given the potential surge
+     sive and abundant, over-allocation yields diminishing
+                                                                in Ordered Block volume during decoding, a separate man-
+     returns and increases lookup overhead. Given the lim-
+                                                                agement framework is established: (1) a reserved space is
+     ited recall window, cache metadata must be maintained
+                                                                dedicated to Ordered Blocks, with elastic capacity expan-
+     in a short time, and controlling cache size therefore
+                                                                sion triggered when their count approaches a predefined
+     accelerates the eviction of non-beneficial OP Blocks.
+                                                                threshold; (2) a fixed-size cache partition is assigned to
+   • free returns the Ordered Blocks to BM, and they may        OP Blocks. To limit per-request lookup cost and avoid
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+eviction interference from Ordered Blocks, a max-heap is         sparsity method that focuses on reducing recall overhead
+constructed for request prioritization. Upon CPU cache           through dynamic KV cache management and speculative
+saturation, the request with the largest OP Block count is       prefetching. It predicts and prefetches critical KVs for the
+selected for eviction.                                           next layer to overlap computation and recall. InfiniGen se-
+                                                                 lects KVs independently for each attention head, and we
+4     I MPLEMENTATION                                            perform a weighted aggregation of partial attention scores
+                                                                 to make the selection at the layer granularity for fair com-
+We implemented a prototype of OPKV on top of vLLM                parison, similar to the approach of OmniKV.
+v0.7.2 (vLLM, 2025), comprising approximately 7,000 lines
+                                                                 Baseline 2: OmniKV. OmniKV exploits the similarity of
+of Python and a small amount of CUDA. The system adopts
+                                                                 attention between successive layers, and recalls the same to-
+a plugin-driven architecture and is integrated with the Llama
+                                                                 kens for multiple adjacent layers after several full-attention
+(Touvron et al., 2023), OPT (Zhang et al., 2022), and Yi
+                                                                 layers. This strategy reduces recall frequency but requires
+(Young et al., 2025) model families.
+                                                                 periodic full-attention computation to refresh the KV se-
+Attention Backend. Recalled pages may contain dupli-             lection. As a result, up to 25% of all the KV cache is
+cate tokens, so we introduce an op mask to suppress their        permanently stored in the GPU memory.
+attention. We extend vLLM’s PagedAttention backend to
+                                                                 Key metrics.           We primarily evaluate the de-
+accept this mask, while preserving the original execution
+                                                                 coding throughput and cache management ef-
+path when masking is disabled.
+                                                                 ficiency using the following metrics:         (1) De-
+Cache Layout. vLLM’s KV cache management targets                 coding Throughput (tokens/s):            batch bize ∗
+iteration-level scheduling. We extend the Cache Engine with      output len/decoding latency.      (2) GPU Page Hit
+additional primitives to enable: (1) a shift from iteration-     Ratio (%): gpu page P   hit num/recalled page num. (3)
+level to hierarchical KV management; and (2) migration           Recall Overhead (s): s∈S ts , where S means all stages
+from request-level KV transfers to page-level KV swapping.       in the recall process.
+We also implement basic object aggregation in PyTorch.
+                                                                 Model, dataset and server configurations. We evalu-
+These additions are non-intrusive, so the modified Cache
+                                                                 ate OPKV using three LLMs with different context win-
+Engine remains compatible with the original scheduling and
+                                                                 dow sizes: OPT-6.7B, LLaMA-8B, and Yi-9B. We use
+commands of vLLM.
+                                                                 ShareGPT (ShareGPT, 2025) as the testing dataset. We
+Algorithm Integration. We migrated and adapted differ-           maintain the model and parameter configuration essentially
+ent sparsity methods, and implemented dedicated algorithm        the same as reported in the baselines, and Table 1 summa-
+plugins for them. Despite our clear interfaces for sparsity      rizes the details for each combination. The experiments are
+methods, vLLM’s advancements over traditional methods in         carried out on a single NVIDIA L40 GPU (48 GB memory)
+terms of tensor shapes posed challenges. Specifically, origi-    with a 256 GB host CPU memory server.
+nal methods based on HuggingFace (Shen et al., 2023) typi-
+cally feature a dedicated batch dimension, whereas vLLM
+performs horizontal concatenation of tensors from multiple       Table 1. Overview of method configuration. Since the number of
+requests. Such structural discrepancies posed difficulties       recalled KVs by InfiniGen depends on a threshold, there is no fixed
+in the integration process. Furthermore, for the sake of ex-     value.
+perimental fairness, we disabled CUDA Graph and other
+compilation-level optimization techniques to eliminate their
+potential confounding effects.                                                            InfiniGen                   OmniKV
+                                                                  Method
+                                                                                  OPT-6.7B      LLaMA-8B        LLaMA-8B       Yi-9B
+5     E VALUATION                                                 Input             1920           1920            8000         8000
+                                                                  Output             128            128             192          192
+5.1   Experiment Setup                                            Recall Num        ∼ 100          ∼ 100            512         512
+
+To our knowledge, OPKV is the first inference accelera-
+tion framework designed for objective-level recallable spar-     Parameter setting. For the overall performance evaluation,
+sity methods in page-level KV cache management. To               we use the same default parameters for both baselines with
+evaluate its generality, we integrate two state-of-the-art re-   block size of 16, page hit ratio of 60%, and KV budget of
+callable sparsity methods with distinct recall mechanisms        25%, of which KV budget means the ratio of the current
+into OPKV and measure their performance improvements.            GPU memory usage to the original KV cache. Following the
+Baseline 1: InfiniGen. InfiniGen is an efficient recallable      setup in Figure 3, we apply FIFO to InfiniGen and S3FIFO
+                                                                 to OmniKV as their eviction policy.
+                                OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+ 5.2                         Case Study: InfiniGen                                              fine-grained cache reuse. A more reasonable size should
+                                                                                                be between 16 and 32, but considering the memory layout
+ 5.2.1                        End-to-End Performance
+                                                                                                and fragmentation, this is not worth it. A lower page hit
+Figure 9a presents the decoding throughput of OPKV and                                          ratio is beneficial for improving cache reuse, but it also
+the InfiniGen prototype under varying batch sizes for OPT-                                      brings I/O amplification. Furthermore, even with a 10%
+6.7B. Across batch sizes from 2 to 10, OPKV improves                                            budget, OPKV still achieves a 46.47% increase in decod-
+the throughput of InfiniGen by 77.39%, 50.27%, 60.74%,                                          ing throughput compared to the prototype. This indicates
+68.46%, and 75.73%, respectively. We further evaluate In-                                       that the transmission overhead caused by a small number of
+finiGen on LLaMA-8B to demonstrate the generality of                                            GPU page misses is still well overlapped.
+OPKV. Figure 9b shows that for batch sizes from 2 to
+10, OPKV achieves decoding throughput gains of 77.38%,                                                                                 Block Size                         Page Hit Ratio                    KV Budget
+                                                                                                                                               47.01 48.08         47.47 47.01                                            47.01
+
+
+
+
+                                                                                                 Throughput (tokens/s)
+37.12%, 57.83%, 39.44%, and 38.44%, respectively. The                                                                                                                             41.28 39.05         40.88 42.83 43.84
+                                                                                                                         40            36.26                  40                                 40
+reason lies in that OPKV minimizes data transfer between                                                                       27.91
+
+CPU and GPU through fine-grained page management, us-                                                                    20                                   20                                 20
+
+ing only a small amount of additional GPU memory. More-                                                                   0                                    0                                  0
+over, page-level operations incur significantly lower over-                                                                   InfiniGen 8       16       32         50%    60%    70%      80%        10%   15%    20%    25%
+
+head than object-level operations, resulting in higher overall
+decoding efficiency.                                                                           Figure 10. Sensitivity analysis of block size, GPU page hit ratio,
+                                                                                               and KV budget on decoding throughput with a fixed batch size of
+                                                                                               8 on OPT-6.7B.
+                        60
+                                  InfiniGen-OPT w/o OPKV
+                                                                                       48.49
+Throughput (tokens/s)
+
+
+
+
+                        50        InfiniGen-OPT w/ OPKV                    47.01
+                                                               38.92                            5.2.3                                Recall Process Analysis
+                        40
+                                                33.36
+                        30         26.16                               27.91       27.58       We also examine the GPU page hit ratio and the overhead
+                                           22.20           24.21
+                        20                                                                     of each stage during the recall process on OPT-6.7B. Figure
+                               14.75
+                                                                                               11 shows the GPU page hit ratio of each of the 32 attention
+                        10
+                                                                                               layers. The layers at the beginning and end have a higher hit
+                        0                                                                      ratio and a greater number of selected tokens. Although the
+                                   2           4               6           8          10
+                                                        Batch Size                             hit ratio of the layers in the middle is lower, the overhead
+                                                                                               remains small because of the limited amount of recalled data.
+                                                   (a) OPT-6.7B
+                                                                                               The overall GPU page hit ratio remains at 77.64%, which
+                        60                                                             55.35
+                                  InfiniGen-LLaMA w/o OPKV                 52.59               means that most of the KV cache can be reused directly on
+Throughput (tokens/s)
+
+
+
+
+                        50        InfiniGen-LLaMA w/ OPKV      48.17
+                                                                                               the GPU.
+                                                                       37.50       39.98
+                        40                      34.61
+                                                           30.52                                                         1.0
+                                                                                               GPU Page Hit Ratio (%)
+
+
+
+
+                        30         28.86
+                                           25.24                                                                         0.8
+                        20     16.27                                                                                     0.6
+                        10                                                                                               0.4
+                                                                                                                         0.2
+                        0
+                                   2           4               6           8          10                                 0.0
+                                                        Batch Size                                                               2     4             8         12            16            20         24          28        32
+                                                                                                                                                                           Layer Index
+                                                   (b) LLaMA-8B
+                                                                                               Figure 11. The GPU page hit ratio of each layer on OPT-6.7B. The
+Figure 9. Decoding throughput between OPKV and InfiniGen un-                                   cache warms up with the first 28 iterations and retains the results
+der different batches                                                                          of the next 100 iterations.
+
+                                                                                               Figure 12 summarizes the time consumption of each stage.
+ 5.2.2                        Parameter Sensitivity Analysis
+                                                                                               At small batch sizes (e.g., 2), object aggregation and na-
+We further analyze the influence of different parameters                                       tive KV selection of InfiniGen are performance bottlenecks.
+on the OPKV’s performance on OPT-6.7B. As shown in                                             However, page retrieval time increases linearly with batch
+Figure 10, block size has the greatest influence on through-                                   size. Because the Global Interpreter Lock (GIL) and thread
+put. When the block size decreases to 8, throughput drops                                      creation overhead of Python are too high to work within
+dramatically due to the increase in retrieval and metadata                                     milliseconds, we can only perform the page retrieval of each
+management overhead. As the block size increases, I/O                                          batch serially. To further reduce CPU time consumption,
+amplification also increases because larger blocks reduce                                      one possible approach is to refactor the retrieval compo-
+                             OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+  nent using a high-performance programming language (e.g.,                                             80
+                                                                                                                     OmniKV-LLaMA w/o OPKV                                               65.68
+
+
+
+
+                                                                               Throughput (tokens/s)
+  C++).                                                                                                              OmniKV-LLaMA w/ OPKV              59.95            63.05
+                                                                                                        60
+                                                                                                                                      47.59                                          46.22
+                      30                                                                                                                                        43.25
+                               KV Selection                                                             40                                      39.07
+Recall Overhead (s)
+
+
+
+                      25       Page Retrieval                                                                                  32.75
+                                                                                                                    28.08
+                               Block Movement                                                                  22.04
+                      20       Object Aggregation                                                       20
+                      15
+                                                                                                         0
+                      10                                                                                             2                4                6               8                10
+                      5                                                                                                                        Batch Size
+                      0                                                                                                                   (a) LLaMA-8B
+                               2            4           6        8   10
+                                                    Batch Size                                          80
+                                                                                                                     OmniKV-Yi w/o OPKV                                 67.84            69.61
+
+
+
+
+                                                                               Throughput (tokens/s)
+                                                                                                                     OmniKV-Yi w/ OPKV
+                                                                                                        60                                             53.47
+ Figure 12. The recall overhead of each stages under different                                                                        47.30                     44.71                48.01
+                                                                                                                                                40.22
+ batches on OPT-6.7B.                                                                                   40          33.75      34.02
+                                                                                                               23.96
+                                                                                                        20
+  5.3                      Case Study: OmniKV
+  5.3.1                     End-to-End Performance                                                       0
+                                                                                                                     2                4                6               8                10
+                                                                                                                                               Batch Size
+For LLaMA-8B, OmniKV executes the first two layers
+(layer 0,1) without modification and selects tokens at                                                                                      (b) Yi-9B
+the filter layers (layer 2,8,18). Meanwhile, it maintains
+one full attention layer after each filter layer, retaining                    Figure 13. Decoding throughput between OPKV and OmniKV
+(2+3+3)/32 = 25% of the KV cache on the GPU memory                             under different batches
+for full attention computation, and using a total KV budget
+of 30%, as reported in its original paper. In comparison,
+OPKV keeps the first two layers and the filter layers, but                      still overly generous and thus fails to demonstrate the ef-
+uses only 10% of normal layers as the active KV budget.                         fectiveness of different eviction policies. In Figure 14, we
+Thus, its total GPU allocation is (5 + 27 × 0.1)/32 ≈ 24%,                      evaluated the impact of different strategies on GPU page hit
+which is slightly lower than OmniKV’s 25%.                                      ratio and decoding throughput under lower KV budgets on
+                                                                                LLAMA-8B, where 2% KV budget of normal layers means
+  Despite being allocated fewer GPU memory, OPKV still                          a total KV budget of (5 + 27 ∗ 0.02)/32 ≈ 17%.
+  significantly improves the decoding throughput of OmniKV
+  over its prototype, with measured gains of 35.77%, 51.08%,                    Although widely used in cache systems, LRU shows signif-
+  52.22%, 56.44% and 55.62% for batch sizes ranging from                        icant performance degradation under low budgets, which
+  2 to 10, as depicted in Figure 13a. This is because simply                    demonstrates the difference between KV recall workloads
+  using additional layers for buffering lacks flexibility and                   and other workloads. Most of the reusable tokens are con-
+  scalability. For different filter layers, they have an uneven                 centrated in the last iteration, and the LRU cannot promptly
+  number of tokens that need to be recalled (layer 2 need to                    evict the tokens that are no longer recalled as the query
+  recall layers 4-7 while layer 18 need to recall layers 19-31),                changes, thus wasting precious GPU memory. In contrast,
+  and for long contexts, more tokens need to be recalled to
+  maintain accuracy. Therefore, highly variable recall over-
+                                                                                                                                  FIFO           LRU           S3FIFO
+  head requires more refined and efficient optimization.                                                0.8
+                                                                               GPU Page Hit Ratio (%)
+
+
+
+
+                                                                                                                                                                                                  Throughput (tokens/s)
+
+
+
+
+                                                                                                                                                                                             125
+ Similarly for Yi-9B, Figure 13b shows the decoding through-                                            0.6                                                                                  100
+ put for batch sizes from 2 to 10. OPKV achieves through-
+                                                                                                        0.4                                                                                  75
+                                                                                                                                                                                  .7
+
+
+
+
+ put improvements of 40.86%, 39.04%, 32.94%, 51.73%,
+                                                                                                                                                                  .8
+
+                                                                                                                                                                                .0
+
+                                                                                                                                                                               67
+                                                                                                                                                               63
+
+                                                                                                                                                                             63
+                                                                                                                                                    .0
+
+                                                                                                                                                               .0
+                                                                                                                        .8
+
+
+
+
+                                                                                                                                                                             .2
+                                                                                                                                     .1
+
+                                                                                                                                                  .9
+
+
+
+
+                                                                                                                                                             .5
+                                                                                                                                                 58
+
+                                                                                                                                                            58
+                                                                                                                      57
+
+
+
+
+                                                                                                                                                                           57
+                                                                                                                                  56
+                                                                                                                .7
+
+
+
+
+                                                                                                                                  .6
+
+
+
+
+                                                                                                                                                                                             50
+                                                                                                                                               53
+
+
+
+
+                                                                                                                                                           53
+                                                                                                                                              .1
+                                                                                                              49
+
+
+
+
+                                                                                                                               49
+                                                                                                                               .3
+
+
+
+
+ 44.99%, respectively. The result indicates that OPKV can
+                                                                                                                                            46
+                                                                                                                             43
+                                                                                                                   .4
+
+
+
+
+                                                                                                        0.2
+                                                                                                                 36
+
+
+
+
+ achieve considerable performance improvements for differ-                                                                                                                                   25
+ ent model architectures.                                                                               0.0                                                                                  0
+                                                                                                                     2            4              6             8                10
+                                                                                                                             KV Budget of Normal Layer (%)
+  5.3.2                     Eviction Policy Analysis
+ To ensure a fair comparison, we use a lower KV budget                         Figure 14. The effectiveness of each eviction policy with different
+ of 24% compared to 30% in OmniKV. However, this is                            KV budgets and a fixed batch size of 8 on LLAMA-8B.
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+S3FIFO inherits the quick demotion mechanism of FIFO                                     100
+                                                                                                Baseline
+which is helpful to evict one-hit objects early, and uses an                                    w/o OP Block Aggregation
+                                                                                                w/o Hot Page Reuse
+                                                                                         80     w/ Full Prefetch
+additional FIFO queue to retain important objects. There-
+
+
+
+
+                                                                 Throughput (tokens/s)
+                                                                                                OPKV
+                                                                                                                                                                              63.05
+fore, it has a better GPU page hit ratio and more object                                 60                                                                   55.47
+aggregation in GPU compared to FIFO, and maintains a                                                                                                  48.23           50.34
+                                                                                                                             47.01
+                                                                                                                                              43.25
+high decoding throughput. With a total KV budget of 17%,                                                       40.31 37.77
+                                                                                         40
+                                                                                                       31.74
+it has a decoding throughput increase of 33.55% compared                                       27.91
+
+to OmniKV.                                                                               20
+
+                                                                                          0
+5.4   Ablation Study                                                                                    InfiniGen-OPT                                 OmniKV-LLaMA
+                                                                                                                                     Method
+To quantify the contribution of each core optimization in
+OPKV, we conduct an ablation study on two representative         Figure 15. Decoding throughput of InfiniGen on OPT-6.7B and
+configurations: InfiniGen with OPT-6.7B and OmniKV with          OmniKV on LLaMA-8B under different ablation configurations
+LLaMA-8B. We compare the full OPKV implementation                with a fixed batch size of 8.
+against three ablated variants. All experiments use a fixed
+batch size of 8 and the same KV budget as in the main
+evaluation. Figure 15 reports the decoding throughput of           6                       R ELATED W ORK
+each configuration.
+                                                                 KV Sparsity Methods KV sparsity methods are rooted
+Disabling OP Block Aggregation. In this variant, we fall         in the sparsity of attention scores—only a small subset of
+back to using only Ordered Blocks, meaning we disable            tokens contributes to most attention weights. The key to
+the creation and reuse of aggregated OP Blocks. Every            these approaches is to determine when and how many to-
+selected KV must be fetched from Ordered Blocks and no           kens should be evicted for effective compression and still
+token-level aggregation or duplication is performed. This        maintain accuracy (WEI et al., 2025). Early static meth-
+ablated configuration isolates the benefit of OP Blocks in       ods, including H2O (Zhang et al., 2023), StreamingLLM
+reducing I/O amplification and recall latency. As shown          (Xiao et al., 2024b), and Keyformer (Adnan et al., 2024),
+in Figure 15, disabling aggregation reduces throughput by        evict KVs of unimportant tokens while keeping critical ones
+33.06% for InfiniGen and 23.51% for OmniKV compared to           to preserve accuracy. They use fixed rules to allocate KV
+the full OPKV implementation, confirming that OP Blocks          budgets, and those evicted tokens are permanently removed
+effectively mitigate the spatial discreteness of critical KVs.   from future computations. However, without considering
+Disabling Hot Page Reuse. Hot page reuse leverages tem-          the dynamic shifts in token importance during iterations, one
+poral locality, where the OP Block will be kept on the GPU       potential risk arises where evicted tokens may be needed
+and directly reused without additional data transfer when        later as queries update, yet are unavailable.
+it contains sufficient selectable tokens for an extended pe-      Dynamic sparsity methods are proposed to address this prob-
+riod of time. In this ablation, we disable this optimization      lem. PyramidKV (Cai et al., 2025) adjusts KV cache bud-
+entirely. All OP Blocks are forced to be offloaded into           get across different layers based on attention patterns and
+CPU memory and copied repeatedly when hit. As shown               SnapKV (Li et al., 2024) refines it down to the attention
+in Figure 15, disabling hot page reuse leads to a through-        head. InfLLM (Xiao et al., 2024a) keeps all the context
+put drop of 14.25% for InfiniGen and 12.02% for OmniKV,           available in CPU memory and recalls relevant KVs for at-
+demonstrating that reusing hot pages substantially reduces        tention computation. However, this approach increases the
+CPU-GPU traffic and recall overhead.                              inference latency.
+Replacing Selective Prefetch with Full Prefetch. The full        Inspired by PagedAttention, several works (e.g., Quest
+OPKV implementation prefetches the hit blocks based on           (Tang et al., 2024), ArkVale (Chen et al., 2024), and PSA
+the threshold per layer. In this ablation, we remove token-      (Zhou et al., 2025)) expand KV selection from token-level
+level selection and instead prefetch blocks that can cover       to block-level to reduce the time consumption with the cost
+all the selected KVs in the current iteration. This coarse-      of I/O amplification and additional KV budget. Meanwhile,
+grained strategy loads more needless blocks, eliminating the     some methods (e.g., InfiniGen (Lee et al., 2024), ClusterKV
+benefit of selectivity. As shown in Figure 15, this change       (Liu et al., 2025), and OmniKV (Hao et al., 2025)) utilize
+causes significant degradation, where the throughput falls       the inter-layer similarity to prefetch critical KVs for subse-
+by 19.66% for InfiniGen and 20.16% for OmniKV, indicat-          quent layers in advance to overlap KV recall and attention
+ing that token-level selection is indispensable for avoiding     computation. OPKV helps token-level methods alleviate the
+saturation of the CPU-GPU interconnect.                          recall overhead and avoids the possible I/O amplification
+                                                                 caused by block-level methods.
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+KV Cache Management System LLM inference imposes                Jiangsu Provincial Frontier Technology Development Pro-
+enormous memory demands on KV cache; therefore, a large         gram (No. BF2025601), and the National Natural Science
+body of research focuses on optimizing KV cache mem-            Foundation of China (No. 62302095, 62363032).
+ory management. In terms of in-memory management, the
+core idea is to reduce memory usage through structural op-
+timization or reuse. Inspired by the page table mechanism
+in operating systems, PagedAttention (Kwon et al., 2023)
+proposes managing KV cache by pages to improve mem-
+ory utilization. Prefix reuse (Gim et al., 2024) technology
+reduces redundant storage overhead by reusing identical pre-
+fix KV cache across different inference requests. SGLang
+(Zheng et al., 2024) further proposes an optimized prefix
+tree structure based on Radix trees, while CacheBlend (Yao
+et al., 2025) enables the reuse of non-prefix KV cache with
+the support of a small amount of additional computation.
+For cross-storage tier management, research focuses on
+utilizing multi-level storage structures such as GPU memory,
+CPU memory, and disks to expand the storage capacity of
+KV cache. CachedAttention (Gao et al., 2024) proposes
+a hierarchical KV cache system that stores historical KV
+cache from multi-turn conversations in low-cost storage
+tiers such as CPU memory or disks. It enables KV cache
+reuse across multi-turn conversations through a layer-by-
+layer prefetching mechanism. Based on the observation of
+the temporal and spatial locality in the prefix KV cache,
+a workload-aware eviction strategy (Wang et al., 2025) is
+proposed to retain the KV cache that is more likely to be
+reused within the limited GPU/CPU memory. However,
+these methods focus on cross-request KV reuse and cannot
+face to fine-grained KV cache management within requests.
+
+7   C ONCLUSION
+In the paper, we present OPKV, a high-throughput, plugin-
+driven framework that unifies recallable sparsity with page-
+level KV cache management for long-context LLM infer-
+ence. Based on three key observations, OPKV applies a uni-
+fied model-sparsity-cache architecture and builds an intra-
+iteration KV cache management system with low latency
+and millisecond-level response. Our experiments demon-
+strate that with reasonable additional caches, OPKV can
+help sparsity methods with recall optimization further re-
+duce recall overhead and increase decoding throughput.
+In the future, we will explore adaptive scheduling strategies
+to transparently enable sparsity plugins, so as to handle a
+mixture of regular and long-context requests. This approach
+can maximize throughput while satisfying SLOs by tuning
+the trade-off between recall and computation.
+
+8   ACKNOWLEDGMENT
+We thank the anonymous reviewers for their helpful feed-
+back on improving the paper. This work is supported by the
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+R EFERENCES                                                     Feige, U. A threshold of ln n for approximating set cover.
+                                                                  Journal of the ACM, 45(4):634–652, 1998. URL https:
+Adnan, M., Arunkumar, A., Jain, G., Nair, P. J., Solovey-
+                                                                  //doi.org/10.1145/285055.285059.
+  chik, I., and Kamath, P. Keyformer: KV cache reduction
+  through key tokens selection for efficient generative in-     Gao, B., He, Z., Sharma, P., Kang, Q., Jevdjic, D., Deng,
+  ference. In Proceedings of the 7th Machine Learning             J., Yang, X., Yu, Z., and Zuo, P. Cost-Efficient large
+  and Systems, volume 6 of MLSys’24, pp. 114–127, 2024.           language model serving for multi-turn conversations with
+  URL https://proceedings.mlsys.org/pa                            CachedAttention. In 2024 USENIX Annual Technical
+  per_files/paper/2024/file/48fecef47b                            Conference, ATC ’24, pp. 111–126, 2024. URL https:
+ 19fe501d27d338b6d52582-Paper-Confere                            //www.usenix.org/conference/atc24/pr
+  nce.pdf.                                                        esentation/gao-bin-cost.
+Allen, T. and Ge, R. In-depth analyses of unified virtual       Gim, I., Chen, G., Lee, S.-s., Sarda, N., Khandelwal, A.,
+  memory system for GPU accelerated computing. In Pro-            and Zhong, L. Prompt cache: Modular attention reuse for
+  ceedings of the International Conference for High Per-          low-latency inference. In Proceedings of the 7th Machine
+  formance Computing, Networking, Storage and Analysis,           Learning and Systems, volume 6 of MLSys’24, pp. 325–
+  SC’21, pp. 1–15, 2021. URL https://doi.org/10                   338, 2024. URL https://proceedings.mlsys.
+  .1145/3458817.3480855.                                          org/paper_files/paper/2024/file/a66c
+                                                                  aa1703fe34705a4368c3014c1966-Paper-C
+Arslan, M., Ghanem, H., Munawar, S., and Cruz, C. A               onference.pdf.
+  survey on RAG with LLMs. Procedia computer science,
+  246:3781–3790, 2024. URL https://doi.org/10                   Hao, J., Zhu, Y., Wang, T., Yu, J., Xin, X., Zheng, B., Ren,
+  .1016/j.procs.2024.09.178.                                      Z., and Guo, S. Omnikv: Dynamic context selection for
+                                                                  efficient long-context llms. In The 13th International
+Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z., Du,     Conference on Learning Representations, ICLR’25, 2025.
+  Z., Liu, X., Zeng, A., Hou, L., Dong, Y., Tang, J., and Li,     URL https://openreview.net/pdf?id=ul
+  J. LongBench: A bilingual, multitask benchmark for long         CAPXYXfa.
+  context understanding. In Proceedings of the 62nd Annual
+  Meeting of the Association for Computational Linguistics,     Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,
+  ACL ’24, pp. 3119–3137, 2024. URL https://acla                  M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+  nthology.org/2024.acl-long.172/.                                KVQuant: Towards 10 million context length LLM
+                                                                  inference with KV cache quantization. In Advances
+Cai, Z., Zhang, Y., Gao, B., Liu, Y., Li, Y., Liu, T., Lu,        in Neural Information Processing Systems, volume 37
+  K., Xiong, W., Dong, Y., Hu, J., and Xiao, W. Pyra-             of NeurIPS’24, pp. 1270–1303, 2024. URL https:
+  midkv: Dynamic kv cache compression based on pyra-             //proceedings.neurips.cc/paper_files
+  midal information funneling, 2025. URL https:                  /paper/2024/file/028fcbcf85435d39a40
+  //arxiv.org/abs/2406.02069.                                     c4d61b42c99a4-Paper-Conference.pdf.
+
+Chen, R., Wang, Z., Cao, B., Wu, T., Zheng, S., Li, X.,         Kocoń, J., Cichecki, I., Kaszyca, O., Kochanek, M., Szydło,
+  Wei, X., Yan, S., Li, M., and Liang, Y. Arkvale: Efficient      D., Baran, J., Bielaniewicz, J., Gruza, M., Janz, A.,
+  generative llm inference with recallable key-value evic-        Kanclerz, K., Kocoń, A., Koptyra, B., Mieleszczenko-
+  tion. In Globerson, A., Mackey, L., Belgrave, D., Fan, A.,      Kowszewicz, W., Miłkowski, P., Oleksy, M., Piasecki,
+  Paquet, U., Tomczak, J., and Zhang, C. (eds.), Advances         M., Łukasz Radliński, Wojtasik, K., Woźniak, S., and
+  in Neural Information Processing Systems, volume 37             Kazienko, P. ChatGPT: Jack of all trades, master of
+  of NeurIPS’24, pp. 113134–113155. Curran Associates,            none. Information Fusion, 99:101861, 2023. URL
+  Inc., 2024. URL https://proceedings.neurip                      https://www.sciencedirect.com/scienc
+  s.cc/paper_files/paper/2024/file/cd4                            e/article/pii/S156625352300177X.
+  b49379efac6e84186a3ffce108c37-Paper-C
+  onference.pdf.                                                Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+                                                                 C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+Choquette, J. and Gandhi, W. Nvidia A100 GPU: Perfor-            memory management for large language model serving
+  mance & innovation for GPU computing. In 2020 IEEE             with PagedAttention. In Proceedings of the 29th Sym-
+  Hot Chips 32 Symposium, HCS ’20, pp. 1–43, 2020. URL           posium on Operating Systems Principles, SOSP ’23, pp.
+  https://doi.org/10.1109/HCS49909.2020.                         611–626, 2023. URL https://doi.org/10.114
+  9220622.                                                       5/3600006.3613165.
+          OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+Lee, W., Lee, J., Seo, J., and Sim, J. InfiniGen: Efficient gen-     LLM inference. In Proceedings of the 41st International
+  erative inference of large language models with dynamic            Conference on Machine Learning, ICML’24, 2024. URL
+  KV cache management. In 18th USENIX Symposium on                   https://dl.acm.org/doi/10.5555/36920
+  Operating Systems Design and Implementation, OSDI’24,              70.3694025.
+  pp. 155–172, 2024. URL https://www.usenix.o
+  rg/conference/osdi24/presentation/lee.                           Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+                                                                     M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A.,           Azhar, F., Rodriguez, A., Joulin, A., Grave, E., and Lam-
+  Ye, H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm               ple, G. LLaMA: Open and efficient foundation language
+  knows what you are looking for before generation. In               models. 2023. URL https://arxiv.org/abs/23
+  Globerson, A., Mackey, L., Belgrave, D., Fan, A., Pa-              02.13971.
+  quet, U., Tomczak, J., and Zhang, C. (eds.), Advances
+  in Neural Information Processing Systems, volume 37 of           vLLM. vLLM, 2025. URL https://github.com/v
+  NeurIPS’24, pp. 22947–22970. Curran Associates, Inc.,              llm-project/vllm/releases/tag/v0.7.2.
+  2024. URL https://proceedings.neurips.                             [Online].
+  cc/paper_files/paper/2024/file/28ab4
+  18242603e0f7323e54185d19bde-Paper-Con                            Wang, J., Han, J., Wei, X., Shen, S., Zhang, D., Fang,
+  ference.pdf.                                                      C., Chen, R., Yu, W., and Chen, H. KVCache cache
+                                                                    in the wild: Characterizing and optimizing KVCache
+Liu, G., Li, C., Zhao, J., Zhang, C., and Guo, M. Clus-
+                                                                    cache at a large cloud provider. In 2025 USENIX Annual
+  terKV: Manipulating LLM KV cache in semantic space
+                                                                    Technical Conference, ATC’25, 2025. URL https:
+  for recallable compression. In 62nd ACM/IEEE Design
+                                                                    //www.usenix.org/conference/atc25/pr
+  Automation Conference, DAC’25, pp. 1–7, 2025. URL
+                                                                    esentation/wang-jiahao.
+  https://doi.org/10.1109/DAC63849.2025.
+  11132479.                                                        WEI, G., Zhou, X., Sun, P., Zhang, T., and Wen, Y. Rethink-
+Liu, Z., Yuan, J., Jin, H., Zhong, S. H., Xu, Z., Braverman,        ing key-value cache compression techniques for large lan-
+  V., Chen, B., and Hu, X. KIVI: a tuning-free asymmetric           guage model serving. In Proceedings of the 8th Machine
+  2bit quantization for KV cache. In Proceedings of the 41st        Learning and System, MLSys’25, 2025. URL https:
+  International Conference on Machine Learning, volume              //openreview.net/forum?id=ou0AsNbXVG.
+  235 of ICML’24, pp. 32332–32344, 2024. URL https:
+  //proceedings.mlr.press/v235/liu24bz                             Wu, X., Martı́nez, A., and Klyen, M. Dialog generation
+  .html.                                                            using multi-turn reasoning neural networks. In Walker,
+                                                                    M., Ji, H., and Stent, A. (eds.), Proceedings of the 2018
+ShareGPT. ShareGPT, 2025. URL https://shareg                        Conference of the North American Chapter of the Associ-
+  pt.com/. [Online].                                                ation for Computational Linguistics: Human Language
+                                                                    Technologies, NAACL’18, pp. 2049–2059, 2018. URL
+Shen, Y., Song, K., Tan, X., Li, D., Lu, W., and Zhuang,
+                                                                    https://aclanthology.org/N18-1186/.
+  Y. HuggingGPT: Solving AI tasks with ChatGPT and its
+  friends in hugging face. In Advances in Neural Informa-          Xiao, C., Zhang, P., Han, X., Xiao, G., Lin, Y., Zhang, Z.,
+  tion Processing Systems, volume 36 of NeurIPS’23, pp.              Liu, Z., and Sun, M. Infllm: Training-free long-context
+  38154–38180, 2023. URL https://proceedings.                        extrapolation for llms with an efficient context memory.
+  neurips.cc/paper_files/paper/2023/fi                               In Globerson, A., Mackey, L., Belgrave, D., Fan, A.,
+  le/77c33e6a367922d003ff102ffb92b658-P                              Paquet, U., Tomczak, J., and Zhang, C. (eds.), Advances
+  aper-Conference.pdf.                                               in Neural Information Processing Systems, volume 37
+Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,          of NeurIPS’24, pp. 119638–119661. Curran Associates,
+  B., Liang, P., Re, C., Stoica, I., and Zhang, C. FlexGen:          Inc., 2024a. URL https://proceedings.neur
+  High-throughput generative inference of large language             ips.cc/paper_files/paper/2024/file/d
+  models with a single GPU. In Proceedings of the 40th               842425e4bf79ba039352da0f658a906-Paper
+  International Conference on Machine Learning, volume              -Conference.pdf.
+  202 of ICML’23, pp. 31094–31116, 2023. URL https:
+  //proceedings.mlr.press/v202/sheng23a.                           Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+  html.                                                              cient streaming language models with attention sinks. In
+                                                                     The 12th International Conference on Learning Repre-
+Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han, S.      sentations, ICLR’24, 2024b. URL https://openre
+  QUEST: query-aware sparsity for efficient long-context             view.net/forum?id=NG7sS51zVF.
+         OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems
+
+Yang, J., Zhang, Y., Qiu, Z., Yue, Y., and Vinayak, R. FIFO     Zhou, Q., Yin, P., Zuo, P., and Cheng, J. Progressive sparse
+  queues are all you need for cache eviction. In Proceedings      attention: Algorithm and system co-design for efficient
+  of the 29th Symposium on Operating Systems Principles,          attention in llm serving, 2025. URL https://arxiv.
+  SOSP’23, pp. 130–149, 2023. URL https://doi.                    org/abs/2503.00392.
+  org/10.1145/3600006.3613147.
+
+Yao, J., Li, H., Liu, Y., Ray, S., Cheng, Y., Zhang, Q.,
+  Du, K., Lu, S., and Jiang, J. Cacheblend: Fast large
+  language model serving for rag with cached knowledge
+  fusion. In Proceedings of the 20th European Conference
+  on Computer Systems, EuroSys’25, pp. 94–109, 2025.
+  URL https://doi.org/10.1145/3689031.
+  3696098.
+
+Young, A., Chen, B., Li, C., Huang, C., Zhang, G., Zhang,
+  G., Wang, G., Li, H., Zhu, J., Chen, J., Chang, J., Yu,
+  K., Liu, P., Liu, Q., Yue, S., Yang, S., Yang, S., Xie, W.,
+  Huang, W., Hu, X., Ren, X., Niu, X., Nie, P., Li, Y., Xu,
+  Y., Liu, Y., Wang, Y., Cai, Y., Gu, Z., Liu, Z., and Dai,
+  Z. Yi: Open foundation models by 01.ai, 2025. URL
+  https://arxiv.org/abs/2403.04652.
+
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  G. Orca: A distributed serving system for Transformer-
+  Based generative models. In 16th USENIX Symposium on
+  Operating Systems Design and Implementation, OSDI’22,
+  pp. 521–538, 2022. URL https://www.usenix.o
+  rg/conference/osdi22/presentation/yu.
+
+Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M.,
+  Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., Mi-
+  haylov, T., Ott, M., Shleifer, S., Shuster, K., Simig, D.,
+  Koura, P. S., Sridhar, A., Wang, T., and Zettlemoyer,
+  L. Opt: Open pre-trained transformer language models,
+  2022.
+
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+  R., Song, Z., Tian, Y., Ré, C., Barrett, C., Wang, Z. A.,
+  and Chen, B. H2O: Heavy-hitter oracle for efficient gen-
+  erative inference of large language models. In Advances
+  in Neural Information Processing Systems, volume 36
+  of NeurIPS’23, pp. 34661–34710, 2023. URL https:
+  //proceedings.neurips.cc/paper_files
+  /paper/2023/file/6ceefa7b15572587b78
+  ecfcebb2827f8-Paper-Conference.pdf.
+
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+  rett, C., and Sheng, Y. SGLang: Efficient execution of
+  structured language model programs. In Advances in
+  Neural Information Processing Systems, volume 37 of
+  NeurIPS’24, pp. 62557–62583, 2024. URL https:
+  //proceedings.neurips.cc/paper_files
+  /paper/2024/file/724be4472168f31ba1c
+  9ac630f15dec8-Paper-Conference.pdf.
+

@@ -1,0 +1,1180 @@
+              D EMYSTIFYING THE M IXTURE OF E XPERTS S ERVING TAX
+
+
+                    Pratyush Patel 1 2 Dayeol Lee 2 Shintaro Iwasaki 2 Arvind Krishnamurthy 1
+
+
+                                                       A BSTRACT
+     Mixture-of-Experts (MoEs) enable massive model sizes but incur higher serving overheads than dense models
+     at the same per-token compute cost. This MoE tax varies with the model architecture, inference phase, and
+     parallelism strategy. We comprehensively study the tax for different MoE models, finding that they perform 2–3×
+     worse than FLOP-equivalent dense models. Using microbenchmarks, we analyze and categorize the underlying
+     tax sources and show how they manifest differently under different configurations. Our key result is that prefill
+     and decode phases incur vastly different taxes; counterintuitively, load imbalance across experts that harms prefill
+     performance can benefit decode by activating fewer experts. We decompose the tax into analytically separable
+     components and propose a balls-bins-buckets framework to study recent MoE developments like fine-grained
+     experts and data parallel attention. We conclude by discussing existing and new techniques to reduce the MoE tax
+     and their associated trade-offs.
+
+1    I NTRODUCTION                                                                                                Prefill Cost                   Decode Cost
+
+                                                                                      2.0               Dense                                             MoE                   2.00
+                                                                    $ per 1M Tokens
+
+The Mixture-of-Experts (MoE) model architecture has be-                                                                                                           1.60
+come a leading paradigm for scaling Large Language Mod-                               1.5
+els (Shazeer et al., 2017). By incorporating multiple “expert”                        1.0                                                        0.89
+                                                                                                                                                                         0.50
+feed-forward networks (FFNs) and activating only a subset                             0.5                      0.30              0.40     0.38            0.38
+for each token, MoEs can significantly increase parameter                                   0.06 0.15   0.10           0.15
+                                                                                      0.0
+                                                                                             .5           B                 2B              3              -4.5         i K2
+                                                                                          en2 r       -32             Q-3               ek V            GLM          Kim 0905
+                                                                                        Qw Code Qwen3
+counts and output quality without a proportional increase in                                                                        pSe
+                                                                                                                  QW
+computational cost. For inference, this architecture carries                                                                     Dee
+a compelling promise: the ability to deliver the superior
+quality of a big model at the performance and cost of a          Figure 1. Token pricing for Dense and MoE models (DeepInfra).
+much smaller dense model that activates the same number          All models activate 32B–37B parameters per token.
+of parameters per token (Mistral AI Team, 2023).                 guidelines for serving systems.
+However, this promise is not easily realized in practice.        We analyze MoE performance using a combination of end-
+While MoEs often demonstrate clear quality benefits (Dai         to-end tax measurements and targeted microbenchmarks to
+et al., 2024; Qwen Team, 2024; Jiang et al., 2024), their con-   identify tax sources. We evaluate the tax across three key
+ditional computation introduces a host of system-level over-     dimensions that define any real-world serving deployment:
+heads that are not captured by FLOP counts alone. These          the inference phase (i.e., prefill vs. decode), the parallelism
+inefficiencies, which we collectively term the “MoE tax”,        strategy (i.e., TP and DP for attention, TP and EP for MoE),
+make MoEs significantly more complex and expensive to            and the model architecture (i.e., the number of experts). Our
+deploy at scale (Zhao et al., 2025a). For example, as shown      analysis reveals that the MoE tax is not a single, uniform
+in Figure 1, cloud providers charge customers 2.5–10× more       penalty but rather consists of distinct, often competing, over-
+for MoE model inferences than for dense models that acti-        heads related to computation, communication, and token
+vate the same number of parameters per token. This paper         distribution effects.
+systematically characterizes the MoE tax, measures it to be
+significant across different models, identifies the underly-     A key finding is the stark dichotomy in the MoE tax across
+ing issues that affect it, and provides effective optimization   inference phases and how it interacts with other system
+                                                                 configurations. In the prefill phase, performance is primarily
+     1
+      University of Washington, Seattle, USA 2 Meta,             limited by lower arithmetic intensity from batch subdivision
+Menlo Park, USA. Correspondence to: Pratyush Patel               across experts and by token distribution effects. The choice
+<patelp1@cs.washington.edu>.
+                                                                 of parallelism strategy determines how the system pays the
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,     tax: token-to-expert mappings create a “padding tax” under
+2026. Copyright 2026 by the author(s).                           both TP and EP, which is typically worse for models with
+                                         Demystifying the Mixture of Experts Serving Tax
+
+
+Table 1. MoE tax sources compared to FLOP-equivalent dense models. Baseline overheads arise from the MoE architecture itself; token
+distribution effects modulate them in phase-dependent ways.
+           Tax Source                    Mechanism                                               Primary Impact
+           Baseline overheads under balanced token routing:
+                                         GroupGEMMs have lower weight reuse than
+           Arithmetic intensity                                                                  Both phases (detrimental)
+                                         DenseFA due to batch subdivision across experts.
+           AllToAll communication Dispatch and combine transfers (EP-only).                      Both phases (detrimental)
+           Ancillary kernels             Routing, alignment, and aggregation.                    Both phases (minor)
+           Token distribution effects (Section 4.3):
+                                         Non-uniform routing can activate fewer experts,
+           Expert activation                                                                     Decode (beneficial)
+                                         improving per-expert weight reuse.
+           Workload imbalance            Straggler GPU determines iteration latency (EP-only).   Prefill (detrimental)
+                                         Token-to-expert mappings may misalign with kernel
+           Padding                                                                               Both phases (variable)
+                                         input shapes or block sizes (TP and EP).
+           Communication volume          Non-uniform AllToAll transfer sizes (EP-only).          Prefill (detrimental)
+
+many fine-grained experts. EP also incurs a “straggler tax”          Conversely, a parameter-aligned dense (DensePA) model
+from non-uniform routing, which is higher for models with            has the same total number of parameters as the MoE model
+fewer experts.                                                       and estimates a lower performance bound. This model
+                                                                     replaces the MoE block with an FFN whose intermediate
+In contrast, the memory-bound decode phase is overwhelm-
+                                                                     size is scaled by the total number of experts. It has the same
+ingly dominated by a “weight amplification” tax, where the
+                                                                     memory needs as the MoE but incurs much higher compute
+need to load a large volume of expert weights for small
+                                                                     since every weight in the FFN is used for every token.
+batches significantly lowers arithmetic intensity. This tax
+causes MoEs to perform almost as poorly as enormous dense            We define the MoE tax (τ ) as the latency (T ) degradation
+models with the same total parameter count. Here, we also            of serving an MoE model relative to a DenseFA model at a
+uncover a counterintuitive insight: skewed routing can im-           given batch size (b):
+prove decode performance by activating fewer overall ex-
+perts, since the savings from mitigating the dominant weight
+amplification tax and reducing the padding overheads out-                                          T (MoE, b)
+                                                                                          τb =                  .               (1)
+weigh the minor costs of imbalance.                                                              T (DenseFA, b)
+Our work provides a comprehensive framework for quanti-
+fying and reasoning about the MoE tax. We show that MoE
+models perform 2–3× worse than FLOP-equivalent dense                 This metric captures the combined overheads of conditional
+models, and that this varies under different configurations.         computation, communication, and other system effects. A
+We decompose the MoE tax into analytically separable com-            tax of 1.0 implies that the MoE model performs identically
+ponents, validate the model against measured data, and               to its ideal dense counterpart, while a higher value indicates
+introduce a balls-bins-buckets framework to analyze token            a greater performance penalty.
+distribution effects across different configurations spanning        Note that the MoE tax is a relative metric that is sensitive to
+expert granularity, parallelism strategy, and deployment size.       the execution environment, model configuration, and work-
+Finally, based on our analysis, we contextualize prior MoE-          load. Its primary utility is to help understand how different
+tax-reduction techniques and propose new approaches to               architectural and system choices contribute to overall ef-
+improve MoE serving efficiency.                                      ficiency. Although we focus on latency, the tax could be
+                                                                     similarly defined in terms of throughput degradation.
+2    T HE M IXTURE OF E XPERTS TAX                                   Table 1 previews the key MoE tax sources we identify in
+MoE models incur additional overheads compared to dense              our analysis (Section 4). MoEs differ from dense models
+models due to conditional computation. To contextualize              in computation (per-expert GEMMs lower arithmetic inten-
+the tax for a given MoE, we consider two types of dense              sity) and communication (AllToAll transfers under DP+EP).
+models. A FLOP-aligned dense (DenseFA) model activates               The token distribution modulates both through differences
+the same number of parameters per token as the MoE model.            in expert activation, workload balance, padding, and com-
+It replaces each MoE layer with a dense FFN whose inter-             munication volume, creating the phase-dependent tax we
+mediate size is scaled by the MoE’s top-K value, ensuring            characterize below. The performance bottleneck depends
+the same per-token compute cost. It represents the ideal per-        on the inference phase, model architecture, and parallelism
+formance feasible if all sparsity overheads were eliminated.         strategy, making it important to characterize diverse config-
+                                                                     urations to guide efficiency optimizations.
+                                       Demystifying the Mixture of Experts Serving Tax
+
+3    M O E TAX C HARACTERIZATION                                  results from HumanEval. The token distribution’s effect on
+                                                                  individual tax sources is analyzed in Section 4.3.
+We measure the MoE tax in terms of the time taken to pro-
+cess a batch of tokens. We analyze prefill and decode phases
+                                                                  3.1   Prefill Phase Tax
+separately, since different workloads (e.g., summarization,
+chat, reasoning) exercise them to different extents. The          Figure 2 shows the prefill iteration latency for our MoE
+overall tax can be modeled by appropriately combining per-        models and their dense counterparts across different batch
+phase analyses. This separation also mirrors disaggregated        sizes and parallelisms. Figure 2d shows the corresponding
+inference, which is commonly deployed at scale (DeepSeek-         MoE tax under the best parallelism configuration. For Mix-
+AI, 2024b; Mitra et al., 2025; Patel et al., 2024). All end-to-   tral and Qwen, TP generally outperforms EP, whereas for
+end measurements report whole-model forward step latency.         DeepSeek, their performance is similar.
+
+Setup. We evaluate three open-source MoE models:                  We observe that the tax varies substantially with batch size:
+Mixtral-8x7B (Jiang et al., 2024), Qwen2-MoE (Qwen                it is higher at small batch sizes and generally reduces as the
+Team, 2024; Yang et al., 2024), and DeepSeek-                     batch size increases. This can be attributed to better amor-
+V3 (DeepSeek-AI, 2024b), shown in Table 2. These models           tization of overheads and a shift towards an increasingly
+capture distinct architectural designs, which broadens our        compute-bound regime. Mixtral and Qwen follow similar
+analysis. Mixtral and Qwen are run on a single server with        trends and incur a minimum tax of around 1.28× at a batch
+eight NVIDIA A100 GPUs, whereas DeepSeek-V3 is run                size of 1024 and 2048, respectively. DeepSeek reaches its
+on eight NVIDIA B200 GPUs, both interconnected with               minimum tax of 1.7× at 1024 tokens, although its trend
+NVLink.                                                           differs: DeepSeek uses DeepGEMM+DeepEP kernels opti-
+                                                                  mized for its 256 fine-grained experts, and its much larger
+Frameworks. We use vLLM under both TP and EP (Kwon                model size shifts the compute-memory trade-off compared
+et al., 2023). We compare MoE and dense baselines at the          to Mixtral and Qwen.
+same parallelism degree, ensuring all use the same hardware
+                                                                  With increased sparsity and finer-grained experts, we ob-
+resources per instance. For example, a sufficiently small
+                                                                  serve that Qwen and DeepSeek generally exhibit a higher
+DenseFA model could use a single GPU without any model
+                                                                  prefill tax than Mixtral. In fact, until a batch size of 1024,
+parallelism, which we do not consider in this work. Mix-
+                                                                  DeepSeek performs similarly to its DensePA equivalent. Al-
+tral and Qwen are run using vLLM’s Triton FusedMoE and
+                                                                  though MoE designs with more experts are often motivated
+AllReduce implementations, whereas DeepSeek uses Deep-
+                                                                  by quality gains (Dai et al., 2024), they can incur poorer
+GEMM and DeepEP (Zhao et al., 2025b; DeepSeek-AI,
+                                                                  hardware utilization and introduce overheads unless large
+2025). Where feasible, we tune the kernels for our hardware
+                                                                  batch sizes are used.
+and enable CUDA graphs to minimize launch overhead. For
+robust statistics, we clip the top and bottom 1% of the mea-
+                                                                  Insight: The prefill tax is higher at smaller batch sizes,
+surements to remove outliers before reporting the mean and
+                                                                  whereas larger batches incur lower tax. MoE models with
+standard deviation of the engine step latencies.
+                                                                  higher sparsity tend to incur a higher prefill tax than those
+Workloads. MoE routing is data-dependent, so we evalu-            with fewer experts.
+ate three different input datasets: language understanding
+(MMLU (Hendrycks et al., 2020)), code generation (Hu-             3.2   Decode Phase Tax
+manEval (Chen et al., 2021)), and random tokens generated
+                                                                  Figure 3 plots decode iteration latencies and the correspond-
+within the model vocabulary. Despite differences in routing
+                                                                  ing MoE tax. The MoE tax is generally higher and more per-
+patterns across datasets (e.g., the random dataset has higher
+                                                                  sistent during the decode phase than during the prefill phase.
+skew likely because the model router is trained on coherent
+                                                                  For example, at a batch size of 32, the MoE tax reaches
+sentences), overall MoE tax trends are similar. We show
+                                                                  2.08× for Mixtral and 2.57× for Qwen. For DeepSeek,
+          Table 2. MoE models used in our analysis.               which typically uses bigger batches (Zhao et al., 2025a), the
+                                                                  peak tax of nearly 3× occurs at a batch size of 128 tokens.
+                    Mixtral    Qwen2-MoE        DeepSeek-V3
+  Total params        47B           57B               671B        The decode phase tax exhibits a bell-shaped curve. It is min-
+ Active params        13B           14B                37B        imal for a single request (as low as 1.05× for Mixtral), rises
+  Num. layers          32            28                 61        sharply to a peak at medium batch sizes, and then gradually
+  Hidden size        4096           3584              7168        decreases for larger batches. Comparing the models, we
+MoE interm. size     14336          2560              2048
+ Routed experts         8            64                256        find that DeepSeek and Qwen generally incur a higher tax
+Experts per token       2             8                  8        than Mixtral due to their higher sparsity.
+ Shared experts         0             8                  1
+                                                                  Under common operating points, the MoE decode latency
+                                                                                                      Demystifying the Mixture of Experts Serving Tax
+
+                                                                                                                                                                                                                                                  Mixtral              DensePA-Mixtral
+                               DensePA (tp4)             Mixtral (tp4)                                    DensePA (tp4)             Qwen (tp4)                                    DensePA (tp8)               DeepSeek (tp8)                      Qwen                 DensePA-Qwen
+                               Mixtral (ep4)             DenseFA (tp4)                                    Qwen (ep4)                DenseFA (tp4)                                 DeepSeek (ep8)              DenseFA (tp8)                       DeepSeek             DensePA-DeepSeek
+                                                                                                 250                                                                                                                                     3.5
+Prefill Latency (ms)
+
+
+
+
+                                                                          Prefill Latency (ms)
+
+
+
+
+                                                                                                                                                     Prefill Latency (ms)
+                       200
+                                                                                                 200                                                                        200                                                          3.0
+                       150
+
+
+
+
+                                                                                                                                                                                                                               MoE Tax
+                                                                                                 150                                                                        150                                                          2.5
+                       100                                                                                                                                                  100                                                          2.0
+                                                                                                 100
+                       50                                                                         50                                                                        50                                                           1.5
+                        0 27         28        29        210        211                            0 27         28        29        210        211                           0 27         28        29        210        211             1.0 27         28        29        210        211
+                                          Batch Size                                                                 Batch Size                                                                Batch Size                                                    Batch Size
+
+                                     (a) Mixtral                                                                (b) Qwen                                                                 (c) DeepSeek                                                (d) MoE Tax
+
+                                                    Figure 2. Prefill iteration latency and MoE tax ratio with a varying number of batched tokens.
+
+                               DensePA (tp4)             Mixtral (tp4)                                    DensePA (tp4)             Qwen (tp4)                                                                                                    Mixtral              DensePA-Mixtral
+                                                                                                                                                                                  DensePA (tp8)               DeepSeek (tp8)                      Qwen                 DensePA-Qwen
+                               Mixtral (ep4)             DenseFA (tp4)                                    Qwen (ep4)                DenseFA (tp4)                                 DeepSeek (ep8)              DenseFA (tp8)                       DeepSeek             DensePA-DeepSeek
+                                                                                                                                                                            80
+Decode Latency (ms)
+
+
+
+
+                                                                          Decode Latency (ms)
+
+
+
+
+                                                                                                                                                                                                                                         3.5
+
+
+
+
+                                                                                                                                                     Decode Latency (ms)
+                       40                                                                        40
+                                                                                                                                                                            60                                                           3.0
+                       30                                                                        30
+
+
+
+
+                                                                                                                                                                                                                               MoE Tax
+                                                                                                                                                                                                                                         2.5
+                       20                                                                        20                                                                         40
+                                                                                                                                                                                                                                         2.0
+                       10                                                                        10                                                                         20                                                           1.5
+                        0       21        23        25         27                                 0        21        23        25         27                                 0      21         23        25         27                   1.0       21        23        25         27
+                                          Batch Size                                                                 Batch Size                                                                Batch Size                                                    Batch Size
+
+                                     (a) Mixtral                                                                (b) Qwen                                                                 (c) DeepSeek                                                (d) MoE Tax
+
+                                                    Figure 3. Decode iteration latency and MoE tax ratio with a varying number of batched tokens.
+closely matches, or even exceeds, that of the DensePA mod-                                                                                           routing, dispatch, experts computation, and combine. For
+els. This severe performance penalty arises due to the                                                                                               each step, we then study the efficiency impact of various
+memory-bound nature of the decode phase. Medium-to-                                                                                                  factors, including top-K, expert skew, token padding, etc.
+large decode batches likely activate most experts in each iter-
+                                                                                                                                                     For computation microbenchmarks, we focus on Mixtral
+ation, so most expert weights must be loaded from memory
+                                                                                                                                                     and Qwen, as they have similar sizes but different archi-
+for relatively minimal computation. Conditional computa-
+                                                                                                                                                     tectures. Our analysis includes Triton FusedMoE (Kwon
+tion overheads such as routing, alignment, and padding can
+                                                                                                                                                     et al., 2023) and DeepGEMM (DeepSeek-AI, 2025) kernels,
+further push MoE latency above DensePA; for DeepSeek,
+                                                                                                                                                     which are widely used in production. Our methodology
+AllToAll communication adds to this. This makes memory
+                                                                                                                                                     generalizes to other kernel backends. For communication
+bandwidth the critical bottleneck for MoE decode phases,
+                                                                                                                                                     microbenchmarks, we focus on the larger DeepSeek model
+even more so than for dense LLM inference.
+                                                                                                                                                     using vLLM’s symmetric memory AllReduce and DeepEP
+                                                                                                                                                     AllToAll kernels (Zhao et al., 2025b), benchmarked on
+Insight: The decode phase tax follows a bell-shaped curve,
+                                                                                                                                                     8×H200 GPUs. The identified tax sources are architecture-
+peaking at medium batch sizes, which are common in prac-
+                                                                                                                                                     independent, though magnitudes may differ across GPU
+tice. This high tax severely impacts overall performance
+                                                                                                                                                     generations.
+since decode phases are typically longer than prefill phases.
+                                                                                                                                                     Microbenchmarks are driven using token routing traces col-
+4                       TAX S OURCE A NALYSIS                                                                                                        lected from end-to-end inference with different datasets.
+                                                                                                                                                     Specifically, we record expert assignments for each token in
+We decompose the MoE tax into its constituent sources                                                                                                each layer and use them as input to our microbenchmarks.
+through microbenchmark analysis. We first characterize
+the baseline overheads under uniform token distributions:                                                                                            4.1                          Computation
+lower arithmetic intensity in GroupGEMM, ancillary ker-
+nel costs, and AllToAll communication under DP+EP. We                                                                                                The dominant computation cost in an MoE layer is expert
+then analyze how the token distribution modulates these                                                                                              computation via GroupGEMM kernels. Several ancillary
+through expert activation, workload imbalance, kernel-                                                                                               kernels (routing, top-K selection, token alignment, output
+specific padding, and communication bottlenecks.                                                                                                     aggregation) contribute a smaller overhead, which we quan-
+                                                                                                                                                     tify separately.
+We microbenchmark MoEs under different configurations
+and use Nsight (NVIDIA, a;b) to measure the achieved                                                                                                 GroupGEMM arithmetic intensity. The fundamental
+FLOPS and memory bandwidth. First, we identify the ker-                                                                                              source of the MoE computation tax is lower arithmetic in-
+nels corresponding to MoE computation steps in vLLM, i.e.,                                                                                           tensity. The MoE router selects K of the E total experts
+                                                                                                           Demystifying the Mixture of Experts Serving Tax
+
+                                                    DenseFA                                   Mixtral                DensePA                                                                                                      DenseFA                                       Qwen                                 DensePA
+                              Performance (TFLOPS)                                     Memory Bandwidth                                          Roofline Analysis                                      Performance (TFLOPS)                                             Memory Bandwidth                                                              Roofline Analysis
+                                                                                3000
+ Performance (TFLOPS)
+
+
+
+
+                                                                                                                    Performance (TFLOPS)
+
+
+
+
+                                                                                                                                                                          Performance (TFLOPS)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         Performance (TFLOPS)
+                                                                                                                                                                                                                                                               3000
+
+
+
+
+                                                             Bandwidth (GB/s)
+
+
+
+
+                                                                                                                                                                                                                                            Bandwidth (GB/s)
+                        1000                                                                                                                                                                     1000
+                                                                                2000                                                                                                              750                                                          2000
+                                                                                                                                                                                                                                                                                                                                                103
+                        500                                                                                                                103                                                    500
+                                                                                1000                                                                                                                                                                           1000
+                                                                                                                                                                                                  250
+                          0       28        210      212                          0      28        210     212                                102           103                                     0         28        210       212                               0      28        210               212                                        102           103
+                                       Batch Size                                             Batch Size                                      Op. Intensity (FLOP/byte)                                            Batch Size                                                   Batch Size                                                        Op. Intensity (FLOP/byte)
+
+                                                                            (a) Mixtral Prefill.                                                                                                                                                               (b) Qwen Prefill.
+                                                    DenseFA                                   Mixtral                DensePA                                                                                                      DenseFA                                       Qwen                                 DensePA
+                              Performance (TFLOPS)                                     Memory Bandwidth                                          Roofline Analysis                                     Performance (TFLOPS)                                             Memory Bandwidth                                                              Roofline Analysis
+
+
+
+
+                                                                                                                                                                          Performance (TFLOPS)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                Performance (TFLOPS)
+ Performance (TFLOPS)
+
+
+
+
+                                                                                                                 Performance (TFLOPS)
+                        800                                                 3000                                                                                                                 800
+                                                         Bandwidth (GB/s)
+
+
+
+
+                                                                                                                                                                                                                                      Bandwidth (GB/s)
+                                                                                                                                                                                                                                                         3000
+                        600                                                                                                                                                                      600                                                                                                                                   103
+                                                                            2000                                                        103                                                                                                              2000
+                        400                                                                                                                                                                      400
+                        200                                                 1000                                                                                                                 200                                                     1000
+                          0                                                       0                                                                                                                0                                                            0                                                                      102
+                                  22     25         28                                    22     25        28                                     102                                                         22     25          28                                        22     25                   28                                             102              103
+                                   Batch Size                                              Batch Size                                         Op. Intensity (FLOP/byte)                                        Batch Size                                                   Batch Size                                                           Op. Intensity (FLOP/byte)
+
+                                                                   (c) Mixtral Decode.                                                                                                                                                                   (d) Qwen Decode.
+
+                                             Figure 4. Mixtral and Qwen DeepGEMM microbenchmarks on H200 using uniform token distributions.
+for each of the m input tokens, activating K ≤ Eactive ≤                                                                                                                                                              Router                               Align
+                                                                                                                                                                                                                                                                                                                                   Router                       Align
+                                                                                                                                                                                                                      Top-K                                LocalSum                                                                Top-K                        LocalSum
+E experts in total. Under a uniform token distribution,                                                                                                                                                                                                                                            8
+each active expert processes mK/Eactive tokens on average,                                                                                                                                             2.0
+                                                                                                                                                                                                                                                                                                   6
+
+
+
+
+                                                                                                                                                                                                                                                                                     Latency (%)
+whereas DenseFA processes all m tokens through a sin-
+                                                                                                                                                                                         Latency (%)
+                                                                                                                                                                                                       1.5
+gle K-scaled FFN with the same total FLOPs. The MoE                                                                                                                                                                                                                                                4
+                                                                                                                                                                                                       1.0
+arithmetic intensity is therefore K/Eactive ≤ 1 of DenseFA’s,                                                                                                                                          0.5                                                                                         2
+i.e., always lower. Since each token is routed to K experts,
+                                                                                                                                                                                                       0.0                                                                                         0        4                          16             64 256 1024 4096
+Eactive ≥ K, and Eactive increases with batch size.                                                                                                                                                            4       16       64 256 1024 4096
+                                                                                                                                                                                                                            Batch Size                                                                                                            Batch Size
+The lower arithmetic intensity affects both inference phases,                                                                                                                                                        (a) Mixtral                                                                                                          (b) Qwen
+but the bottleneck resource determines which aspect domi-
+nates. In prefill, throughput is limited by how well the ker-                                                                                                                   Figure 5. Latency breakdown of ancillary computation in Mixtral
+nel saturates GPU compute; the smaller per-expert batches                                                                                                                       and Qwen as a fraction of the overall MoE block computation time.
+lower GroupGEMM efficiency, causing compute units to sat-                                                                                                                       Uses uniform token distributions.
+urate at higher batch sizes than DenseFA (batch subdivision).                                                                                                                   heads constitute a small fraction of the total tax, typically
+In memory-bound decode, latency is limited by weight load-                                                                                                                      under 5% for Mixtral and under 8% for Qwen. However,
+ing from HBM; MoE loads Eactive /K times the weight vol-                                                                                                                        their behavior varies with batch size. The align kernel,
+ume of DenseFA, causing decode latency to approach that of                                                                                                                      which permutes and pads tokens, is most significant at small
+the much larger DensePA model when Eactive ≈ E (weight                                                                                                                          batch sizes, while the local sum kernel, which aggregates
+amplification).                                                                                                                                                                 expert outputs, becomes more prominent at very large batch
+Figure 4 confirms this empirically. In the prefill phase, MoE                                                                                                                   sizes as the output tensors grow. Because the local sum ker-
+GroupGEMMs achieve lower TFLOPS than dense GEMMs                                                                                                                                nel latency scales up quickly with the number of activated
+due to batch subdivision. In the decode phase, MoE kernel                                                                                                                       experts, Qwen (K = 8) has a higher aggregate overhead
+TFLOPS closely track those of the much larger DensePA                                                                                                                           from ancillary computations than Mixtral (K = 2). Fusing
+FFN, confirming weight amplification. In practice, even                                                                                                                         these operations (e.g., combine with local sum (Zhao et al.,
+small batches activate nearly all experts for smaller models,                                                                                                                   2025b)) can help reduce the cumulative overhead.
+requiring the system to load most expert weights from HBM
+(Section 4.3). Both phases can additionally suffer from                                                                                                                          4.2                         Communication
+padding overheads needed to align tokens to specific block                                                                                                                       Under TP, both MoE and DenseFA shard weights across
+sizes, which can further reduce arithmetic intensity.                                                                                                                            GPUs and use AllReduce to aggregate partial results. Both
+                                                                                                                                                                                 models incur two AllReduces per layer (one after attention,
+Ancillary kernels. Beyond the expert computation itself,                                                                                                                         one after expert/FFN computation), each reducing a matrix
+MoEs require several ancillary kernels to enable conditional                                                                                                                     of size m × dmodel . Since these are identical for MoE and
+computation. Figure 5 shows the latency of these kernels                                                                                                                         DenseFA, there is no communication tax under TP.
+(router, top-k, align, and local sum) as a percentage of the
+total MoE layer computation time. Collectively, these over-                                                                                                                      Under DP+EP, experts are distributed across GPUs, and
+                                                                                                  Demystifying the Mixture of Experts Serving Tax
+
+                        15                                                                                                                                      MMLU                        MMLU                           HumanEval                   HumanEval
+ AllToAll / AllReduce
+                                                                                                                                                                Prefill                    Decode                            Prefill                    Decode
+
+
+
+
+                                                                    AllToAll / AllReduce
+                                                                                           10.0                                                  0                             0                                 0                           0
+                                                                                                                                                                                                                                                                               100
+                        10                          AllReduce                               7.5                       AllReduce
+                                                    AllToAll (1N)                                                     AllToAll (1N)
+
+
+
+
+                                                                                                                                      Layer ID
+                                                                                                                                       Mixtral
+                                                    AllToAll (2N)                           5.0                       AllToAll (2N)              16                            16                                16                          16                                80
+                        5
+
+
+
+
+                                                                                                                                                                                                                                                                                    Experts Activated (%)
+                                                                                            2.5
+                                                                                                                                                 31                            31                                31                          31                                60
+                             27   28   29    210     211      212                                   21      23           25                           27   28     29 210 211        20 21 22 23 24 25 26 27 28        27   28   29 210 211        20 21 22 23 24 25 26 27 28
+                                       Batch size                                                        Batch size                              0                             0                                 0                           0
+                                                                                                                                                                                                                                                                               40
+                                   (a) Prefill                                                      (b) Decode
+
+
+
+
+                                                                                                                                      Layer ID
+                                                                                                                                       Qwen2
+                                                                                                                                                 14                            14                                14                          14                                20
+Figure 6. AllToAll/AllReduce latency ratio at DeepSeek-V3 trans-                                                                                                                                                                                                               0
+                                                                                                                                                 27                            27                                27                          27
+fer sizes (NCCL, H200 GPUs). Decode uses NCCL with sym-                                                                                               27   28     29 210 211
+                                                                                                                                                           Batch Size
+                                                                                                                                                                                    20 21 22 23 24 25 26 27 28
+                                                                                                                                                                                          Batch Size
+                                                                                                                                                                                                                      27   28   29 210 211
+                                                                                                                                                                                                                           Batch Size
+                                                                                                                                                                                                                                                  20 21 22 23 24 25 26 27 28
+                                                                                                                                                                                                                                                        Batch Size
+metric memory; prefill uses default NCCL. Values >1 indicate
+AllToAll is more expensive. 1N = 8×H200; 2N = 16×H200.
+                                                                                                                                      Figure 7. Average expert activation per iteration for Mixtral and
+tokens must be routed to the GPUs hosting their assigned                                                                              Qwen at different batch sizes in the prefill and decode phases.
+experts via AllToAll dispatch; results are returned via All-
+                                                                                                                                      and the performance is less sensitive to the token imbalance.
+ToAll combine. For mg local tokens, the per-GPU dispatch
+                                                                                                                                      For communication under DP+EP, the token distribution
+buffer is mg ⋅ K ⋅ dmodel , compared to AllReduce’s input of
+                                                                                                                                      determines per-GPU AllToAll transfer volumes.
+m ⋅ dmodel . Since AllToAll volume scales with the routing
+fan-out K while AllReduce does not, AllToAll sends K×
+                                                                                                                                      Expert activation. The token distribution determines how
+more data at the API level (8× for DeepSeek-V3). Adding
+                                                                                                                                      many of the E total experts are activated (Eactive ), directly
+more GPUs reduces the per-GPU volume (since mg de-
+                                                                                                                                      modulating the GroupGEMM arithmetic intensity ratio
+creases) but increases the number of peer-to-peer messages,
+                                                                                                                                      K/Eactive : fewer activated experts means higher per-expert
+each incurring a fixed latency overhead that compounds at
+                                                                                                                                      arithmetic intensity, closer to DenseFA.
+multi-node scale.
+                                                                                                                                      In practice, expert activation saturates rapidly with batch
+The actual data traversing the network differs from the API-
+                                                                                                                                      size (Figure 7). Even medium-sized batches activate nearly
+level volumes for both collectives. Ring AllReduce (Re-
+                                                                                                                                      all experts, especially for models with fewer total experts
+duceScatter + AllGather) transfers 2(n−1)/n of its input
+                                                                                                                                      like Mixtral (E=8). At smaller batch sizes, non-uniform
+per GPU, which is ∼1.75× for n=8 GPUs. For AllToAll,
+                                                                                                                                      distributions can concentrate tokens onto fewer experts, re-
+a fraction 1/n of token-expert assignments target local ex-
+                                                                                                                                      ducing Eactive . During decode, this directly reduces weight
+perts and do not traverse the network, reducing the effective
+                                                                                                                                      loading, making non-uniform distributions beneficial. Dur-
+transfer to (n−1)/n of the dispatch buffer. Accounting
+                                                                                                                                      ing prefill, most experts are activated regardless and the
+for both effects, the network volume ratio narrows from
+                                                                                                                                      kernel is compute-bound, so the effect is less significant.
+K to approximately K ⋅ n/(2(n−1)), which is ∼4.6× for
+DeepSeek-V3.
+                                                                                                                                      Padding. MoE routing creates irregular per-expert token
+Figure 6 shows the measured NCCL AllToAll/AllReduce                                                                                   counts, which causes a ragged input tensor shape. GPU
+latency ratio at DeepSeek-V3 transfer sizes, using single-                                                                            GEMM kernels often require aligned dimensions for effi-
+node AllReduce as the baseline (since TP stays intra-node).                                                                           cient execution, so the input tensor must be padded, poten-
+Decode uses NCCL with symmetric memory, which reduces                                                                                 tially wasting compute and memory on empty slots. Unlike
+communication overhead at small transfer sizes. Within a                                                                              dense models, where all tokens pass through a single FFN
+single node, the ratio is around 2× during decode and grows                                                                           with a uniform batch, the irregularity introduced by routing
+to 3–4× at large prefill batches, consistent with the network                                                                         makes padding an MoE-specific overhead that affects both
+volume ratio as bandwidth dominates over fixed overheads.                                                                             TP and EP. The overhead depends not on skew per se, but
+Across two nodes, the ratio reaches 7–15× because RDMA                                                                                on the interaction between the token distribution and the
+inter-node latency and bandwidth become the bottleneck                                                                                kernel’s padding mechanism.
+compared to NVLink.
+                                                                                                                                      The padding scheme is kernel-specific. We identify two
+                                                                                                                                      common schemes in production kernels. Blockwise padding
+4.3                          Token Distribution Effects                                                                               independently rounds each expert’s tokens to a block bound-
+Our analysis so far assumed uniform token distributions.                                                                              ary (used by FusedMoE and DeepGEMM prefill). Max
+In practice, the token distribution modulates the above tax                                                                           padding pads all experts to a single shared dimension equal
+sources. The impact is phase-dependent: for prefill, per-                                                                             to the maximum per-expert token count (used by Deep-
+GPU time scales with the token count, so workload imbal-                                                                              GEMM decode). These have opposite worst cases: block-
+ance and kernel-specific padding directly inflate latency. In                                                                         wise padding is maximized by spread distributions (many
+decode, weight loading from activated experts dominates,                                                                              experts with few tokens each), while max padding is maxi-
+                                                                                                                                      mized by concentrated distributions (one expert with many
+                                                                                        Demystifying the Mixture of Experts Serving Tax
+
+                     MMLU                        MMLU                        HumanEval                 HumanEval                                                                                  MMLU                       MMLU                        HumanEval                              HumanEval
+                     Prefill                    Decode                         Prefill                  Decode                                                                                    Prefill                   Decode                         Prefill                               Decode
+             0                        0                                 0                       0                                                                                         0                       0                                 0                                    0                                     80
+                                                                                                                                 20
+ Layer ID
+
+
+
+
+                                                                                                                                                                Layer ID
+  Mixtral
+
+
+
+
+                                                                                                                                                                 Mixtral
+            16                       16                                16                      16                                10                                                16                            16                                16                                   16                                     60
+
+
+
+
+                                                                                                                                      Overhead vs Uniform (%)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                    Overhead vs Uniform (%)
+                                                                                                                                 0                                                                                                                                                                                             40
+            31                       31                                31                      31                                                                                  31                            31                                31                                   31
+                 27 28 29 210 211         20 21 22 23 24 25 26 27 28        27 28 29 210 211        20 21 22 23 24 25 26 27 28       10                                                       27 28 29 210 211        20 21 22 23 24 25 26 27 28        27 28 29 210 211                     20 21 22 23 24 25 26 27 28
+                                                                                                                                                                                                                                                                                                                               20
+             0                        0                                 0                       0                                                                                         0                       0                                 0                                    0
+                                                                                                                                     20
+                                                                                                                                                                                                                                                                                                                               0
+ Layer ID
+
+
+
+
+                                                                                                                                                                Layer ID
+                                                                                                                                     30
+  Qwen2
+
+
+
+
+                                                                                                                                                                 Qwen2
+            14                       14                                14                      14                                                                                  14                            14                                14                                   14
+                                                                                                                                     40                                                                                                                                                                                            20
+            27                       27                                27                      27                                                                                  27                            27                                27                                   27
+                 27 28 29 210 211         20 21 22 23 24 25 26 27 28        27 28 29 210 211        20 21 22 23 24 25 26 27 28                                                                27 28 29 210 211        20 21 22 23 24 25 26 27 28        27 28 29 210 211                     20 21 22 23 24 25 26 27 28
+                   Batch Size                 Batch Size                      Batch Size                Batch Size                                                                              Batch Size                Batch Size                      Batch Size                             Batch Size
+
+                                    (a) FusedMoE kernels under TP.                                                                                                                                           (b) DeepGEMM kernels under EP.
+                                Figure 8. Latency overhead of profiled vs. uniform token distributions for Mixtral and Qwen on H200.
+
+
+
+
+                                                                                                                                                                   Overhead vs. uniform
+
+
+
+
+                                                                                                                                                                                                                                                           Overhead vs. uniform
+tokens inflates the shared dimension for all). Other kernel                                                                                                                                                                       Uniform                                               Uniform
+                                                                                                                                                                                          2.5                                     Median skew                                     2.5   Median skew
+implementations may use different schemes. Even a per-                                                                                                                                                                            p95 skew                                              p95 skew
+                                                                                                                                                                                          2.0                                                                                     2.0
+fectly uniform token distribution can incur padding, since
+                                                                                                                                                                                          1.5                                                                                     1.5
+the overhead depends on block alignment rather than skew.                                                                                                                                 1.0                                                                                     1.0
+                                                                                                                                                                                                     21          23              25                27                                   21              23                25                         27
+Figure 8a quantifies the padding tax under TP using Fused-                                                                                                                                                Avg. tokens per GPU                                                                Avg. tokens per GPU
+MoE kernels with profiled token distributions. During pre-
+                                                                                                                                                                                                      (a) Dispatch                                                                      (b) Combine
+fill, the padding tax grows with batch size, reaching around
+15–25%. The tax is greater for Qwen than for Mixtral, since                                                                                                      Figure 9. AllToAll dispatch and combine overhead under profiled
+its larger number of experts creates more padding oppor-                                                                                                         vs. uniform token distributions for DeepSeek-V3 decode using
+tunities. During decode, the latency impact of padding is                                                                                                        DeepEP low latency kernels on 8×H200.
+smaller for both models across batch sizes. Non-uniform dis-                                                                                                     Communication imbalance. Under DP+EP, the per-GPU
+tributions can yield a net benefit by activating fewer experts,                                                                                                  AllToAll cost under non-uniform token distributions is de-
+which outweighs the padding overheads.                                                                                                                           termined by max(Sg , Rg ), the larger of the token-expert
+                                                                                                                                                                 assignments sent and received by GPU g. Two sources of
+Worker stragglers. The straggler tax is unique to expert                                                                                                         imbalance interact differently across dispatch and combine.
+parallelism. When an uneven distribution of tokens is routed                                                                                                     Expert popularity determines how many tokens each GPU’s
+to experts distributed across different GPUs, some workers                                                                                                       experts receive: during dispatch, GPUs hosting popular ex-
+are assigned more tokens than others. Since the end-to-end                                                                                                       perts receive more data (receiver-side imbalance); during
+latency is determined by the slowest worker, this workload                                                                                                       combine, these same GPUs send more results back (sender-
+imbalance can severely degrade performance. Figure 8b                                                                                                            side imbalance). The DP token count determines how many
+quantifies this tax by measuring the latency overhead of re-                                                                                                     tokens each rank contributes: during dispatch, this is the
+alistic expert distributions compared to a perfectly balanced                                                                                                    sender-side load; during combine, it is the receiver-side load.
+load.                                                                                                                                                            Under decode, per-rank token counts are approximately bal-
+Straggler tax dominates during the prefill phase, where it                                                                                                       anced due to DP load balancing, so the dominant imbalance
+can increase MoE kernel latency by 40–80% compared to                                                                                                            comes from expert popularity. Under prefill or mixed batch-
+a uniform token distribution. Padding amplifies the imbal-                                                                                                       ing (e.g., chunked prefill), DP ranks may contribute different
+ance: the hot GPU’s token count is further inflated by block                                                                                                     numbers of tokens, introducing imbalance on the DP token
+alignment, compounding the overhead. The effect is less                                                                                                          count side as well.
+severe for Qwen, since its larger number of experts allows                                                                                                       Figure 9 quantifies the impact of this imbalance on All-
+the workload to be spread more evenly.                                                                                                                           ToAll performance for DeepSeek-V3 decode, showing the
+The straggler tax is minimal during decode because per-                                                                                                          overhead relative to a uniform baseline under profiled to-
+GPU time is dominated by fixed kernel launch overheads                                                                                                           ken distributions from traced routing. The median and p95
+and weight loading, which depend on Eg (the number of                                                                                                            skew lines represent the communication overhead at the me-
+active experts on each GPU) rather than the token count                                                                                                          dian and tail token distribution skew across profiled batches.
+Rg . When each GPU hosts many experts, Eg is roughly                                                                                                             At small batch sizes (1–8 tokens per rank), the overhead
+balanced, and token imbalance has little effect. Under wider                                                                                                     is minimal since fixed per-transfer latency dominates. At
+EP with fewer experts per rank, Eg can become more vari-                                                                                                         larger batch sizes, imbalance grows substantially: at 128
+able: some GPUs may have all their experts activated while                                                                                                       tokens per rank, the p95 combine overhead reaches 2.7×,
+others have none, creating a weight loading imbalance that                                                                                                       compared to 1.9× for dispatch. Combine is more sensitive
+directly translates to straggler overhead.                                                                                                                       because DeepSeek-V3 dispatches in FP8 but combines in
+                                      Demystifying the Mixture of Experts Serving Tax
+
+BF16, nearly doubling the per-token transfer volume and
+                                                                                   Table 3. MoE tax model parameters.
+amplifying the effect of routing imbalance.                      Symbol              Description
+                                                                 m                   Batch size (tokens)
+4.4   Summary                                                    E, K                Total experts, top-K routing
+                                                                 Eactive             Number of activated experts
+Table 1 summarizes the key tax sources identified above.         Eg , Rg             Active experts and routed tokens on GPU g
+These sources explain the end-to-end tax profiles from Sec-      Sg                  Token-expert assignments sent by GPU g
+tion 3. The prefill tax decreasing with batch size (Figure 2)    α, αact             Per-expert weight and per-token activation I/O cost
+                                                                 β                   Per-token-expert compute cost
+is driven by batch subdivision: larger batches improve per-      γ                   Per-token network transfer cost
+expert arithmetic intensity, approaching DenseFA efficiency.     η, ηg               Padding overhead (global, per-GPU)
+Models with more experts (Qwen, DeepSeek) incur a higher         ntp , ndp , nep     TP, DP, EP parallelism degrees
+prefill tax because finer-grained experts create more padding    f                   FFN fraction of DenseFA forward time
+opportunities and lower per-expert batch sizes. The decode       N⃗                  Token distribution
+bell curve (Figure 3) reflects weight amplification: at batch    Tanc , TAR          Ancillary kernel and AllReduce time
+size 1, few experts are activated, and weight loading is min-   baseline throughout. The DenseFA FFN block processes all
+imal; at medium batches, nearly all experts are activated,      m tokens through K experts’ worth of weights. Per GPU:
+maximizing weight loading; at large batches, compute be-
+gins to catch up.                                                                     1
+                                                                       TFFN,c =          max(α ⋅ K + αact ⋅ mK, β ⋅ mK)           (2)
+                                                                                     ntp
+The token distribution modulates these baseline overheads
+in phase-dependent ways. During prefill, non-uniform rout-                                           TP
+                                                                The full block time adds AllReduce: TFFN = TFFN,c +TAR . A
+ing creates stragglers under EP and interacts with padding,     DP DenseFA deployment would instead process mg =m/ndp
+compounding the overhead. During decode, non-uniform            tokens per GPU with no communication overheads.
+routing can actually reduce the tax by concentrating to-
+kens onto fewer experts, lowering weight loading. Under         TP+TP. We compare MoE and DenseFA at the same TP de-
+DP+EP, AllToAll communication adds an MoE-specific              gree ntp , so both use identical sharding and communication.
+overhead that scales with the routing fan-out K and grows       Each GPU holds a 1/ntp shard of every expert and processes
+significantly at multi-node scale. The relative dominance of    all m tokens. All GPUs see symmetric workloads, so per-
+the tax sources shifts with the inference phase, batch size,    GPU time equals block time. The non-FFN computation
+parallelism strategy, and token distribution, motivating an     Tother (attention, norms, embeddings) is identical. Letting
+analytical model to reason about them jointly.                  TMoE and TFFN denote block times:
+                                                                               Tother + TMoE
+5     M ODELING THE M O E TAX                                            τ=                  = 1 + (TMoE /TFFN − 1) ⋅ f           (3)
+                                                                               Tother + TFFN
+We develop an analytical model to decompose the MoE
+                                                                where f = TFFN /(Tother + TFFN ) is the fraction of DenseFA
+tax τ at a given batch size of m tokens from architecture
+                                                                time in FFN computation. The MoE block performs mK
+and hardware parameters. We model routed-expert com-
+                                                                routed token-expert computations, loading Eactive experts.
+putation, ancillary MoE kernels, and communication; we
+                                                                Kernel padding introduces an overhead η ≥ 1 that depends
+do not model compute-communication overlap. We derive
+                                                                on the token distribution and padding scheme:
+the model for each parallelism strategy below, then detail
+two supporting inputs: the padding overhead and the token                   1
+distribution model.                                              TMoE,c =      max(α ⋅ Eactive + αact ⋅ η ⋅ mK, β ⋅ η ⋅ mK)
+                                                                           ntp
+                                                                                                                          (4)
+Hardware parameters. Let We be the weight bytes per             Comparing with TFFN,c , the 1/ntp factors cancel. Weight
+expert, dact the activation bytes per token-expert, Fe the      loading differs (Eactive vs. K); without padding (η=1), total
+FLOPs per token-expert, and s the bytes per token for net-      FLOPs are equal (mK⋅Fe ). This yields three regimes. In the
+work transfer. Weight loading takes α = We /BWHBM per           memory-bound regime (decode, small m), TMoE,c /TFFN,c ≈
+expert, activation I/O takes αact = dact /BWHBM per token-      Eactive /K. When Eactive ≈ E, this reaches E/K, explain-
+expert, computation takes β = Fe /FLOPSpeak per token-          ing why MoE decode approaches DensePA latency. In the
+expert, and network transfer takes γ = dmodel ⋅ s/BWnet per     compute-bound regime (prefill, large m), weight loading is
+token, where BWnet is the effective link bandwidth. We          hidden behind compute. Since total FLOPs match, the ra-
+denote the TP, DP, and EP parallelism degrees by ntp , ndp ,    tio reduces to the padding overhead: TMoE,c /TFFN,c ≈ η.
+and nep , respectively.                                         In between, a transition regime occurs where MoE is
+                                                                memory-bound but DenseFA is compute-bound, giving
+DenseFA baseline. We compare against a TP DenseFA               TMoE,c /TFFN,c = α ⋅ Eactive /(β ⋅ mK), decreasing with m.
+                                        Demystifying the Mixture of Experts Serving Tax
+
+                              TP+TP
+The full MoE block time is TMoE     = TMoE,c + Tanc + TAR ,                                                8E,4G        64E,4G          64E,32G
+           TP                                                                             Expert skew (unpadded)   Expert skew (padded)     GPU skew (padded)
+mirroring TFFN with the addition of Tanc .                                          1.0
+
+
+
+
+                                                                  Mean / Max Load
+                                                                                    0.9
+TP+EP. Attention remains TP, so the τ decomposition still
+                                                                                    0.8
+applies. Experts are partitioned across nep GPUs. Unlike
+TP+TP, per-GPU workloads are now asymmetric: GPU g                                  0.7
+hosts Eg active experts and receives Rg routed token-expert                               512 1024 2048 4096 512 1024 2048 4096 512 1024 2048 4096
+                                                                                            Avg. Tokens per GPU Avg. Tokens per GPU Avg. Tokens per GPU
+assignments, with padding overhead ηg ≥ 1. Its compute
+time is Tc,g = max(α ⋅ Eg + αact ⋅ ηg Rg , β ⋅ ηg Rg ). Because                                                     (a) Prefill.
+per-GPU workloads vary with the token distribution, the                                                   8E,4G         64E,4G          64E,32G
+                                                                                          Expert skew (unpadded)   Expert skew (padded)      GPU skew (padded)
+straggler GPU sets the block latency:                                               1.0
+
+
+
+
+                                                                  Mean / Max Load
+               TP+EP
+              TMoE   = max Tc,g + Tanc + TAR                (5)
+                        g                                                           0.5
+
+
+DP+EP. Under DP+EP, attention uses DP while experts                                        4       8 16 32 64 4 8 16 32 64 4 8 16 32 64
+use EP. Unlike TP+TP and TP+EP, attention parallelism                                          Avg. Tokens per GPU Avg. Tokens per GPU Avg. Tokens per GPU
+now differs between the MoE and DenseFA deployments:                                                               (b) Decode.
+DP processes mg = m/ndp tokens per GPU with no com-
+                DP
+munication (Tother  ≈ Tattn (mg )), while TP DenseFA shards       Figure 10. Simulated token load under different configurations
+                                                                  (e.g., 8E,4G = 8 experts on 4 GPUs), assuming uniform random
+                                TP
+attention across ntp GPUs (Tother   ≈ Tattn (m)/ntp ). Because
+                                                                  token routing. Padded using DeepGEMM kernels (Section 5.1).
+Tother no longer cancels, the tax depends on both the block
+                                                                  Higher is more balanced (1.0 = perfect). Each data point is aver-
+ratio and the attention overhead:                                 aged over 1000 runs.
+                               DP
+                              Tother + TMoE
+                                        DP+EP
+                                                                  Pg = Eg × ⌈max(Ni )/B⌉ × B. Concentrated distributions
+                  τ DP+EP =      TP + T TP
+                                                            (6)
+                               Tother    FFN
+                                                                  (one expert with many tokens) maximize waste. The two
+                                                                  schemes thus have opposite worst cases. In both cases,
+DP feeds m = ndp ⋅ mg total tokens to the MoE block, so           Pg connects to the tax model: η = Pg /(mK) under TP;
+experts see a larger effective batch than any single GPU’s        ηg = Pg /Rg under EP. The blockwise padding model pre-
+attention.                                                        dicts kernel latency with R2 > 0.99 against the microbench-
+                                                                  marks in Section 4.
+The per-GPU expert compute follows TP+EP, but AllToAll
+replaces AllReduce (Section 4.2). The per-phase AllToAll
+cost on GPU g is Ta2a,g = γ ⋅ max(Sg , Rg ), where Sg is the      5.2                     Token Distribution Model
+token-expert assignments sent. Each GPU runs dispatch,            The token distribution N   ⃗ determines per-GPU workloads.
+compute, and combine in sequence; the overall latency is          Under uniform random routing, the expected number of acti-
+the slowest GPU’s total:                                          vated experts is E[Eactive ] = E ⋅(1−(1−K/E)m ) (Mazurek
+                                                                  & Schreiber, 2025), which approaches E rapidly with batch
+       DP+EP
+      TMoE   = max (TA2Ad,g + Tc,g + TA2Ac,g ) + Tanc       (7)   size m. For models with fewer experts, such as Mixtral and
+                  g
+                                                                  Qwen, expert activation closely tracks the expected formula
+5.1   Padding Model                                               and saturates quickly. For models with many fine-grained
+                                                                  experts like DeepSeek-V3, the uniform assumption often
+The padding overheads η and ηg from the tax model depend          overestimates Eactive , especially if the trained router concen-
+on how the kernel handles irregular per-expert token counts.      trates tokens on a subset of experts (e.g., via grouped topk
+Given the token distribution N⃗ = [N1 , . . . , NE ] (∑i Ni =     routing (DeepSeek-AI, 2024b)).
+mK), kernels pad tokens to fixed block sizes B for efficient
+execution, creating additional effective work Pg on each          Balls-and-bins theory further gives analytical bounds on the
+GPU. We model the two padding schemes identified in               expected worst-case per-expert load under uniform √ random
+Section 4.                                                        routing: logloglogEE when m ∼ E (decode) and m
+                                                                                                               E
+                                                                                                                  + 2m E  log E
+
+                                                                  when m ≫ E (prefill). However, the classic balls-and-bins
+Under blockwise padding, each expert’s tokens are inde-
+                                                                  setting does not capture MoE routing because (1) experts are
+pendently padded to block size B, giving effective work
+       Eg                                                         housed in GPUs, creating a three-level hierarchy of tokens
+Pg = ∑i=1 ⌈Ni /B⌉ × B. Spread distributions (many experts         (balls), experts (bins), and GPUs (buckets) with two sources
+with few tokens each) maximize padding waste. Under               of imbalance; and (2) batches are padded for efficient kernel
+max padding, all experts share a padded dimension equal           implementations, introducing performance non-linearities.
+to the largest per-expert count rounded up to B, giving
+                                                                                  Demystifying the Mixture of Experts Serving Tax
+
+               3.0                       Mixtral (model)
+                                         Qwen (model)
+                                                                                                                      batch size from performance profiles using a performance
+                                         Mixtral (measured)                 2.5                                       projection tool.
+               2.5
+ MoE Tax ( )
+
+
+
+
+                                                              MoE Tax ( )
+                                         Qwen (measured)
+
+               2.0                                                          2.0
+                                                                                                                      The model reproduces the qualitative tax trends: the decode
+                                                                                                 Mixtral (model)
+               1.5                                                          1.5                  Qwen (model)
+                                                                                                 Mixtral (measured)
+                                                                                                                      tax bell curve driven by Eactive /K and the prefill tax decrease
+                                                                                                 Qwen (measured)
+               1.0                                                          1.0                                       from improving arithmetic intensity. Tax predictions are
+                     27   28      29        210         211                         21   23     25         27
+                               Batch size                                                Batch size                   within 10–30% of measured values across most batch sizes
+                          (a) Prefill.                                               (b) Decode.
+                                                                                                                      for both models and phases. The remaining gap can be
+                                                                                                                      attributed to several factors, such as using a constant η
+Figure 11. MoE tax model predictions vs. measured tax for Mixtral                                                     rather than batch-dependent padding, fixed per-invocation
+and Qwen on A100 from Section 3.                                                                                      latencies not captured in the throughput-only cost model,
+We therefore use an augmented balls-bins-buckets (BBB)                                                                and differences in achieved FLOPS and HBM utilization
+model that applies the analytical worst-case formulas at                                                              between GroupGEMM and dense GEMM kernels.
+both expert and GPU levels to bound the expected straggler
+ratio. To capture the non-linear effect of kernel padding                                                             6     R EDUCING THE M O E TAX
+on per-GPU workloads, we additionally use Monte Carlo
+simulation.                                                                                                           MoE inference is bottlenecked by distinct, often competing,
+                                                                                                                      overheads, making a single system configuration inherently
+Figure 10 shows simulated token loads under uniform ran-                                                              suboptimal. Table 4 summarizes key tax reduction strategies
+dom routing. Finer-grained experts (8E,4G vs. 64E,4G)                                                                 and trade-offs for each tax source. Many of these have been
+increase per-expert skew but GPU-level skew remains sim-                                                              proposed by prior work. Our analysis contextualizes them
+ilar, since the bins-and-buckets averaging compensates.                                                               in terms of the MoE tax and identifies new optimization
+Adding DP attention (64E,4G vs. 64E,32G) increases                                                                    opportunities. By carefully optimizing the dominant tax
+worst-case GPU load, which padding can further worsen;                                                                sources for each phase, we can improve the efficiency of
+such deployments require load balancing strategies like                                                               serving MoE models at scale.
+EPLB (DeepSeek-AI, 2024b).
+Under EP, the straggler GPU determines iteration latency.                                                             6.1   Prefill Optimizations
+The ratio maxg Rg /(mK/nep ) measures how much the                                                                    Prefill phase optimizations primarily target token distribu-
+most-loaded GPU exceeds the mean. This ratio matters                                                                  tion effects and batch subdivision (Sections 4 and 5).
+most during prefill, where each GPU’s compute time scales
+with its token load Rg . During decode, per-GPU time is                                                               Load balancing. The optimization goal depends on paral-
+instead dominated by weight loading, and token load imbal-                                                            lelism: under EP, the goal is to minimize the combination of
+ance has a lesser impact on decode latency.                                                                           straggler and padding taxes; under TP, only padding applies.
+The analysis above assumes uniform random routing. Prac-                                                              Straggler tax can be reduced via load-aware routing or by
+tical routing can deviate: as noted, DeepSeek-V3’s router                                                             replicating popular experts (He et al., 2022; DeepSeek-AI,
+can concentrate tokens, reducing Eactive below the uniform                                                            2024b; Li et al., 2023). Padding tax can be addressed at
+random prediction. Straggler loads similarly diverge from                                                             the batching, router, or kernel levels, e.g., by minimizing
+the analytical bounds under non-uniform routing. The MoE                                                              the number of padding tokens across experts. Padding tax
+tax model accepts profiled token distributions N⃗ as inputs                                                           is a less-explored but significant optimization opportunity.
+for such cases.                                                                                                       Routers could also be trained to penalize routing decisions
+                                                                                                                      that cause high straggler or padding taxes, co-designing
+                                                                                                                      model quality with system efficiency.
+5.3                  Model Validation
+                                                                                                                      DeepSeek-V3’s Expert Parallel Load Balancer
+The model’s primary purpose is to analytically decompose
+                                                                                                                      (EPLB) (DeepSeek-AI, 2024b) replicates popular ex-
+the MoE tax and identify the dominant tax source for a
+                                                                                                                      perts across GPUs to reduce the straggler tax. This
+given configuration, rather than serve as a precise latency
+                                                                                                                      improves prefill latency but can worsen decode latency,
+predictor. To verify that it captures the right tax trends, Fig-
+                                                                                                                      since replication increases the number of activated experts
+ure 11 compares TP+TP tax predictions against end-to-end
+                                                                                                                      and thus the weight amplification tax (Yu et al., 2025).
+tax measurements from Section 3 for Mixtral and Qwen
+                                                                                                                      Furthermore, EPLB balances raw token counts (Rg ) rather
+on A100-40GB GPUs. We instantiate the model with each
+                                                                                                                      than padded workloads (Pg = ηg ⋅ Rg , Section 5.1). A
+architecture’s expert dimensions, A100 hardware parame-
+                                                                                                                      padding-aware and activation-aware EPLB that balances Pg
+ters (BWHBM =1500 GB/s, FLOPSpeak =312 TFLOPS BF16),
+                                                                                                                      would more effectively minimize straggler compute time.
+constant padding overheads (ηdecode =1.05, ηprefill =1.25), the
+uniform random formula for Eactive , and f estimated at each                                                          Fine-grained experts. Expert granularity is a key factor
+                                           Demystifying the Mixture of Experts Serving Tax
+
+                                                                                                                       3.5
+
+
+
+
+                                                                                                    Experts-only Tax
+                                                                                                                       3.0
+Tax Source               Reduction Strategy                   Key Trade-offs                                           2.5
+                                                                                                                       2.0
+Batch subdivision        DP attention; Custom kernels         Higher memory footprint; extra                           1.5
+                                                              load balancing for attention.                            1.0 2           4         6         8
+Weight amplification     Wide parallelism; Skewed rout-       Higher communication tax; Rout-                                     # of activated experts
+                         ing; Quantization                    ing complexity.
+                                                                                                                                (a) Fewer experts
+Workload imbalance       Expert replication; Balanced         Higher memory footprint; Rout-
+                                                                                                                       8
+                         routing                              ing complexity.                                                                        Prefill
+
+
+
+
+                                                                                                    Experts-only Tax
+                                                                                                                       6                             Decode
+Padding                  Smarter batching; Skewed rout-       Straggler tax for EP; Routing
+                         ing; Custom kernels                  complexity.
+                                                                                                                       4
+Ancillary Kernels        Kernel fusion; Selecting             High complexity for relatively
+                         fewer experts                        small gains.                                             2
+
+Communication            Micro-batching for DP+EP;            Higher computation tax due to                                20         21        22         23
+                                                                                                                                  Parallelism degree
+                         Locally routing tokens               batch subdivision.
+                                                                                                                             (b) Wider parallelism
+          Table 4. MoE tax sources, key reduction strategies, and associated trade-offs.
+                                                                                                Figure 12. Reducing the decode tax for
+                                                                                                Mixtral.
+for prefill performance. Finer-grained experts help reduce             phase. Quantization directly reduces the total volume of
+straggler tax by enabling a more balanced load distribution.           data that must be loaded from HBM, thus lowering the
+However, they can simultaneously increase the padding tax              weight amplification tax. This can make it feasible to serve
+and exacerbate the computational inefficiency from batch               MoEs with a smaller degree of parallelism, reducing costs
+subdivision. Thus, the optimal number of experts is not just           and communication demands.
+a modeling decision, but a system-dependent parameter that
+should be co-designed with the target parallelism strategy.             6.3   Cross-phase Optimizations
+
+6.2   Decode Optimizations
+                                                                        DP attention. Batch subdivision is a key cause of poor
+Decode phase optimizations focus on memory bandwidth                    performance in medium-batch prefill and decode. By pro-
+due to the dominant weight amplification tax.                           cessing multiple sequences in parallel, DP attention helps
+                                                                        ensure that the MoE layer processes a larger batch of to-
+Skewed routing. As shown in Figure 12a, activating fewer                kens (DeepSeek-AI, 2024b). This not only mitigates the
+experts improves performance since it reduces the volume                subdivision effect, but it also helps enable wider parallelism
+of weights loaded from memory. This could be achieved                   for the MoE layer to reduce decode phase taxes.
+in different ways. For example, routers could be trained to
+reduce the number of activated experts per batch. Alterna-
+tively, decode phases could batch requests that are predicted          Batch size interactions. Techniques that alter the effective
+to use the same set of experts (Qian et al., 2024). At the             batch size interact directly with the MoE tax. Speculative
+cluster level, a scheduler could co-locate requests that share         decoding increases the decode batch size during verification,
+expert subsets to reduce the effective number of activated             shifting toward a prefill-like tax regime. Dual-batch overlap
+experts per batch.                                                     splits a batch into two microbatches and overlaps compute
+                                                                       with communication to hide transfer latency (DeepSeek-
+Wide parallelism. Increasing the available memory band-                AI, 2024b). However, the halved per-microbatch size shifts
+width is an alternative strategy to address the weight ampli-          toward a more decode-like tax regime, increasing the weight
+fication tax. Figure 12b shows how increasing the degree               amplification overhead.
+of parallelism reduces the memory bandwidth required per
+device. Large-scale MoE serving systems (DeepSeek-AI,
+2024b; Perplexity AI Team, 2025) have similarly shown the              Disaggregated MoE serving. Since MoE models approach
+effectiveness of distributing model weights across a large             DensePA performance during decode, a disaggregated sys-
+number of devices. However, wider parallelism incurs ex-               tem (Patel et al., 2024; Zhong et al., 2024a) could use the
+tra communication tax, can leave some GPUs idle during                 MoE architecture for prefill and a dense model architecture
+decode, and is brittle to GPU failures.                                for decode, avoiding the dominant weight amplification tax.
+                                                                       This requires phase-specific model architecture specializa-
+Quantization. Weight quantization is even more critical                tion, introducing unique challenges in maintaining output
+for MoEs than for dense models, especially for the decode              quality across different architectures for prefill and decode.
+                                       Demystifying the Mixture of Experts Serving Tax
+
+7    L IMITATIONS                                                the MoE to facilitate better load balancing (Cai et al., 2024).
+                                                                 Fine-grained experts improve model quality but introduce
+Our analysis has several limitations. MoE tax is a relative      complex trade-offs between straggler and padding taxes (Dai
+metric that can mask poor hardware utilization; e.g., low        et al., 2024). Inference systems manage skew by replicating
+tax at small batch sizes can be deceptive, since inference is    popular experts (He et al., 2022; Liu et al., 2023), using
+simply memory-bound. Our scope is limited to steady-state        load-aware routing (He et al., 2022; Huang et al., 2023), or
+latency, omitting JIT compilation overheads that can cause       dynamically adjusting parallelism (Hwang et al., 2023; Zhai
+significant latency spikes in dynamic MoE systems. We            et al., 2023; Qian et al., 2024) to reduce straggler tax. To
+do not compare accuracy between MoE and dense models,            our knowledge, prior works have not similarly addressed
+focusing exclusively on system-level performance. Our end-       the padding tax.
+to-end evaluation uses relatively short sequences; in long-
+context scenarios, attention dominates, and the MoE tax
+becomes proportionally smaller. Our end-to-end evaluation        9    C ONCLUSION
+uses single-node NVLink-connected GPUs; a full multi-            We systematically characterize the performance tax inherent
+node end-to-end tax characterization remains future work.        to serving MoEs, and show that it causes them to perform 2–
+While our microbenchmarks show that the multi-node com-          3× worse than FLOP-equivalent dense models. Our analysis
+munication tax can be substantial (Figure 6), newer GPU          shows that the MoE tax consists of interlinked overheads
+architectures with larger NVLink scale-up domains (e.g.,         across computation, communication, and token distribution
+GB200, GB300) can significantly reduce this overhead. We         effects that manifest differently across inference phases and
+also ignore the significant engineering tax of MoEs, since       parallelism strategies. For example, non-uniform token dis-
+their specialized kernels, routing, and load balancing are far   tributions create a straggler tax under EP and a padding tax
+harder to implement and maintain than dense models.              under both TP and EP, both of which primarily affect prefill.
+                                                                 During decode, reducing the number of activated experts
+8    R ELATED W ORK                                              can mitigate the dominant weight amplification tax. We
+                                                                 decompose the MoE tax into analytically separable compo-
+Our analysis provides a holistic framework to reason about       nents and use a balls-bins-buckets framework to analyze
+the MoE tax. Prior works typically address only a subset of      distribution-dependent effects across configurations like
+these taxes using various techniques across the stack.           fine-grained experts and DP attention. Our analytical tax
+                                                                 model identifies three compute regimes, and its predictions
+Computation tax. System-level solutions mitigate the
+                                                                 are within 10–30% of measured tax values. Our results
+batch subdivision tax by creating larger expert batches. For
+                                                                 indicate a critical need for phase-specific, tax-aware serving
+example, MegaScale-Infer decouples expert and attention
+                                                                 systems designed to mitigate the MoE tax.
+servers, enabling bigger expert batches (Zhu et al., 2025).
+DeepSeek-V3 uses DP attention to feed larger batches to
+the MoE layers (Zhao et al., 2025a). At the kernel level, spe-   ACKNOWLEDGEMENTS
+cialized block-sparse operations and GroupGEMM kernels
+                                                                 We thank Lequn Chen, Esha Choukse, Iñigo Goiri, Theo
+directly improve hardware utilization for these fragmented
+                                                                 Gregersen, Yile Gu, Keisuke Kamahori, Aditya Kamath,
+workloads (Gale et al., 2023; DeepSeek-AI, 2025).
+                                                                 Stephanie Wang, Zihao Ye, Chaojie Zhang, and Liangyu
+                                                                 Zhao for early discussions that motivated this work. We
+Weight amplification tax. DeepSeek-V3 uses wide expert
+                                                                 thank Preyas Shah for helping secure resources for our ex-
+parallelism on decode instances to increase total available
+                                                                 periments. We thank the reviewers for their insightful feed-
+bandwidth (Zhao et al., 2025a; Perplexity AI Team, 2025).
+                                                                 back which helped improved our paper. This work was
+At the scheduling layer, Lynx uses batch-aware expert se-
+                                                                 supported in part by ACE, one of the seven centers in JUMP
+lection to minimize the number of activated experts (Gupta
+                                                                 2.0, a Semiconductor Research Corporation (SRC) program
+et al., 2024). Model co-design techniques include pruning
+                                                                 sponsored by DARPA.
+experts to reduce the weight amplification tax (Huber et al.,
+2025; Liu et al., 2024), and using predictive prefetching to
+hide memory latency by proactively loading experts before        R EFERENCES
+they are needed (Hwang et al., 2024).
+                                                                 Cai, R., Ro, Y., Kim, G.-W., Wang, P., Bejnordi, B. E.,
+                                                                   Akella, A., and Wang, Z. Read-ME: Refactorizing LLMs
+Straggler tax. Training techniques reduce skew using loss
+                                                                   as Router-Decoupled Mixture of Experts with System Co-
+functions that encourage balanced routing, with potentially
+                                                                   Design. In Advances in Neural Information Processing
+reduced model quality (Zoph et al., 2022; Chen et al., 2022;
+                                                                   Systems (NeurIPS), 2024.
+DeepSeek-AI, 2024a; Zhong et al., 2024b). Model-system
+co-design techniques explore decoupling the router from
+                                       Demystifying the Mixture of Experts Serving Tax
+
+Chen, C., Li, M., Wu, Z., Yu, D., and Yang, C. TA-MoE:           Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika,
+  Topology-aware Large Scale Mixture-of-Expert Training.           M., Song, D., and Steinhardt, J. Measuring Massive
+  In Advances in Neural Information Processing Systems             Multitask Language Understanding. arXiv preprint
+ (NeurIPS), 2022.                                                  arXiv:2009.03300, 2020.
+
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,      Huang, H., Ardalani, N., Sun, A., Ke, L., Lee, H.-H. S.,
+  H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,           Sridhar, A., Bhosale, S., Wu, C.-J., and Lee, B. To-
+  Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,           wards MoE Deployment: Mitigating Inefficiencies in
+  M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,         Mixture-of-Expert (MoE) Inference. arXiv preprint
+  S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-         arXiv:2303.06182, 2023.
+  ian, M., Winter, C., Tillet, P., Such, F. P., Cummings, D.,
+  Plappert, M., Chantzis, F., Barnes, E., Herbert-Voss, A.,      Huber, P., Shrivastava, A., Chang, E., Sankar, C., Aly, A.,
+  Guss, W. H., Nichol, A., Paino, A., Tezak, N., Tang,             and Sagar, A. CoSMoEs: Compact Sparse Mixture of
+  J., Babuschkin, I., Balaji, S., Jain, S., Saunders, W.,          Experts. arXiv preprint arXiv:2503.00245, 2025.
+  Hesse, C., Carr, A. N., Leike, J., Achiam, J., Misra,
+  V., Morikawa, E., Radford, A., Knight, M., Brundage,           Hwang, C., Cui, W., Xiong, Y., Yang, Z., Liu, Z., Hu, H.,
+  M., Murati, M., Mayer, K., Welinder, P., McGrew, B.,            Wang, Z., Salas, R., Jose, J., Ram, P., Chau, J., Cheng,
+  Amodei, D., McCandlish, S., Sutskever, I., and Zaremba,         P., Yang, F., Yang, M., and Xiong, Y. Tutel: Adaptive
+  W. Evaluating Large Language Models Trained on Code.            Mixture-of-Experts at Scale. In Proceedings of Machine
+  arXiv preprint arXiv:2107.03374, 2021.                          Learning and Systems (MLSys), 2023.
+
+Dai, D., Deng, C., Zhao, C., Xu, R. X., Gao, H., Chen,           Hwang, R., Wei, J., Cao, S., Hwang, C., Tang, X., Cao, T.,
+  D., Li, J., Zeng, W., Yu, X., Wu, Y., Xie, Z., Li, Y. K.,       and Yang, M. Pre-Gated MoE: An Algorithm-System Co-
+  Huang, P., Luo, F., Ruan, C., Sui, Z., and Liang, W.            Design for Fast and Scalable Mixture-of-Expert Inference.
+  DeepSeekMoE: Towards Ultimate Expert Specialization             In ACM/IEEE International Symposium on Computer
+  in Mixture-of-Experts Language Models. arXiv preprint           Architecture (ISCA), 2024.
+  arXiv:2401.06066, 2024.
+                                                                 Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A.,
+DeepInfra. Token Pricing. https://deepinfra.com/                    Savary, B., Bamford, C., Chaplot, D. S., de las Casas,
+  pricing.                                                          D., Hanna, E. B., Bressand, F., Lengyel, G., Bour, G.,
+                                                                    Lample, G., Lavaud, L. R., Saulnier, L., Lachaux, M.-
+DeepSeek-AI. Deepseek-V2: A Strong, Economical, and                 A., Stock, P., Subramanian, S., Yang, S., Antoniak, S.,
+  Efficient Mixture-of-Experts Language Model. arXiv                Scao, T. L., Gervet, T., Lavril, T., Wang, T., Lacroix, T.,
+  preprint arXiv:2405.04434, 2024a.                                 and Sayed, W. E. Mixtral of Experts. arXiv preprint
+                                                                    arXiv:2401.04088, 2024.
+DeepSeek-AI. Deepseek-V3 Technical Report. arXiv
+  preprint arXiv:2412.19437, 2024b.                              Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+DeepSeek-AI. DeepGEMM: Clean and Efficient FP8                    C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  GEMM Kernels with Fine-grained Scaling. https:                  Memory Management for Large Language Model Serv-
+ //github.com/deepseek-ai/DeepGEMM, 2025.                         ing with PagedAttention. In Proceedings of the Sympo-
+                                                                  sium on Operating Systems Principles (SOSP), 2023.
+Gale, T., Narayanan, D., Young, C., and Zaharia, M.
+  MegaBlocks: Efficient Sparse Training with Mixture-            Li, J., Jiang, Y., Zhu, Y., Wang, C., and Xu, H. Accelerating
+  of-Experts. In Proceedings of Machine Learning and                Distributed MoE Training and Inference with Lina. In
+  Systems (MLSys), 2023.                                           USENIX Annual Technical Conference (ATC), 2023.
+
+Gupta, V., Sinha, K., Gavrilovska, A., and Iyer, A. P.           Liu, E., Zhu, J., Lin, Z., Ning, X., Blaschko, M. B., Yan,
+  Lynx: Enabling Efficient MoE Inference Through Dy-               S., Dai, G., Yang, H., and Wang, Y. Efficient Expert
+  namic Batch-aware Expert Selection. arXiv preprint               Pruning for Sparse Mixture-of-Experts Language Models:
+  arXiv:2411.08982, 2024.                                          Enhancing Performance and Reducing Inference Costs.
+                                                                   arXiv preprint arXiv:2407.00945, 2024.
+He, J., Zhai, J., Antunes, T., Wang, H., Luo, F., Shi, S., and
+  Li, Q. FasterMoE: Modeling and Optimizing Training of          Liu, J., Wang, J. H., and Jiang, Y. Janus: A Unified
+  Large-scale Dynamic Pre-trained Models. In ACM SIG-              Distributed Training Framework for Sparse Mixture-of-
+  PLAN Symposium on Principles and Practice of Parallel            Experts Models. In Conference of the ACM Special Inter-
+  Programming (PPoPP), 2022.                                       est Group on Data Communication (SIGCOMM), 2023.
+                                       Demystifying the Mixture of Experts Serving Tax
+
+Mazurek, P. and Schreiber, E. DeepSeek Inference The-             Zhao, C., Deng, C., Ruan, C., Dai, D., Gao, H., Li, J.,
+ oretical Model: Deriving the Performance from Hard-                Zhang, L., Huang, P., Zhou, S., Ma, S., Liang, W., He, Y.,
+ ware Primitives. Technical report, Aleph Alpha GmbH,               Wang, Y., Liu, Y., and Wei, Y. Insights into DeepSeek-V3:
+ September 2025.                                                    Scaling Challenges and Reflections on Hardware for AI
+                                                                    Architectures. In ACM/IEEE International Symposium
+Mistral AI Team. Mixtral of Experts. https:                         on Computer Architecture (ISCA), 2025a.
+ //mistral.ai/news/mixtral-of-experts,
+ 2023.                                                            Zhao, C., Zhou, S., Zhang, L., Deng, C., Xu, Z., Liu, Y.,
+                                                                    Yu, K., Li, J., and Zhao, L. DeepEP: An Efficient Expert-
+Mitra, T., Borkar, R., Bhatia, N., Matas, R., Raj, S., Mudi-
+                                                                    Parallel Communication Library. https://github.
+ gere, D., Zhao, R., Golub, M., Dutta, A., Madduri, S.,
+                                                                    com/deepseek-ai/DeepEP, 2025b.
+ Jani, D., Pharris, B., and Rouhani, B. D. Beyond the
+ Buzz: A Pragmatic Take on Inference Disaggregation.              Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin,
+ arXiv preprint arXiv:2506.05508, 2025.                             X., and Zhang, H. DistServe: Disaggregating Prefill and
+                                                                    Decoding for Goodput-optimized Large Language Model
+NVIDIA. NSight Compute. http://developer.
+                                                                    Serving. In USENIX Symposium on Operating Systems
+ nvidia.com/nsight-compute, a.
+                                                                    Design and Implementation (OSDI), 2024a.
+NVIDIA. NSight Systems. http://developer.
+                                                                  Zhong, Z., Xia, M., Chen, D., and Lewis, M. Lory:
+ nvidia.com/nsight-systems, b.
+                                                                    Fully Differentiable Mixture-of-Experts for Autoregres-
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í., Maleki,     sive Language Model Pre-training. arXiv preprint
+  S., and Bianchini, R. Splitwise: Efficient Generative             arXiv:2405.03133, 2024b.
+  LLM Inference Using Phase Splitting. In ACM/IEEE In-
+  ternational Symposium on Computer Architecture (ISCA),          Zhu, R., Jiang, Z., Jin, C., Wu, P., Stuardo, C. A., Wang,
+  2024.                                                             D., Zhang, X., Zhou, H., Wei, H., Cheng, Y., Xiao, J.,
+                                                                    Zhang, X., Liu, L., Lin, H., Chang, L.-W., Ye, J., Yu, X.,
+Perplexity AI Team. Lower Latency and Higher Throughput             Liu, X., Jin, X., and Liu, X. MegaScale-Infer: Serving
+  with Multi-node DeepSeek Deployment, 2025.                        Mixture-of-Experts at Scale with Disaggregated Expert
+                                                                    Parallelism. arXiv preprint arXiv:2504.02263, 2025.
+Qian, Y., Li, F., Ji, X., Zhao, X., Tan, J., Zhang,
+  K., and Cai, X. EPS-MoE: Expert Pipeline Sched-                 Zoph, B., Bello, I., Kumar, S., Du, N., Huang, Y., Dean, J.,
+  uler for Cost-efficient MoE Inference. arXiv preprint             Shazeer, N., and Fedus, W. ST-MoE: Designing Stable
+  arXiv:2410.12247, 2024.                                           and Transferable Sparse Expert Models. arXiv preprint
+                                                                    arXiv:2202.08906, 2022.
+Qwen Team. Qwen1.5-MoE: Matching 7B Model Per-
+ formance with 1/3 Activated Parameters. https://
+ qwenlm.github.io/blog/qwen-moe/, 2024.
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le,
+  Q., Hinton, G., and Dean, J. Outrageously Large Neural
+  Networks: The Sparsely-Gated Mixture-of-Experts Layer.
+  arXiv preprint arXiv:1701.06538, 2017.
+Yang, A., Yang, B., Hui, B., Zheng, B., Yu, B., Zhou,
+  C., et al. Qwen2 Technical Report. arXiv preprint
+  arXiv:2407.10671, 2024.
+Yu, Y., Ma, H., Agarwal, K., Oswald, N., Huang, Q., Lin-
+  senmaier, H., Mei, C., Zhao, R., Borkar, R., Rouhani,
+  B. D., Nellans, D., Krashinsky, R., and Khandelwal, A.
+  Efficient MoE Serving in the Memory-Bound Regime:
+  Balance Activated Experts, Not Tokens. arXiv preprint
+  arXiv:2512.09277, 2025.
+Zhai, M., He, J., Ma, Z., Zong, Z., Zhang, R., and Zhai, J.
+  SmartMoE: Efficiently Training Sparsely-Activated Mod-
+  els through Combining Offline and Online Parallelization.
+  In USENIX Annual Technical Conference (ATC), 2023.
+

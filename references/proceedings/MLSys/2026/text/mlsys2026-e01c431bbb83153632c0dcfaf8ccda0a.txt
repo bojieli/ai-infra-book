@@ -1,0 +1,897 @@
+U NLEASHING SCALABLE CONTEXT PARALLELISM FOR FOUNDATION MODELS
+                      PRE - TRAINING VIA FCP
+
+
+
+        Yilong Zhao * 1 † Xiaonan Nie * 2 Kan Zhu 3 Shuang Ma 4 Zhichao Lai 2 Hongxiang Hao 2 Yang Zhou 4
+                                              Baris Kasikci 3 Ion Stoica 1
+
+
+                                                          A BSTRACT
+        Context parallelism (CP) has been widely adopted to support the growing context length in foundation model
+        pretraining. However, existing designs fail to handle the large variation in sequence length from training datasets,
+        resulting in suboptimal performance. These methods often over-shard short sequences, leading to compute
+        inefficiency and excessive communication, or process long and short sequences separately without proper bin-
+        packing, causing workload imbalance. In this paper, we propose FCP, a flexible context parallelism paradigm that
+        shards and schedules sequences at block-level granularity, where each sequence is partitioned into fixed-size blocks
+        regardless of its original length. Unlike common implementations that rely on rigid communication topologies
+        such as rings, FCP enables arbitrary peer-to-peer communication, allowing flexible placement of sequence blocks
+        across workers. By bin-packing blocks from both short and long sequences, FCP achieves both high compute
+        efficiency and balanced workload distribution. Extensive evaluations show that FCP attains near-linear scalability
+        on up to 256⇥ NVIDIA GPUs, with 1.13⇥–2.21⇥ improvement in the attention MFU.
+
+1       I NTRODUCTION                                                  that need large inputs to saturate (Chen et al., 2023). How-
+                                                                       ever, short sequences could be over-sharded into tiny ones,
+Training foundation models has become prohibitively ex-                which greatly under-utilizes hardware (Wang et al., 2025b).
+pensive, largely because of long-context sequences arising             Even worse, such tiny shards still needs to be transferred
+from extended documents and multimodal inputs. For ex-                 across GPUs, causing excessive communication that fur-
+ample, a single 1080p image corresponds to thousands of                ther decreases compute efficiency. The second challenge is
+patch tokens and a one-minute video at 30 fps can expand to            workload imbalance (§ 3.2). Since attention computation
+millions (Gao et al., 2025). Such million-token sequences              scales quadratically with context length, GPUs handling
+amplify both memory and compute demands of the self-                   longer sequences must perform substantially more opera-
+attention module. To handle such sequences, context par-               tions per token than those processing shorter ones. As a
+allelism (CP) (e.g., ring attention (Liu et al., 2023)) was            result, even if each GPU is assigned the same total number
+proposed to shard each sequence across several GPUs for                of tokens, uneven distribution of context lengths leads to sig-
+attention parallelization, which reduces per-GPU memory                nificant imbalance, where some GPUs become overloaded
+usage and scales compute capability. Combined with model               while others remain underutilized, reducing overall cluster
+parallelism, CP is expected to keep scaling to larger models           efficiency (Wang et al., 2025b).
+and longer sequences (Zheng et al., 2022; Gu et al., 2024).
+                                                                       Therefore, achieving optimal CP scheduling requires ex-
+However, real-world corpus features high diversity in con-             ploring a huge search space to determine the shard size
+text lengths, which poses significant complexity and chal-             for each sequence and the mapping of these shards across
+lenges in designing efficient CP algorithms (Ge et al., 2025;          GPUs. In order to reduce the search space, existing designs
+Wang et al., 2025b; Yang et al., 2025b). The first chal-               oversimplify the scheduling problem by compromising ei-
+lenge is compute inefficiency (§ 3.1). Modern GPUs have                ther compute efficiency or load balance (§ 3.4), resulting in
+specialized matrix-multiplication units (i.e., TensorCores)            suboptimal performance. For instance, some methods (Liu
+    *
+    Equal contribution † Work done during internship at ByteDance      et al., 2023; Gu et al., 2024; Fang & Zhao, 2024) uniformly
+Seed. 1 University of California, Berkeley. 2 ByteDance Seed.          split all sequences into the same number of shards, disregard-
+3
+  University of Washington. 4 University of California, Davis.. Cor-   ing variation in context length and causing underutilization
+respondence to: Xiaonan Nie <niexiaonan@bytedance.com>.                of hardware resources. Others (Ge et al., 2025; Wang et al.,
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,
+                                                                       2025b) separate short and long sequences across different
+2026. Copyright 2026 by the author(s).                                 GPUs without mixing them, leading to workload imbalance.
+                     Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+                                                Attn of Seq 1                Attn of Seq 2    Attn of Seq 3,4,5
+                                                Seqlen = 9K                  Seqlen = 6K        Seqlen = 1K
+                                                324 GFLOPs                    144 GFLOPs             4    4   4 GFLOPs
+
+                                         Existing Solutions                                                         FCP
+                          Too Small!          Ring                            Ring
+          GPU 0                                        GPU 0      108                        GPU 0       36    36     36   4 44
+                     81         36     1 11
+
+          GPU 1                                        GPU 1      108                        GPU 1       36    36    24    24
+                     81         36     1 11
+                                                                                                                                  P2P
+          GPU 2                                        GPU 2      108                        GPU 2       36    36    24    24
+                     81         36     1 11                                          Ring
+
+          GPU 3                                        GPU 3    144 GFLOPs    4 44           GPU 3       36    36    24    24
+                     81         36     1 11
+
+                               Low Hardware                     Imbalanced                               Balanced & Efficient
+                                 Utilization                     Workloads
+
+
+Figure 1. Comparison between FCP and existing designs. (Left) Compute inefficiency: all sequences are uniformly sharded across GPUs.
+(Middle) Workload imbalance: sequences are grouped by length and assigned to different GPUs. Within each group, ring attention is
+applied. (Right) FCP adopts block-grained scheduling with arbitrary peer-to-peer communication.
+
+
+In this paper, we propose flexible context parallelism, FCP,                 ing could cause several GPU to pull blocks from the same
+a new context parallelism paradigm that achieves linear scal-                source GPU simultaneously, which can lead to network
+ability of attention when processing batches of sequences                    congestion.
+with varying lengths. The key idea behind FCP is fine-
+                                                                             To address these challenges, FCP adopts a block-level
+grained block-wise sharding and a flexible GPU assignment
+                                                                             pipeline and a congestion-free communication planner
+policy. Specifically, unlike existing designs that follow a
+                                                                             (§ 4.2). From a high level, CP essentially comprises three
+predefined pattern (e.g., splitting sequences onto contigu-
+                                                                             stages: pulling remote blocks, computing corresponding
+ous GPUs as a ring), FCP treats each sequence as a series
+                                                                             attention blocks, and pushing local blocks to remote. To
+of blocks and formulates the scheduling problem as a bin-
+                                                                             effectively overlap computation with communication, FCP
+packing problem to balance the load. Figure 1 shows an
+                                                                             decomposes each stage into block-level sub-stages and in-
+example illustrating the differences between FCP and exist-
+                                                                             terleaves them at a block-by-block granularity. To avoid
+ing solutions.
+                                                                             congestion across N GPUs at each sub-stage, FCP models
+To reduce the search complexity, FCP shards each sequence                    the communication of blocks as a bipartite graph with N
+into fixed-size blocks (e.g., 1K tokens) regardless of its                   send and N receive nodes, where each edge i ! j rep-
+context length, which serves as the basic scheduling and                     resents a block that transfers from GPU i to j. From this
+computation unit. To maximize compute efficiency, the size                   bipartite representation, FCP defines each graph matching as
+of block is set to be large enough to saturate the hardware                  a congestion-free communication round, where each GPU
+resources even when processing a single block. Besides,                      sends and receives at most one block (i.e., one outgoing
+the redundant communication from over-sharding short se-                     and one incoming edge). Therefore, FCP iteratively com-
+quences can be saved. To minimize the workload imbalance,                    putes maximal matching as a block-level communication
+FCP proposes a workload-aware block distributor (§ 4.1). In                  plan, which guarantees an optimal order of block transfers
+particular, block distributor estimates the computation and                  (§ 4.2).
+memory usage of each block based on the context length
+                                                                             Notably, FCP incurs more complex traffic than a ring topol-
+of its source sequence, and applies a variant of Longest-
+                                                                             ogy—a trade-off that enables greater flexibility by fine-
+Processing Time (LPT) scheduling algorithm (Chandran
+                                                                             grained, block-wise scheduling. Such traffic is guaranteed to
+et al., 2024) that iteratively assigns blocks to the least-loaded
+                                                                             overlap with computation, as communication planner lever-
+GPUs, achieving near-optimal workload balance.
+                                                                             ages a performance model (§ 3.5) to ensure that the compu-
+Despite the theoretical benefit, the efficient implementation                tation time is larger than communication at each stage. We
+of FCP in practice raises several challenges. First, given                   also show that traffic does not become a system bottleneck.
+the flexibility of block assignment, blocks from a single
+                                                                             Beyond these performance benefits, FCP is designed with
+sequence could exist on any GPUs, which requires peer-to-
+                                                                             modularity in mind, allowing transparent integration with
+peer communication between any two GPUs in the clusters.
+                                                                             various parallelism approaches, including FSDP (Zhao et al.,
+Therefore, inter-node communication (i.e., InfiniBand or
+                                                                             2023), TP (Shoeybi et al., 2019), EP (DeepSeek-AI, 2024;
+Ethernet) takes a significant fraction of the total time. To
+                                                                             Nie et al., 2023), and SP (Jacobs et al., 2023). Instead of
+reduce this overhead, we need to effectively overlap compu-
+                                                                             requiring users to provide sequences in a specific layout,
+tation and communication (Wang et al., 2024). In addition,
+                                                                             FCP on the fly reshuffles the blocks at the beginning of the
+it is non-trivial to determine the optimal communication
+                                                                             attention module in each layer and restores them afterward
+ordering of each single GPU. For example, random order-
+                    Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+(§ 4.3). Therefore, non-attention operations (e.g., computing
+positional embeddings) can be performed using existing
+parallelism approaches without modification. Furthermore,
+the reshuffling is opportunistically overlapped with local
+attention computation, incurring negligible overhead.
+We provide a comprehensive evaluation of FCP on the
+Llama-3-70B model configuration across modern data-
+center clusters, including up to 256⇥ NVIDIA GPUs (§ 6.3).
+We compare FCP with state-of-the-art CP frameworks in-
+cluding ByteScale (Ge et al., 2025), WLB-LLM (Wang
+et al., 2025b), and RingAttention (Liu et al., 2023). We         Figure 2. The context length distribution, and cumulative compu-
+also include a recent open-source project, MagiAtten-            tation and communication ratio from our internal training tasks.
+tion (Zewei & Yunpeng, 2025). Across three workloads
+with different context length distributions, FCP consistently
+achieves near-linear scalability, outperforming the baselines    take the same magnitude of computation while short ones
+by 1.13⇥–2.21⇥ in attention Model FLOPs Utilization              dominate communication, necessitating an adaptive paral-
+(MFU). We summarize our contributions as follows:                lelization that can efficiently handle diverse datasets.
+
+    • We analyze the inefficiencies of existing CP designs       2.2   Attention Computation
+      and the challenges in implementing an optimal solu-
+      tion.                                                      Attention is one of the key components in modern founda-
+    • We propose a block-wise abstraction that enables fine-     tion models (Vaswani et al., 2023). Considering a sequence
+      grained scheduling for flexible workload partitioning.     with length L, number of attention heads H, and head di-
+    • We design FCP as a modular context parallelism frame-      mension D, the attention computation is formulated as:
+      work that integrates transparently with existing paral-                           ✓                          ◆
+      lelism approaches, including FSDP, TP, EP, and SP.                                    QK>
+                                                                        O = Softmax         p       M, dim =      1 V
+    • We provide an efficient implementation and compre-                                      D
+      hensive evaluation that demonstrate the generality and
+      feasibility of the proposed method.                        Here, Q (query), K (key), V (value), and O (output) are
+                                                                 tensors with shape [H, L, D]. Therefore, the overall time
+2     BACKGROUND                                                 complexity of attention is O(HDL2 ), while the space com-
+                                                                 plexity is O(HLD). This quadratic scaling of computa-
+2.1   Pretraining Datasets Feature Long-tailed Length            tion with respect to L and the linear scaling of memory
+Large language models have recently extended their context       introduce challenges in balancing computation and memory,
+window dramatically, from 4K to 1M tokens (Research,             especially under batches of diverse L.
+2025; 2024). Within such long windows, the training              In this paper, we focus on causal and non-causal atten-
+datasets exhibit highly diverse and long-tailed sequence         tion masks, while leaving irregular patterns for future work.
+length distributions (Wang et al., 2025b). In addition, the      Without explicitly written, attention in following sections
+emergence of multi-modality beyond text further amplifies        denotes the above-mentioned operations excluding QKV
+this heterogeneity. For example, a minutes-long video sam-       projections. As the forward and backward share similar char-
+ple can be mixed with a short text-only sequence, leading        acteristic, while we design and implement both the forward
+to tens of thousands of tokens difference in context length.     and backward, we discuss the forward for simplicity.
+Such extended context windows and heterogeneous data
+samples greatly diversify the overall context length distribu-   2.3   Context Parallelism
+tion.
+                                                                 To scale pretraining over long-context sequences, atten-
+To illustrate this, we collect the context length distribution   tion computation is parallelized across multiple workers by
+from our internal pretraining tasks (with a maximum se-          sharding the first two dimensions of input tensors [H, L, D].
+quence length of 512K). As shown in Figure 2, the context        For example, since different attention heads compute inde-
+lengths feature long-tailed up to 512K, approximately fol-       pendently, the head dimension H can be easily split and par-
+lowing a lognormal distribution. We further calculate            allelized. This approach is called sequence parallelism (SP)
+the total FLOPs and communication volume from each se-           in tradition (Jacobs et al., 2023; Shoeybi et al., 2020). How-
+quence under the naive CP setup and plot the cumulative          ever, as the number of attention heads is typically limited to
+ratio. As shown in Figure 2, both short and long sequences       only a few dozens (e.g., 4 KV heads in Qwen3-235B (Yang
+                         Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+et al., 2025a)), SP can only scale up to the number of heads,
+failing to scale up to thousands of workers.
+Another common practice for parallelizing attention is split-
+ting along the context dimension L, known as context paral-
+lelism (CP) (Liu et al., 2023). This is feasible because the
+attention computation of a single sequence is associative.                         Total Context Length (Hopper)   Total Context Length (Blackwell)
+
+Therefore, intermediate results can be computed by differ-
+ent workers over different slices of L and then reduced to
+the final outputs. During CP, each sequence is divided into         Figure 3. MFU of attention on different hardware, which is pro-
+several blocks (i.e., slices of Q/K/V tensors) across workers.      filed with 8 KV heads, 64 QO heads, and a head dimension of
+As blocks from the same sequence have data dependencies,            128. We vary the total context length and the number of blocks
+inter-worker communication is introduced.                           that compose this total number of tokens. Results showcase that
+                                                                    sharding sequences into fine-grained blocks greatly hurt MFU.3
+Assuming N workers, a popular solution, ring attention (Liu
+et al., 2023), uniformly shards each sequence into N blocks,        under the same context length ) drastically reduces MFU. As
+with each worker assigned one block. During execution,              shown in Figure 3, MFU remains low when len(B) < 2K
+each worker pulls all KV blocks from one neighbor, com-             and begins to saturate beyond 4K. For example, with a total
+putes pulled KV blocks with local Q blocks, and pushes              context length of 32K from 64 blocks, each block has 512
+KV blocks to another neighbor, forming a ring topology.             tokens, leading to 25% utilization.
+In practice, ring attention uses double buffering to overlap
+communication and computation efficiently. Note that due            Furthermore, sharding small sequences introduces unnec-
+to memory-efficient attention variants (e.g., group-query           essary communication, which further decreases compute
+attention (Ainslie et al., 2023)), the memory usage of KV           efficiency. For example, sequences with lengths smaller
+tensors is typically smaller than Q. Thus, instead of moving        than 4K can easily fit into a single worker without incurring
+Q, KV is passed across workers to reduce communication              any communication. As shown in Figure 2, such sequences
+volume. In this paper, we mainly focus on efficient CP              account for about 50% of the total communication volume
+design due to its potential scalability. Meanwhile, SP is           in vanilla context parallelism, which can be saved by not
+orthogonal to CP, and both can be composed together.                sharding with a flexible parallelization strategy. Conse-
+                                                                    quently, the actual computation time needs to be modeled as
+                                                                    f (B), which considers both the total compute amount and
+3         A NALYSIS                                                 the compute efficiency determined by block size.
+3.1        Compute Efficiency
+                                                                    3.2        Workload Balance
+In context parallelism, attention computation for each se-
+quence is divided into blocks across multiple GPUs, allow-          In addition to single-GPU compute efficiency, the workload
+ing parallel computation. Therefore, the overall hardware           assignment M : B ! workerid significantly affects the
+utilization depends on the compute efficiency of each block         overall MFU. A single straggler with heavier workloads
+B. However, the block size len(B) cannot be arbitrar-               can leave all other workers idle, reducing cluster utilization.
+ily small, as modern accelerators require high arithmetic           The workload balance needs consider three types of resource
+intensity to saturate their compute capacity (Zhao et al.,          required by executing a single sequence shard B:
+2024). For instance, the latest Hopper GPUs offer up to
+                                                                    Memory. The memory usage of worker i equals the sum of
+989 TFLOPs of dense BF16 Tensor Core throughput with
+                                                                    len(B) where M (B) = i. Memory balance is critical to
+4.8 TB/s of memory bandwidth. To saturate its compute,
+                                                                    the end-to-end MFU, as it influences the compute balance
+each memory-loaded element must be reused 412 times 1 ,
+                                                                    of non-attention modules such as FFN. It also constrains
+which is further amplified by the complexity of attention
+                                                                    the global batch size, as a high memory usage potentially
+kernels (Dao et al., 2022).
+                                                                    leads to out-of-memory during training. Therefore, an ideal
+To demonstrate this, we measure the model FLOPs utiliza-            solution should enforce strict limits on the total number of
+tion (MFU) of state-of-the-art variable-length atten-               tokens assigned to each worker.
+tion implementations, namely FA3 (Shah et al., 2024) on
+Hopper GPUs and FA4 on Blackwell GPUs. By varying                   Compute. Existing studies have extensively explored bal-
+total context length and the number of sharded blocks, we           ancing the computation of a single sequence (i.e., intra-
+observe that smaller len(B) (i.e., larger number of blocks          sequence) under both causal and non-causal masks (Bran-
+                                                                    don et al., 2023; Li et al., 2024). For example, as shown
+      1
+          Assuming FP16 data type, 989/(4.8/2) ⇡ 412                      3
+                                                                              All results were profiled on UC Berkeley’s computing cluster.
+                           Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+                                                                                                                     Seq2                                        Seq2
+        0                     0                       0 7   +
+                                                       +                                                               0                                          0
+        1                     1                       0 7
+        2                     2              Zigzag                                                                    1                                          1                   GPU 1
+                                                      1 6       +                            Inefficient   GPU 0
+        3                     3                        +                                                               2                                          2
+Query                                                 1 6                       +              Seq1                    3                      Seq1     Imbalanced 3                   GPU 2
+        4                     4
+        5                     5                       2 5           +                             0          GPU 1     4                       0         GPU 0    4
+             Compute              Network              +                                          1                    5                       1                  5
+        6                     6                       2 5                   +
+        7                     7                                                                   2                    6                       2                  6
+                                                      3 4               +                         3                    7                       3                  7
+                                                       +
+            0 1 2 3 4 5 6 7       0 1 2 3 4 5 6 7     3 4               +
+                                                                                                      0 1 2 3               0 1 2 3 4 5 6 7          0 1 2 3            0 1 2 3 4 5 6 7
+                                                                              Balanced
+               Key/Value             Key/Value
+                                                                            Compute & Net
+                                                                                                             (a) Balance-Optimized                         (b) Efficiency-Optimized
+
+
+
+Figure 4. Zig-Zag packing of an 8-tokens sequence for intra-
+                                                                                            Figure 5. Illustration of two kinds of existing CP designs. (a)
+sequence computation and communication balance under causal
+                                                                                            balance-optimized: each sequence is sharded into 2⇥2 = 4 blocks
+mask. The computation and communication volume of a block
+                                                                                            and packed with Zig-Zag ordering, thus achieving perfect balance.
+depends on its position within the sequence. For example, 4-th Q
+                                                                                            (b) efficiency-optimized: sequences are spatially partitioned into
+needs to compute with 5 KV blocks, while 4-th KV is transferred
+                                                                                            different workers based on the context length.
+3 times to the subsequent Q blocks. By packing i-th block with
+(2N i)-th block, both resources can be perfectly balanced.
+
+                                                                                            are ignored for simplicity. Considering all workers, the end-
+in Figure 4, ring attention assigns B to workers in a Zig-                                  to-end time is T = maxi2N (⌘i · Comp(wi )). Therefore,
+Zag order, ensuring that each worker performs the same                                      the optimal context parallelism scheduling (G, M ) is given
+amount of computation. However, balancing both compute                                      by (G⇤ , M ⇤ ) = arg minG,M (T ), which achieves both high
+and memory across multiple sequences (i.e., inter-sequence)                                 compute efficiency and balanced workloads.
+with different context lengths is non-trivial, as computation
+grows quadratically with the context length and len(B)                                      However, solving this optimization problem is apparently
+scales linearly. Therefore, achieving balanced overall work-                                NP-complete, with an exponential computational com-
+load requires considering inter-sequence length variation.                                  plexity. It is thus infeasible to obtain a meaningful solution
+                                                                                            within practical time. Therefore, all existing approaches
+Communication. The communication volume of each                                             approximate the optimal scheduling by reducing the search
+worker is also crucial, as a network hotspot causes conges-                                 space through simplified assumptions.
+tion and reduces the overall bandwidth utilization. Fortu-
+nately, communication balance can be reduced to compu-                                      3.4       Existing Context Parallelism Fails to Approach
+tation balance for both causal and non-causal masks. As                                               Optimal Scheduling
+shown in Figure 4, although the communication volume
+of B depends on its position within the sequence, the Zig-                                  To derive a practical strategy within a reasonable time, exist-
+Zag assignment ensures that communication volume is pro-                                    ing solutions simplify either G or M through human-crafted,
+portional to computation. In this paper, unless otherwise                                   rule-based heuristics. Such simplifications lead to designs
+specified, Zig-Zag ordering is applied for causal masks, sim-                               that overfit to specific workloads and lack adaptability to
+plifying communication balance into computation balance.                                    the diverse real-world corpus as discussed in § 2.1.
+                                                                                            Balance-optimized. Ring attention (Liu et al., 2023) over-
+3.3     Optimal Context Parallelism Scheduling                                              simplifies G and fails to consider compute efficiency. It
+Given a set of ⌧ input sequences S = {s1 , ..., s⌧ } with dif-                              shards each sequence into 2N blocks, where N is the num-
+ferent lengths, and a set of N workers W = {w1 , ..., wN },                                 ber of workers, and assigns two blocks from each sequence
+each context parallelism scheduling is defined by a shard-                                  to every worker (with the i-th and (2N i)-th blocks). As
+ing function G and an assignment function M . The shard-                                    shown in Figure 5 (a), when combined with Zig-Zag or-
+ing function G determines how many blocks are generated                                     dering, this heuristic can achieve perfect workload balance
+from each sequence and how large each block is, that is,                                    across workers. However, it fixes 8i 2 ⌧, ki = 2N , without
+G : si ! {Bi1 , ..., Biki } where ki denotes the number of                                  considering both the context length and compute efficiency
+blocks from si . The assignment function M maps each                                        f (·). As a result, short sequences are over-sharded into
+block to one of the workers, M : B ! wi .                                                   very small blocks with len(B) < 2K, causing severe MFU
+                                                                                            degradation as discussed in § 3.1.
+For the i-th worker wi , its computation
+                                   P       load Comp(wi )
+can be calculated as Comp(wi ) = j f (Bj ) · IM (Bj )=wi ,                                  Efficiency-optimized. To improve compute efficiency,
+where f (·) considers both FLOPs and compute efficiency                                     other works (Ge et al., 2025) make G context-length-aware
+defined in § 3.1, and I is the indicator function. With a                                   instead of applying constant k. They cluster sequences into
+network overlapping factor ⌘i 1, the total time for wi is                                   groups according to their context length and allocate differ-
+⌘i · Comp(wi ), where perfect overlap of computation and                                    ent numbers of workers to each subgroup proportionally to
+communication is achieved when ⌘ = 1. Note that constants                                   the context length. As shown in Figure 5 (b), ring attention
+                    Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+          Data Plane
+                                         Reshuffler      Iter 1            Iter 2           Iter N        Reshuffler
+                                         Local Attn      Attn              Attn             Attn              Local Attn
+          Seq
+                               Non-                                                   ...                                        Non-
+                               Attn       Reshuffle       Net               Net              Net              Reshuffle          Attn
+
+                                                             Block-level pipelining
+
+                                                                                                     Iter 1           Iter 2
+                         Block Distributor                      Send                Recv             0    0           0      0
+                                 GPU 0                                                               1    1           1      1
+                                                             GPU 0                  GPU 0
+                                                                                                     2    2           2      2
+                                 GPU 1                                                                                           Comm
+                                                             GPU 1                  GPU 1            Iter 3           Iter N
+                                                                                                     0    0           0
+                                                                                                                          ... 0 Planner
+                                 GPU 2                       GPU 2                  GPU 2            1    1
+                                                                                                                ...   1   ... 1
+                  Sharding               Assignment                                                  2    2           2   ... 2
+          Control Plane                                    Communication Graph                     Congestion-free Solver
+
+
+
+                                               Figure 6. FCP System Overview.
+
+
+is applied within each subgroup. However, these designs                optimal. To demonstrate this, we analyze the computation
+oversimplify M by isolating subgroups on separate workers              and communication demands of a block B under various
+without resource sharing. Consequently, outlier sequences              worker types and network configurations. We vary len(B)
+with extreme context length (which are common as shown                 and compute the network bandwidth required for the com-
+in § 2.1) can severely disturb workload balance. For exam-             munication time of B to match its computation time.
+ple, a 64K sequence requires 256⇥ more computation than
+                                                                       For example, with the latest Hopper GPUs and a 50GB/s
+a 4K one but is only given 16⇥ more compute resources, re-
+                                                                       ConnectX-7 InfiniBand network, only 22GB/s (44% of the
+sulting in 16⇥ higher per-worker computation. Such a rigid
+                                                                       line rate) is required to fully overlap communication with
+constraint on the search space of M greatly hurts workload
+                                                                       computation (i.e., ⌘ = 1). Furthermore, increasing the block
+balance thus the overall MFU.
+                                                                       size len(B) reduces the bandwidth requirement, because
+Switch between two. Other studies (Wang et al., 2025b)                 computation within each block scales quadratically with the
+identify that existing approaches perform poorly on certain            block size, whereas communication scales linearly. This
+workloads. Therefore, they propose adaptively switching                enables a flexible trade-off between scheduling granularity
+between the two aforementioned methods through a profile-              and communication efficiency.
+guided performance estimator, to achieve best of two. How-
+ever, these solutions do not expand the limited search space,          3.6        FCP: Enabling Flexible Context Parallelism with
+which fundamentally reflects a trade-off between compute                          Block-wise Sharding and Assignment
+efficiency and workload balance. As a result, they fail to
+achieve both objectives simultaneously.                                Opportunity. In this paper, we aim to remove the ring-
+                                                                       topology constraint in the search space of the assignment
+                                                                       policy M . By enabling arbitrary peer-to-peer communica-
+3.5   Ring-Based Assignment Policy: A Gilded Cage
+                                                                       tion, each sequence block B can be placed arbitrarily on any
+Despite different implementations of the sharding policy               worker. This flexibility allows the system to achieve ideal
+G, existing CP designs share the same principle for the as-            workload balance under various context length distributions.
+signment policy M (§ 3.4). They all adopt a ring-based
+topology, either as a monolithic ring or as heterogeneous              Challenges. However, realizing this flexibility raises sev-
+sub-rings. This is because a ring-based topology provides a            eral challenges: (1) how to maintain high compute efficiency
+simple and symmetric communication pattern. Each worker                f (·) for each single batch B. (2) how to balance workloads
+only exchanges data with its neighboring workers, which                across workers in terms of memory, computation, and com-
+enables high network bandwidth utilization and better com-             munication. (3) how to enable efficient communication (i.e.,
+munication–computation overlap (i.e., lower ⌘).                        ⌘ = 1) to avoid system bottlenecks.
+
+However, we argue that the ring topology is not the only
+way to achieve efficient communication. Moreover, its rigid
+                                                                       4       D ESIGN
+constraint requires each sequence to be sharded symmetri-              As shown in Figure 6, FCP consists of three main com-
+cally across a fixed ring of workers, which greatly limits             ponents: block distributor (§ 4.1), communication planner
+the search space, making CP scheduling fundamentally sub-              (§ 4.2), and transparent reshuffler (§ 4.3). Given a set of se-
+                                  Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+
+      Seq A     Seq B
+                        Comp A1 A1   Send A1   Comp A1 A2   Send B1      Comp B1 B2   Comp B1 B1   enable effective communication and computation overlap
+   A1 A2       B1 B2      Block                             Interleave                             as shown in § 3.5. Therefore, len(B) is a trade-off between
+        Q     A1 B1     Comp A1 A1   Comp A1 A2   Comp B1    B2   Comp B1 B1                       scheduling granularity and runtime efficiency. We provide a
+GPU0
+       KV A1 B1         Send A1      Send B1
+                                                                                                   sensitivity study on different choices of len(B) in § 6.6.
+                                                                                            Time
+
+        Q     A2 B2     Comp A2 A2   Comp A2 A1   Comp B2    B1   Comp B1 B1                       Assignment Policy. After sharding sequences into blocks,
+GPU1
+       KV A2 B2         Send A2      Send B2                                                       block distributor distributes these blocks across workers.
+                                                            Interleave
+                                                                                                   The objective is to minimize the maximum computation
+                        Comp A2 A2   Send A2   Comp A2 A1   Send B2      Comp B2 B1   Comp B1 B1
+                                                                                                   workload among all workers, subject to the constraint of
+                                                                                                   maximal memory usage per worker. FCP employs a variant
+                                                                                                   of the well-known Longest Processing Time (LPT) schedul-
+Figure 7. Example of block-level pipelining for efficient compu-                                   ing algorithm, which greedily assigns each block to the
+tation and communication overlap. FCP decomposes end-to-end                                        least loaded worker. We describe the policy in detail in
+execution into computation and communication of blocks, which                                      Appendix A.1. Given K blocks and N GPUs, the time
+are executed block-by-block in an interleaving way.
+                                                                                                   complexity is O(K log N ), which incurs negligible latency.
+
+                                                                                                   4.2   Communication Planner
+quences from a training batch, block distributor determines
+how to shard these sequences and assign the blocks to work-                                        After sharding and assignments, the data flow (i.e., data
+ers. It takes into account both compute efficiency and load                                        dependency among blocks between workers) is determined.
+balance. Based on the block assignment, communication                                              However, due to arbitrary peer-to-peer communication,
+planner builds a communication bipartite graph according                                           naive communication without overlapping computation in-
+to the dependencies among blocks, and derives an optimal                                           troduces huge overhead. To achieve efficient communica-
+communication plan using a congestion-free solver. These                                           tion, FCP introduces three techniques: block-level pipelin-
+plans are executed through block-level pipelining, which                                           ing, a congestion-free solver, and a bottom-up coalescer.
+enables overlap between communication and computation.
+                                                                                                   Block-level pipelining. FCP divides both computation
+To make FCP transparent to existing frameworks, transpar-                                          and communication across workers into block-grained sub-
+ent reshuffler reshuffles the user-provided sequence layout                                        stages. This design allows flexible and predictable schedul-
+into the workload-aware layout required by FCP when en-                                            ing. Specifically, as CP consists of three main stages in-
+tering the attention module, and restores the original layout                                      cluding pulling remote blocks, computing attention blocks,
+afterward. To minimize overhead, the reshuffling is inte-                                          and pushing local blocks, FCP decomposes each stage into
+grated into the block-level pipeline and overlapped with                                           fine-grained block-level sub-stages and interleaves them
+local attention computation whenever possible.                                                     block by block. For example, as shown in Figure 7, each
+                                                                                                   worker pulls or pushes only one block at a time, while simul-
+4.1         Block Distributor                                                                      taneously computing the previous block, thus overlapping
+                                                                                                   communication and computation effectively.
+Sharding Policy. Given a set of input sequences, block
+distributor first divides each sequence into a list of fixed-                                      Congestion-free solver. The ordering of pipelining sub-
+size blocks, for the following two main advantages: First,                                         stages is crucial. A random ordering may cause multiple
+it greatly reduces the search space of optimal scheduling                                          workers to pull blocks from the same worker, resulting in net-
+without losing expressiveness. It adapts to various context                                        work congestion. To ensure congestion-free communication,
+lengths, producing more blocks for longer sequences and                                            FCP models the data flow among N workers as an undi-
+fewer for shorter ones. Second, since each block shares the                                        rected bipartite graph. The graph consists of N send nodes
+same communication and computation volume per execu-                                               S and N receive nodes R, where an edge S(i) ! R(j)
+tion with another block (although the total number of execu-                                       indicates that a block must be transferred from the i-th to
+tions may differ), the block-wise abstraction allows system-                                       the j-th worker. As shown in Figure 8, once the block as-
+atic modeling and scheduling at the block level (§ 4.2). For                                       signments are determined, the bipartite graph can be directly
+sequences with context length shorter than block size, FCP                                         constructed based on the data dependencies. The maximal
+packs them into minimal number of blocks and adopts the                                            degree of the bipartite represents the workload balance
+varlen API of the attention kernel for computation.                                                defined by block distributor.
+
+To maximize compute efficiency, the block size len(B) is                                           We then show that the optimal number of congestion-
+determined by both hardware and model configurations,                                              free sub-stages is , and provide a practical solver with
+ensuring it can fully utilize f (·) as discussed in § 3.1. More-                                   polynomial-time complexity. A single-stage congestion-free
+over, len(B) also depends on the network configuration to                                          plan means each worker sends at most one block, receives at
+                         Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+                   Seq A                 Seq B              Seq C
+              1      2       3       1    2      3      1     2     3
+                                                                                    Iter 1                    Iter 2                   Iter 3
+                    Block                     Send                  Recv    Send             Recv     Send             Recv    Send             Recv
+       GPU0    1         2       3            GPU 0                 GPU 0   GPU 0            GPU 0    GPU 0            GPU 0   GPU 0            GPU 0
+
+
+       GPU1    3         1       2            GPU 1                 GPU 1   GPU 1            GPU 1    GPU 1            GPU 1   GPU 1            GPU 1
+
+
+       GPU2    2         3       1            GPU 2                 GPU 2   GPU 2            GPU 2    GPU 2            GPU 2   GPU 2            GPU 2
+
+
+                                                     Communication
+          Block Assignments                                                                          Congestion-free Solver
+                                                     Bipartite Graph
+
+
+Figure 8. Example of the congestion-free solver over three sequences with causal mask. Given the block assignments from block
+distributor, communication planner constructs a bipartite graph based on the data dependency across GPUs. For example, 1-st block
+from sequence B are transferred from GPU 2 to GPU 0 and 1, adding edges 2 ! 1 and 2 ! 0. The solver then calculates the maximal
+matching of the bipartite graph with minimum iterations, providing an optimal congestion-free communication ordering.
+
+
+most one block, and computes at most one block. Therefore,                           example, assuming a coalesce degree of 4, the computation
+for all i 2 N , deg(S(i))  1 and deg(R(i))  1. This                                and communication of four consecutive sub-stages can be
+is exactly the definition of a matching in the corresponding                         merged into a larger stage. In each sub-stage, every worker
+bipartite graph. Thus, we have Lemma 1.                                              sends, receives, and computes at most one block. After
+Lemma 1. A single-stage congestion-free communication                                coalescing, each worker sends 4, receives 4, and computes 4
+is exactly a matching on the bipartite communication graph.                          blocks in a single stage without incurring a network hotspot.
+                                                                                     This merging improves kernel efficiency by increasing block
+In each sub-stage, a worker transfers at most one block.                             sizes of execution (§ 3.1). Therefore, the coalescer essen-
+The worker with degree of needs at least sub-stages                                  tially decouples the scheduling granularity (i.e., block size)
+to finish. Hence, the minimal number of congestion-free                              from the execution granularity (i.e., coalesced block size),
+sub-stages is at least . Thus, we have Lemma 2. We then                              enabling more flexible scheduling of FCP.
+construct a solution that partitions all edges into disjoint
+matchings. We detailed the construction in Appendix A.2.                             4.3     Transparent Reshuffler
+Therefore, combining with Lemma 1 and 2, the optimal
+number of congestion-free sub-stages equals .                                        Even with efficient implementation, CP is hard to deploy
+                                                                                     in real-world systems. This is because it requires intrusive
+Lemma 2. A bipartite with maximal degree is partitioned
+                                                                                     modifications to existing frameworks. For example, align-
+into at least disjoint matchings.
+                                                                                     ing the sequence layout with desired assignments requires
+Assuming an edge set E and a vertex set V , the communica-                           modifying sequence-dependent components, including the
+tion plans can be calculated with O(|V |1/2 |E|) = O(N̂ 2.5 )                        dataloader (Ge et al., 2025) and the positional embedding
+time complexity via Hopcroft–Karp algorithm (Wikipedia,                              (e.g., RoPE) (Zewei & Yunpeng, 2025).
+2025a), where N̂ is the CP group size (typically in the                              Therefore, making FCP transparent is important for deploy-
+hundreds). Given the sharding and assignments of the se-                             ment. A strawman solution is to insert two all-to-all com-
+quences, FCP will first construct the corresponding bipartite,                       munications before and after the attention module. These
+which is then partitioned into a set of matchings. At each                           operations on-the-fly reshuffle the user-provided sequence
+sub-stage, FCP follows one matching to determine the net-                            layout into the workload-aware layout required by CP. How-
+work flow, while the communication is overlapped with the                            ever, such standalone all-to-all operations can introduce
+computation of one block. Moreover, the solver runs once                             additional overhead. Fortunately, the communication of
+per batch, which can be either overlapped or pre-computed.                           all-to-all can be overlapped with computation. This is be-
+Since total GPUs are partitioned into independent CP groups                          cause the total communication volume is bounded by the
+and different training batches are independent, the match-                           total context length, as each sequence only has one copy.
+ings are massively parallelizable across CPUs, completing                            Meanwhile, the total computation grows quadratically.
+within seconds at the scale of hundreds of workers. We
+illustrate the process in Figure 8.                                                  To achieve overlap between reshuffling and computation,
+                                                                                     FCP leverages the fine-grained block-level pipeline (§ 4.2).
+Bottom-up coalescer. Furthermore, the fine-grained block-                            It reorders local computation (i.e., computation that does
+wise sub-stages can be coalesced into coarse-grained stages                          not depend on remote blocks) to the beginning and end of
+without compromising congestion-free communication. For
+                    Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+the pipeline. When entering or exiting attention, FCP first
+launches local computation before the reshuffling, enabling
+effective overlap between communication and computation.
+
+5     I MPLEMENTATION
+Implementation details. We implement FCP with 4K lines
+of Python code, with minor modifications on FlashAtten-
+tion3 (Shah et al., 2024) kernels. To prevent interference be-
+tween computation and communication, we employ CUDA
+Green Context (Cui et al., 2025) to spatially partition GPU      Figure 9. Computation (upper) and communication (lower) imbal-
+SMs into communication and computation ones. Since the           ance ratio when scaling the number of GPUs.
+communication operations are pure data transport without
+reduction, the network (e.g., 50 GB/s InfiniBand) rather
+than HBM (2 TB/s) is the bottleneck, so a small number
+of SMs suffices to saturate the link bandwidth. We set the
+number of communication SMs to the minimum feasible
+value following the CUDA driver API (NVIDIA, 2024). We
+specify sm margin in the attention kernel to mitigate wave
+quantization (Osama et al., 2023). For communication, we
+use the group peer-to-peer primitives of NCCL and make the       Figure 10. Normalized attention MFU with perfect load balance.
+communication pattern aware of the network topology. For
+the railed-optimized network topology (Wang et al., 2024),       large-scale pretraining. We also test the performance under
+we enable Ulysess (Jacobs et al., 2023) with FCP to avoid        different number of per-GPU tokens in § 6.6. We apply the
+two-hop communication. For block-level pipelining (§ 4.2),       causal attention mask for all sequences.
+we implement a multi-buffer pipeline that launches several
+communication operation concurrently, reducing pipeline          Baselines. We compare FCP with the following state-of-
+bubbles. In our evaluation, we use three buffers.                the-art CP designs: ¨ Ring Attention: Balance-optimized
+                                                                 design. ≠ ByteScale: Compute-efficiency optimized design
+                                                                 that dynamically partitions short and long sequences into dif-
+6     E VALUATION                                                ferent GPUs (Ge et al., 2025). Æ WLB-LLM: adaptive switch
+6.1   Evaluation Setups                                          between balance- and efficiency-optimized baselines based
+                                                                 on an online performance estimator. Besides these well-
+Hardware. We conduct the evaluation on two computing             established literature, we also include a concurrent work
+clusters from industry and academia, respectively. Across        from an open-sourced project, MagiAttention (Ø) (Zewei &
+these clusters, we use two GPU types, denoted as GPU-X           Yunpeng, 2025), to provide comprehensive comparison. We
+and GPU-Y. Their computation-to-communication ratios,            provide detailed configuration of baselines in Appendix A.3.
+measured as BFloat16 TensorOp throughput divided by net-
+work bandwidth, are summarized in Table 1. To respect            Hyper-parameters. We use a 4K block size for both GPU-
+confidentiality constraints, we anonymize certain system         X and GPU-Y, while we also conduct a sensitivity test over
+details, including the exact GPU models and the cluster          various block sizes in § 6.6. We use a coalesce degree of 16
+scale.                                                           by default for better efficiency (§ 4.2). We assign 6 and 8
+                                                                 SMs for communication operators on GPU-X and GPU-Y.
+Table 1. Computation-to-communication ratios of GPU-X and
+GPU-Y.
+                            GPU-X GPU-Y                          6.2   Attention Workload Balance
+             Comp/Comm         5920      2500                    We evaluate the workload balance (i.e., computation and
+                                                                 communication volume) by accumulating the FLOPs and
+Model and workload. We adopt the model configuration             network traffic of each GPU. As the GPU with heaviest
+from Llama-3-70B (AI, 2024), with 8 KV heads, 64 QO              workload bottlenecking the cluster, we define the imbal-
+heads and a head dimention of 128. We randomly sample se-        ance ratio as (max(load) mean(load))/max(load). As
+quences from our training traces as shown in Figure 2, with      shown in Figure 9, FCP consistently achieves less than 5%
+a maximum sequence length of 512K. We provide results            workload imbalance, owing to its fine-grained block-level
+with more datasets in Appendix A.4. We set the number            block assignments. In contrast, as MagiAttention only opti-
+of tokens per GPU as 32K, which is common practice in            mizes for computation, it incurs up to 17% communication
+                          Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+
+
+
+Figure 11. Weak-scaling of module-level attention MFU on real-                     Figure 13. Sensitivity test of per-GPU tokens on 128⇥ GPU-X.
+world dataset. The number of tokens per GPU is fixed at 32K.
+            Fine-grained: better scheduling    Coarse-grained: better efficiency
+
+
+                                        Sweet Spot
+
+
+
+
+   Figure 12. Sensitivity test of block sizes on 128⇥ GPU-X.
+
+                                                                                   Figure 14. Weak scaling test of module-level attention MFU
+volume imbalance, leading to sub-optimal communication.                            (forward-only), with various number of GPU-Y.
+Besides, as ByteScale spatially partitions sequences based
+on their context length L, the O(L2 ) computation is only
+assigned with O(L) GPUs, causing up to 70% imbalance.                              As shown in Figure 11, FCP consistently surpasses by all
+                                                                                   baselines under all configurations. Specifically, all imple-
+6.3    Attention Compute Efficiency                                                mentations perform similarly with 16 GPUs since there is
+                                                                                   less opportunity in small scale. With increased CP degrees,
+To measure the compute efficiency excluding the effect of                          Ring Attention falls short due to the decreased compute
+workload imbalance, we assume all context lengths equal to                         efficiency as discussed in § 6.3; while ByteScale performs
+the average length of Figure 2. We compute the attention                           even worse due to the significant workload imbalance as
+MFU as the ratio of total computation to the total attention                       shown in § 6.2 under the long-tailed distribution.
+time, normalized by the MFU of single-GPU FlashAttention.
+As shown in Figure 10, FCP consistently achieves more                              6.5   Ablation Studies
+than 90% MFU, with the minimal degradation due to SMs
+specialized for communication. In contrast, Ring Attention                         To validate the effectiveness of each proposed design in FCP,
+greatly decreases MFU due to the over-sharding on short se-                        we conduct ablation studies by adding on components one-
+quences, increasing computation and communication time.                            by-one, including block-level pipelining (#1), congestion-
+                                                                                   free solver (#2), bottom-up coalescer (#3), and transparent
+6.4    Scaling Test of Module-level MFU                                            reshuffler (#4). We use the same evaluation setup as de-
+                                                                                   scribed in § 6.1, with the number of GPUs fixed at 128⇥
+We further measure the end-to-end attention-module MFU                             GPU-X for simplicity. As shown in Table 2, each compo-
+at the cluster level, considering for both inter-GPU workload                      nent contributes to considerable utilization improvement.
+imbalance and single GPU compute efficiency. The module-
+level MFU is defined as the average MFU across the clusters.                       6.6   Sensitivity Tests
+
+                                                                                   Various block size. We measure the module-level attention
+       Table 2. Ablation study of MFU on 128⇥ GPU-X.                               MFU under various block sizes, with the same workload
+             Base           #1                #2           #3              #4      under 128⇥ GPU-X. As shown in Figure 12, FCP achieves
+                           0.48            0.62          0.70            0.75      the best MFU with 4K block size, achieving a sweet spot
+      Fwd    0.29
+                         (64%")          (29%")        (10%")           (7%")      between workload balance and compute efficiency.
+                           0.46            0.59          0.69            0.74
+      Bwd    0.37
+                         (24%")          (28%")        (17%")           (7%")      Various number of per-GPU tokens.           To demonstrate
+                    Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+the generality of FCP, we also measure the module-level           parallelizes along the head dimension, whose scalability
+MFU with different number of per-GPU tokens . As shown            is limited. Another concurrent work, CAD (Zhuang et al.,
+in Figure 13, FCP consistently surpasses all baselines.           2025), introduces a fine-grained, load-balanced CP strategy
+                                                                  with attention disaggregation. However, it fails to model
+GPU types. To assess the portability and generality of            communication traffic after shard migration, resulting in
+FCP, we evaluate it on GPU-Y. We adopt the state-of-the-art       suboptimal performance. In contrast, FCP is a fine-grained,
+FlashAttention-4 implementation and adjust the baselines          input-adaptive CP method that jointly achieves computation
+accordingly. We exclude MagiAttention because it relies on        and communication balance, ensuring efficient execution
+customized kernels. As shown in Figure 14, FCP consis-            through congestion-free communication.
+tently outperforms the baselines, achieving over 70% of the
+single-GPU FlashAttention-4 MFU. The remaining gap is             Dynamic attention masks. Another line of concurrent
+mainly due to the SM resources consumed by communica-             work focuses on load balance in parallelizing block-sparse
+tion and the higher arithmetic intensity required.                attention (Xi et al., 2025), including BurstEngine (Sun
+                                                                  et al., 2025), MagiAttention (Zewei & Yunpeng, 2025), and
+7    D ISCUSSION AND L IMITATION                                  DCP (Jiang et al., 2025). These methods adopt a similar
+                                                                  block-level abstraction to allow flexible scheduling across
+Hyperparameter selection. The block size in FCP is                workers. However, they fail to consider communication
+determined automatically by the cluster configuration and         congestion, leading to suboptimal performance. Although
+workload characteristics. Concretely, the block size is cho-      evaluated on causal masks, the block-level abstraction of
+sen to (1) saturate the attention kernel-level MFU as shown       FCP can be extended to block-sparse by deriving block
+in Figure 3, (2) enable computation–communication over-           dependencies from the sparsity map.
+lap, and (3) balance compute and communication across
+GPUs. Given a fixed cluster configuration, the first two          9   C ONCLUSION
+factors can be profiled in advance, which yields a hardware-
+efficient block size (e.g., 2K on GPU-X). In practice, these      We propose FCP, a scalable context parallelism paradigm
+hardware-driven choices provide sufficient scheduling flex-       that achieves both compute efficiency and workload balance.
+ibility for production workloads (e.g., 32K context length        The key idea of FCP is to enable flexible sequence partition
+in Gemini training (Team, 2024)), offering a simple and           by leveraging arbitrary peer-to-peer communication. With a
+effective solution. Further fine-tuning of the block size for a   communication planner, FCP ensures efficient runtime exe-
+particular workload provides only marginal improvement.           cution. Our evaluation shows that FCP scales near-linearly
+Figure 12 shows about a 7% difference between 2K and 6K           up to 256 GPUs and improves attention MFU by up to 2⇥.
+block sizes. For scenarios where users require the absolute
+optimal configuration, a cost model-based simulation can          ACKNOWLEDGEMENTS
+efficiently validate load balance by running the LPT-based
+scheduling without executing the full workload.                   We thank Jiaming Tang and Yifan Qiao for their insight-
+                                                                  ful discussions and feedback. We also thank Heng Zhang,
+Limitations and network assumptions. FCP requires                 Yanghua Peng, and Haibin Lin for their support throughout
+arbitrary peer-to-peer communication. When multiple on-           the project.
+the-fly packets are coalesced, the resulting pattern effec-
+tively resembles all-to-all communication, which demands
+a topology well suited for such traffic. Consequently, FCP
+                                                                  R EFERENCES
+generalizes well on fat-tree or rail-optimized networks with      AI, M. The llama 3 herd of models, 2024. URL https:
+InfiniBand or RoCE on NVIDIA GPUs, but its performance              //arxiv.org/abs/2407.21783.
+is limited on topologies such as torus-based TPU v3 clus-
+ters.                                                             Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+                                                                    Lebrón, F., and Sanghai, S. Gqa: Training generalized
+                                                                    multi-query transformer models from multi-head check-
+8    R ELATED W ORKS
+                                                                    points, 2023. URL https://arxiv.org/abs/23
+Long-context pre-training. LoongTrain (Gu et al., 2024)             05.13245.
+proposes a double-ring topology to leverage high intra-node
+interconnection bandwidth. However, its parallelism de-           Brandon, W., Nrusimha, A., Qian, K., Ankner, Z., Jin,
+sign is input-agnostic, leading to compute inefficiency on          T., Song, Z., and Ragan-Kelley, J. Striped attention:
+short sequences. FlexSP (Wang et al., 2025a) dynamically            Faster ring attention for causal transformers. ArXiv,
+partitions sequences into different SP groups. However, it          abs/2311.09431, 2023. URL https://api.sema
+                                                                    nticscholar.org/CorpusID:265220849.
+                    Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+Cameron, P. J. Hall’s marriage theorem, 2025. URL http           Ge, H., Feng, J., Huang, Q., Fu, F., Nie, X., Zuo, L., Lin, H.,
+  s://arxiv.org/abs/2503.23159.                                    Cui, B., and Liu, X. Bytescale: Communication-efficient
+                                                                   scaling of llm training with a 2048k context length on
+Chandran, L. S., Gajjala, R., Mehra, S., and Rahul, S. Two        16384 gpus. In Proceedings of the ACM SIGCOMM 2025
+  results on lpt: A near-linear time algorithm and parcel          Conference, SIGCOMM ’25, pp. 963–978. ACM, August
+  delivery using drones, 2024. URL https://arxiv.                  2025. doi: 10.1145/3718958.3754352. URL http:
+  org/abs/2407.16323.                                              //dx.doi.org/10.1145/3718958.3754352.
+
+Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., and Krishna-       Goyal, P., Dollár, P., Girshick, R., Noordhuis, P.,
+  murthy, A. Punica: Multi-tenant lora serving, 2023. URL         Wesolowski, L., Kyrola, A., Tulloch, A., Jia, Y., and
+  https://arxiv.org/abs/2310.18547.                                He, K. Accurate, large minibatch SGD: Training ima-
+                                                                   genet in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Csárdi, G. and Nepusz, T. The igraph software package             URL https://arxiv.org/abs/1706.02677.
+  for complex network research. InterJournal, Complex
+  Systems, pp. 1695, 2006.                                       Gu, D., Sun, P., Hu, Q., Huang, T., Chen, X., Xiong, Y.,
+                                                                  Wang, G., Chen, Q., Zhao, S., Fang, J., Wen, Y., Zhang,
+Cui, W., Chen, Y., Zhao, H., Xu, Z., Chen, Q., Chen, X.,          T., Jin, X., and Liu, X. Loongtrain: Efficient training of
+  Zhou, Y., Sun, S., and Guo, M. Optimizing slo-oriented           long-sequence llms with head-context parallelism, 2024.
+  llm serving with pd-multiplexing, 2025. URL https:               URL https://arxiv.org/abs/2406.18485.
+  //arxiv.org/abs/2504.14489.
+                                                                 Jacobs, S. A., Tanaka, M., Zhang, C., Zhang, M., Song,
+Dao, T. FlashAttention-2: Faster attention with better paral-      S. L., Rajbhandari, S., and He, Y. Deepspeed ulysses:
+  lelism and work partitioning. In International Conference        System optimizations for enabling training of extreme
+  on Learning Representations (ICLR), 2024.                        long sequence transformer models, 2023. URL https:
+                                                                   //arxiv.org/abs/2309.14509.
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Ré, C. FlashAt-
+  tention: Fast and memory-efficient exact attention with        Jiang, C., Cai, Z., Tian, Y., Jia, Z., Wang, Y., and Wu, C.
+  IO-awareness. In Advances in Neural Information Pro-              Dcp: Addressing input dynamism in long-context training
+  cessing Systems (NeurIPS), 2022.                                  via dynamic context parallelism. In Proceedings of the
+                                                                    ACM SIGOPS 31st Symposium on Operating Systems
+DeepSeek-AI. Deepseek-v2: A strong, economical, and                 Principles, SOSP ’25, pp. 221–236. ACM, October 2025.
+  efficient mixture-of-experts language model, 2024. URL            doi: 10.1145/3731569.3764849. URL http://dx.d
+  https://arxiv.org/abs/2405.04434.                                 oi.org/10.1145/3731569.3764849.
+
+Esser, P., Kulal, S., Blattmann, A., Entezari, R., Müller,      Li, D., Shao, R., Xie, A., Xing, E. P., Ma, X., Stoica, I.,
+  J., Saini, H., Levi, Y., Lorenz, D., Sauer, A., Boesel, F.,      Gonzalez, J. E., and Zhang, H. Distflashattn: Distributed
+  Podell, D., Dockhorn, T., English, Z., Lacey, K., Good-          memory-efficient attention for long-context llms training,
+  win, A., Marek, Y., and Rombach, R. Scaling rectified            2024. URL https://arxiv.org/abs/2310.0
+  flow transformers for high-resolution image synthesis,           3294.
+  2024. URL https://arxiv.org/abs/2403.0                         Liu, H. et al. Ring attention with blockwise transformers for
+  3206.                                                            near-infinite context. arXiv preprint arXiv:2310.01889,
+                                                                   2023. URL https://arxiv.org/abs/2310.0
+Fang, J. and Zhao, S. Usp: A unified sequence parallelism
+                                                                   1889.
+  approach for long context generative ai, 2024. URL
+  https://arxiv.org/abs/2405.07719.                              Narayanan, D., Shoeybi, M., Cho, T., et al. Memory-
+                                                                   efficient pipeline-parallel DNN training. In Proceedings
+Gao, Y., Guo, H., Hoang, T., Huang, W., Jiang, L., Kong,           of the 38th International Conference on Machine Learn-
+  F., Li, H., Li, J., Li, L., Li, X., Li, X., Li, Y., Lin, S.,     ing (ICML), 2021. URL https://proceedings.
+  Lin, Z., Liu, J., Liu, S., Nie, X., Qing, Z., Ren, Y., Sun,      mlr.press/v139/narayanan21a/narayana
+  L., Tian, Z., Wang, R., Wang, S., Wei, G., Wu, G., Wu,           n21a.pdf.
+  J., Xia, R., Xiao, F., Xiao, X., Yan, J., Yang, C., Yang,
+  J., Yang, R., Yang, T., Yang, Y., Ye, Z., Zeng, X., Zeng,      Nie, X., Miao, X., Wang, Z., Yang, Z., Xue, J., Ma, L.,
+ Y., Zhang, H., Zhao, Y., Zheng, X., Zhu, P., Zou, J., and         Cao, G., and Cui, B. Flexmoe: Scaling large-scale sparse
+  Zuo, F. Seedance 1.0: Exploring the boundaries of video          pre-trained model training via dynamic device placement.
+  generation models, 2025. URL https://arxiv.or                    Proceedings of the ACM on Management of Data, 1(1):
+  g/abs/2506.09113.                                                1–19, 2023.
+                   Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+NVIDIA. CUDA driver API: Green contexts. https:                Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani, P.,
+ //docs.nvidia.com/cuda/cuda-driver-a                            and Dao, T. Flashattention-3: Fast and accurate attention
+ pi/group__CUDA__GREEN__CONTEXTS.html,                           with asynchrony and low-precision, 2024. URL https:
+ 2024.                                                           //arxiv.org/abs/2407.08608.
+
+NVIDIA. Nvl72-datasheet. https://nvdam.widen.                  Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,
+ net/s/wwnsxrhm2w/blackwell-datasheet                            J., and Catanzaro, B. Megatron-LM: Training multi-
+ -3384703, 2025. [Accessed 28-10-2025].                          billion parameter language models using model paral-
+                                                                 lelism. arXiv preprint arXiv:1909.08053, 2019. URL
+Osama, M., Merrill, D., Cecka, C., Garland, M., and Owens,       https://arxiv.org/abs/1909.08053.
+  J. D. Stream-k: Work-centric parallel decomposition
+  for dense matrix-matrix multiplication on the gpu, 2023.     Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,
+  URL https://arxiv.org/abs/2301.03598.                          J., and Catanzaro, B. Megatron-lm: Training multi-
+                                                                 billion parameter language models using model paral-
+Patel, D. Nvidia’s New China AI Chips Circumvent US              lelism, 2020. URL https://arxiv.org/abs/19
+  Restrictions — H20 Faster Than H100 — Huawei Ascend            09.08053.
+  910B — newsletter.semianalysis.com. https://news
+  letter.semianalysis.com/p/nvidias-new                        Sivamani, K. S., Moon, T., Tredak, P., Yang, C.,
+ -china-ai-chips-circumvent, 2025. [Accessed                     and Nguyen, P.           Nvidia/TransformerEngine.
+  28-10-2025].                                                   https://github.com/NVIDIA/TransformerEngine,
+                                                                 oct 28 2025. URL https://github.com/NVIDI
+Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. ZeRO:        A/TransformerEngine.
+  Memory optimizations toward training trillion parameter
+  models. arXiv preprint arXiv:1910.02054, 2020. URL           Sun, A., Zhao, W., Han, X., Yang, C., Liu, Z., Shi, C., and
+  https://arxiv.org/abs/1910.02054.                              sun, M. Burstengine: an efficient distributed framework
+                                                                 for training transformers on extremely long sequences of
+Ramel, D. Open source foundation models cost tens of             over 1m tokens, 2025. URL https://arxiv.org/
+  millions to train. https://pureai.com/article                  abs/2509.19836.
+  s/2024/04/23/open-source-models-cost.
+  aspx, 2024. Accessed: 2025-10-07.                            Tao, Z. and Huang, Y. Official benchmark scripts for ma-
+                                                                 giattention. https://github.com/SandAI-org
+Ravikumar, A., Parthasarathy, S., Thyagarajan, K., et al.        /MagiAttention/blob/main/exps/dist_a
+  Dpro–sm: A distributed framework for proactive straggler       ttn/run_benchmark.py, 2025. [Accessed 28-10-
+  mitigation in synchronous SGD. Heliyon, 2024. URL ht           2025].
+  tps://www.sciencedirect.com/science/
+  article/pii/S2405844023107754. Stragglers                    Team, G. Gemini technical report, 2024. URL https:
+  delay synchronization during each iteration’s aggregation      //arxiv.org/pdf/2312.11805.
+  step.
+                                                               Teng, H., Jia, H., Sun, L., Li, L., Li, M., Tang, M., Han,
+Research, A. M. L. Apple foundation models: 2025 updates.        S., Zhang, T., Zhang, W. Q., Luo, W., Kang, X., Sun, Y.,
+  https://machinelearning.apple.com/re                           Cao, Y., Huang, Y., Lin, Y., Fang, Y., Tao, Z., Zhang, Z.,
+  search/apple-foundation-models-2025-u                          Wang, Z., Liu, Z., Shi, D., Su, G., Sun, H., Pan, H., Wang,
+  pdates, 2025. Accessed: 2025-10-07.                            J., Sheng, J., Cui, M., Hu, M., Yan, M., Yin, S., Zhang,
+                                                                 S., Liu, T., Yin, X., Yang, X., Song, X., Hu, X., Zhang,
+Research, M. A. Effective long-context scaling of foun-          Y., and Li, Y. Magi-1: Autoregressive video generation at
+  dation models. https://ai.meta.com/resear                      scale, 2025. URL https://arxiv.org/abs/25
+  ch/publications/effective-long-conte                           05.13211.
+  xt-scaling-of-foundation-models/, 2024.
+  Accessed: 2025-10-07.                                        Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+                                                                 L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Attention
+Sergeev, A. and Del Balso, M. Horovod: Fast and easy             is all you need, 2023. URL https://arxiv.org/
+  distributed deep learning in tensorflow. arXiv preprint        abs/1706.03762.
+  arXiv:1802.05799, 2018. URL https://arxiv.or
+  g/abs/1802.05799.                                            Wang, W., Ghobadi, M., Shakeri, K., Zhang, Y., and Hasani,
+                                                                N. Rail-only: A low-cost high-performance network
+Severson, M. et al. The cost of training frontier ai models.    for training llms with trillion parameters, 2024. URL
+  arXiv preprint arXiv:2405.21015, 2024.                        https://arxiv.org/abs/2307.12169.
+                     Unleashing Scalable Context Parallelism for Foundation Models Pre-Training via FCP
+
+Wang, Y., Wang, S., Zhu, S., Fu, F., Liu, X., Xiao, X., Li,           and Ceze, L. Flashinfer: Efficient and customizable
+ H., Li, J., Wu, F., and Cui, B. Flexsp: Accelerating large           attention engine for llm inference serving. arXiv preprint
+ language model training via flexible sequence parallelism,           arXiv:2501.01005, 2025. URL https://arxiv.or
+ 2025a. URL https://arxiv.org/abs/2412.0                              g/abs/2501.01005.
+ 1523.
+                                                                    Zewei, T. and Yunpeng, H. Magiattention: A distributed
+Wang, Z. Official wlb-llm codebase. https://github                    attention towards linear scalability for ultra-long context,
+ .com/Ash-Zheng/WLB-LLM-CP, 2025. [Accessed                           heterogeneous mask training. https://github.c
+ 28-10-2025].                                                         om/SandAI-org/MagiAttention/, 2025.
+
+Wang, Z., Cai, A., Xie, X., Pan, Z., Guan, Y., Chu, W.,             Zhao, Y., Gu, A., Varma, R., Luo, L., Huang, C.-C., Xu,
+ Wang, J., Li, S., Huang, J., Cai, C., Hao, Y., and Ding, Y.          M., Wright, L., Shojanazeri, H., Ott, M., Shleifer, S.,
+ Wlb-llm: workload-balanced 4d parallelism for large lan-             Desmaison, A., Balioglu, C., Damania, P., Nguyen, B.,
+ guage model training. In Proceedings of the 19th USENIX              Chauhan, G., Hao, Y., Mathews, A., and Li, S. Pytorch
+ Conference on Operating Systems Design and Implemen-                 fsdp: Experiences on scaling fully sharded data parallel,
+ tation, OSDI ’25, USA, 2025b. USENIX Association.                    2023. URL https://arxiv.org/abs/2304.1
+ ISBN 978-1-939133-47-2.                                              1277.
+
+Wikipedia. Hopcroft–Karp algorithm — Wikipedia, the                 Zhao, Y., Lin, C.-Y., Zhu, K., Ye, Z., Chen, L., Zheng, S.,
+ free encyclopedia. http://en.wikipedia.org/w                         Ceze, L., Krishnamurthy, A., Chen, T., and Kasikci, B.
+ /index.php?title=Hopcroft%E2%80%93Ka                                 Atom: Low-bit quantization for efficient and accurate llm
+ rp%20algorithm&oldid=1290392689, 2025a.                              serving. In Gibbons, P., Pekhimenko, G., and Sa, C. D.
+ [Online; accessed 24-October-2025].                                  (eds.), Proceedings of Machine Learning and Systems,
+                                                                      volume 6, pp. 196–209, 2024. URL https://proc
+Wikipedia. Longest-processing-time-first scheduling —                 eedings.mlsys.org/paper_files/paper/
+ Wikipedia, the free encyclopedia. http://en.wik                      2024/file/5edb57c05c81d04beb716ef1d5
+ ipedia.org/w/index.php?title=Longest                                 42fe9e-Paper-Conference.pdf.
+ -processing-time-first%20scheduling&
+ oldid=1315996044, 2025b. [Online; accessed 21-                     Zheng, L., Li, Z., Zhang, H., Zhuang, Y., Chen, Z., Huang,
+ October-2025].                                                       Y., Wang, Y., Xu, Y., Zhuo, D., Xing, E. P., Gonzalez,
+                                                                      J. E., and Stoica, I. Alpa: Automating inter- and intra-
+Xi, H., Yang, S., Zhao, Y., Xu, C., Li, M., Li, X., Lin, Y., Cai,     operator parallelism for distributed deep learning, 2022.
+  H., Zhang, J., Li, D., Chen, J., Stoica, I., Keutzer, K., and       URL https://arxiv.org/abs/2201.12023.
+  Han, S. Sparse videogen: Accelerating video diffusion
+  transformers with spatial-temporal sparsity, 2025. URL            Zhuang, Y., Chen, J., Pang, B., Gu, Y., Zhu, Y., Jiang, Y.,
+  https://arxiv.org/abs/2502.01776.                                   Stoica, I., Xing, E., and Zhang, H. Efficient long-context
+                                                                      language model training by core attention disaggregation,
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng,                2025. URL https://arxiv.org/abs/2510.1
+  B., Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu,             8121.
+  D., Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin,
+  H., Tang, J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang,
+  J., Zhou, J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang,
+  K., Yu, L., Deng, L., Li, M., Xue, M., Li, M., Zhang,
+  P., Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S., Luo,
+  S., Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang,
+  X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan,
+  Y., Liu, Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and
+  Qiu, Z. Qwen3 technical report, 2025a. URL https:
+  //arxiv.org/abs/2505.09388.
+
+Yang, A., Yang, J., Ibrahim, A., Xie, X., Tang, B., Sizov,
+  G., Reizenstein, J., Park, J., and Huang, J. Context paral-
+  lelism for scalable million-token inference, 2025b. URL
+  https://arxiv.org/abs/2411.01783.
+
+Ye, Z., Chen, L., Lai, R., Lin, W., Zhang, Y., Wang, S.,
+  Chen, T., Kasikci, B., Grover, V., Krishnamurthy, A.,
+

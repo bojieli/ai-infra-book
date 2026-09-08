@@ -1,0 +1,1215 @@
+          MAC-ATTENTION : A M ATCH –A MEND –C OMPLETE S CHEME FOR FAST
+                AND ACCURATE ATTENTION C OMPUTATION
+
+
+
+        Jinghan Yao 1 2 Sam Adé Jacobs 2 Walid Krichene 2 Masahiro Tanaka 3 Dhabaleswar K Panda 1
+
+
+                                                       A BSTRACT
+    Long-context decoding in LLMs is IO-bound: each token re-reads an ever-growing KV cache. Prior accelerations
+    cut bytes via compression (lowering fidelity) or selection/eviction (restricting what remains accessible), which can
+    degrade delayed recall and long-form generation. We introduce MAC-Attention, a fidelity and access-preserving
+    alternative that accelerates decode by reusing prior attention computations for semantically similar recent queries.
+    It starts with a match stage that performs pre-RoPE L2 matching over a short local window; an amend stage
+    rectifies the reused attention by recomputing a small band near the match boundary; and a complete stage fuses the
+    rectified results with a fresh attention computed on the KV tail, via a numerically stable merge. On a match hit, the
+    compute and bandwidth complexity is constant regardless of the context length. The method is model-agnostic, and
+    composes with IO-aware kernels, paged-KV managers, and MQA/GQA. Across LongBench v2 (120K), RULER
+    (120K), and LongGenBench (16K continuous generation), compared to latest FlashInfer library, MAC-Attention
+    reduces KV accesses by up to 99%, cuts token generation latency by over 60% at 128K, and achieves over
+    14.3× attention-phase speedups (up to 2.6× end-to-end), while maintaining full-attention quality. By reusing
+    computation, MAC-Attention delivers long-context inference that is both fast and faithful. Code is available here.
+
+                                                                                                                             LongBench v2
+
+                                                                                33                                    Full attention             StreamingLLM         TOVA
+                                                                                                                      Quest                      SnapKV               MAC-Attention
+                                                                                32
+                                                                 Accuracy (%)
+
+
+
+
+1   I NTRODUCTION                                                               30
+
+                                                                                28
+
+Large Language Models (LLMs) now operate over tens to                           27
+
+hundreds of thousands of tokens, enabling long-document                         26
+                                                                                        1          2        3         4          5          10          20      30   40      50
+understanding, multi-turn dialogue, codebase analysis,                                 LongGenBench
+                                                                                                                                KV Budget (%)
+                                                                                                                                                    RULER
+and scientific literature processing at unprecedented                           32                               75
+
+scales. Despite impressive kernel and runtime engineering,
+                                                                 Accuracy (%)
+
+
+
+
+                                                                                                                 60
+                                                                                24
+
+long-context decoding remains dominated by two factors:                         16
+                                                                                                                 45
+
+repeatedly streaming an ever-growing Key–Value (KV)                              8
+                                                                                                                 30
+
+
+cache from high-bandwidth memory (HBM) and reducing                                                              15
+
+
+attention over long prefixes at every generated step.                                1024   2048   3072
+                                                                                       KV Budget (tokens)
+                                                                                                          4096              5          10          20        30
+                                                                                                                                                  KV Budget (%)
+                                                                                                                                                                     40      50
+
+
+IO-aware attention kernels (Dao, 2023; Dao et al., 2022;
+Ye et al., 2025) and memory managers such as vLLM’s             Figure 1. Accuracy vs. KV budget (the fraction of KV cache
+                                                                used in each decoding step) across long-context benchmarks.
+PagedAttention (Kwon et al., 2023) reduce waste and
+                                                                Top: LongBench v2 (up to 120K context) (Bai et al., 2024). Bottom
+improve locality; nevertheless, the cost of re-reading and
+                                                                left: LongGenBench (up to 16K continuous generation) (Wu et al.,
+processing large KV regions continues to be a primary           2024). Bottom right: RULER (120K context) (Hsieh et al., 2024).
+latency bottleneck at long lengths.                             MAC-Attention is highlighted (dark pink); Full attention shown as
+Two families of approaches mitigate this IO bottleneck. The     a gray dashed line.
+first compresses KV states (e.g., low-rank projection or        quantization) to reduce footprint and bandwidth (Chang
+    1                              2
+    The Ohio State University Microsoft, WA, USA                et al., 2024; Zhang et al., 2024). The second selects or
+3
+Anyscale, CA, USA. Correspondence to: Jinghan Yao               evicts tokens/pages (often adaptively) to shrink the effective
+<yjhmitweb@gmail.com>.                                          context (Feng et al., 2024; Ge et al., 2023; Li et al., 2024;
+                                                                Liu et al., 2023; Tang et al., 2024; Xiao et al., 2024;
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,    Zhang et al., 2023). Both are effective at lowering bytes
+2026. Copyright 2026 by the author(s).
+                                                                moved, but they introduce approximation errors either by
+               MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+constraining the range of tokens the model can attend to         performs in-stream semantic reuse with local rectification,
+(selection/eviction), or by reducing fidelity (compression).     independent of literal prefix overlap or alternating step
+As a result, performance on tasks with delayed recall,           schedules, and preserves access to the full context.
+cross-document linking, long generation/reasoning, or
+                                                                 Results at a glance. Across LongBench v2 (120K) (Bai
+distributed evidence can degrade (Hsieh et al., 2024), as
+                                                                 et al., 2024), RULER (120K) (Hsieh et al., 2024), and
+shown in Fig. 1.
+                                                                 LongGenBench (16K continuous generation) (Wu et al.,
+This paper introduces MAC-Attention (MAC)—a                      2024), MAC reduces KV accesses by up to 99%, cuts
+training-free, model-agnostic mechanism that accelerates         per-token latency by over 60% at 128K, achieves ≥ 14.3×
+long-context decoding by reusing prior attention                 attention-phase speedups (up to ∼ 46× under 256K context
+computation for semantically similar recent queries while        settings), and delivers up to 2.6× end-to-end generation
+preserving access to the full sequence, and achieving high       speedups on LLaMA—while maintaining full-attention
+fidelity. MAC maintains two short-horizon ring buffers           quality.
+per request: a pre-positional (pre-RoPE) query ring and
+                                                                 Contributions are as follows:
+a corresponding rectified attention-summary ring. When
+a new query matches one in the window, MAC reuses
+                                                                     • We propose Match–Amend–Complete (MAC) Attention,
+the cached attention-summary of the prefix, computes the
+                                                                       a fidelity and access-preserving reuse scheme
+contribution of the tail, then merges them via an associative,
+                                                                       that matches pre-RoPE queries using an L2,
+numerically stable log-domain merge (Dao et al., 2022;
+                                                                       dimension-aware threshold, amends a short high-mass
+Milakov & Gimelshein, 2018). Whenever there is a match,
+                                                                       band near the reuse boundary, and completes with an
+the computation (and memory bandwidth) are constant in
+                                                                       associative, numerically stable log-domain merge.
+the sequence length. When there is no match, it falls back
+to full attention computation (linear).                              • MAC is training-free, model-agnostic, and drop-in
+How MAC Attention maintains high fidelity. There                       for high-performance inference stacks, composing
+are two algorithmic improvements that are crucial to                   with IO-aware attention (Dao, 2023; Dao et al., 2022;
+maintaining a high fidelity (i.e., a low approximation error           Ye et al., 2025), optimized decode paths (Hong
+of the attention output). The first improvement is how                 et al., 2024), paged KV (Kwon et al., 2023), and
+query matching is done. Most modern LLMs use positional                MQA/GQA (Ainslie et al., 2023; Shazeer, 2019).
+encodings that express relative position via rotations or            • Across     LongBench      v2,      RULER,      and
+distance-dependent biases, e.g., RoPE and ALiBi (Press                 LongGenBench (Bai et al., 2024; Hsieh et al.,
+et al., 2021; Su et al., 2024). While it may be simpler                2024; Wu et al., 2024), MAC reduces KV accesses
+to match in post-position (post-RoPE) space, we find that              by up to 99%, achieves ≥ 14.3× (up to ∼ 46×)
+due to the effect of position encodings, distances between             attention-phase speedups and up to 2.6× end-to-end
+otherwise similar queries can become large in post-RoPE                speedups on LLaMA, while maintaining full-attention
+space, which significantly reduces close matches. Instead,             quality.
+MAC matches in pre-RoPE space, which increases the
+matching rate and results in matches that are semantically
+close (regardless of position). The second improvement is        2    BACKGROUND
+the observation that tokens that are near the match position     Long-context decode Even with I/O-aware kernels, the
+account for a significant fraction of the approximation error    dominant cost at long context decoding remains memory
+introduced by reusing the cached output. This is because         traffic: streaming large KV regions from high-bandwidth
+the softmax probability mass typically concentrates near the     memory (HBM) (Dao et al., 2022; 2023; Hong et al.,
+decoding cursor (Press et al., 2021; Su et al., 2024). Thus      2024). To lower bytes moved, existing work either (i)
+MAC rectifies the cached output by recomputing a short           compresses KV states (e.g., by projection or quantization),
+band (of width r) around the match, significantly reducing       or (ii) selects/evicts tokens or pages to shrink the effective
+approximation errors, while only paying a constant O(r)          context (Ge et al., 2024; Hooper et al., 2024; Liu et al., 2024;
+cost per-head.                                                   2023; Xiao et al., 2024; Zhang et al., 2023). Both strategies
+Relation to other reuse paradigms.                  Beyond       can substantially cut I/O, but they also change either how
+compression/selection, prior work reuses structure               information is represented (compression) or which tokens
+across requests (e.g., prefix caching or tree-structured         remain accessible (selection/eviction).
+decoding) (Gim et al., 2024; Yao et al., 2025) or alternates
+full and partial steps by recycling top-k attention from         Exploiting temporal redundancy This paper explores a
+previous steps (Xu et al., 2024). MAC is orthogonal: it          third path, rooted in the observation that computation within
+                                                                 a single decoding stream often exhibits high temporal
+                           MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+                                                                                                  (p)                                          (m)
+redundancy (Chen et al., 2024; Liu et al., 2023; Xu et al.,                               and S1:p can be a good approximation of the true S1:p (and
+2024). In many generative tasks, such as multi-turn dialogue,                             similarly for Z). This forms the basis of our method.
+code generation, or long reasoning, the model’s internal
+                                                                                          The next crucial observation is that in order to further
+state-represented by the query vector at each step-is not
+                                                                                          reduce approximation errors, we can discard and recompute
+drawn from a uniform distribution. Instead, queries often
+                                                                                          a very small part of the prefix (the interval near the
+perform repetitive information-retrieving patterns. This
+                                                                                          match position [p − r, p], which in practice accounts for
+redundancy presents a clear opportunity for reuse. The
+                                                                                          most of approximation error for reasons we shall discuss).
+attention distribution of two similar queries induced over                                                                               (p)
+the shared prefix is likely to be highly correlated. Rather                               More precisely, we use the truncated prefix S1:p−r as an
+                                                                                                               (m)                             (m)
+than re-streaming attention over the shared prefix, reusing it                            approximation of S1:p−r , and freshly compute Sp−r+1:m .
+becomes a clear and intuitive path.                                                       This only slightly increases the KV access (by a constant r)
+                                                                                          while significantly reducing approximation errors.
+Notation Let Qt , Kt , Vt denote, respectively, the query,                                Figure 2 summarizes the method: MAC-Attention keeps
+key and value encodings for token position t (our discussion                              two additional caches: a past query cache (for Qt ) and a past
+applies to any attention block, so we omit indexing of layers                             attention result cache (for the truncated/rectified attention
+or heads for notational simplicity). We also denote by                                    summaries S, Z). In decoding step m, we first perform a
+Q̃t the query encodings prior to applying any positional                                  past-query match; if a matching query Qp is found (p <
+encodings (in short, the per-RoPE query). We will denote                                  m), we reuse the corresponding summaries, which carry
+by m the position of the current token, for which we seek                                 context information up to p − r. Then, we complete the
+to compute the attention output. Define the logits vector                                                                     (m)         (m)
+ (m)                                                                                      result by computing the suffixes Sp−r+1:m , Zp−r+1:m and
+ℓt    = √1d Q⊤ m Kt . The attention output is then defined                                online-merge to obtain the final output.
+as follows: om = S (m) /Z (m) where S (m) is the weighted
+                     (m)                                                                  In the remainder of this section, we discuss design choices
+sum S (m) = t≤m eℓt Vt , and Z (m) is the normalizing
+             P
+                           (m)
+                                                                                          and additional details for each step.
+constant Z (m) = t≤m eℓt .
+                P
+
+                                                                                          3.2     Match: where and how to compare
+3         MAC-ATTENTION : D ESIGN                                                         In this part, we discuss details of the match strategy.
+3.1       Design overview
+                                                                                          3.2.1    Pre vs. post position match
+Our design starts with the following simple observation:
+that the attention computation can be decomposed, at any                                  A first question is at what stage should the query match
+position p, into a prefix and suffix computations. For a set                              be performed. Indeed, in most recent models, positional
+I, Define the attention summary                                                           encodings are applied to the query after QKV projection,
+      (m)
+                  
+                       (m)      (m)
+                                             P          (m)
+                                                         ℓt            P       (m)
+                                                                              ℓt
+                                                                                         and a natural question is whether the match should occur
+ASI         =         SI     , ZI         =         t∈I e       vt ,     t∈I e        .   before or after the positional encodings. Let Q̃t ∈ Rd be
+                                                                                          the pre-positional query at position t, and let Qt = R(t)Q̃t
+                                              (m)      (m)
+The exact output is om = S1:m /Z1:m . Summaries over                                      be the RO PE-transformed query with R(·) orthogonal (Su
+disjoint sets merge by addition. For any position p, attention                            et al., 2024).
+                                                                        (m)   (m)
+                                                                       S1:p +Sp+1:m
+computation can be decomposed into om =                                 (m)   (m)     .   From the perspective of the operation order (QKV projection
+                                                                       Z1:p +Zp+1:m
+This decomposition is numerically stable and associative,                                 → RO PE → attention), post-RO PE matching seems
+and the special case p = m − 1 is used in popular methods                                 more natural in principle because attention consumes the
+such as Flash Attention (Dao et al., 2022; Milakov &                                      post-position vectors. Writing the logits at position m
+                                                                                              (m)
+Gimelshein, 2018).                                                                        as ℓt   = √1d Q⊤ m Kt with Qm = R(m)Q̃m and Kt =
+
+The starting point of the design is to attempt to cache                                   R(t)K̃t (Vaswani et al., 2017), Cauchy–Schwarz yields,
+the results of similar past computations and use them in                                                        (m)      (p)         (Qm −Qp )⊤ Kt
+                                                                                          for any key Kt , ℓt         − ℓt       =        √
+                                                                                                                                            d
+                                                                                                                                                     ≤
+the decomposition above. Specifically, we will attempt to                                 ∥Qm −Qp ∥ ∥Kt ∥
+                    (m)       (m)                                                              √          . Thus a smaller post-RO PE distance directly
+reuse the prefixes S1:p and Z1:p , and approximate them by                                       d
+    (p)     (p)                                                                           bounds the worst-case logit error across all keys.
+S1:p , Z1:p . These quantities are similar but not identical: the
+                                                        (m)                               In practice, however, due to the relative rotation R(m−p),
+first is computed based on the logits ℓt = Kt⊤ Qm , t ≤ p
+                        (p)                                                               as |m−p| grows, the post-RO PE distance between similar
+while the second uses ℓt = Kt⊤ Qp , t ≤ p (they share the
+                                                                                          queries tends to increase, reducing match success. Indeed,
+keys but differ in the queries). However, notice that if the
+                                                                                          matching in post-RO PE space injects a relative phase
+current query Qm is close to Qp , their logits are also close,
+                MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+
+
+
+Figure 2. MAC-Attention: Match–Amend–Complete with async cache update. (a) Match: at position m, compare the pre-RoPE query
+Q̃m against a small ring of recent queries; if the nearest match p passes an L2 threshold, fetch its attention summary AS1:p−r (otherwise
+run full attention). (b) Complete (critical path): with the post-RoPE query qm , compute attention only on the band+tail [ p−r+1, m ]
+and log-domain merge AS1:p−r ⊕ ASp−r+1:m ; the KV [1, p−r] is not accessed. (c) Amend (async): compute a rectification term
+ASr+1:m and update the cache via online subtraction to obtain ASm−r ; insert q̃m , ASm−r into the rings. Symbols: p—match position,
+r—band width; ⊕—log-domain merge, ⊖—log-domain removal. Shaded regions denote KV segments not re-read under reuse.
+
+
+R(m−p) into the comparison. For m > p,                                 3.2.2   L2 vs. cosine match
+
+                      2
+                                                        2              A second design choice is the similarity measure. Choosing
+        ∥Qm − Qp ∥        =   Q̃m − R(m − p)Q̃p             .    (1)   the right measure is important to reduce approximation
+                                                                       errors. Two natural choices are cosine and dot-product.
+                                                                       Cosine similarity captures only direction; two colinear
+Even if Q̃m ≈ Q̃p , the cross-term −2 Q̃⊤
+                                        m R(m−p)Q̃p                    queries with different norms have the same cosine yet
+diminishes as ∆ = |m−p| grows because RO PE is                         induce different logit scales and therefore different softmax
+block-diagonal in 2×2 rotations:
+                                                                       sharpness. In contrast, the Euclidean distance controls both
+                                                                      angle and magnitude. This matters for fidelity as shown
+  R(∆) = diag Rω1 (∆), . . . , Rωd/2 (∆) ,
+                                                                       above, hence minimizing ∥Qm − Qp ∥ uniformly bounds the
+                                    d/2
+                                    X                                  worst-case logit approximation error.
+                     x⊤ R(∆)x =           cos(ωj ∆) ∥x(j) ∥2 ,   (2)
+                                    j=1                                For isotropic pre-RO PE queries, a simple Gaussian model
+                                                                                                                    2 d     2
+                                                                       Q̃m − Q̃p ∼ N (0, 2Id ) implies
+                                                                                                     √∥Q̃m − Q̃p ∥ = 2 χd , so
+with x(j) ∈ R2 the j-th frequency pair. When energy is                 ∥Q̃m − Q̃p ∥ concentrates near 2d. We therefore accept a
+distributed across frequencies, the weighted average                   match when the L2 distance falls proportionally below this
+                                                                       baseline:
+                                                   2                                             √
+                              P
+                                j cos(ωj ∆) ∥x(j) ∥                            ∥Q̃m − Q̃p ∥ <        2d (1 − τ ),    τ ∈ [0, 1),     (3)
+          avg cos(∆) ≡
+                                      ∥x∥2
+                                                                       The parameter τ defines a threshold relative to random
+becomes small for moderate ∆ due to destructive phase                 coincidence, and is set to a fixed value across heads.
+mixing, and ∥x − R(∆)x∥2 = 2∥x∥2 1 − avg cos(∆)
+approaches 2∥x∥2 . Consequently, ∥Qm −Qp ∥ tendsd to                   3.2.3   Local window and search cost
+increase with the gap |m−p|, potentially reducing matches
+                                                                       The candidate set is restricted to a short, recent window of
+even for semantically similar pairs.
+                                                                       size K per (grouped) head. There are several reasons for
+Our design, therefore, matches pre-RO PE to measure                    this: First, reuse is most valuable when the matched prefix
+semantic similarity without positional phase (Fig. 2 a), then          is long (i.e. when the match position is near the current
+performs a short, local rectification near the reuse boundary          token). Second, this allows us to cache only a constant
+to recompute the logits that carry most softmax mass under             number of attention results, and match against a constant
+the true Qm (see Section 3.4). This combination recovers               number of past queries (making the memory and compute
+the practical fidelity one would expect from post-RO PE                cost of matching constant, rather than linear in the sequence
+matching while maintaining robust match frequency. If                  length). Last, similar queries are more likely to occur within
+no match is found, fall back to full attention; outputs are            a short horizon, so restricting to the last K tokens does not
+identical to baseline.                                                 significantly impact the match rate.
+                MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+The matcher is a single streaming pass over the window: for        Then the final output is
+each candidate Q̃p it accumulates two inner products to form
+                                                                                                (p)         (m)
+the squared distance, ∥Q̃m − Q̃p ∥2 = ∥Q̃m ∥2 + ∥Q̃p ∥2 −                                      S1:p−r + Sp−r+1:m
+                                                                                     om =                             .           (7)
+2 Q̃⊤
+    m Q̃p , performing bf16 reads with fp32 accumulation.
+                                                                                                (p)         (m)
+                                                                                               Z1:p−r + Zp−r+1:m
+Arithmetic intensity is low, so the kernel is memory-bound
+but lightweight; tiling over the ring and a warp-only reducer      Removing and recomputing only the short high-mass band
+ensures sufficient waves to hide latency (see §4).                 significantly reduces approximation errors, while keeping a
+                                                                   constant O(r) cost per head (independent of context length).
+3.3     Complete: attention summaries and online merge
+                                                                   3.4.3    Error decays with residual mass outside the band
+As shown in Fig 2 b, suppose the matcher selects index
+                             (p)
+p < m and we have cached AS1:p−r . If we could replace             Using a Lipschitz bound for exponentials and (5), one can
+  (m)        (p)                                                   show that the prefix error after rectification scales as
+AS1:p−r by AS1:p−r without loss, then
+                                                                               (m)
+                                                                     oreuse          ≲ (e∆ − 1) (1 − ρ) · Et∼α(p) ∥vt ∥ , (8)
+                                                                                                                           
+             (m)       (m)                (p)     (m)                 1:p − o1:p
+            S1:p−r + Sp−r+1:m            S1:p−r + Sp−r+1:m                                                                R̄
+  om =       (m)      (m)
+                                    ≈    (p)      (m)
+                                                             .
+            Z1:p−r + Zp−r+1:m           Z1:p−r + Zp−r+1:m          so choosing r to capture most mass (ρ ↑) drives the error
+                                                     (4)           down quickly. In practice, a fixed small r per head works
+Equation (4) is the essence of complete: once a prefix             well across lengths, as shown in Fig. 2 c, we cache rectified
+is summarized, fusing it with a freshly computed tail is           summaries at creation time (position p), making reuse a
+constant-time in the size of the tail.                             constant-time merge at position m via (7).
+
+3.4     Amend: why rectification is necessary, and how to          3.5     Putting it together: match + amend + complete
+        do it
+                                                                   Per query, per head, and per layer:
+3.4.1    Where naive reuse errs
+                                                                     1. Match. Search the recent window of K pre-RO PE
+To understand why rectification is important, consider the
+                                                                        queries using squared L2 and accept if (3) holds.
+naive reuse strategy, that directly replaces the full prefix
+    (m)           (p)               (m)     (p)
+AS1:p with AS1:p . Let δt ≡ ℓt − ℓt for t ≤ p.                       2. Amend.         Load the rectified prefix summary
+        (m)            (p)            (m)              (p)                (p)      (p)
+Then S1:p = t≤p eℓt +δt vt and Z1:p = t≤p eℓt +δt .                     (S1:p−r , Z1:p−r ) and recompute only the band
+               P                             P
+Using the (full) cached prefix corresponds to setting δt = 0.           [p−r+1, p] and tail (p, m] under the current query.
+A first-order expansion of softmax gives
+                                                                     3. Complete. Merge via the online identity (7).
+                                            
+                        (p)
+             ∆αt ≈ αt δt − Eu∼α(p) [δu ] ,                 (5)
+                                                                   We cache (i) the last K pre-RO PE queries and (ii) the
+                                                             (p)   corresponding K rectified prefix summary; Alone with the
+so the approximation error at position k increases with αk .       existing KV cache. In practice, K ≤ 1024, introducing a
+In practice, softmax weights are typically larger for recent       negligible memory overhead in long context scenarios.
+tokens near p due to semantic similarity and recency bias
+from position encodings (Press et al., 2021; Su et al., 2024).
+                                                                   3.6     Economics: when does MAC reduce memory
+Thus, the approximation error is typically dominated by
+                                                                           bandwidth?
+local tokens.
+                                                                   Let BKV be bytes read per cached token in attention and
+3.4.2    Rectification as removing a short high-mass band          Bq bytes read per candidate query during matching. If
+                                                                   the match is at position p with rectification width r and
+Let R = {p − r + 1, . . . , p} be a short band capturing
+                           P        (p)                            we search K candidates, a coarse break-even condition (in
+most prefix mass, with ρ = t∈R αt . Define the rectified           terms of memory traffic) is
+                                                     (p)
+cached prefix by removing this band at position p: AS1:p−r .
+                                                                               p BKV          ≳ K Bq +            rB              (9)
+At position m, we recompute only [p − r + 1, m] under the                      | {z }           | {z }            | {zKV}
+                                                                             prefix avoided    match cost   band+tail recompute
+new query, and merge with the cached summary:
+                   m
+                           (m)
+                                                    m
+                                                            (m)
+                                                                In practice, we will keep K ≤ 1024 and r ≤ 512 so that
+ (m)                                    (m)
+                   X                                X
+Sp−r+1:m =               eℓt vt ,   Zp−r+1:m =            eℓt . MAC-Attention can skip a substantial amount of KV access
+               t=p−r+1                            t=p−r+1       while also maintain a full attention fidelity. We provide a
+                                                           (6)  thorough analysis in §A.2.
+               MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+3.7   Practical notes and compatibility
+Short-horizon rings. We maintain per-request size K
+ring buffers for queries and rectified summaries. The ring
+capacity bounds memory and ensures O(1) insertion.
+KV sharing. MQA/GQA (Ainslie et al., 2023; Shazeer,
+2019) reduce the number of KV heads. MAC-Attention
+matches and reuses at the query granularity as attention is
+performed per-query head, thus the matching kernel is more
+memory-bound then the attention kernel (See Figure 8(a)).
+
+4     S YSTEM DESIGN
+MAC-Attention targets that decoding IO-bound challenge
+directly by (i) matching to reuse a long prefix, (ii) amending
+only a short high-mass band, and (iii) completing with an
+online merge. The system must therefore (1) keep the             Figure 3. Decode micro-pipeline for MAC-Attention. (a):
+matching and amendment overhead below the saved KV               per-request rings L2 match with SplitQ design; (b): per-head work
+traffic, (2) preserve numerical precision during multiple        spans differ because the reuse point p and band size r vary, the
+merges, and (3) integrate cleanly with IO-aware attention        schedule assigns more CTAs to longer band+tail spans as shown in
+                                                                 green blocks; many heads do a cheap merge when reuse is strong;
+and paged KV managers without perturbing batching or
+                                                                 (c): Overview of MAC-Attention workflow.
+memory layout.
+                                                                 the query–head axis and allocate CTAs proportionally to
+4.1   State and data layout
+                                                                 workloads (Fig. 3 b), giving longer spans more thread blocks.
+We maintain two short-horizon, per-request ring buffers,         (2) Attention computation: Given a hit, compute attention
+each with a capacity of K tokens. The query ring stores          only over the band+tail under the current query with the
+pre-RO PE queries from the most recent K tokens for each         effective KV. (3) Merge: Load the rectified prefix summary
+request. The attention-summary ring preserves the rectified      from the attention-summary ring and merge in place.
+prefix summaries (Sprect , Zprect ). Both rings are indexed by
+the request’s global length in modulo K order, so the recent     K3. Rectify–append (ultra-fast, off-critical-path). To
+window is contiguous and insertion is O(1). The scheduler        prepare future reuse, we construct the next rectified
+maps multiple query heads to the corresponding KV head           summary for the just-produced token and append it, together
+without changing the underlying layout.                          with the pre-RO PE query, to the rings. K3 writes three rows:
+                                                                 the query, the rectified attention row, and the ln-LSE scalar.
+4.2   Per-step micro-pipeline                                    Crucially, K3 runs on an auxiliary stream with a single
+                                                                 event dependency—the result is not needed until the next
+In each decode step, MAC-Attention executes three kernels
+                                                                 step visits the same layer. Crucially, as we implemented
+with minimal synchronization:
+                                                                 K3 with fully in-place operations, it also can run within the
+                                                                 main stream as its latency is negligible.
+K1. Match. A tiled, L2 nearest-neighbor scan compares
+each active query against the local window in its request’s      The overall kernel execution order and HBM traffic
+query ring (pre-RO PE) as shown in Fig. 3 (a). We emit           within the attention operation is shown in Fig. 3 (c).
+per-tile minima and run a warp-only final reducer to choose      MAC-Attention composes with IO-aware kernels (Dao,
+at most one reuse point p per (request, head), then apply the    2023; Dao et al., 2022; Ye et al., 2025), optimized decode
+dimension-aware threshold from Eq. (3). Implementation           paths (Hong et al., 2024), and KV virtualization (Kwon
+choices are geared to IO efficiency. The reducer is              et al., 2023).
+shuffle-based to eliminate barrier stalls. Compared to
+standard attention kernels with MQA/GQA, the match               5    E VALUATION
+kernel is intrinsically more memory-bound as it needs to
+stream all query heads.                                          We evaluate whether MAC-Attention (i) preserves task
+                                                                 quality relative to full attention, (ii) delivers end-to-end
+K2. Amend & complete. (1) Workload shaping and load              efficiency gains in decode with real serving frameworks,
+balance: Because each head may reuse a different prefix,         and (iii) derives its gains from its intended mechanisms
+the band+tail span varies per head. We therefore flatten         (pre-RoPE matching, L2 metric, local-band rectification).
+                   MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+
+Table 1. Main accuracy results across models and benchmarks. Accuracy (%) on LongBench v2 (up to 120K context), LongGenBench
+(up to 16K continuous generation), and RULER (120k context). Rows compare Full attention, Quest variants (config / shows the
+budget settings for each benchmark; Quest only supports LLaMA models.), and our MAC-Attention. The KV%↓ columns report average
+KV-budget reduction relative to full attention (higher is more savings); - denotes not applicable. LongGenBench is generation-heavy;
+most models cannot complete the required task; we therefore report Finish% (higher is better), and finish-weighted accuracy.
+                                                                               LongBench v2                                   LongGenBench                     RULER
+Model                            Config.                  Overall      Short     Medium        Long      KV%↓       Finish %       Acc.     KV%↓          Acc.   KV%↓
+LLaMA-3.1-8B                     Full attention             29.0        35.0        26.0        25.0         0         93.1        34.7         0         79.8     0
+(Grattafiori et al., 2024)       Quest-8K/4K/8K             28.0        33.9        24.2        25.9        85         92.8        32.9        35         77.0    93
+                                 Quest-4K/3K/4K             27.4        33.3        24.7        23.1        92         91.6        34.8        48         75.5    97
+                                 Quest-2K                   27.8        32.2        26.0        24.1        96         89.9        33.8        63         73.4    98
+                                 Quest-1K                   26.2        33.3        22.3        22.2        98         83.6        27.2        80         72.4    99
+                                 MAC-Attention              30.2        34.4        27.4        28.7        99         90.0        38.2        80         78.8    95
+Phi-4-Mini                       Full attention             28.0        32.8        23.3        29.6         0           –           –         –          74.4     0
+(Abouelenin et al., 2025)        MAC-Attention              29.8        33.9        25.1        32.4        91           –           –         –          73.1    77
+GLM-4-32B                        Full attention               –           –           –           –         –          69.8        29.7         0          –      –
+(GLM et al., 2024)               MAC-Attention                –           –           –           –         –          66.1        30.1        70          –      –
+LLaMA-3.1-70B                    Full attention             31.4        41.7        26.5        24.1         0         98.1        41.9         0         80.1     0
+(Grattafiori et al., 2024)       Quest-8K/4K/8K             31.2        40.6        27.4        23.1        85         97.5        45.8        29         79.8    93
+                                 Quest-4K/3K/4K             31.8        40.6        27.9        25.0        92         98.6        45.2        40         79.8    97
+                                 Quest-2K                   31.2        39.4        27.9        22.2        96         98.3        46.2        54         79.5    98
+                                 Quest-1K                   30.8        39.4        27.9        22.2        98         93.8        41.9        72         78.3    99
+                                 MAC-Attention              32.2        40.6        28.8        25.0        99         98.6        43.6        75         78.0    99
+GLM-4-32B has 32K context limit, Phi-4-Mini baseline generates poor-quality responses on LongGenBench, hence their results are excluded from the table.
+
+
+
+Unless otherwise noted, MAC-Attention is enabled for                                  LongGenBench (Wu et al., 2024) targets continuous
+decode only. MAC-Attention also applies to prefill and                                long-form generation with outputs up to 16K tokens,
+is fully functioning, but may require additional tweaking,                            using an LLM as judge (default LLaMA-3.3-70B). It
+see results and analysis in §A.3.                                                     is particularly stringent for KV-efficient methods: small
+                                                                                      perturbations in attention can accumulate over thousands
+5.1   Experimental Setup                                                              of decode steps, producing cascading errors. To our
+                                                                                      knowledge, prior KV-efficiency works have rarely reported
+Models. As shown in Table 1.                                                          evaluations on this benchmark; our study fills this gap.
+Runtime. SGLang 0.4.9 with FlashInfer 0.2.7 kernels,                                  Across benchmarks, we mostly use a fixed search window
+running on NVIDIA H100 SXM5 with CUDA 12.8.1.                                         K = 1024 with a rectification band r = 256, and a
+Besides Quest, we also compare our method to other                                    threshold τ = 0.45 for context-heavy tasks and τ = 0.75
+efficient attention strategies, e.g. SnapKV, TOVA, in                                 for generation-heavy tasks. More detailed on how to choose
+Fig. 1. For all experiments, we fix the random seed, set the                          these parameters can be found in §A.1, §A.2, and §B.
+temperature to 0, and keep only the attention path different.
+                                                                                      5.3    Task Fidelity Relative to Full Attention
+5.2   Benchmark details                                                               In Table 1, we report accuracy/finish rates on these
+LongBench v2 (Bai et al., 2024) is a diverse long-context                             three benchmarks. Under identical decode settings,
+suite (up to 120K tokens in our experiment) spanning QA,                              MAC-Attention matches (and in some cases, slightly
+summarization, and retrieval tasks; results are partitioned                           improves) full-attention quality (we suspect it is due to some
+into Short/Medium/Long to evaluate length sensitivity.                                potential noise in long context computation for the baseline
+                                                                                      full attention), while achieving significant KV-budget
+RULER (Hsieh et al., 2024) provides controlled synthetic                              reductions. Gains concentrate in the Medium/Long buckets
+probes (fixed at 120K in our experiment) that stress                                  of LongBench v2 and carry over to LongGenBench with
+long-range retrieval, delayed recall, and robustness to                               comparable finish rates; the few regressions (e.g., RULER
+positional biases and length extrapolation.                                           at 70B) are small.
+                     MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+
+            Table 2. Overall accuracy on LongBench v2
+ KV %      Full Attn.         Quest   RocketKV       Multipole        MAC-Attn.
+       1           29.0        27.6           29.4           27.6           30.2
+       5           29.0        27.8           29.2           27.8           30.4
+      10           29.0        27.6           29.2           30.2           30.2
+      20           29.0        28.2           29.4           28.0           29.6
+
+
+
+Table 3. End-to-end Attention Latency (µs) on 120K context
+ KV %      Full Attn.         Quest   RocketKV       Multipole        MAC-Attn.
+       1          234.2       581.2          822.8          192.4           62.9
+       5          234.2       594.7          844.7          210.8           64.0
+      10          234.2       608.5         1042.5          265.4           78.1
+      20          234.2       640.5         1855.6          324.6          103.8
+                                                                                   Figure 4. Rectification error vs. reuse gap and band width.
+                                                                                   Layerwise heatmaps show the normalized output error as a function
+                                                                                   of reuse gap (∆) and rectification band width (r); representative
+Compared to selection. Relative to token-selection                                 layers are displayed.
+baselines (Quest), MAC-Attention typically attains
+equal or higher accuracy at similar or stricter KV
+budgets—consistent with preserving access to all tokens                            Discussion. Across all window sizes, MAC-Attention
+rather than compressing/evicting them.                                             maintains stable accuracy relative to full attention while
+                                                                                   achieving very high hit and skip ratios. This suggests that,
+5.4    Comparison on accuracy vs. speedup                                          despite the conditional computation introduced by MoE
+                                                                                   routing, the semantic structure exploited by our matching
+We evaluate more efficient attention methods on LongBench                          mechanism remains sufficiently consistent for effective
+v2, and measure their end-to-end latencies at 120K context                         reuse.
+length. Full Attn. denotes the FlashInfer full attention
+baseline. For Quest (Tang et al., 2024), RocketKV (Behnam                          5.6   Rectification Error vs. Reuse Gap and Band Width
+et al., 2025), and Multipole (Hooper et al., 2025), we
+followed the authors’ official repositories to build kernels                       Setup and metric. We quantify how much amend reduces
+and used their official evaluation scripts for accuracy/latency.                   approximation error as a function of the rectification band
+As shown in Table 2 and Table 3, most existing efficient                           width r and the reuse gap ∆ = m−p, where m is the current
+attention methods have significant overheads in addition to                        decode position and p is the matched query position selected
+attention, thereby failing to surpass even the full attention                      by the pre-RO PE L2 matcher from §3.2. For each layer we
+FlashInfer baseline.                                                               compute the per-token output error
+                                                                                                                  oMAC
+                                                                                                                   m   − ofull
+                                                                                                                          m 2
+5.5    Query Hit Rate Beyond Dense Models                                                          Err(m) =                       ,
+                                                                                                                       ofull
+                                                                                                                        m 2
+
+                                                                                   and average over LongGenBench sequences and over all
+Table 4. Evaluation on MoE model (Qwen3-30B-A3B-Instruct)
+                                                                                   query heads (GQA: 32 Q heads sharing 8 KV heads).
+ Model / Setting      τ         K      r     Overall Acc.    Hit (%)    Skip (%)
+                                                                                   Figure 4 visualizes the average error as a heatmap for a
+ Full attention           –      –    –          37.0           –          –
+                                                                                   few representative layers of LLaMA-3.1-8B (32 layers):
+ MAC-Attention       0.45       512   256        37.0          99.5       98.9     layers 2, 4, 8, 9, 15, and 20. The x-axis is the relative match
+ MAC-Attention       0.45      1024   256        36.6          99.6       99.0
+ MAC-Attention       0.45      2048   256        37.6          99.6       98.8     position ∆, the y-axis is the rectification band width r, and
+ MAC-Attention       0.45      4096   256        36.6          99.7       98.6     lighter color indicates lower error.
+                                                                                   Insights. Error decays rapidly as the band widens, r ≈ 8
+Mixture-of-Experts (MoE) models introduce dynamic                                  removes most discrepancy, and r ≥ 256 is effectively
+expert routing, therefore, we evaluate our method on the                           indistinguishable from full attention, indicating that
+MoE model Qwen3-30B-A3B-Instruct using the same                                    recomputing a short high-mass band captures the dominant
+threshold (τ = 0.45). Table 4 shows that MAC-Attention                             discrepancy near the reuse boundary. At fixed r, larger reuse
+consistently achieves a ≥ 99% hit ratio while maintaining                          gaps are more sensitive, and deeper layers tend to require
+comparable accuracy to full attention. This indicates that                         slightly wider bands—both consistent with position-induced
+MoE expert routing does not significantly hinder effective                         logit drift and layerwise aggregation. Occasional outliers
+semantic query matching in practice.                                               arise when residual attention mass extends beyond the
+                                                            MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+                            Per-layer Acceptance (L2 Threshold τ Sweep)                                                                Per-layer KV Skip (L2 Threshold τ Sweep)
+                               0.0   0.1        0.2   0.3   0.4    0.5    0.6   0.7   0.8        0.9                                    0.0   0.1        0.2   0.3   0.4    0.5    0.6   0.7   0.8        0.9
+
+                                                                                                                             80
+                                                                                                                                                                                                                     Table 5. Fine-grained attention-path latency profile (µs) at fixed
+Acceptance Rate (%)
+
+
+
+
+                      80
+                                                                                                                                                                                                                     match window K = 1024. Full attention reports FlashInfer
+
+
+
+
+                                                                                                            Skip Ratio (%)
+                                                                                                                             70
+                      70
+                                                                                                                                                                                                                     attention latency. MAC reports the Match kernel, load balancer,
+                                                                                                                             60
+                      60
+                                                                                                                                                                                                                     attention kernel, and overall attention-path latency.
+                      50                                                                                                     50
+                                                                                                                                                                                                                      Context    KV %   Full Attn.              MAC-Attention
+                           0    4          8          12      16         20     24          28         32                         0      4          8          12      16         20     24          28         32
+                                                             Layer                                                                                                    Layer                                                             Attention    Match   Load bal.   Attention   Overall
+                           Per-layer Acceptance (Search Window K Sweep)                                                               Per-layer KV Skip (Search Window K Sweep)
+                               32          64         128     256        512      1024       2048                                       32          64         128     256        512      1024       2048              32K       1        71.6       9.1      28.8        26.0       63.9
+                                                                                                                             80                                                                                         32K       5        71.6       9.1      28.9        25.2       63.2
+                      80
+Acceptance Rate (%)
+
+
+
+
+                                                                                                                                                                                                                        32K       10       71.6       9.1      28.6        25.1       62.8
+                      60                                                                                    Skip Ratio (%)   60
+                                                                                                                                                                                                                        32K       20       71.6       9.1      29.5        27.3       65.9
+                      40                                                                                                     40
+                                                                                                                                                                                                                        60K       1       133.0       9.1      28.6        24.8       62.5
+                      20                                                                                                     20
+                                                                                                                                                                                                                        60K       5       133.0       9.1      29.1        25.7       63.9
+                           0    4          8          12      16         20     24          28         32                         0      4          8          12      16         20     24          28         32      60K       10      133.0       9.1      29.4        27.3       65.8
+                                                             Layer                                                                                                    Layer
+                                                                                                                                                                                                                        60K       20      133.0       9.1      30.2        41.2       80.5
+                                                                                                                                                                                                                       120K       1       234.2       9.1      28.9        25.6        63.6
+Figure 5. Layerwise reuse patterns. Acceptance rate (left) and                                                                                                                                                         120K       5       234.2       9.1      30.1        25.5        64.7
+skipped-prefix fraction (right) per layer. Top: threshold sweep at                                                                                                                                                     120K       10      234.2       9.1      30.6        39.1        78.8
+                                                                                                                                                                                                                       120K       20      234.2       9.1      30.2        65.2       104.5
+fixed window size. Bottom: window-size sweep at fixed threshold.
+
+
+
+
+amended band or when query differences behave like
+near-uniform logit rescaling. Overall, a small, fixed r
+per head suffices to make reuse faithful across layers and
+sequence lengths.                                                                                                                                                                                                    5.8      Fine-Grained Match/Attention Latency Profile
+                                                                                                                                                                                                                     The match kernel runs only within the fixed search window
+5.7                            Layerwise Reuse Patterns: Acceptance and
+                                                                                                                                                                                                                     K, never over the full context. Thus its overhead is a
+                               Skipped-Prefix Fraction
+                                                                                                                                                                                                                     constant regardless of the context length. Table 5 makes
+Setup and metrics. We profile how often MAC can reuse                                                                                                                                                                this explicit by showing the fine-grained latency profile of
+a prefix per layer using LongGenBench. For a current                                                                                                                                                                 the Match kernel, load balancer, and attention kernel under
+decode position m and a matched index p (see §3.2),                                                                                                                                                                  32K, 60K, and 120K contexts.
+Figure 5 reports: (i) the acceptance rate—the fraction of
+                                                                                                                                                                                                                     First, the Match kernel stays fixed at 9.1 µs across all
+decoding steps for which at least one candidate in the cache
+                                                                                                                                                                                                                     contexts and KV-budget settings, confirming that it is
+window passes the pre-RO PE L2 test in Eq. (3); and (ii)
+                                                                                                                                                                                                                     bounded by the search window rather than the total sequence
+the skip ratio—the expected fraction    of the prefix that is
+                                                                                                                                                                                                                   length. Second, the load balancer is also nearly constant,
+not re-read when a reuse occurs, E (p − r)+ /m (we count
+                                                                                                                                                                                                                     staying in the 28.6 to 30.6 µs range; this indicates that the
+misses as zero). All quantities are averaged over sequences
+                                                                                                                                                                                                                     scheduling overhead also does not scale materially with
+and over the 32 query heads that share 8 KV heads (GQA)
+                                                                                                                                                                                                                     context length. Third, the MAC attention kernel is the only
+within each layer in the LLaMA-3.1-8B model.
+                                                                                                                                                                                                                     component that grows meaningfully, because it still depends
+Threshold sweep (fixed window K=2048) varies the                                                                                                                                                                     on the effective band+tail span after reuse. At aggressive
+L2 threshold τ ∈ [0, 0.9] from Eq. (3), revealing                                                                                                                                                                    budgets (1%–5%), that kernel remains around 25 µs even at
+layer dependent query similarity.         Window sweep                                                                                                                                                               120K, while at the more relaxed 20% budget it grows from
+(fixed threshold τ =0.75) varies the search window                                                                                                                                                                   27.3 µs at 32K to 65.2 µs at 120K.
+K ∈ {32, . . . , 2048}, revealing layer dependent temporal
+                                                                                                                                                                                                                     Overall, these numbers show that MAC converts the
+locality.
+                                                                                                                                                                                                                     dominant context-sensitive cost into a small constant
+Insights. Reuse is strongly layer-dependent. Early layers                                                                                                                                                            front-end plus a reduced attention computation. For
+exhibit high self-similarity and thus frequent reuse; specific                                                                                                                                                       example, at 1% KV budget the overall attention-path latency
+mid and upper layers are more variable and benefit from                                                                                                                                                              remains essentially flat, from 63.9 µs at 32K to 63.6 µs at
+slightly larger windows. Increasing the search window                                                                                                                                                                120K, whereas full attention increases from 71.6 to 234.2 µs.
+stabilizes acceptance and increases the skipped-prefix                                                                                                                                                               Even at 20% KV budget, MAC rises only to 104.5 µs at
+fraction up to a point, beyond which returns diminish.                                                                                                                                                               120K, still well below the full-attention baseline. This is
+These profiles suggest that lightweight, per-layer tuning                                                                                                                                                            the intended operating behavior: once the match window is
+of the match threshold and window size could further raise                                                                                                                                                           fixed, the remaining latency growth is driven mainly by the
+acceptance and skip ratios without meaningful overhead.                                                                                                                                                              unreused suffix rather than by the full prefix length.
+                                                      MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+                                                             32K                                                               64K                                                                        128K                                                                                                             256K
+                                                                                 MAC-Attention 99%                 MAC-Attention 90%                  MAC-Attention 70%                       MAC-Attention 60%                                  Full Attention (FlashInfer)                                                                                  46.13×
+                           50×                                                                                                                                                                                                                                                                                                                     40.55×
+                                                                                                                                                                                                                                                  33.99×                                                                         34.18×
+                                                                                 MAC-Attention 95%                 MAC-Attention 80%                                                                                             26.91×
+                           30×                                                                                                                          21.72×                                                     21.94×                                                                                       23.98×
+       Attention speedup
+
+
+
+
+                                                                                                                                            17.36×
+                                                                                       13.51×                                                                                                  14.34×                                                                                            15.09×
+                                                                                                                                 13.21×
+                           15×
+                                                                             10.10×
+                           10×                                                                                        7.39×                                                    7.73×                                                                                         7.91×
+                                                                 6.80×
+                            7×
+                            5×                         3.78×                                               4.07×                                                 4.08×
+                            4×
+                            3×              2.11×                                                 2.17×
+                            2×
+                                 1.13×
+                            1×
+                                  1          2           4            8         16          32      1        2             4          8         16        32      1              2                    4               8                16           32                              1               2                  4              8              16          32
+                                                         Batch size                                                        Batch size                                                              Batch size                                                                                                         Batch size
+
+
+
+
+Figure 6. Attention speedup vs. batch size and KV skip ratio across context lengths. Speedup is computed as the combined
+attention-phase latency of our scheme (512-token matching window, load-balanced planning, rectified-prefix reuse, and tail attention).
+The wide shared axes are split into four subgroups for contexts {32K, 64K, 128K, 256K}; within each subgroup, the x-axis places batch
+sizes {1, 2, 4, 8, 16, 32}, the y-axis (shown once, left) is log-scale with a 1× reference line. Each line denotes a KV skip ratio. For more
+thorough latency comparison with existing efficient attention methods, refer to §5.4.
+
+
+                                              KV skip ratio = 0.99                                        KV skip ratio = 0.9                                                 (a) Match vs. Attention kernel latency                                                                                    (b) Eff. of Load Balance Planner
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                        Context 32K Context 64K Context 128K
+                 1600                                                       1476 μs                                                   1476 μs                                                                                                    42.2                                                                              412.7
+
+
+
+
+                                                                                                                                                                                                                                                         GQA 40-10
+                                                                                                                                                                  2048                                         21.5                                                                 σ=0.3                                                  498.9
+                                                                                                                                                                                                                                                                                                                                                               795.1
+                                                                                                                                                                                                             19.8                                                                                                       283.5
+                                                                                                                                                                  1024                                    17.5                                                                      σ=0.2                                  335.5
+                                                                                                                                                                                                                                                                                                                                             541.0
+                                                                                                                                                                                                 13.6                                                                                                       150.0
+                 1200
+ Latency (μs)
+
+
+
+
+                                                      1066 μs                                                    1066 μs         −813.3 μs (×2.23)                 512                                       19.8                                                                   σ=0.1                     176.7
+                                                                                                                                                                                                                                                                                                                        283.5
+                                                                          −911.0 μs (×2.61)
+                                 821 μs                                                      821 μs          −442.5 μs (×1.71)                                                                                                  31.7                                                                                216.3
+                                                    −498.0 μs (×1.88)                                                                                             2048                                                                                                              σ=0.3                              259.4
+
+
+
+
+                                                                                                                                                                                                                                                         GQA 32-8
+                                                                                                                                                                                                           17.9                                                                                                                   407.2
+                           800
+                             −245.3 μs (×1.43)                                             −220.5 μs (×1.37)                               662.7 μs                                                           19.8                                                                                          151.1
+                                      575.7 μs                                                    600.5 μs          623.5 μs                                      1024                                    17.2                                                                      σ=0.2                     176.7
+                                                             568 μs               565 μs                                                                                                                                                                                                                                281.5
+                                                                                                                                                                                                 13.5                                                                                               82.5
+                                                                                                                                                                   512                                    17.3                                                                      σ=0.1            97.9
+                                                                                                                                                                                                                                                                                                         151.1
+                           400
+                                                                                                                                                                                               12.6                                                                                                   117.9
+                                                                                                                                                                  2048                                    17.3                                                                      σ=0.3               138.3
+                                                                                                                                                                                                                                                                                                                                                       MAC Perfect
+
+
+
+
+                                                                                                                                                                                                                                                         GQA 8-2
+                                                                                                                                                                                                                                                                                                              213.1
+                                                                                                                                                                                            10.7                                                                                                    83.6
+                                                                                                                                                                  1024                                    17.5                              Match                                   σ=0.2            98.8
+                                                                                                                                                                                                                                                                                                         147.7                                         MAC w.LB
+                             0                                                                                                                                                          8.8                                                                                                       50.6
+                                      32K                 64K                  128K              32K                64K                   128K                     512                                     18.1                             Attention                               σ=0.1          58.9
+                                                                                                                                                                                                                                                                                                     83.5                                              MAC w.o. LB
+
+                                                 KV skip ratio = 0.8                                      KV skip ratio = 0.6                                             0            10                  20              30               40                                               0               200                400            600           800
+                                                                                                                                                                                                           Latency (us)                                                                                                        Latency (us)
+                 1600                                                       1476 μs                                                   1476 μs
+                                                                                                                                                                                      (c) Breakdown at GQA 32-8                                                                                             (d) Breakdown at GQA 64-8
+                                                                                                                                 −492.7 μs (×1.50)
+
+
+
+
+                                                                                                                                                                                                                                                         Context 64K Context 128K
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                        Context 64K Context 128K
+                 1200                                                     −708.4 μs (×1.92)
+ Latency (μs)
+
+
+
+
+                                                      1066 μs                                                    1066 μs                                           Full                                                                          959.8                                Full                                                                     1360.8
+                                                                                                                                           983.3 μs
+                                                                                                             −263.2 μs (×1.33)                                    0.99         69.4                                                                                                  0.99         80.1
+                               821 μs          −382.7 μs (×1.56)                           821 μs                                                                 0.90                164.8                                                                                          0.90                   241.6
+                                                                                 767.6 μs−119.9 μs (×1.17)          802.8 μs
+                             −183.7 μs (×1.29)
+                           800                        683.3 μs                                  701.1 μs                                                          0.80                        269.5                                                                                  0.80                             425.7
+                                    637.3 μs
+
+                                                                                                                                                                   Full                                           487.9                                                               Full                                       685.6
+                           400                                                                                                                                    0.99         68.9                                                                                                  0.99         73.0
+                                                                                                                                                                  0.90            114.8                                                                                              0.90             164.3
+                                                                                                                                                                  0.80               167.3                                                                                           0.80                 267.4
+
+                             0                                                                                                                                                                                                              Full                                                                                                            Full
+                                      32K                 64K                  128K              32K                64K                   128K
+
+
+
+
+                                                                                                                                                                                                                                                         Context 32K
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                        Context 32K
+                                                                                                                                                                   Full                       252.5                                         Match                                     Full                      346.9                                       Match
+                                                                                                                                                                  0.99         69.1
+                                                                                                                                                                                                                                            Plan                                     0.99         71.6
+                                                                                                                                                                                                                                                                                                                                                            Plan
+                                                                                                                                                                  0.90          88.2                                                                                                 0.90           115.2
+                            QKV Proj+RoPE                Full Attention (FlashInfer)                MAC-Attention               FFN          Misc.                0.80            116.3                                                     Attention                                0.80             165.8                                                 Attention
+
+                                                                                                                                                                          0           200             400            600         800             1000                                        0           250          500        750         1000     1250      1500
+                                                                                                                                                                                                           Latency (us)                                                                                                        Latency (us)
+
+Figure 7. End-to-end decode latency breakdown and speedup.
+For a fixed batch size, stacked bars show phase-level latency                                                                                                    Figure 8. Kernel-level costs and load balancing. (a) L2 Match
+(QKV+RoPE, attention, FFN, misc.) under full attention and                                                                                                       kernel latencies under different GQA settings and window lengths
+MAC-Attention across contexts and skip ratios; speedup is                                                                                                        (using standard Attention for reference). (b) Effect of the
+computed end-to-end.                                                                                                                                             load-balancing planner compared with a perfectly balanced oracle
+                                                                                                                                                                 and an unbalanced baseline. (c–d) Per-step composition of
+5.9                              Attention-Phase Speedup vs. Batch Size, Context                                                                                 MAC-Attention (Match, Plan, Attention) across contexts.
+                                 Length, and Skip Ratio
+                                                                                                                                                                 At lower skip (e.g., MAC-60%) and very small batches, the
+Figure 6 shows that MAC-Attention’s gains grow                                                                                                                   fixed reuse overhead can outweigh KV savings—hence a
+systematically with (i) the KV skip ratio, (ii) batch size,                                                                                                      small regression vs. baseline at 32K/batch 1, suggesting a
+and (iii) context length—exactly what we expect for an                                                                                                           regression point where we should use full attention instead.
+IO-bound workload. At fixed length and batch, higher
+skip (e.g., MAC-99%) yields the largest acceleration
+                                                                                                                                                                 5.10                 End-to-End Decode Latency: Phase Breakdown
+because only ∼ 1% of the KV region is streamed and
+                                                                                                                                                                                      and Speedup
+reduced per step; the remaining overheads—pre-RoPE
+matching, a small rectification band, and a constant-time                                                                                                        Figure 7 shows that MAC’s end-to-end gains on
+log-domain merge—are largely length-independent. As                                                                                                              LLaMA3.1-8B-Instruct increase monotonically with both
+batch size increases, the baseline saturates HBM bandwidth,                                                                                                      context length and the KV skip ratio at a fixed batch size.
+so reducing KV bytes translates into direct wall-clock gains                                                                                                     MAC-Attention only changes the attention path, with other
+for MAC-Attention; for example at 32K, the MAC-99%                                                                                                               operations untouched. This is the IO-bound regime we
+series scales from ∼ 1.1× (batch 1) to ∼ 13.5× (batch 32).                                                                                                       target: as sequences grow longer, attention (and thus KV
+The effect compounds with longer contexts: at batch 32 and                                                                                                       traffic) occupies a larger fraction of the decode profile, so
+MAC-99%, speedups climb from ∼ 13.5× (32K) to ∼ 21×                                                                                                              reducing KV bytes moved translates into proportionally
+(64K), ∼ 34× (128K), and ∼ 46× (256K).                                                                                                                           larger wall-clock wins. Conversely, non-attention stages
+               MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+(QKV+RoPE, FFN, and runtime overheads) cap the overall          thread block to a KV group and loads KV once for all heads
+speedup, consistent with Amdahl’s law. At high skip (e.g.,      in the group, a single head with a low KV skip ratio directly
+≳ 0.9), MAC amortizes its fixed overheads (short-band           increase work for that group.
+rectification and constant-time log-domain merge), yielding
+substantially larger gains at 64K–128K than at 32K.
+                                                                Table 6. MAC Attention matching skew within each KV group at
+                                                                different model layers. Numbers are rounded to integers.
+5.11   Kernel-Level Costs and Load Balancing Effects
+                                                                       Layer     Avg.   Std.     Layer   Avg.    Std.
+Kernel micro-benchmarks (Fig. 8a). The L2 Match                          0       -399    0        18      -278   17
+kernel is inherently more memory-bound than FlashInfer                   6       -369   64        24      -483   121
+Attention under GQA because it scans per query head while                12      -272   15        31      -346   40
+attention streams per (fewer) KV heads. Consequently, with
+GQA 8 − 2 the matcher remains faster across lengths; at
+32−8 it is faster at 512 but becomes slower at 1,024–2,048      The latency numbers of MAC-Attentionwe reported already
+as DRAM traffic dominates; and at 40 − 10 the trend             take into account this potential fallback. As shown in
+amplifies, with match latency approaching ∼ 2× attention        Fig 8(b), the gap to the perfect balance is due to this
+at 2,048. Note, Figure 8(a) is designed to evaluate the         non-uniformity. To quantify this, in Table 6 we measured
+L2 Match kernel and the reference Attention kernel at the       within-KV-group match-position skew across layers on
+same token counts to expose their raw kernel behavior,          LongBench v2. The skew is typically small with some
+since matching is more memory-bound under GQA. Across           outliers. Avg. measures the averaged median of the relative
+all experiments, however, the match window is fixed at          position of successful matches, e.g., -399 denotes matching
+K = 1024, so its latency is effectively constant regardless     to a query that is 399 tokens prior to the current decoding
+of the context length. Table 5 makes this explicit by showing   token. Std. measures the median non-uniformity of these
+the fine-grained latency profile of the Match kernel, load      relative positions within each KV group. In the first layer,
+balancer, and attention kernel under 32K, 60K, and 120K         surprisingly, we observed a uniform matching, where all
+contexts.                                                       attention heads match to the same previous query. In other
+                                                                layers, we observed some fluctuations in matching positions.
+Load balancing efficacy (Fig. 8b). Across contexts
+{32K, 64K, 128K} and reuse skew σ ∈ {0.1, 0.2, 0.3},            5.13   Auxiliary HBM Overhead of Query and
+the CTA load-balancing planner consistently narrows                    Summary Caches
+the gap to an oracle “perfect” schedule. Relative to            An important property of MAC-Attention is that its extra
+a naı̈ve (unbalanced) assignment, load balancing trims          state is bounded by the search window K, rather than by
+attention-phase latency by ∼ 29%–38%, and recovers ≈            the full context length L. Besides the baseline KV cache,
+75%–80% of the excess over the perfect baseline. A residual     we only keep a ring of recent queries for matching and the
+∼ 16%–21% overhead remains due to CTA-granularity               associated cached summary bookkeeping within the same
+limits—once a CTA is partially filled, intra-CTA imbalance      window. Therefore, the auxiliary HBM footprint grows as
+cannot be further corrected under the GQA scheme                O(K), whereas the baseline KV cache grows as O(L). In
+due to the workload mapping strategy in the current             practice, the query ring is the dominant term, while the
+implementation. We conducted a more in-depth study to           cached summary scalars contribute only a small additional
+investigate the effect of this reuse skew in §5.12.             overhead.
+
+Component breakdown (Fig. 8c–d). The per-step Match
+cost is flat with respect to context length (bounded by         Table 7. Approximate auxiliary HBM overhead at 128K context.
+fixed K); the Plan stage is nearly constant and negligible.            Search window K         Aux. HBM overhead %
+The Attention component scales with length and dominates                       256                       1.2
+variability, decreasing predictably with higher KV skip.                       512                       2.3
+Hence end-to-end gains are driven by avoided KV bytes,                         1024                      4.7
+growing with both skip ratio and sequence length, in line                      2048                      9.4
+with the budget in Eq. (9).
+                                                                In our default setting K = 1024, the measured auxiliary
+5.12   Performance fallback inside GQA KV group
+                                                                footprint is only about 5% of the KV-cache size at
+MAC-Attentionperforms matching per query head, so               120K context, while the same setting delivers a 7.9×
+different query heads within the same KV group may reuse        attention-phase speedup. This is the key systems tradeoff:
+different prefix points. Because our implementation maps a      MAC-Attention pays a small, constant-size cache overhead
+                MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+in exchange for substantially reducing repeated KV traffic         7    D ISCUSSION AND FUTURE W ORK
+over the much longer active context.
+                                                                   In long context scenarios, we often observe that
+Using the profiled K = 1024, L = 120K point                        MAC-Attention can achieve an acceptance/hit rate greater
+as a reference, the relative auxiliary footprint can be            than 99% within the K search window, achieve a de-facto
+approximated as                                                    O(1) complexity computation and memory access once hits.
+                                                                   Although it still needs to visit all context on a match miss,
+                                                                   falling back to O(n) overall, we believe this scheme can be a
+                                        K     120K                 promising direction for future research in efficient attention.
+         Overhead(K, L) ≈ 5% ·              ·      ,
+                                       1024     L                  More broadly, MAC-Attention complements linear and
+                                                                   sub-quadratic attention by amortizing computation across
+                                                                   time rather than altering representations or discarding
+which reflects the linear dependence on K and the inverse          tokens. As we suggested in §5.6 and §5.7, a more robust
+dependence on the total context length L. Table 7 reports          and adaptive configuration may further strengthen it.
+the resulting auxiliary HBM overhead at L = 128K. Even
+at K = 2048, the extra footprint remains below 10%, which
+supports the practical operating regime used throughout the
+                                                                   8    C ONCLUSION
+paper.                                                             We presented a training-free,                  model-agnostic
+                                                                   scheme, MAC-Attention. It accelerates long context
+6    R ELATED W ORK                                                inference by reusing prior attention via a lightweight
+                                                                   Match–Amend–Complete pipeline. The approach preserves
+Compression and selection                                          full access to context, composes with IO-aware kernels and
+KV compression cuts memory traffic via low-rank/quantized          paged-KV managers. Across a wide range of long context
+caches and two-stage pipelines (Behnam et al., 2025; Chang         benchmarks, MAC-Attention maintains full-attention
+et al., 2024; Zhang et al., 2024), while selection/eviction        quality while largely reducing KV reads, cutting end-to-end
+prunes tokens or pages using statistics, heuristics, or learned    latency by over 60% at 128K, and yielding up to 2.6×
+signals—including position-persistent sparsity (Feng et al.,       faster token generation on LLaMA models (and up to 46×
+2024; Ge et al., 2023; Li et al., 2024; Liu et al., 2023; Tang     on the attention phase). In practice, high match rates make
+et al., 2024; Xiao et al., 2024; Yang et al., 2025; Zhang          step cost largely prefix-insensitive, directly targeting the IO
+et al., 2023); in contrast, MAC-Attention keeps access to          bottleneck that dominates long-context decode. By reusing
+KV as a fallback or a correction in a very low frequency,          computation rather than compressing or discarding tokens,
+avoiding prefix reads by reusing prior attention summaries,        MAC-Attention complements KV compression/selection
+mathematically approaching the original full attention’s           and broadens the design space for fast, faithful attention.
+fidelity.
+                                                                   R EFERENCES
+Structural/prefix reuse and stepwise reuse                         Abouelenin, A. et al.        Phi-4-mini technical report:
+Prefix reuse across requests and tree-structured decoding            Compact yet powerful multimodal language models via
+shares computation when textual prefixes overlap (Gim                mixture-of-loras. arXiv preprint arXiv:2503.01743, 2025.
+et al., 2024; Yao et al., 2025), and stepwise reuse alternates       doi: 10.48550/arXiv.2503.01743.
+full and partial updates from prior attention patterns (Xu
+                                                                   Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+et al., 2024) which alternates full attention steps with partial
+                                                                     Lebrón, F., and Sanghai, S. GQA: Training generalized
+steps that attend only to the top-k tokens from a previously
+                                                                     multi-query transformer models from multi-head
+computed attention pattern; MAC-Attention reuses within
+                                                                     checkpoints. arXiv preprint arXiv:2305.13245, 2023.
+a single stream based on query similarity, independent of
+literal prefix overlap or decoding topology.                       Bai, Y., Tu, S., et al. Longbench v2: Towards deeper
+                                                                     understanding and reasoning on realistic long-context
+Systems and kernels                                                  multitasks. arXiv preprint arXiv:2412.15204, 2024.
+IO-aware kernels and serving systems improve locality,             Behnam, P., Fu, Y., Zhao, R., Tsai, P.-A., Yu, Z., and
+tiling, and paged-KV memory for high-throughput                      Tumanov, A. Rocketkv: Accelerating long-context LLM
+decode (Dao, 2023; Dao et al., 2022; Hong et al., 2023;              inference via two-stage KV cache compression. arXiv
+Kwon et al., 2023; Ye et al., 2025); MAC-Attention                   preprint arXiv:2502.14051, 2025.
+composes with these stacks by reducing how much of the
+prefix must be used, without any training changes.                 Chang, C.-C., Lin, W.-C., Lin, C.-Y., Chen, C.-Y., Hu,
+               MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+  Y.-F., Wang, P.-S., Huang, N.-C., Ceze, L., Abdelfattah,     Hooper, C., Shao, Y. S., et al. Towards 10 million context
+  M. S., and Wu, K.-C. Palu: Compressing kv-cache with           length LLM inference with KV cache quantization. In
+  low-rank projection. arXiv preprint arXiv:2407.21118,         Advances in Neural Information Processing Systems
+  2024.                                                         (NeurIPS), 2024.
+Chen, R., Wang, Z., Cao, B., Wu, T., Zheng, S., Li, X., Wei,   Hooper, C., Zhao, S., Manolache, L., Kim, S., Mahoney,
+  X., Yan, S., Li, M., and Liang, Y. Arkvale: Efficient          M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+  generative llm inference with recallable key-value             Multipole attention for efficient long context reasoning.
+  eviction. Advances in Neural Information Processing            arXiv preprint arXiv:2506.13059, 2025.
+  Systems, 37:113134–113155, 2024.
+                                                               Hsieh, C.-P., Sun, S., Kriman, S., Acharya, S., Rekesh, D.,
+Dao, T. Flashattention-2: Faster attention with better           Jia, F., Zhang, Y., and Ginsburg, B. RULER: What’s the
+  parallelism and work partitioning. arXiv preprint              real context size of your long-context language models?
+  arXiv:2307.08691, 2023.                                        arXiv preprint arXiv:2404.06654, 2024.
+Dao, T., Fu, D., Ermon, S., Rudra, A., and Ré, C.             Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L.,
+  Flashattention: Fast and memory-efficient exact attention     Yu, C. H., Gonzalez, J., Zhang, H., and Stoica, I.
+  with io-awareness. Advances in neural information             Efficient memory management for large language model
+  processing systems, 35:16344–16359, 2022.                     serving with pagedattention. In Proceedings of the 29th
+                                                                symposium on operating systems principles, pp. 611–626,
+Dao, T., Haziza, D., Massa, F., and Sizov, G. Flash-decoding
+                                                                2023.
+  for long-context inference. Stanford CRFM Blog, 2023.
+Feng, Y., Lv, J., Cao, Y., Xie, X., and Zhou, S. K.            Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli,
+  Ada-kv: Optimizing kv cache eviction by adaptive budget        A., Ye, H., Cai, T., Lewis, P., and Chen, D. Snapkv:
+  allocation for efficient llm inference. arXiv preprint         Llm knows what you are looking for before generation.
+  arXiv:2407.11550, 2024.                                        Advances in Neural Information Processing Systems, 37:
+                                                                 22947–22970, 2024.
+Ge, S., Zhang, Y., Liu, L., Zhang, M., Han, J., and Gao,
+  J. Model tells you what to discard: Adaptive kv cache        Liu, A. et al. Minicache: KV cache compression in depth
+  compression for llms. arXiv preprint arXiv:2310.01801,         dimension for efficient large language model inference.
+  2023.                                                          In Advances in Neural Information Processing Systems
+                                                                 (NeurIPS), 2024.
+Ge, S. et al. Model tells you what to discard: Adaptive
+  KV cache compression for LLMs. In The Twelfth                Liu, Z., Desai, A., Liao, F., Wang, W., Xie,
+  International Conference on Learning Representations           V., Xu, Z., Kyrillidis, A., and Shrivastava, A.
+ (ICLR), 2024.                                                   Scissorhands: Exploiting the persistence of importance
+                                                                 hypothesis for llm kv cache compression at test time.
+Gim, I., Chen, G., Lee, S.-s., Sarda, N., Khandelwal, A.,        Advances in Neural Information Processing Systems, 36:
+  and Zhong, L. Prompt cache: Modular attention reuse for        52342–52364, 2023.
+  low-latency inference. Proceedings of Machine Learning
+  and Systems, 6:325–338, 2024.                                Milakov, M. and Gimelshein, N. Online normalizer
+                                                                calculation for softmax. arXiv preprint arXiv:1805.02867,
+GLM, T., Zeng, A., Xu, B., Wang, B., Zhang, C., Yin, D.,        2018.
+ Zhang, D., Rojas, D., Feng, G., Zhao, H., et al. Chatglm:
+ A family of large language models from glm-130b to            Press, O., Smith, N. A., and Lewis, M. Train short, test
+ glm-4 all tools, 2024.                                          long: Attention with linear biases enables input length
+                                                                 extrapolation. arXiv preprint arXiv:2108.12409, 2021.
+Grattafiori, A. et al. The llama 3 herd of models. arXiv
+  preprint arXiv:2407.21783, 2024. doi: 10.48550/arXiv.        Shazeer, N. Fast transformer decoding: One write-head is
+  2407.21783.                                                    all you need. arXiv preprint arXiv:1911.02150, 2019.
+
+Hong, K., Li, X., Huang, X., Ma, X., Hao, Y., Wu, W., Dai,     Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., and Liu, Y.
+  G., Yang, H., et al. Faster large language model inference     Roformer: Enhanced transformer with rotary position
+  on gpus (flashdecoding++). Proceedings of MLSys, 2024.         embedding. Neurocomputing, 568:127063, 2024.
+
+Hong, K. et al.       Flashdecoding++: Faster large            Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han,
+  language model inference on gpus. arXiv preprint               S. Quest: Query-aware sparsity for efficient long-context
+  arXiv:2311.01282, 2023.                                        llm inference. arXiv preprint arXiv:2406.10774, 2024.
+               MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J.,            A.1   Quality–Efficiency trade-off curve
+  Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I.
+                                                                Figure 9 plots normalized model quality (solid) versus KV
+  Attention is all you need. Advances in neural information
+                                                                usage (dashed) as the matching threshold τ sweeps. The
+  processing systems, 30, 2017.
+                                                                “knee” typically occurs where KV usage drops sharply while
+Wu, Y. et al. Benchmarking long-form generation in              quality remains ≈100%. Choose τ at or just before the knee,
+ long-context llms. arXiv preprint arXiv:2409.02076,            then adjust K and r minimally.
+ 2024.
+
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M.
+  Efficient streaming language models with attention sinks.
+  arXiv preprint arXiv:2309.17453, 2024. ICLR 2024.
+
+Xu, F., Goyal, T., and Choi, E. Recycled attention: Efficient
+  inference for long-context language models. arXiv
+  preprint arXiv:2411.05787, 2024.
+
+Yang, L. et al. Tidaldecode: Fast and accurate LLM              Figure 9. Quality–efficiency trade-off vs. matching threshold
+  decoding with position-persistent sparse attention. In        τ . Left: LongBench v2. Right: LongGenBench. Solid: quality
+  International Conference on Learning Representations          (relative to baseline). Dashed: KV usage (lower is better).
+  (ICLR), 2025.
+
+Yao, J., Chen, K., Zhang, K., You, J., Yuan, B., Wang, Z.,      A.2   Band–Window heatmap: normalized efficiency &
+  and Lin, T. Deft: Decoding with flash tree-attention for            accuracy gating
+  efficient tree-structured LLM inference. In International
+                                                                Figure 10 shows the normalized KV token efficiency
+  Conference on Learning Representations (ICLR), 2025.
+                                                                Eff raw (r, K)    =     Acc(r, K)/KVFrac(r, K) over
+Ye, Z., Chen, L., Lai, R., Lin, W., Zhang, Y., Wang,            rectification band r and window K.             Colors are
+  S., Chen, T., Kasikci, B., Grover, V., Krishnamurthy,         normalized within the grid (white→pink: higher is
+  A., et al. Flashinfer: Efficient and customizable             better). A star marks configurations whose accuracy
+  attention engine for llm inference serving. arXiv preprint    satisfies Acc(r, K) ≥ θ Accbase (default θ = 0.95).
+  arXiv:2501.01005, 2025.                                       Empirically:      (i) very small windows (K≤128)
+Zhang, R., Wang, K., Liu, L., Wang, S., Cheng, H., Zhang,       look accurate but inefficient (few matches, little
+  C., and Shen, Y. LoRC: Low-rank compression for llms          skipping); (ii) larger windows expose longer reuse
+  kv cache with a progressive compression strategy. arXiv       gaps and require larger bands (typically r≥256)
+  preprint arXiv:2410.03111, 2024.                              for fidelity; and (iii) practical knees cluster near
+                                                                (K, r) ∈ {(1024, 256), (1024, 512), (2048, 256)}.
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+  R., Song, Z., Tian, Y., Ré, C., Barrett, C., et al. H2o:     A.3   MAC-Attention for both prefilling and decoding:
+  Heavy-hitter oracle for efficient generative inference of           exploratory study
+  large language models. Advances in Neural Information
+  Processing Systems, 36:34661–34710, 2023.                     Setting. Modern serving systems prefill in large chunks
+                                                                (e.g., 8K–16K tokens). We ablate enabling MAC-Attention
+                                                                inside prefill by letting each prefill token match against
+                                                                any earlier token (global window, denoted inf.),
+A    E XTENDED E XPERIMENTS AND                                 then amending a short band and completing with a
+     A BLATIONS                                                 merge—exactly as in decode. This explores feasibility;
+This appendix is reorganized to present experimental results    it is not a production configuration.
+first, followed by operator pseudocode and implementation
+analyses.     We begin with (i) the quality–efficiency          Observations (Table 8). Even with very high hit/skip
+trade-off curves (§A.1), (ii) the band–window heatmap           rates, overall accuracy trails full attention when reuse spans
+for configuration selection (§A.2), and then (iii) an           very long gaps inside prefill. Length stratification shows
+exploratory study enabling MAC-Attention during both            that MAC-Attention can help in the Long bucket but may
+prefill and decode (§A.3). Subsequent sections provide the      underperform in Short/Medium buckets if the rectification
+operator contract, numerics, data layout, pseudocode, tuning    band is too small. Increasing band size r improves fidelity
+guidance, scheduling notes, diagnostics, and limitations.       for long gaps but adds per-step cost.
+                             MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+
+Table 8. Enabling MAC-Attention for both prefilling and decoding on LongBench v2. We sweep τ and band r; the window
+is set to inf. to permit global search across the entire prefix (ablation-only; not production). Hit% and Skip% are reported as
+prefill/decode. Baseline is full attention.
+                                            Settings                                                                            LongBench v2
+                          Threshold τ         Window             Band r     Overall                                    Short    Medium Long          Hit %   Skip %
+                                Baseline (full attention)                       29.0                                   35.0       26.0        25.0     –        –
+                               0.30               inf.              512         26.6                                   30.6       25.1        23.1   99/99    55/86
+                               0.35               inf.              512         26.8                                   34.4       22.8        22.2   99/99    55/86
+                               0.45               inf.              128         25.6                                   29.4       21.4        27.8   96/95    56/85
+                               0.45               inf.              256         27.2                                   33.3       22.3        26.9   96/95    55/85
+                               0.45               inf.              512         27.2                                   30.0       21.9        33.3   96/95    54/84
+                               0.55               inf.              512         26.8                                   30.6       21.4        31.5   86/83    49/74
+                               0.60               inf.              512         27.4                                   31.7       23.7        27.8   77/71    45/62
+
+
+                       Model: Llama-3.1-8B-Instruct · Benchmark: LongGenBench                                           Bottom line. MAC-Attention is robust for decode. For
+                                   Acceptable accuracy ( 95% of baseline)
+                                                                                1.0                                     prefill, naive global matching with a short fixed band
+                2048                                                                                                    underperforms full attention overall despite high hit rates.
+                                                                                 KV Token Efficiency (Acc./KV-usage)
+
+
+
+                                                                                                                        Prefill viability improves with distance caps and adaptive
+                1024                                                            0.8
+                                                                                                                        bands.
+Search window
+
+
+
+
+                 512
+                                                                                0.6
+                 256                                                                                                    B      P RACTICAL G UIDANCE , S CHEDULING ,
+                                                                                0.4                                            D IAGNOSTICS , AND A SSUMPTIONS
+                 128
+                                                                                                                        B.1    Tuning guide
+                  64                                                            0.2
+                                                                                                                       Window K. Start with K ∈ {1024, 2048}; increase only if
+                  32                                                                                                   mid/deep layers show low acceptance. Diminishing returns
+                                                                                0.0
+                        64            128             256            512                                               beyond ≈4096.
+                                    Rectification band r
+                                                                                                                       Threshold τ . Under an isotropic null, pick τ to
+                                                                                                                                                                       target
+                                                                                                                       a false-positive rate α via α ≈ Fχ2d dq (1−τ )2 , τ ≈
+Figure 10. Normalized       KV       token         efficiency                                                             q                               q
+
+ Acc./KV-usage fraction across rectification band and                                                                           −1
+                                                                                                                       1 − Fχ2 (α)/dq . In practice, τ ∈ [0.4, 0.8] works well
+                                                                                                                                  dq
+search window. Stars denote accuracy ≥ θ of baseline.
+                                                                                                                        globally; minor per-layer nudges can help.
+                                                                                                                        Band r. Choose the smallest r whose cumulative mass near
+Why prefill is harder. During prefill, the reuse gap ∆                                                                  the cursor exceeds 1−ε under baseline (ε ∈ [0.01, 0.05]).
+for late tokens in a chunk often spans the entire chunk                                                                 Rules of thumb: r ∈ [128, 512]; deeper layers may prefer
+because no within-chunk summaries exist yet. Post-position                                                              slightly larger r.
+(post-RO PE) logit drift accumulates across many positions;
+rectifying only a short band can leave residual error.                                                                  Dtypes. Rings in bf16/fp16 with fp32 accumulators;
+By contrast, decode reuse typically happens over shorter                                                                keep (m, Z) in fp32.
+horizons where a small fixed band suffices.
+                                                                                                                        B.2    Scheduling and concurrency
+Recommendations. (i) Distance cap: accept a match                                                                      Micro-pipeline. Three kernels with minimal sync each
+only if the pre-RO PEL2 test passes and ∆ ≤ ∆max (e.g.,                                                                step: K1 L2-match (memory-bound, warp-reduced), K2
+1–2K). (ii) Adaptive band: scale r with ∆ or until the local                                                           band+tail attention + merge (dominant), K3 rectify–append
+mass outside the band is below ε (e.g., 1 − ρ ≤ 0.01–0.05).                                                            (aux stream).
+(iii) Two-gate acceptance: combine pre-RO PEL2 with a
+cheap post-RO PEdrift proxy (e.g., cached ∥Qm − Qp ∥).                                                                 Auxiliary stream and graphs. Launch K3 on an auxiliary
+(iv) Microprefill: if supported, use smaller prefill chunks to                                                         CUDA stream with a single event wait; its outputs are
+reduce reuse gaps.                                                                                                     consumed when the same layer is revisited. Capture
+               MAC-Attention: a Match–Amend–Complete Scheme for Fast and Accurate Attention Computation
+
+steady-state into a CUDA Graph to amortize launches.
+Load balancing. Heads have heterogeneous spans; flatten
+the (request, head) axis, assign CTAs proportional to span
+length, cap CTA size to preserve occupancy. This recovers
+most of the gap to an oracle perfectly balanced schedule.
+
+B.3   Diagnostics, failure Modes, and safeguards
+Log (per layer/head).           (i) acceptance rate; (ii)
+skipped-prefix fraction E[(p−r)+ /m] (misses as 0); (iii)
+                     Pp            (p)
+baseline band mass t=p−r+1 αt (periodic probe); (iv)
+norms ∥q̃∥2 , ∥v∥2 percentiles.
+Common issues and mitigations. (1) Low acceptance
+in specific layers: increase K or relax τ for those layers
+only. (2) Quality drift at very long gaps: enlarge r slightly
+or cap reuse by ∆. (3) Numerical glitches in downdate:
+enforce common baseline m, and fall back to full attention
+if Z rect ≈ 0. (4) Memory pressure: reduce K; keep (m, Z)
+in fp32.
+Determinism. With fixed seeds and decode settings,
+MAC-Attention is deterministic given fixed match
+decisions; misses execute the full attention baseline.
+
+B.4   Deployment scope and assumptions
+Decode-only augmentation. MAC-Attention modifies
+decode and leaves prefill and weights unchanged unless
+explicitly enabled (ablation in §A.3).
+Serving stack. Assumes an IO-aware attention kernel
+(FlashAttention-style) and a paged-KV manager; composes
+with MQA/GQA (matching is per query head; attention
+streams shared KV heads).
+Per-request state. Two rings of capacity K (we only cache
+what we search): a query ring with pre-RO PE queries and
+an attention-summary ring with rectified prefix summaries.
+
+B.5   Limitations and when to back off
+MAC-Attention relies on short-horizon semantic repetition
+and recency-biased attention. Heads with global, flat
+attention or idiosyncratic behaviors may see few matches
+and naturally fall back to baseline. For extremely large reuse
+gaps, a small fixed band can under-rectify; enlarge r or skip
+reuse beyond a distance cap.
+

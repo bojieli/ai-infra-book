@@ -1,0 +1,1124 @@
+   BATCH LLM: O PTIMIZING L ARGE BATCHED LLM I NFERENCE WITH
+G LOBAL P REFIX S HARING AND T HROUGHPUT- ORIENTED T OKEN BATCHING
+
+
+               Zhen Zheng 1 Xin Ji 1 Taosong Fang 1 2 Fanghao Zhou 1 Chuanjie Liu 1 Gang Peng 1
+
+
+                                                        A BSTRACT
+     Large language models (LLMs) increasingly play an important role in a wide range of information processing
+     and management tasks in industry. Many of these tasks are performed in large batches or even offline, and the
+     performance indicator for which is throughput. These tasks usually show the characteristic of prefix sharing,
+     where different prompt input can partially show the common prefix. However, the existing LLM inference engines
+     tend to optimize the streaming requests and show limitations of supporting the large batched tasks with the prefix
+     sharing characteristic. The existing solutions use the LRU-based cache to reuse the KV context of common prefix
+     between requests. The KV context that are about to be reused may be prematurely evicted with the implicit cache
+     management. Besides, the streaming oriented systems do not leverage the request-batch information and can not
+     mix the decoding tokens with the prefill chunks to the best for the batched scenarios, and thus fails to saturate
+     the GPU. We propose BatchLLM to address the above problems. BatchLLM explicitly identifies the common
+     prefixes globally. The requests sharing the same prefix will be scheduled together to reuse the KV context the
+     best. BatchLLM reorders the requests and schedules the requests with larger ratio of decoding first to better
+     mix the decoding tokens with the latter prefill chunks, and applies memory-centric token batching to enlarge
+     the token-batch sizes, which helps to increase the GPU utilization. Extensive evaluation shows that BatchLLM
+     outperforms vLLM and SGLang by 1.3× to 10.8× on a set of microbenchmarks and a typical industry workload
+     under different hardware environments. Code is available at https://github.com/microsoft/MixLL
+     M/tree/batchllm_vllm_064.
+
+1    I NTRODUCTION                                                  Zheng et al., 2023) can flexibly support the execution of
+                                                                    LLM inference tasks, especially with blocked KV memory
+The modern information processing and management tasks              management (Kwon et al., 2023) and per-iteration token
+are starting to leverage large language models (LLMs) to            batching (Yu et al., 2022). However, the design of exist-
+achieve better results, such as the search engine (Wang et al.,     ing inference engines tend to optimize streaming online
+2023; Xiong et al., 2024), advertisement (Meguellati et al.,        services and show limitations in throughput-oriented large-
+2024), and recommender systems (Zhao et al., 2024; Kim              batch processing. 1) Lack of global prefix sharing. The
+et al., 2024). Due to the huge amount of data to be processed,      state-of-the-art (SOTA) LLM inference engines support to
+many of these LLM tasks are performed in large batches              cache the KV context with LRU policy to enable prefix shar-
+or even offline (e.g., offline ranking), for which the most         ing between prompts. However, from a global perspective of
+important performance indicator is throughput. Besides,             large batches, an LRU-based cache may prematurely evict
+different input (prompts) of these tasks can partially share        KV contexts that are about to be reused and retain unused
+the same prefix (e.g., the same web document in the search          KV contexts for a long time, causing unnecessary recalcula-
+engine tasks). Given the high cost of LLM inference, how            tion. 2) Suboptimal token batching for throughput-oriented
+to serve these tasks efficiently is a critical problem for the      and prefix-shared tasks. The current LLM inference engines
+information processing systems.                                     schedule different requests independently and do not cluster
+The recent LLM inference engines (Kwon et al., 2023;                the requests with common prefix together to schedule. It can
+    1
+                                                                    extend the lifetime of the common prefix and thus increase
+      Microsoft 2 Chinese Information Processing Laboratory,        the memory usage, and may prematurely evict KV contexts
+ISCAS, UCAS. Work was done when Taosong Fang was
+interned at Microsoft.     Correspondence to: Zhen Zheng
+                                                                    that are about to be reused as discussed above. Besides, they
+<zhengzhen@microsoft.com>.                                          usually schedule the requests in the first-come-first-serve
+                                                                    or similar order to guarantee the fairness and latency of
+Proceedings of the 9 th MLSys Conference (Industry Track), Belle-   the streaming requests. The requests with larger ratio of
+vue, WA, USA, 2026. Copyright 2026 by the author(s).                decoding steps may be scheduled too late to be able to mix
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+with the prefill chunks to increase the hardware utilization.          2023; Xiong et al., 2024) in search engine as an example,
+They apply the mix of prefill and decoding tokens together             which is to generate the snippet of the web document (web
+according to the threshold of token number and request                 content) in the search result page according to both docu-
+number. This limits the number of decoding tokens that                 ment and user query. An example prompt in industry (Wang
+can be batched and keeps the GPUs from saturating for the              et al., 2023) is: generate a short snippet based on the given
+iterations dominated by decoding tokens.                               Document to answer the given Query. Document: <...>
+                                                                       Query: <...>. Due to that it is hard to meet the SLO when
+In this work, we introduce BatchLLM, the holistic opti-
+                                                                       performing the massive LLM inferences online, a common
+mization for the throughput-oriented large-batch LLM infer-
+                                                                       practice is to run the snippet generation task offline for the
+ence with global prefix preprocessing, and prefix-aware and
+                                                                       high-frequency web documents and queries, and retrieve the
+throughput-oriented token batching. The basic insight is
+                                                                       offline results during online serving when the corresponding
+based on the fact that, the prompt characteristics are known
+                                                                       document-query pair occurs.
+ahead before processing the large batch. Compared to the
+implicit LRU cache that cannot retain the KV context for                Many of the LLM-based information processing and man-
+reuse accurately, the common prefixes between prompts can               agement tasks show the characteristic of the shared prefix
+be identified explicitly and can be reused explicitly. Besides,         between the prompts of different requests, which comes
+the length distribution of the prompts is known ahead and               from the nature that different tasks can perform on the same
+the main performance target is throughput, which allows                 content (e.g., web document). Take the search engine task
+the inference engine to reorder the requests and form larger            as an example, it may extract different information from the
+token-batches1 . It makes the following contributions:                  same web document so that the document can be a shared
+                                                                        prefix in the prompt. Specifically, as for the snippet gen-
+▶ It pioneers the LLM inference optimization for the
+                                                                        eration task, given that it is to extract the snippet of the
+throughput oriented large batched prefix-shared scenarios
+                                                                        document-query pair, a document can be the common prefix
+with the insight of using global information of the batch, for
+                                                                        for different queries. There are many other industry tasks
+the increasingly important LLM-based information process-
+                                                                        that fall into the offline processing mode with a common
+ing and management.
+                                                                        prefix. The very important offline ranking tasks for search
+▶ It designs the ahead-of-time prefix identification and                and recommendation can use the prompt of "please evaluate
+enlargement method to achieve effective prefix reusing                  the relevance of the document for the query, Query: <...>,
+in global view, and proposes the requests reordering and                Document: <...>", where each query corresponds to many
+memory-centric token batching method to increase the per-               documents and can be the common prefix. The Ads title
+iteration GPU utilization.                                              rewrite task in industry can use the prompt of "given the
+                                                                        Query and the Landing Page info, please refine the old title
+▶ It presents BatchLLM implementation building upon
+                                                                       ‘xxx’ to get a better ad title. Landing Page: <...>, Query:
+vLLM. BatchLLM achieves end-to-end performance im-
+                                                                       <...>", where the landing page can be the common prefix
+provement of 1.3× to 10.8× than vLLM and SGLang for
+                                                                        and the computation is usually throughput critical. The of-
+the benchmarks and an industry workload under different
+                                                                        fline labeling and scoring tasks in industry can have long
+hardware environments.
+                                                                        system prompt and few shot examples, which can also be
+                                                                        the common prefix in the prompt.
+2     O PPORTUNITIES
+                                                                       The shared prefix can be managed in multiple levels. For
+2.1   Emerging Industry Scenarios                                      example, the first level prefix can be the global system
+                                                                       information and instructions, and the second level can be
+LLM has been increasingly used in a broad range of in-
+                                                                       the web document. However, with the development of LLM
+dustry tasks with its in-context learning and reasoning abil-
+                                                                       and the using of task-specific model fine-tuning, the prefix of
+ity (Wang et al., 2023; Xiong et al., 2024; Meguellati et al.,
+                                                                       instructions becomes shorter and shorter: On the one hand,
+2024; Zhao et al., 2024; Kim et al., 2024; Chen et al., 2023;
+                                                                       the LLM models are incorporating more and more reasoning
+Fernandez et al., 2023). Due to the large traffic of these
+                                                                       abilities into themselves (like OpenAI o1 (OpenAI, Cited
+tasks and the high cost of LLM inference, many of these
+                                                                       2024a)) and will not rely on complex prompts. On the other
+tasks are processed in very large batch (or even offline)
+                                                                       hand, the task-specific fine-tuning can help to incorporate
+whose performance metric is mainly the throughput rather
+                                                                       the complex prompts into the model weight. As a result, the
+than latency. Take the snippet generation task (Wang et al.,
+                                                                       prefix sharing of the long context rather than the instructions
+    1
+      This paper uses the term token-batch to represent a batch of     can be the most important for many industry tasks. This
+tokens to be processed for an iteration of continuous batching (Yu     motivates the first-level prefix enlargement in Sec.3.2.
+et al., 2022). It differs from the concept of large batch of all the
+prompt to be processed in a job.
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+          Request 1       Request 2       Request 3
+                                                                                                 Decode Tokens          Prefill Tokens
+                                                                                3000
+
+          prefill           decoding
+
+
+
+
+                                                                      #Tokens
+                                                                                2000
+
+
+                                                                                1000
+         a. Naïve
+                                                                                   0
+                                                                                       0   250    500    750     1000   1250   1500      1750
+         b. Reordered                                                                                     Iterations
+
+                                   Time
+                                                                  Figure 2: The token number in the batch processed at each
+Figure 1: The effect of processing order of requests with         iteration for an industry task with vLLM’s chunked-prefill.
+chunked-prefill enabled. Given the three requests with dif-       It has "valleys" for many iterations.
+ferent prefill/decoding length characteristics, the naive token
+batching in the coming order of the requests has worse token
+mixing of decoding and prefill chunks.                            extends the lifetime of the shareable KV memory, exacerbat-
+                                                                  ing the problem of large KV memory consumption. Besides,
+                                                                  these systems design tends to support online services. They
+2.2   The New Optimization Demands                                form the token-batches at each iteration with the constraint
+Even though prefix sharing and per-iteration token batch-         of requests’ arriving order, which can result in suboptimal
+ing are functionally supported in previous works, they lack       token-batches. Take the example in Fig.1, the naive schedul-
+specialized optimization for the increasingly import large        ing in the order of request’s coming cannot mix the decoding
+batched scenarios (Sec.2.1), showing two main limitations:        of request 3 with the prefill chunks (Holmes et al., 2024;
+                                                                  Agrawal et al., 2023) of other requests. Instead, by schedul-
+1. The implicit prefix caching cannot achieve the optimal         ing request 3 earlier, its decoding can be mixed with the
+KV reuse for the large batched inference. The industrial          prefill chunks of other requests. Another problem is that,
+LLM serving systems (Kwon et al., 2023; Zheng et al.,             the current systems use the token and request number in the
+2023) use the prefix tree to maintain the KV blocks. The          token-batch as the threshold to limit the batching, which lim-
+same prefix (identified by runtime hashing) can be mapped         its to batch more tokens together in the decoding dominated
+to the same KV blocks to avoid repeated computation. It           token-batches and prevents better utilizing the GPU even
+uses the LRU policy to evict the blocks from the block table.     when the memory is enough. Fig.2 shows the number of
+As for a large batch of inputs to be processed, it does not       tokens at each iteration for a typical industry task (Sec.4.2.2)
+keep the prefix in memory in the global view in the large         performing with vLLM’s best configuration. It shows that
+batch, but only according to the history input. As a result,      there are "valleys" at many iterations where the number of
+the shareable KV blocks can be easily evicted prematurely.        tokens are not large enough to saturate the GPU. There is a
+We have evaluated vLLM’s prefix sharing with a typical            demand to reschedule the tasks to make the requests sharing
+industry workload. The optimal token saving ratio by prefix       common prefix closer, and enable better mix of decoding
+reusing is 58.1% by analyzing the input dataset. Note that        tokens with prefill chunks. There is also a room to enlarge
+the saving ratio is calculated by:                                the size of token-batches dominated by the decoding tokens.
+                          Nprocessed_pre_tok
+        Rsaving = (1 −                       ) × 100       (1)
+                           Nlogical_pre_tok                       3             D ESIGN M ETHODOLOGY
+Nprocessed_pre_tok is the number of prefill tokens processed      3.1            Overview
+after prefix sharing, and Nlogical_pre_tok is the original pre-
+                                                                  BatchLLM has the following insights to address the limita-
+fill token number of all the requests. The vLLM’s implicit
+                                                                  tions described in Sec.2.2.
+prefix caching only achieves 35.8% (Sec.4.3.1). There is a
+need for better prefix sharing for the large batched tasks.       1. Explicit prefix identification and sharing. Instead of
+                                                                  managing the prefix with LRU cache, BatchLLM explicitly
+2. The online serving oriented scheduling and token
+                                                                  identifies the common prefix globally within the large batch
+batching can be suboptimal for the prefix-shared and
+                                                                  ahead-of-time, which will not miss the opportunity of prefix
+throughput oriented tasks. The current LLM inference
+                                                                  sharing caused by the implicit cache. Besides, BatchLLM
+systems schedule the tasks at the granularity of request.
+                                                                  refactors the prefix tree with a Dynamic Programming al-
+They do not analyze the prefix sharing characteristics of
+                                                                  gorithm to enlarge the first-level prefix to avoid the system
+the whole large batch nor schedule the requests sharing
+                                                                  complexity and kernel overhead of the multi-level prefix.
+common prefix together. This not only can evict the share-
+able KV context prematurely as discussed above, but also          2. Grouped scheduling, request reordering and memory-
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+                              Explicit prefix processing                     0                         0                        0
+                                 Compact prefix tree
+
+                           Maximize 1st-level prefix with DP             6       1                 6       1           6        1
+   large-batch
+      input
+                        Throughput-oriented token batching                   1       7             1               7       1        7
+                      Reorder groups to postpone longer prompts
+                                                                     1       2       6         1       2       7       1        2           8
+                        Scheduling with prefix-sharing groups
+
+                          KV-memory aware token batching
+                                                                                 2       3                 2       3                    2       3
+      Inference
+        engine
+                      Horizontal fused prefix-shared Attention           a. initial            b. intermediate                 c. final
+
+                  Figure 3: BatchLLM overview.                       Pseudo tokens 1: a b c d e a
+                                                                     Pseudo tokens 2: b a b
+                                                                     Pseudo tokens 3: b a c d
+                                                                     Pseudo tokens 4: b a a b c d e a b c
+centric token batching. BatchLLM schedules the requests              Pseudo tokens 5: b a a b c d e a d e a
+at the granularity of a group of requests sharing the com-           Pseudo tokens 6: b b c d e a b c
+mon prefix, which makes the prefix sharing convenient and                                d. the pseudo tokens of 6 prompts
+shrinks the lifetime of the prefix’s KV memory. BatchLLM
+reorders the requests according to the length of the prompt       Figure 4: The preprocessing to maximize the first level
+and the estimated decoding length. As indicated in Fig.1,         prefix reusing. Each circle represents a node containing a
+BatchLLM will schedule the requests with larger ratio of          number of tokens. The number in the circle is the token
+decoding length to prompt length with higher priority. In         number of the node.
+this way, the longer prompts will be scheduled later and can
+be better mixed with the earlier decoding tokens. It also
+forms the token-batches with the consideration of the KV          of the multi-level reuse. Instead, BatchLLM compresses the
+memory usage, allowing to batch more tokens together to           multi-level prefixes into a single level prefix to avoid the
+increase the size of token-batches and reduce the "valleys".      above challenges, based on the insight that the length of the
+                                                                  prefixes are usually dominated by a single level (Sec.2.1).
+Fig.3 shows the overview of BatchLLM optimizations. First,
+it analyzes the large batch of input prompts and identifies the   BatchLLM explicitly identifies the common prefix among
+common prefix explicitly. This is done before the schedul-        the prompts within the large batch. It makes use of the
+ing of the requests. It simplifies the multi-level prefix into    compact prefix tree2 to identify and represent the common
+a single level prefix with the insight that the prefixes of       prefix between prompts. However, directly using the first
+the industry tasks are usually dominated by a long context        level prefix of the basic prefix tree as the common prefix can
+(Sec.2.1). The explicit prefix processing is illustrated in       lead to suboptimal prefix reusing. Take the pseudo prompts
+Sec.3.2. The requests will be organized into groups where         in Fig.4d as an example. The 6 prompts are organized
+each group corresponds to the queries sharing the same            with the compact prefix tree in Fig.4a, where each node
+prefix. The group will be the basic unit of task schedul-         represents several consecutive tokens of the prompt and the
+ing. Before scheduling the groups, BatchLLM will also             tokens in a node is shared by its children. The right child of
+reorder the groups according to the ratio of prefill length       the root node (i.e., token ’b’) is shared by 5 prompts in total
+and postpone the groups with longer prefill. It then forms        (prompt 2 to 6) according to Fig.4a, thus reusing the first
+the token-batches with the consideration of the KV mem-           level prefix can save 4 tokens’ KV computation. However,
+ory usage. This aims to better mix the decoding steps with        it is easy to infer that sharing the first 8 tokens between
+the prefill chunks to increase the overall token-batch size.      prompt 4 and 5 can save 8 tokens’ KV computation. Thus
+The throughput-oriented scheduling and token-batching op-         it requires to refactor the naive prefix tree to maximize the
+timization is described in Sec.3.3.                               achieved first-level token reusing.
+                                                                  We design a Dynamic Programming algorithm on the com-
+3.2     Explicit Global KV Reuse Identification                   pact prefix tree to maximize first-level token reusing, shown
+                                                                  in Algo.1. The basic insight is that, given a node D to
+As discussed in Sec.2.1, different prompts may have mul-
+                                                                  maximize its first-level token reusing, it first solves the
+tiple levels of prefixes. The multi-level prefixes can lead
+                                                                  sub-problems of all D’s children to maximize each child’s
+to system challenges and overhead of token batching and
+                                                                  first-level token reusing (line 6 in Algo.1), it then try to
+fused Attention kernel. For the token batching, it requires to
+manage the dependencies of the different levels of prefixes.          2
+                                                                        The compact prefix tree, also called Radix tree, is the prefix
+For the Attention kernel, it will introduce more GPU kernels      tree that merges the only child with its parent.
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+Algorithm 1 Dynamic Programming on the prefix tree to               compared to the memory consumption of model weights.
+maximize the first-level token reusing of node D.                   Algo.1 does not introduce KV residency time as it is com-
+ 1: ▷ The 1st-level prefixes of a node are its children             puted based on the input token_ids before processing
+ 2: function MaximizeReuse(D)                                       the tokens. As a result, the DP algorithm only introduces
+ 3:   if D has no children then                                     less than 0.01% overhead in our evaluation (Sec.4.3.1)
+ 4:      return                                                     BatchLLM does not completely disable the LRU mecha-
+ 5:   for child ∈ D.children do                                     nism. It explicitly applies global prefix cache to the longest
+ 6:      MaximizeReuse(child)         ▷ Solve sub-problems          first-level prefix and relies on vLLM’s LRU to manage
+ 7:      for gchild ∈ child.children do                             the possible remaining prefixes (e.g., the second-level sub-
+ 8:        gain ← (leaves(gchild) - 1) × tokens(gchild)             prefix) for distinct prompt parts.
+ 9:        penalty ← tokens(child)
+10:        if gain > penalty then                                   3.3     Throughput-oriented Token Batching
+11:           Fork child and merge with gchild
+                                                                    3.3.1    Prefix-sharing Group Based Scheduling
+                                                                    To simplify the KV reuse and reduce the lifetime of the
+merge D’s first-level prefix with its children’s to see if it can   common prefix in the memory, BatchLLM schedules the
+enlarge D’s token reusing (line 7-11 in Algo.1). It recursive       requests sharing the same prefix all together. Specifically,
+performs the above procedure until reaching the root note,          the procedure described in Sec.3.2 will generate the prefix-
+by calling MaximizeReuse(root). Fig.4b and Fig.4c shows             sharing groups (the collection of requests sharing the same
+an example of this procedure. In Fig.4b, the left node in           prefix) and BatchLLM will schedule the requests at the
+level 3 of the tree is forked and merged with it’s right child,     granularity of prefix-sharing group rather than each single
+which enlarges the 1st-level prefix reusing of the right node       request. In this way, the requests sharing the same prefix
+in level 2. Similarly, the right node in level 2 is forked and      can start at the same time and the memory of the common
+merged with its second child to enlarge the 1st-level prefix        prefix can be released as soon as the group is completed.
+reusing of the root node. After maximizing the first-level          This differs from the LRU cache based prefix management
+prefix, the other levels of prefixes will be expanded during        and can make sure all the common prefix can be reused the
+the token batching and will not be the shared context.              best and the memory will not be retained unnecessarily.
+We have compared the token saving ratio between the orig-           To realize the prefix-sharing group based scheduling, Batch-
+inal multi-level prefix and the enlarged single prefix. The         LLM maintains three queues of the to-be-batched tokens:
+saving ratio is calculated according to Eq.1. For a dataset of      common prefix queue, distinct prompt queue, and decoding
+the snippet generation task, the saving ratio of the original       queue. At each iteration, BatchLLM will form the token-
+multi-level prefixes is about 56%, and the ratio is about 55%       batch by fetching the tokens from the three queues in the
+for the first-level prefix after enlarging (Sec.4.2.2). It means    order of decoding queue, distinct prompt queue, and com-
+the enlarged first-level prefix only has 1% loss of the to-         mon prefix queue (one constraint is that the a common prefix
+ken reuse compared to the multi-level prefix for this typical       should be fetched and processed before its corresponding
+workload, with the advantage of reducing the complexity             distinct prompts). On the one hand, fetching the decoding
+and the overhead of the token batching and Attention kernel         tokens before prefills can help to better mix the two types of
+optimization. More details will be presented in Sec.4.3.1.          tokens together in the token-batch (Holmes et al., 2024). On
+Time and Space Complexity Analysis. The complexity of               the other hand, fetching the decoding and distinct prompt
+Algo.1 is O(nc2 ), where n is the number of nodes and c is          tokens before the prefix tokens can make sure the active
+the number of average children. The algorithm visits every          requests (i.e., the request that has been partially processed)
+node once and has O(n) for traversal, and iterates over its         are scheduled before the inactive requests, which finishes
+children and their children for each node and has O(c2 ) per        the active requests earlier and releases their memory earlier.
+node as the worst case. Thus, the time complexity is O(nc2 ).
+In real scenarios, c is typically small on average, so this is      3.3.2    Request Groups Reordering
+close to O(n) in practice. The space complexity is O(n).            BatchLLM reorders the input requests to schedule the re-
+The memory overhead introduced by "fork child and merge             quests according to the ratio of prompt length to decoding
+with grandchild" is very small, as the metadata of the node         length (R). We define the ratio R as:
+is the token_id, which is in int64 datatype. The worst
+case is that all nodes are fully forked, which means the same
+prefix of different prompts are stored independently. In this
+case, the storage will be equal to the sum of token numbers                                      Ldecode
+of all prompts (in int64 datatype), which is still small                                   R=                                 (2)
+                                                                                                 Lpref ill
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+                                                                             to reach the upper bound of the request number while still
+        100                                             mean=14.8            have not achieved a large number of the total tokens. For
+                                                        median=14.0
+Count
+
+
+         50                                                                  example, vLLM sets the threshold of request number as
+                                                                             256 by default, if a token-batch already has 256 decoding
+          0 5         10   15      20 25 30           35     40      45      tokens, it will have no chance to add more prefill chunks
+                                     Token Length                            into this token-batch even if there is still enough memory
+              (a) Output length distribution of Ads title rewrite.           to hold the KV memory of the prefill chunks. Note that
+                                                                             purely increasing this threshold does not solve the problem
+                                                                             in practice (noted by the vLLM community3 ), as directly
+        200                                           mean=118.3             excessively enlarging batch size may cause the engine to
+                                                      median=118.0
+Count
+
+
+
+
+                                                                             have more frequent memory swaps and recomputation due
+        100
+                                                                             to the GPU memory can be not enough.
+          0      50          100        150           200            250     The target of the token-batching is to enlarge the number
+                                    Token Length
+                                                                             of tokens in the batch under the constraint of GPU memory
+          (b) Output length distribution of caption generation.              size. Thus there are two main factors that matters for the
+                                                                             token-batching procedure: whether the number of tokens
+Figure 5: Generation output length distribution of two typi-                 is large enough in the batch to saturate the GPU, indicat-
+cal real-industry workloads.                                                 ing the current status of the token-batch; and whether the
+                                                                             remaining memory is enough to accommodate more pre-
+                                                                             fill chunks, indicating if the status can be improved. With
+In Eq.2, Lpref ill is the number of prefill tokens and Ldecode
+                                                                             this insight, BatchLLM uses the KV memory itself and the
+is the length of the output tokens. The requests with larger
+                                                                             predetermined chunk size Schunk as the limiter rather than
+R will be scheduled earlier. This helps to issue the requests
+                                                                             using the indirect limiter of the request number.
+with long decoding steps earlier and make the latter prompts’
+length larger and thus can be better mixed with the previous                 Specifically, BatchLLM predefines a size as the upperbound
+decoding tokens to enlarge the token-batch size (example                     of the KV memory size (Mthreshold ). When deciding the
+in Fig.1). The challenge is that the exact number of output                  token-batching at each iteration, it will only check whether
+tokens is not known before finishing the execution. We                       adding a prefill chunk will exceed Mthreshold or not, with-
+profiled the dataset of several typical industry tasks (ads,                 out considering the number of requests. The prefill chunk
+caption generation, offline ranking, etc.) and observed that                 will be added into the token-batch if the remaining GPU
+the distribution of output length is relatively concentrated for             memory capacity allows it. Note that we also use a fixed
+the same kind of task, which means the effect of the output                  number to limit the per-batch token number for token-
+length in Eq.2 is less significant for the same kind of task as              batching decision (noted as the chunk size Schunk ), which
+it does not vary a lot. We thus make an approximation by                     aligns with that in vLLM and helps to distribute the token
+normalizing Ldecode into 1 in Eq.2 for all requests uniformly.               numbers in different iterations more even.
+As we schedule the requests in the unit of prefix-sharing
+group, the ratio of the group (after normalization) becomes:                 3.4        End-to-end System Integration
+                                             1                               The integration of BatchLLM into other frameworks is quite
+                   Rgroup =                  P                         (3)
+                                Lpref ix +       Ldistinct                   easy. BatchLLM comprises two pluggable modules: (i) a
+                                                                             token-batching scheduler and (ii) an attention backend, that
+The request groups with larger Rgroup will be scheduled                      can be added alongside existing components in common in-
+with higher priority.                                                        ference frameworks (e.g., vLLM, SGLang) without altering
+Fig.5 shows the output length distributions of two repre-                    user-facing APIs or the serving loop. Token-batching sched-
+sentative industry workloads. It shows that the the output                   uler is orthogonal to the framework’s existing continuous
+lengths are in a very narrow range, which motivates our                      batching/prefill–decode pipeline. We add lightweight per-
+choice of normalizing decoding length.                                       request metadata to indicate shared prefix vs. distinct part.
+                                                                             The scheduler ensures the common prefix across requests is
+3.3.3         Memory-centric Token Batching to Saturate GPU                  computed once and reused, reducing redundant calculation
+                                                                             in both attention (KV-cache construction) and non-attention
+Another limiter of the size of token-batches is that, the ex-                compute (e.g., projection and FFN GEMMs) during pre-
+isting works (Kwon et al., 2023) use a fixed request number                  fill and decoding. Attention backend is a drop-in backend
+to limit the token batching, i.e., the request number can-                   with full fallback. The backend presents the same public
+not exceed a fixed threshold within a token-batch. For a
+                                                                                   3
+token-batch dominated by the decoding tokens, it is easy                               https://github.com/vllm-project/vllm/issues/6801
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+interface as the framework’s attention module and simply                               1. vLLM               2. vLLM + c       3. vLLM + p
+                                                                                       4. vLLM + c + p       5. SGLang         6. BatchLLM
+registers as an additional backend. If shapes/hardware are
+unsupported, it falls back to the standard kernel, ensuring
+
+
+
+
+                                                                    Throughput
+                                                                                 4
+
+
+
+
+                                                                    Normalized
+compatibility and graceful degradation.                                          3
+
+                                                                                 2
+
+                                                                                 1
+
+4     E VALUATION                                                                0
+                                                                                       2000/200   2000/200   2000/1000     2000/1000   1000/1000   1000/1000
+                                                                                         sd=4      sd=16       sd=4          sd=16       sd=4        sd=16
+
+4.1   Setup                                                                 (a) Llama 3.1 8B throughput on A100, #requests = 6400
+
+Baseline Specification. We compare BatchLLM with
+
+
+
+
+                                                                    Throughput
+                                                                                 4
+
+
+
+
+                                                                    Normalized
+vLLM and SGLang, two state-of-the-art LLM inference                              3
+                                                                                 2
+engines with prefix sharing, for the end-to-end comparison                       1
+
+to demonstrate the efficacy (Sec.4.2). We integrate all our                      0
+                                                                                       2000/200 2000/200 2000/1000 2000/1000 1000/1000 1000/1000
+                                                                                         sd=4    sd=16     sd=4      sd=16     sd=4      sd=16
+design in vLLM v0.6.4 and the baseline for comparison is
+also vLLM v0.6.4 (except as noted).                                        (b) Qwen 2.5 14B throughput on A100, #requests = 6400
+
+We enable the prefix-caching and chunked-prefill in vLLM
+
+
+
+
+                                                                    Throughput
+                                                                    Normalized
+                                                                                 5
+                                                                                 4
+baseline for the end-to-end comparison in Sec.4.2. The                           3
+                                                                                 2
+prefix-caching uses the implicit LRU-based caching policy.                       1
+
+We use 2048 as the token-batch size for chunked-prefill of                       0
+                                                                                       2000/200 2000/200 2000/1000 2000/1000 1000/1000 1000/1000
+                                                                                         sd=4    sd=16     sd=4      sd=16     sd=4      sd=16
+vLLM baseline to maximize its throughput.
+                                                                           (c) Llama 3.1 70B throughput, on A100, #requests = 800
+Hardware and System Specification. We conduct our ex-
+periments on both NVIDIA A100 80GB GPUs (both single
+                                                                    Throughput
+                                                                    Normalized
+
+
+                                                                                 4
+
+GPU and 2-GPUs) and AMD MI200 GPU. For multi-GPU                                 3
+                                                                                 2
+experiments on NVIDIA A100, we utilize tensor parallelism                        1
+                                                                                 0
+(TP) with size of 2 (denoted as A100-TP2). The CUDA ver-                               2000/200 2000/200 2000/1000 2000/1000 1000/1000 1000/1000
+                                                                                         sd=4    sd=16     sd=4      sd=16     sd=4      sd=16
+sion on the NVIDIA platform is 12.1. The ROCm version
+on the AMD platform is 6.1. The CPU is AMD EPYC 7V12                (d) Llama 3.1 70B throughput, on A100-TP2, #requests = 800
+CPU @2.45GHz. The operation system is Ubuntu 20.04.                              3.5
+                                                                    Throughput
+                                                                    Normalized
+
+
+
+
+                                                                                 3.0
+                                                                                 2.5
+Models and Dataset. We evaluate BatchLLM and the                                 2.0
+                                                                                 1.5
+                                                                                 1.0
+baselines with Llama-3.1-8B (AI@Meta, 2024), Qwen-2.5-                           0.5
+                                                                                 0.0
+14B (Qwen et al., 2025) and Llama-3.1-70B (4-bit GPTQ),                                 2000/200 2000/200 2000/1000 2000/1000 1000/1000 1000/1000
+                                                                                          sd=4    sd=16     sd=4      sd=16     sd=4      sd=16
+with a set of input/output with different data distributions,
+                                                                   (e) Llama 3.1 8B throughput with Poisson perturbed lengths on
+and Qwen-2.5-7B for a typical industry task. As for the ba-        A100, #requests = 6400
+sic evaluation, we use three different settings of the length of
+common prefix and distinct prompt. The length of prefix/dis-
+                                                                    Throughput
+
+
+
+
+                                                                                 5
+                                                                    Normalized
+
+
+
+
+                                                                                 4
+tinct are 2000/200, 2000/1000 and 1000/1000 respectively,                        3
+                                                                                 2
+while the length of generated tokens is 100. We evaluate                         1
+                                                                                 0
+the three settings under different share-degrees. The share-                           2000/200 2000/200 2000/1000 2000/1000 1000/1000 1000/1000
+                                                                                         sd=4    sd=16     sd=4      sd=16     sd=4      sd=16
+degree means the number of distinct prompts sharing the
+same prefix. Note that all requests are randomly shuffled.                (f) Llama 3.1 8B throughput, on MI200, #requests = 6400
+The above input/output settings are very representative as                       4.0
+                                                                    Throughput
+                                                                    Normalized
+
+
+
+
+                                                                                 3.5
+they come from the real industry workloads running on thou-                      3.0
+                                                                                 2.5
+                                                                                 2.0
+sands of GPUs. We use a uniform length to avoid analysis                         1.5
+                                                                                 1.0
+                                                                                 0.5
+inconvenience caused by different lengths. Additionally, to                      0.0
+                                                                                        2000/200 2000/200 2000/1000 2000/1000 1000/1000 1000/1000
+assess performance under more dynamic lengths, we con-                                    sd=4    sd=16     sd=4      sd=16     sd=4      sd=16
+
+duct experiments on Llama-3.1-8B (A100, TP=1) where the                 (g) Qwen 2.5 14B throughput, on MI200, #requests = 6400
+lengths of the shared prefix, distinct context, and generated
+tokens are perturbed around base values using a Poisson            Figure 6: Microbenchmark evaluation. The setting m/n
+distribution. These experiments help evaluate the robust-          (like 2000/200) indicates the length of shared prefix/non-
+ness of BatchLLM and baselines to variations in sequence           shared context, sd means sharing degree. For subfigure (e),
+lengths. The microbenchmark evaluation is in Sec.4.2.1.            lengths are perturbed around base values using a Poisson
+As for the industry tasks, we conduct the evaluation on a          distribution. The vLLM setting with ’+ p’ (’+ c’) means
+typical scenario in web search engines, which is the snippet       prefix-caching (chunked-prefill) enabled.
+         BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+                                                                                                                                                          Table 1: Industry workload evaluation.
+
+                                                                                                                                               Settings                  Throughtput, A100   Throughput, MI200
+                                                                                                                                               vLLM                            5.45                2.75
+                            shared-prefix-length=2000                                                     shared-prefix-length=4000              + c (chunked-prefill)         5.48                2.84
+                                                                                                 6
+Normalized Throughput
+
+
+
+
+                                                                              Normalized Throughput
+                                                                                                                                                 + p (prefix-caching)          6.2                 3.27
+                   4                                                                                                                             +c+p                          6.71                3.36
+
+                   3                                                                             4                                             BatchLLM                    8.67(1.30×)         4.24(1.26×)
+
+                   2
+                                                                                                 2
+                   1                                                                                                                        and memory for this case. With lower sharing-degree and
+                        2    4       8                  16                                            2   4         8                  16
+                                 Shared Degree                                                                  Shared Degree               shorter common prefix (like sd is 2 and the length of prefix
+                            shared-prefix-length=8000                                                     shared-prefix-length=16000        is 2000), the acceleration of BatchLLM is 1.7×/1.5×, com-
+                                                                                12.5                                                        paring with the best setting of vLLM and SGLang. When
+Normalized Throughput
+
+
+
+
+                                                             Normalized Throughput
+
+
+
+
+                   8
+                                                                                10.0                                                        the length of shared prefix is 16000, and the share degree
+                   6                                                                   7.5                                                  is 16, the best performance of vLLM and SGLang are 0.49
+                   4                                                                   5.0                                                  and 0.56, while BatchLLM achieves 10.8×/9.5× speedup.
+                   2                                                                   2.5                                                  Comparison between vLLM + request sorting and Batch-
+                        2    4       8                  16                                            2   4         8                  16   LLM. We perform a preprocess for the setting of vLLM +
+                                 Shared Degree                                                                  Shared Degree
+                                                                                                                                            chunked-prefill + prefix-cahcing: use python.sorted() to
+ Figure 7: Microbenchmark evaluation of different sharing-                                                                                  gather all requests with the same prefix together4 . This
+ degrees and different shared-prefix lengths on A100. Given                                                                                 can help vLLM to cache the tokens better. After this pre-
+ 6400 requests. This evaluation is based on Llama-3.1-8B-                                                                                   process, vLLM’s throughput is boosted from 6 to 13.02,
+ Instruct, while the length of non-shared context is 200, and                                                                               while the throughput of BatchLLM is 18. One reason is
+ the generated length is 100.                                                                                                               that vLLM cannot simplify the attention calculation when
+                                                                                                                                            there are more than 1 common prefix in the batch every step
+                                                                                                                                            of its inference, while BatchLLM could handle it. Besides,
+ generation task that generates the snippet of a document for                                                                               BatchLLM has a better token-batching strategy than vLLM.
+ the user query. We conduct the breakdown experiments in
+                                                                                                                                            Comparison with the latest prefix-caching advances by
+ Sec.4.3 to demonstrate the efficacy of each technique.
+                                                                                                                                            early 2026. BatchLLM is implemented based on an old
+                                                                                                                                            vLLM version, v0.6.4. The latest vLLM version has inte-
+ 4.2                        End to End Comparison                                                                                           grated many of the most recent prefix-sharing technologies
+ 4.2.1                       Basic Evaluation                                                                                               from the community, and we make a comparison against
+                                                                                                                                            it. We evaluate the industry workload in this paper with the
+ Fig.6 shows the end-to-end throughput comparison be-                                                                                       latest vLLM (the vLLM’s github commit by 1/16/2026). Its
+ tween BatchLLM and the baselines with different shared-                                                                                    throughput on A100 is 6.57 for this workload with its latest
+ prefix/non-shared context settings. The results show that                                                                                  prefix-caching optimization, while BatchLLM achieves 8.67
+ BatchLLM outperforms the vLLM and SGLang baseline                                                                                          even with a very old vLLM as the implementation base.
+ under different configurations, for different models on dif-
+ ferent GPU platforms with different input data distributions.                                                                              Overall, the performance improvement of BatchLLM comes
+ Specifically, when comparing with vLLM + prefix-caching +                                                                                  from the better KV reuse with the explicit prefix identifi-
+ chunked-prefill, which performs the best across all vLLM’s                                                                                 cation, the token-batching to better mix the decoding with
+ configurations, BatchLLM can get 1.4-3× speedup on A100                                                                                    prefill chunks together, and the better Attention kernels,
+ and 1.8-4.1× speedup on MI200. BatchLLM also achieves                                                                                      which we will analyze through the breakdown in Sec.4.3.
+ better performance than SGLang, with 1.2-2.5× speedup on
+ A100 and 1.3-2.8× speedup on MI200. The acceleration is                                                                                    4.2.2   Industry Workload Evaluation
+ stable from 7B to 70B models.                                                                                                              This industry workload is similar to the snippet generation
+ The impact of sharing-degree and shared prefix. We also                                                                                    task described in the recent work (Wang et al., 2023), which
+ compare the throughput of different settings after changing                                                                                is also described in Sec.2.1. The original input has two
+ the sharing-degree and the length of shared prefix. Fig.7                                                                                  levels of prefixes: the global shared instruction to extract the
+ shows that the speedup becomes more significant when                                                                                       information from the document-query pair, and the shared
+ more requests share the same prefix and the portion of the                                                                                    4
+                                                                                                                                                Here the length of shared prefix/non-shared context/generated
+ common prefix becomes larger, which contributes to a big-                                                                                  tokens are 2000/200/100, while the sharing degree is 16. The
+ ger reuse ratio, and BatchLLM can save more computation                                                                                    model is Llama-3.1-8B. And the GPU is NVIDIA A100.
+   BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+             The length of shared prefix              The length of non-shared context   Table 2: End-to-end throughput under the heavy-tail work-
+    100                                        1500
+                                                                                         load.
+        80                                     1250
+        60                                     1000
+Count
+
+
+
+
+                                           Count
+                                                                                                      Configuration   Throughput (req/s)   Speedup
+                                                750
+        40                                                                                               vLLM                5.26           1.0×
+                                                500                                                    BatchLLM             17.02           3.2×
+        20                                      250
+        0                                         0
+        1500 1600 1700 1800 1900 2000                      30       40        50
+                    Length                                        Length
+                                                                                         generation length of 51.2 tokens. However, the heavy-tail
+ Figure 8: The length distribution of shared prefix/non-
+                                                                                         nature of the workload is best illustrated by its percentiles:
+ shared context in the dataset of the industry workload.
+                                                                                         while the median (p50) is just 25 tokens, the 99th percentile
+                                                                                         (p99) reaches 509 tokens, resulting in an extreme p99/p50
+                                                                                         ratio of 20.3×. The evaluation is conducted using the Qwen
+ document between different groups of queries. The first-                                2.5 7B model at FP16 precision. To stress-test the prefix-
+ level prefix is very short. With the optimization described                             sharing capabilities of our system, the 320 requests are
+ in Sec.3.2, the first-level prefixes are enlarged (i.e., some                           divided into 20 groups. Each group consists of 16 requests
+ of the second-level prefix of the document is merged into                               that share a common, lengthy prefix of 2000 tokens, ap-
+ the first-level prefix). We have analyzed the token saving                              pended with a distinct prompt of 200 tokens (totaling an
+ ratio according to Eq.1. It shows that the saving ratio are                             input length of 2200 tokens per request). We enable chun-
+ nearly the same between the multi-level and the enlarged                                ked prefill with a maximum of 2048 batched tokens and
+ single level prefixes, 56% for the former and 55% for the                               configure a KV cache block size of 64.
+ latter. Besides, the DP algorithm only introduces less than                             We compare BatchLLM with vLLM. Tab.2 summarizes
+ 0.01% overhead.                                                                         the end-to-end throughput under the heavy-tail workload.
+ The data distribution of this workload is shown in Fig.8.                               BatchLLM achieves a substantial 3.2× speedup over the
+ The average share-degree (i.e., the number of the distinct                              baseline, increasing throughput from 5.26 req/s to 17.02 re-
+ prompt that share the same prefix) is about 3, the average                              q/s. This performance gain demonstrates that BatchLLM’s
+ common prefix length is about 1570 tokens, and the average                              context sharing mechanism is highly resilient to the decod-
+ distinct prompt length is about 30 tokens. We sample 8000                               ing inefficiencies traditionally caused by heavy-tail distribu-
+ queries for this case study.                                                            tions.
+ We conduct this experiment on the NVIDIA A100 GPU and
+                                                                                         4.3     Breakdown Analysis
+ AMD MI200 GPU. The model is a fine-tuned Qwen-2.5-
+ 7B model. Table.1 shows the effectiveness of BatchLLM                                   To better isolate the performance improvements of Batch-
+ of this workload, with about 1.3×/1.26× speedup over the                                LLM, we provide the breakdown analysis to evaluate the
+ best configuration of vLLM. BatchLLM better reuses the                                  individual effects of our core techniques: prefix grouping,
+ KV context than the vLLM baseline with the optimization                                 request reordering (token-batching), and kernel fusion.
+ in Sec.3.2, for which we have the breakdown analysis in
+ Sec.4.3.1. BatchLLM also better mixes the decoding to-                                  4.3.1    Effect of Prefix Grouping
+ kens with prefill tokens to increase the size of token-batches
+                                                                                         Algorithm Effectiveness on Multi-level Prefix Inputs. To
+ with the optimization in Sec.3.3, for which we have the
+                                                                                         demonstrate the effectiveness of our proposed prefix identi-
+ breakdown analyze in Sec.4.3.2. It also benefits from the
+                                                                                         fication algorithm, we conduct an ablation study comparing
+ optimized Attention kernel described later. During the exe-
+                                                                                         it against a baseline sorting-based heuristic approach for
+ cution, it does not have KV swaps/recomputations in Batch-
+                                                                                         multi-level prefix inputs. The heuristic method relies on lex-
+ LLM when processing the industry workload above. The
+                                                                                         icographical sorting and greedy scanning, grouping requests
+ peak KV usage is about 50% for this workload.
+                                                                                         only if their longest common prefix exceeds a rigid 50%
+                                                                                         length threshold relative to the shortest member. In contrast,
+ 4.2.3       Heavy-tailed decoding with varied output lengths.
+                                                                                         our approach automatically discovers shared prefixes of ar-
+ We evaluate heavy-tailed decoding to demonstrate Batch-                                 bitrary lengths without rigid ratio constraints, merging paths
+ LLM’s efficacy for varied output lengths, using a Pareto-                               based on a dynamic gain formula.
+ distributed output length configuration.
+                                                                                         We construct a synthetic dataset to evaluate edge cases
+ We generate a workload of 320 requests sampled from a                                   where prompts share significant context but fall short
+ Pareto distribution (shape parameter α = 1.5) bounded be-                               of heuristic thresholds. Each prompt consists of 1000
+ tween 10 and 512 tokens. This distribution yields a mean                                tokens formulated as: group_pref ix + sub_pref ix +
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+                                                                                                 shared-prefix-length=2000                                      shared-prefix-length=4000
+random_suf f ix. We generate 6400 prompts divided into                            80           vLLM + c + p
+                                                                                               SGLang                                              80
+50 global groups. Each group contains 64 subcategories,
+
+
+
+
+                                                                 Token reusing ratio
+
+
+
+
+                                                                                                                                  Token reusing ratio
+                                                                                               BatchLLM
+                                                                                  60                                                               60
+with 2 prompts per subcategory. We test two configura-
+tions: Setting A uses a 490-token group_pref ix and an                            40                                                               40
+11-token sub_pref ix, while Setting B uses a 400-token                            20                                                               20
+group_pref ix and a 101-token sub_pref ix.                                             0 2                                                              0
+                                                                                               4          8                  16                             2   4        8                   16
+                                                                                                      Shared Degree                                                  Shared Degree
+In both settings, the prefix ratio within the same subcategory
+is > 50% (e.g., (490 + 11)/1000 = 50.1%), but the prefix                                         shared-prefix-length=8000                                      shared-prefix-length=16000
+ratio across different subcategories within the same global                       80                                                               80
+
+
+
+
+                                                                 Token reusing ratio
+
+
+
+
+                                                                                                                                  Token reusing ratio
+group falls strictly below 50% (e.g., 490/1000 = 49%).                            60                                                               60
+                                                                                  40                                                               40
+Table 3: Performance comparison of prefix grouping algo-
+                                                                                  20                                                               20
+rithms across 6400 requests. The baseline executes without
+context sharing (CS) or BatchLLM optimizations.                                        0                                                                0
+                                                                                           2   4          8                  16                             2   4        8                   16
+                                                                                                      Shared Degree                                                  Shared Degree
+       Configuration       Saving Ratio   Throughput (req/s)
+                                                                       Figure 9: The token saving (or reusing) ratio of different
+                  Setting A (group_pref ix = 490)                      sharing-degrees and different shared-prefix lengths on A100,
+       Baseline (No CS)       0.0%                  10.7               based on the microbenchmark. This evaluation is based
+       Heuristic CSGroup     ∼25.0%                 12.4
+       BatchLLM              48.6%                  15.9               on Llama-3.1-8B-Instruct, while the length of non-shared
+                  Setting B (group_pref ix = 400)                      context is 200, and the generated length is 100.
+       Baseline (No CS)       0.0%                  10.7
+       Heuristic CSGroup     ∼25.0%                 12.3
+       BatchLLM              39.7%                  14.5
+                                                                       of the requests number and the length of prefix, it can be
+                                                                       expected that the implicit LRU cache policy of vLLM’s
+As shown in Table 3, the heuristic approach is bottlenecked            prefix-caching can suffer more from the eviction of the
+by its 50% threshold. It successfully groups prompts within            reusable KV context, while the inference could benefit more
+the same subcategory (forming 3200 groups of 2 members),               from BatchLLM. For example, when the length of shared
+yielding a limited token saving ratio of ∼25% and through-             prefix is 16000, and the share degree is 16, the token reusing
+put of ∼12.4 prompts/s.                                                ratio of vLLM and SGLang are 6.3% and 5.2%, while the
+                                                                       reusing ratio of BatchLLM is 92.6 %, much better than the
+Conversely, our longest prefix identification algorithm com-
+                                                                       other two baselines.
+pletely bypasses this limitation, identifying the global
+group_pref ix and clustering all 128 members of a group               Global Prefix Identification Overhead. We have mea-
+together (forming 50 groups). In Setting A, BatchLLM                  sured the time of the global prefix identification described
+achieves a 48.6% token saving ratio and a throughput of               in Sec.3.2. The time range of the overhead starts before
+15.9 prompts/s, delivering a 1.28× speedup over the heuris-           adding the token ids of each prompt to form the basic prefix
+tic method and a 1.49× speedup over the baseline. Fur-                tree and ends after generating the final list of prefix-sharing
+thermore, BatchLLM grouping closely matches theoretical               groups. As for the industry workload in Sec.4.2.2, the total
+ground truth grouping limits, proving its robustness in cap-          overhead of the 8000 requests is 1.51 seconds. While the
+turing complex, multi-level prefix hierarchies.                       time to process the 8000 requests with the input of prefix-
+                                                                      sharing groups format is 919.54 seconds. The global prefix
+KV Cache Reusing Effect. To show that this grouping
+                                                                      identification procedure nearly has no overhead compared
+optimizes the KV reuse, we evaluate the throughput and the
+                                                                      with the end-to-end execution time.
+token saving ratio in both microbenchmarks and the industry
+task. Note that all samples in the the industry task are not
+                                                                       4.3.2                    Effect of Request Reordering and Token-Batching
+sorted too.
+                                                                       Fig.10 shows the number of per-iteration tokens, using the
+As shown in Fig.9, we can see the token saving ratio is
+                                                                       same workload with Fig.2. It clearly shows that the request
+improved in BatchLLM across different settings. And it
+                                                                       reordering and token-batching optimization in BatchLLM
+becomes higher when the sharing-degree is larger. Specifi-
+                                                                       successfully reduces the "valleys" of the iterations, thus
+cally, in the microbenchmark setting where length of shared
+                                                                       increasing the overall GPU utilization.
+prefix is 2000 and the sharing-degree is 16, BatchLLM
+achieves 85.2% token saving ratio, the upper bound in this            We evaluated our token-batching optimization through abla-
+scenario, comparing to the 40.1% token saving ratio in                tion studies on throughput-oriented token-batching. Testing
+vLLM + chunked-prefill + prefix-caching. With the increase            on Qwen-2.5-7B with 3000 industry workload query (Fig.4)
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+                                                                                                                 1. Triton FlashAttention         2. flash-attn(CUDA)
+                                Decode Tokens                 Prefill Tokens
+                                                                                                                 3. flashinfer_cascade(CUDA)      4. BatchLLM(Triton)
+          3000
+#Tokens
+
+
+
+
+          2000                                                                                   5
+
+
+
+
+                                                                                      Speed-up
+                                                                                                 4
+          1000                                                                                   3
+                                                                                                 2
+               0                                                                                 1
+                    0     200    400     600     800   1000     1200   1400    1600
+                                                                                                 0
+                                              Iterations                                                 256/2048/all    256/2048/2      2048/256/all     2048/256/2
+                                                                                      (a) Kernel performance under decoding scenarios, #request = 32.
+Figure 10: Token number per iteration with token-batching
+optimization (Sec.3.3), showing significant valley reduction                                     10
+compared to Fig.2’s baseline. Prefix-sharing disabled to                                             8
+
+
+
+
+                                                                                      Speed-up
+demonstrate general batched/offline inference efficacy.                                              6
+                                                                                                     4
+                        Table 4: Token-Batching Breakdown.                                           2
+                                                                                                     0
+                                                                                                          256/2048/all    256/2048/2      2048/256/all     2048/256/2
+               Settings      Disable token-batching    Enable token-batching
+                                                                                      (b) Kernel performance under decoding scenarios, #request = 256.
+               vLLM + c                5.79                     5.94
+               BatchLLM                8.16                     8.47
+                                                                                                 5
+                                                                                                 4
+                                                                                      Speed-up
+                                                                                                 3
+shows effective performance improvement. Results demon-                                          2
+strate effectiveness both with and without prefix-sharing,                                       1
+with combined optimizations working particularly well in                                         0
+                                                                                                         256/2048/all    256/2048/2       2048/256/all    2048/256/2
+prefix-sharing scenarios.
+                                                                                      (c) Kernel performance under chunked-prefill scenarios, with
+                                                                                      #prefill-request = 7, and #decoding-request = 256.
+4.3.3              Effect of Horizontal Kernel Fusion
+The existing works use separate kernels to compute the                                Figure 11: The performance comparison between the base-
+partial Attention on the prefix and the distinct KV context.                          line, CascadeInfer and BatchLLM. The setting i/j/k (like
+This will lead to the tail effect of each kernel and the launch                       256/2048/all) means the length of global shared prefix, the
+overhead of these kernels. BatchLLM horizontally fuses the                            length of distinct parts for each request, and how many re-
+two partial Attention calculation into one kernel. Different                          quests in one prefix-sharing group.
+parts of the computation are performed in different thread
+blocks. Note that the problem shape of the two parts are
+different. BatchLLM applies different tiling configuration
+for the two parts to achieve the best performance. It uses the
+common auto-tuning method to find the best configuration.                             among different kernels under two scenarios: the pure de-
+                                                                                      coding scenario (request count 256) and the chunked-prefill
+We implement the Attention in BatchLLM through OpenAI                                 scenario where a token-batch includes both prefill chunks
+Triton language (Tillet et al., 2019). We use the builtin auto-                       and decoding tokens (7 prefill requests and 256 decoding
+tuner of Triton to tune the tiling size of the Attention imple-                       requests).
+mentation in BatchLLM. Besides that, some ahead-of-time
+compilation methods are applied to reduce the launching                               Results show that the Triton-based FlashAttention still has
+overhead, including warm-up process on NVIDIA GPUs,                                   a performance gap to the CUDA-based FlashAttention, al-
+and AOTriton5 on AMD GPUs.                                                            though we have already tuned the hyparameters using Tri-
+                                                                                      ton’s autotuner. This indicates the high-level Triton compiler
+We compare BatchLLM’s prefix-shared Attention imple-                                  still have a room to achieve the performance of low-level
+mentation with several baselines on both NVIDIA A100                                  CUDA compiler for complex computations.
+GPU and AMD MI200 GPU. Fig.11 shows the performance
+comparison of different implementations, including Triton                             However, based on the insufficient performance of Triton,
+official FlashAttention implementation, official FlashAtten-                          our kernel still shows good performance compared to the
+tion v2.6.1, FlashinferCascade v0.1.4 (Ye et al., 2024b),                             Cascade-Inference kernel. BatchLLM’s kernel can still
+and BatchLLM’s kernels. We compare the performance                                    achieve similar or better performance comparing with all
+                                                                                      these CUDA implementations, showing the potential of the
+          5
+              https://github.com/ROCm/aotriton                                        kernel optimization in BatchLLM.
+ BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+4.4   Limitations and Deployment Considerations                  better SLO for online LLM serving. BatchLLM differs from
+                                                                 these works as it targets the large batched inference, leverag-
+While BatchLLM demonstrates superior performance in
+                                                                 ing the static information to reorder the requests and using
+the industrial scenarios detailed in Sec.2.1, it is subject to
+                                                                 the memory-aware scheduling to enlarge the size of token-
+specific limitations. Primarily, the system’s design may ad-
+                                                                 batch. The vLLM (Kwon et al., 2023) uses the multi-step
+versely affect individual request latency, rendering it less
+                                                                 scheduling method to reduce the token-batch scheduling
+suitable for latency-critical workloads. A potential miti-
+                                                                 overhead, which is orthogonal to BatchLLM. Another or-
+gation is the development of a hybrid architecture that dy-
+                                                                 thogonal dimension to improve the token-batch performance
+namically toggles between streaming and batching modes.
+                                                                 is the pruning and quantization (Xia et al., 2023; Frantar
+Specifically, when the system encounters a backlog of
+                                                                 et al., 2022; Lin et al., 2024), which can be applied concur-
+tasks—transitioning into a batching-intensive regime—and
+                                                                 rently with the optimizations in this paper.
+identifies a high global prefix sharing ratio, it could em-
+ploy BatchLLM techniques to maximize throughput and              Attention kernel optimization. Memory-efficient Atten-
+reduce queue depth. Otherwise, the system should utilize         tion (Rabe & Staats, 2021) and FlashAttention (Dao et al.,
+standard execution paths to prioritize low latency. We leave     2022) fuse the Attention operators into a single kernel to
+the implementation of such a hybrid system for future work.      boost the performance, with Online Softmax (Milakov &
+Secondly, the advantages of BatchLLM are diminished in           Gimelshein, 2018) to tile the Attention computation. The
+environments lacking common prefixes. In the absence of          recent prefix-shared Attention optimization (ChunkAtten-
+prefix caching, performance gains are restricted solely to       tion (Ye et al., 2024a), RelayAttention (Zhu et al., 2024),
+those provided by token batching. Therefore, we recom-           Hydragen (Juravsky et al., 2024), and Cascade Inference (Ye
+mend deploying BatchLLM specifically for prefix-heavy,           et al., 2024b)) compute the attention on the prefix and other
+throughput-oriented workloads rather than general-purpose        part separately in different kernels, for which the former is
+tasks.                                                           transformed from matrix-vector multiplication between Q
+                                                                 and K/V into MatMul, and reduce the results of different
+                                                                 parts through Online Softmax. Different from these works,
+5     R ELATED W ORK
+                                                                 BatchLLM fuses the Attention computation of different
+Prefix sharing systems. The vLLM (Kwon et al., 2023)             parts into the same kernel to reduce tail latency and kernel
+proposes the PagedAttention to manage the KV memory in           launch overhead. The horizontal fusion has been proposed
+blocks, which enables to reuse the KV context both intra and     and used in the existing machine learning optimizers (Pan
+inter requests in memory block level. Prompt Cache (Gim          et al., 2023; 2024; Li et al., 2022). BatchLLM borrows this
+et al., 2024) and SGLang (Zheng et al., 2023) propose the        idea and applies it in the prefix-shared Attention.
+domain specific language (DSL) to define the shared prefix
+of prompt. Besides, SGLang proposes the radix tree based         6    C ONCLUSION
+KV cache management with LRU policy for KV memory
+eviction. RAGCache (Jin et al., 2024a) studies the common        This paper presents BatchLLM, the holistic optimization
+KV caching for RAG optimization. Some recent works (Gao          techniques for large batched LLM-based information pro-
+et al., 2024; Jin et al., 2024b; Qin et al., 2024; Hu et al.,    cessing and management tasks. It identifies the limitations
+2024; OpenAI, Cited 2024b) study the distributed request         of existing methods, and optimizes the tasks with the global
+scheduling with the consideration of prompt prefix reuse.        information of the large batch. It explicitly extracts the com-
+None of these works identify the common prefix ahead-of-         mon prefix globally to avoid prefix’s early eviction problem,
+time and enable the explicit reusing. Instead, BatchLLM          and simplifies the prefix pattern by enlarging the first-level
+manages the prefix reusing explicitly and can reuse the KV       prefix with a DP algorithm on the tree to reduce the overhead
+context the best for the large batched scenario.                 of scheduling and Attention computation. It schedules the
+                                                                 requests at the granularity of prefix-sharing groups, which
+Token batching and serving optimization. Orca (Yu et al.,
+                                                                 enables the global prefix sharing the best and shrinks the
+2022) proposes the continuous batching method for trans-
+                                                                 lifetime of prefix’s KV memory. It proposes the request
+former models with the per-iteration token batching of auto-
+                                                                 reordering and memory-centric token batching method to
+regressive models (Gao et al., 2018). FastGen (Holmes
+                                                                 better mix the prefill chunks into the decoding token-batches
+et al., 2024) and SARATHI (Agrawal et al., 2023) study the
+                                                                 and thus better saturates the GPU. Finally, it presents the
+mix of prefill chunks and decoding tokens into the same
+                                                                 horizontal fused prefix-shared Attention kernel to reduce the
+token-batch to increase the compute intensity of the batch.
+                                                                 tail effect and kernel launch overhead. Extensive evaluation
+FlexGen (Sheng et al., 2023) proposes the swizzled token
+                                                                 shows that BatchLLM outperforms vLLM and SGLang by
+computation and offloading to support the LLM inference
+                                                                 1.3× to 10.8× on a set of microbenchmarks and a typical
+with limited GPU memory. Some works (Fu et al., 2024;
+                                                                 industry workload under different hardware environments.
+Sheng et al., 2024) study the request scheduling to achieve
+BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+R EFERENCES                                                       mlsys.org, 2024. URL https://proceedings.ml
+                                                                  sys.org/paper_files/paper/2024/hash/
+Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani,
+                                                                  a66caa1703fe34705a4368c3014c1966-Abs
+  B. S., and Ramjee, R. SARATHI: efficient LLM inference
+                                                                  tract-Conference.html.
+  by piggybacking decodes with chunked prefills. CoRR,
+  abs/2308.16369, 2023.                                         Holmes, C., Tanaka, M., Wyatt, M., Awan, A. A., Rasley,
+                                                                 J., Rajbhandari, S., Aminabadi, R. Y., Qin, H., Bakhtiari,
+AI@Meta. Llama 3 model card. 2024. URL https:
+                                                                 A., Kurilenko, L., and He, Y. Deepspeed-fastgen:
+  //github.com/meta-llama/llama3/blob/m
+                                                                  High-throughput text generation for llms via MII and
+  ain/MODEL_CARD.md.
+                                                                  deepspeed-inference. CoRR, abs/2401.08671, 2024.
+Chen, Z., Cao, L., and Madden, S. Lingua manga: A generic
+  large language model centric system for data curation.        Hu, C., Huang, H., Hu, J., Xu, J., Chen, X., Xie, T., Wang,
+  Proc. VLDB Endow., 16(12):4074–4077, August 2023.               C., Wang, S., Bao, Y., Sun, N., and Shan, Y. Memserve:
+  ISSN 2150-8097. doi: 10.14778/3611540.3611624.                  Context caching for disaggregated LLM serving with
+                                                                  elastic memory pool. CoRR, abs/2406.17565, 2024.
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Ré, C. Flashat-
+  tention: Fast and memory-efficient exact attention with       Jin, C., Zhang, Z., Jiang, X., Liu, F., Liu, X., Liu, X., and Jin,
+  io-awareness. In Advances in Neural Information Pro-             X. Ragcache: Efficient knowledge caching for retrieval-
+  cessing Systems 35: Annual Conference on Neural In-              augmented generation. CoRR, abs/2404.12457, 2024a.
+  formation Processing Systems 2022, NeurIPS 2022, New          Jin, Y., Wang, T., Lin, H., Song, M., Li, P., Ma, Y., Shan,
+  Orleans, LA, USA, November 28 - December 9, 2022,                Y., Yuan, Z., Li, C., Sun, Y., Wu, T., Chu, X., Huan,
+  2022.                                                            R., Ma, L., You, X., Zhou, W., Ye, Y., Liu, W., Xu, X.,
+Fernandez, R. C., Elmore, A. J., Franklin, M. J., Krish-           Zhang, Y., Dong, T., Zhu, J., Wang, Z., Ju, X., Song,
+  nan, S., and Tan, C. How large language models will              J., Cheng, H., Li, X., Ding, J., Guo, H., and Zhang, Z.
+  disrupt data management. Proc. VLDB Endow., 16                   P/d-serve: Serving disaggregated large language model
+  (11):3302–3309, July 2023. ISSN 2150-8097. doi:                  at scale. CoRR, abs/2408.08147, 2024b.
+  10.14778/3611479.3611527.
+                                                                Juravsky, J., Brown, B., Ehrlich, R., Fu, D. Y., Ré, C., and
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D.          Mirhoseini, A. Hydragen: High-throughput llm inference
+  GPTQ: accurate post-training quantization for genera-           with shared prefixes, 2024.
+  tive pre-trained transformers. CoRR, abs/2210.17323,
+                                                                Kim, S., Kang, H., Choi, S., Kim, D., Yang, M., and Park,
+  2022.
+                                                                  C. Large language models meet collaborative filtering:
+Fu, Y., Zhu, S., Su, R., Qiao, A., Stoica, I., and Zhang, H.      An efficient all-round llm-based recommender system. In
+  Efficient LLM scheduling by learning to rank. CoRR,             Proceedings of the 30th ACM SIGKDD Conference on
+  abs/2408.15792, 2024.                                           Knowledge Discovery and Data Mining, KDD ’24, pp.
+                                                                  1395–1406. Association for Computing Machinery, 2024.
+Gao, B., He, Z., Sharma, P., Kang, Q., Jevdjic, D., Deng,         ISBN 9798400704901. doi: 10.1145/3637528.3671931.
+  J., Yang, X., Yu, Z., and Zuo, P. Cost-efficient large
+  language model serving for multi-turn conversations with      Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  cachedattention. In Proceedings of the 2024 USENIX             C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+ Annual Technical Conference, USENIX ATC 2024, Santa             memory management for large language model serving
+  Clara, CA, USA, July 10-12, 2024, pp. 111–126. USENIX          with pagedattention. In Proceedings of the 29th Sym-
+  Association, 2024.                                             posium on Operating Systems Principles, SOSP 2023,
+                                                                 Koblenz, Germany, October 23-26, 2023, pp. 611–626.
+Gao, P., Yu, L., Wu, Y., and Li, J. Low latency rnn in-          ACM, 2023.
+  ference with cellular batching. In Proceedings of the
+ Thirteenth EuroSys Conference. Association for Com-            Li, A., Zheng, B., Pekhimenko, G., and Long, F. Automatic
+  puting Machinery, 2018. ISBN 9781450355841. doi:                 horizontal fusion for GPU kernels. In IEEE/ACM Interna-
+ 10.1145/3190508.3190541.                                          tional Symposium on Code Generation and Optimization,
+                                                                  CGO 2022, Seoul, Korea, Republic of, April 2-6, 2022,
+Gim, I., Chen, G., Lee, S., Sarda, N., Khandelwal, A., and         pp. 14–27. IEEE, 2022.
+  Zhong, L. Prompt cache: Modular attention reuse for
+  low-latency inference. In Proceedings of the Seventh          Lin, J., Tang, J., Tang, H., Yang, S., Chen, W., Wang,
+  Annual Conference on Machine Learning and Systems,              W., Xiao, G., Dang, X., Gan, C., and Han, S. AWQ:
+  MLSys 2024, Santa Clara, CA, USA, May 13-16, 2024.              activation-aware weight quantization for on-device LLM
+BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+  compression and acceleration. In Gibbons, P. B., Pekhi-     Rabe, M. N. and Staats, C. Self-attention does not need
+  menko, G., and Sa, C. D. (eds.), Proceedings of the Sev-      o(n2 ) memory. CoRR, abs/2112.05682, 2021. URL ht
+  enth Annual Conference on Machine Learning and Sys-           tps://arxiv.org/abs/2112.05682.
+  tems, MLSys 2024, Santa Clara, CA, USA, May 13-16,
+  2024. mlsys.org, 2024.                                      Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,
+                                                                B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen:
+Meguellati, E., Han, L., Bernstein, A., Sadiq, S., and          High-throughput generative inference of large language
+ Demartini, G. How good are llms in generating per-             models with a single GPU. In Krause, A., Brunskill, E.,
+ sonalized advertisements?    In Companion Proceed-             Cho, K., Engelhardt, B., Sabato, S., and Scarlett, J. (eds.),
+ ings of the ACM Web Conference 2024, WWW ’24, pp.              International Conference on Machine Learning, ICML
+ 826–829. Association for Computing Machinery, 2024.            2023, 23-29 July 2023, Honolulu, Hawaii, USA, volume
+ doi: 10.1145/3589335.3651520.                                  202 of Proceedings of Machine Learning Research, pp.
+                                                                31094–31116. PMLR, 2023.
+Milakov, M. and Gimelshein, N. Online normalizer calcu-
+ lation for softmax. CoRR, abs/1805.02867, 2018. URL          Sheng, Y., Cao, S., Li, D., Zhu, B., Li, Z., Zhuo, D., Gon-
+ http://arxiv.org/abs/1805.02867.                               zalez, J. E., and Stoica, I. Fairness in serving large lan-
+                                                                guage models. In 18th USENIX Symposium on Operating
+OpenAI. Introducing openai o1-preview. https://open
+                                                                Systems Design and Implementation, OSDI 2024, Santa
+  ai.com/index/introducing-openai-o1-p
+                                                                Clara, CA, USA, July 10-12, 2024, pp. 965–988. USENIX
+  review/, Cited 2024a.
+                                                                Association, 2024.
+OpenAI. Openai prompt caching. https://platform
+  .openai.com/docs/guides/prompt-cachi                        Tillet, P., Kung, H. T., and Cox, D. Triton: an intermediate
+  ng, Cited 2024b.                                               language and compiler for tiled neural network compu-
+                                                                 tations. In Proceedings of the 3rd ACM SIGPLAN Inter-
+Pan, Z., Zheng, Z., Zhang, F., Wu, R., Liang, H., Wang, D.,      national Workshop on Machine Learning and Program-
+  Qiu, X., Bai, J., Lin, W., and Du, X. Recom: A compiler        ming Languages, MAPL 2019, pp. 10–19. Association
+  approach to accelerating recommendation model infer-           for Computing Machinery, 2019. ISBN 9781450367196.
+  ence with massive embedding columns. In Proceedings of
+  the 28th ACM International Conference on Architectural      Wang, L., Yang, N., Huang, X., Yang, L., Majumder, R.,
+  Support for Programming Languages and Operating Sys-         and Wei, F. Large search model: Redefining search stack
+  tems, Volume 4, ASPLOS 2023, Vancouver, BC, Canada,          in the era of llms. SIGIR Forum, 57(2):23:1–23:16, 2023.
+  March 25-29, 2023, pp. 268–286. ACM, 2023.
+                                                              Xia, H., Zheng, Z., Li, Y., Zhuang, D., Zhou, Z., Qiu, X.,
+Pan, Z., Zheng, Z., Zhang, F., Xie, B., Wu, R., Smith, S.,      Li, Y., Lin, W., and Song, S. L. Flash-llm: Enabling low-
+  Liu, C., Ruwase, O., Du, X., and Ding, Y. Recflex:            cost and highly-efficient large generative model inference
+  Enabling feature heterogeneity-aware optimization for         with unstructured sparsity. Proc. VLDB Endow., 17(2):
+  deep recommendation models with flexible schedules. In        211–224, 2023.
+  Proceedings of the International Conference for High Per-
+  formance Computing, Networking, Storage, and Analysis,      Xiong, H., Bian, J., Li, Y., Li, X., Du, M., Wang, S., Yin,
+  SC 2024, Atlanta, GA, USA, November 17-22, 2024, pp.          D., and Helal, S. When search engine services meet
+  41. IEEE, 2024.                                               large language models: Visions and challenges. CoRR,
+                                                                abs/2407.00128, 2024.
+Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W.,
+  and Xu, X. Mooncake: A kvcache-centric disaggregated        Ye, L., Tao, Z., Huang, Y., and Li, Y. Chunkattention:
+  architecture for LLM serving. CoRR, abs/2407.00079,           Efficient self-attention with prefix-aware KV cache and
+  2024.                                                         two-phase partition. In Proceedings of the 62nd Annual
+                                                                Meeting of the Association for Computational Linguistics
+Qwen, :, Yang, A., Yang, B., Zhang, B., Hui, B., Zheng,         (Volume 1: Long Papers), ACL 2024, Bangkok, Thailand,
+ B., Yu, B., Li, C., Liu, D., Huang, F., Wei, H., Lin, H.,      August 11-16, 2024, pp. 11608–11620. Association for
+ Yang, J., Tu, J., Zhang, J., Yang, J., Yang, J., Zhou, J.,     Computational Linguistics, 2024a.
+ Lin, J., Dang, K., Lu, K., Bao, K., Yang, K., Yu, L.,
+ Li, M., Xue, M., Zhang, P., Zhu, Q., Men, R., Lin, R.,       Ye, Z., Lai, R., Lu, B.-R., Lin, C.-Y., Zheng, S., Chen, L.,
+ Li, T., Tang, T., Xia, T., Ren, X., Ren, X., Fan, Y., Su,      Chen, T., and Ceze, L. Cascade inference: Memory band-
+ Y., Zhang, Y., Wan, Y., Liu, Y., Cui, Z., Zhang, Z., and       width efficient shared prefix batch decoding, February
+ Qiu, Z. Qwen2.5 technical report, 2025. URL https:             2024b. URL https://flashinfer.ai/2024/0
+ //arxiv.org/abs/2412.15115.                                    2/02/cascade-inference.html.
+BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching
+
+Yu, G., Jeong, J. S., Kim, G., Kim, S., and Chun, B. Orca:
+  A distributed serving system for transformer-based gener-
+  ative models. In 16th USENIX Symposium on Operating
+  Systems Design and Implementation, OSDI 2022, Carls-
+  bad, CA, USA, July 11-13, 2022, pp. 521–538. USENIX
+  Association, 2022.
+Zhao, Z., Fan, W., Li, J., Liu, Y., Mei, X., Wang, Y., Wen, Z.,
+  Wang, F., Zhao, X., Tang, J., and Li, Q. Recommender
+  systems in the era of large language models (llms). IEEE
+  Transactions on Knowledge and Data Engineering, 36
+  (11):6889–6907, 2024. doi: 10.1109/TKDE.2024.3392
+  335.
+
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Barrett,
+  C., and Sheng, Y. Efficiently programming large language
+  models using sglang. 2023.
+Zhu, L., Wang, X., Zhang, W., and Lau, R. W. H. Relay-
+  attention for efficient large language model serving with
+  long system prompts. In Proceedings of the 62nd Annual
+  Meeting of the Association for Computational Linguistics
+  (Volume 1: Long Papers), ACL 2024, Bangkok, Thai-
+  land, August 11-16, 2024, pp. 4945–4957. Association
+  for Computational Linguistics, 2024.
+

@@ -1,0 +1,1126 @@
+             T ELE RAG: E FFICIENT R ETRIEVAL -AUGMENTED G ENERATION
+                      I NFERENCE WITH L OOKAHEAD R ETRIEVAL
+
+
+     Chien-Yu Lin * 1 Keisuke Kamahori * 1 Yiyu Liu * † 2 Xiaoxiang Shi † 3 Madhav Kashyap 1 Yile Gu 1
+Rulin Shao 1 Zihao Ye 1 Kan Zhu 1 Rohan Kadekodi 1 Stephanie Wang 1 Arvind Krishnamurthy 1 Luis Ceze 1
+                                              Baris Kasikci 1
+
+
+                                                          A BSTRACT
+        Retrieval-augmented generation (RAG) extends large language models (LLMs) with external data sources to
+        enhance factual correctness and domain coverage. Modern RAG pipelines rely on large datastores, creating
+        a significant system challenge: achieving high throughput and low latency is difficult, especially when GPU
+        memory is limited. To address these challenges, we propose T ELE RAG, an efficient inference system that reduces
+        latency and improves throughput with minimal GPU memory requirements. The core innovation of T ELE RAG is
+        lookahead retrieval, a prefetching mechanism that predicts required data and transfers them from CPU to GPU in
+        parallel with LLM generation. In addition, T ELE RAG adopts a prefetching scheduler and a cache-aware scheduler
+        to support efficient multi-GPU inference with minimal overhead. Evaluations show T ELE RAG achieves up to
+        a 1.98× average end-to-end latency reduction (single-query) and 1.83× higher average throughput (batched),
+        as well as good scalability in throughput. This confirms the practical utility of T ELE RAG for faster and more
+        memory-efficient deployments of RAG applications.
+
+1       I NTRODUCTION
+                                                                         Pre-retrieval   Retrieval   Post-retrieval
+                                                                                                                      Judgement
+Retrieval-augmented generation (RAG) has emerged as                       generation                  generation
+
+a powerful technique to enhance large language models
+                                                                      Figure 1. Typical pipeline stages of a RAG application.
+(LLMs) by integrating them with external databases (Gao
+et al., 2023b; Asai et al., 2024c; Lewis et al., 2020). During
+inference, RAG retrieves relevant content from external data      generation: generates a response based on the user’s query
+sources, usually indexed as vector datastores, to mitigate        and retrieved documents; (4) judgment: evaluates the output
+issues such as hallucinations (Mallen et al., 2023; Ram et al.,   to determine the execution flow.
+2023; Khandelwal et al., 2019) and incorporate up-to-date or      RAG datastores are typically large, as datastore size is
+private information (Izacard et al., 2023; Min et al., 2023).     strongly correlated with model accuracy (Min et al., 2023;
+To provide accurate responses, modern RAG applications            Khandelwal et al., 2019; Borgeaud et al., 2022; Hardt & Sun,
+employ multiple rounds of LLM calls and retrievals for a          2023; Shao et al., 2024). However, a brute-force search on
+single query (Gao et al., 2023b; Fan et al., 2024; Ilin, 2023;    such a large datastore is prohibitively slow and inefficient,
+Gao, 2024; Databricks, 2024; Wei, 2024). As shown in              as most data is irrelevant to the query. This drives the adop-
+Figure 1, RAG pipelines typically consist of four stages:         tion of solutions like the Inverted File Index (IVF) (Sivic
+(1) pre-retrieval generation: refines the initial user query      & Zisserman, 2003), which partitions the data into clusters
+to improve retrieval effectiveness. (2) retrieval: finds the      and restricts the search to only the most relevant ones.
+relevant documents from the datastore; (3) post-retrieval         While this partitioning effectively reduces the computational
+    *                  †                                 1
+   Equal contribution Work done during internship at UW. Paul     burden of the search, it does not solve the memory capacity
+G. Allen School of Computer Science and Engineering, Uni-         challenge. To accelerate the IVF retrieval process with the
+versity of Washington, Seattle, WA, USA 2 Harvard John A.         GPU, one straightforward approach is to keep the entire
+Paulson School of Engineering and Applied Sciences, Harvard       datastore in the GPU memory (case A in Figure 2). As the
+University, Cambridge, MA, USA 3 Shanghai Jiao Tong Uni-
+                                                                  size of a datastore is large (tens to thousands of GB) (Quinn
+versity, Shanghai, China. Correspondence to: Baris Kasikci
+<baris@cs.washington.edu>.                                        et al., 2025), such a setting is expensive and often commer-
+                                                                  cially impractical for local and custom RAG deployments
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,      handling private or sensitive data. Even in large data centers,
+2026. Copyright 2026 by the author(s).                            where user requests are often batched, this approach chal-
+                     T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+   Case A: ideal scenario (requires substantial GPU memory)                 our approach aims to significantly reduce retrieval latency
+    CPU
+                                                            Latency: Low    without exceeding GPU memory constraints. To guarantee
+                                                               Cost: High
+                             GPU
+                                                                            retrieval accuracy, T ELE RAG complements this prefetching
+    GPU     Pre-retrieval               Post-retrieval
+             generation     Retrieval    generation                         with a hybrid search: any clusters missed by the lookahead
+   Case B: typical CPU offload                                              are simultaneously searched on the CPU, and the results are
+                                                            Latency: High
+                                                               Cost: Low    merged. In addition to prefetching, T ELE RAG also utilizes
+    CPU                           CPU Retrieval
+                                                                            on-GPU caching to further reduce redundant data transfers
+            Pre-retrieval                                 Post-retrieval
+    GPU
+             generation                                    generation       for frequently accessed clusters.
+   Case C (our solution): lookahead retrieval                               T ELE RAG also optimizes for batch and multi-GPU infer-
+                                                            Latency: Low
+              Prefetch        CPU                              Cost: Low
+                                                                            ence (§4.2). To mitigate increased data transfer in batched
+            CPU → GPU
+    CPU
+                            Retrieval
+                             GPU
+                                                                            scenarios, T ELE RAG uses a prefetching scheduler to group
+    GPU     Pre-retrieval                Post-retrieval
+             generation     Retrieval     generation                        similar queries, maximizing the overlap of their prefetched
+                                                                            clusters. In multi-GPU settings, T ELE RAG employs a
+Figure 2. Illustration of T ELE RAG’s lookahead retrieval mech-
+                                                                            cache-aware query scheduler that routes queries to the ap-
+anism and comparison to different RAG systems. T ELE RAG
+prefetches relevant retrieval data from CPU to GPU, overlaps data
+                                                                            propriate GPU to maximize the utility of its cached clusters.
+transfer with the pre-retrieval stage, and accelerates retrieval with       Results summary. We evaluated T ELE RAG using six RAG
+GPU–CPU cooperation.                                                        pipelines with Llama 3B/8B models (AI@Meta, 2024) on a
+                                                                            Wikipedia datastore (Karpukhin et al., 2020). T ELE RAG
+lenges service level objectives (SLOs) because allocating                   demonstrates significant efficiency, enabling a datastore
+GPU memory to the datastore reduces the LLM’s key-value                     (61 GB) and a Llama-3-8B (16 GB) LLM to run on a single
+cache (KV cache), limiting effective batch sizes (Kwon                      RTX4090 GPU (24 GB), with performance far exceeding the
+et al., 2023). An alternative approach is to load the relevant              CPU baseline. For single-query inference on an RTX4090,
+data clusters from CPU to GPU at runtime. However, be-                      T ELE RAG achieves an average 1.53× end-to-end latency
+cause bandwidth between the CPU and GPU is typically                        speedup. Throughput gains increase with batching, reach-
+limited, this approach suffers from high transfer latency.                  ing 1.98× on average (batch size 8, H100). In multi-GPU
+As a result, modern RAG systems (Jiang et al., 2025; Shen                   settings, its prefetching and cache-aware scheduling deliver
+et al., 2025) process retrieval on CPUs as they typically                   strong scaling (e.g., on H200, 3.8× speedup on 4 GPUs,
+offer large and relatively cheap memory. However, CPUs                      compared to the performance on 1 GPU). These results con-
+are not as efficient as GPUs for highly parallelizable opera-               firm that T ELE RAG enables scalable RAG serving under
+tions such as vector similarity search, and therefore using                 tight GPU memory constraints. Our code is publicly avail-
+CPUs for search (case B in Figure 2) increases RAG system                   able at https://github.com/uw-syfi/TeleRAG.
+latency. For latency-sensitive applications such as customer                In summary, we make the following key contributions:
+chatbots (Chemmagate, 2024; Akkiraju et al., 2024; Tung,
+2024), financial analysis (Malec, 2024; MyScale, 2024), and                 • Analysis of the correlation of queries between the pre-
+emergency medical diagnosis (Klang et al., 2024; GM &                         retrieval generation and retrieval stages, revealing signifi-
+Dhar, 2024), high latency can lead to poor user experience                    cant overlap in their corresponding IVF clusters.
+and even critical failures. To make matters worse, any la-                  • Lookahead retrieval, which prefetches likely IVF clus-
+tency increase of RAG systems has compounding effects                         ters to the GPU, and hides CPU–GPU data transfer time
+due to multiple rounds of LLM generation and retrieval.                       during pre-retrieval generation.
+Our proposal. In this work, we observe that there is a sub-                 • T ELE RAG, an efficient RAG inference system that inte-
+stantial semantic overlap between a user’s initial query and                  grates lookahead retrieval and supports high-performance
+the query refined by an LLM during the pre-retrieval stage                    multi-GPU inference through prefetching and cache-
+(see Figure 1). Since both queries represent the same core                    aware scheduling, resulting in significant acceleration
+information need, their relevant IVF clusters are also likely                 of RAG with minimal GPU memory usage.
+to overlap significantly (see §3.3 for detailed analysis).
+Using this insight, we propose T ELE RAG (§4), an efficient                 2     BACKGROUND
+inference system that optimizes RAG performance by lever-
+                                                                            2.1   Retrieval-Augmented Generation (RAG)
+aging GPU retrieval acceleration while minimizing GPU
+memory consumption. T ELE RAG employs lookahead re-                         RAG is a technique that enhances the capabilities of LLMs
+trieval to proactively load relevant IVF clusters onto the                  by integrating them with information retrieval to generate
+GPU, hiding the CPU–GPU data transfer overhead during                       more accurate and relevant text (Gao et al., 2023b; Asai
+concurrent LLM generation. As illustrated in Figure 2,                      et al., 2024c; Lewis et al., 2020). The core idea behind RAG
+                    T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+                                                                        2.2   Datastore, Inverted File Index (IVF), and Retrieval
+                     Documents
+                                                   Embed & Cluster      Datastore. The datastore is processed by cleaning, chunk-
+                                                                        ing, and indexing to enable efficient retrieval. The raw
+    Vector Index (IVF)
+                                                                        data, in various formats, is first cleaned, converted to plain
+       Query
+                                                                        text, and divided into chunks. The chunks are then con-
+                                                             Output
+                                                                        verted into vector embeddings using an embedding model
+                      Centroids                                         such as Contriever (Izacard et al., 2021). The document
+                                   Embedding Vectors
+                                      (Clustered)
+                                                                        chunks, along with vector embeddings, are stored in a vec-
+                                                                        tor database, which enables efficient retrieval by searching
+     RAG Application                                                    for chunks based on vector similarities between the query
+                   LLM
+                                 Query
+                                               IVF      Retrieval
+                                                                        and the chunk embeddings.
+                               (Refined)      Index
+               Pre-retrieval
+                Generation
+                                                                        IVF-based retrieval. Many RAG deployments use the In-
+                                                                        verted File Index (IVF) algorithm (Sivic & Zisserman, 2003)
+                Query                  LLM          Output              for efficient vector search. IVF partitions the vectors into
+                                                             Judgment
+                                  Post-retrieval                        clusters based on similarity, each represented by a centroid.
+                                   Generation           Rules/LLM
+                                                                        The search is then restricted to only the few clusters most
+                                                                        relevant to the query, avoiding searching the entire datastore.
+
+                                     User
+                                                                        With clustering, an IVF search is a two-step process:
+                   Figure 3. Overview of RAG.
+                                                                        (1) Cluster probing: The query is compared only to the
+                                                                        cluster centroids to quickly identify the few most relevant
+                                                                        clusters. (2) Searching: The system then performs a de-
+                                                                        tailed search only within that small set of selected clusters
+                                                                        and returns the final top-k best-matching items.
+is to augment the LLM with relevant information retrieved               A parameter called nprobe (Douze et al., 2024) controls
+from a large corpus of documents, improving the LLM’s                   the number of clusters to check in the first step. A larger
+ability to answer questions without hallucinations (Mallen              nprobe increases accuracy at the cost of higher latency, as
+et al., 2023; Ram et al., 2023; Khandelwal et al., 2019) and            more data must be searched. Appendix B provides a formal
+generate content based on up-to-date or private informa-                description of IVF.
+tion (Izacard et al., 2023; Min et al., 2023).
+                                                                        Latency of retrieval. Since the search process is highly par-
+Modern RAG pipelines. In order to deliver precise and con-              allelizable across clusters and vectors, this search algorithm
+textually appropriate responses, modern RAG models adopt                can be highly accelerated by GPUs. Furthermore, open-
+a modular approach that employs multiple rounds of LLM                  source libraries offer efficient GPU implementations (John-
+calls and retrievals for a single query (Gao et al., 2023b;             son et al., 2019; Rapidsai, 2022). However, the vector
+Fan et al., 2024; Ilin, 2023; Gao, 2024; Databricks, 2024;              database in modern RAG deployments can reach tens to
+Wei, 2024). Typically, they have the following types of steps           thousands of GB (Quinn et al., 2025; Sella, 2024) as a
+(shown in Figure 3): (1) Pre-retrieval generation decides               result of the positive correlation of datastore size with accu-
+whether retrieval is needed or polishes queries before re-              racy (Min et al., 2023; Khandelwal et al., 2019; Borgeaud
+trieval; for example, query transformation (Ma et al., 2023;            et al., 2022; Hardt & Sun, 2023; Shao et al., 2024). The
+Jagerman et al., 2023; Gao et al., 2023a; Zhou et al., 2022;            large vector databases increase the latency of RAG pipelines
+Ye et al., 2023; Press et al., 2023; Peng et al., 2024; Zheng           significantly in both local setups and data centers.
+et al., 2023; Liu, 2022a) reformulates the original query to
+make it clearer and more suitable for retrieval. (2) Retrieval          Local setups typically consist of personal workstations or
+then identifies relevant documents for the query, taking the            laptops with a single consumer-grade GPU (e.g., RTX4090
+output of pre-retrieval generation and producing the evi-               has 24 GB of memory), where latency is critical. Data center
+dence for the next stage. (3) Post-retrieval generation                 environments, on the other hand, care about both latency
+uses the user’s query and the retrieved documents to pro-               and throughput since they handle numerous simultaneous
+duce the final response; it can also include processes like             user queries. In both scenarios, GPU memory capacity
+summarization (Jiang et al., 2023a; Kim et al., 2023) or                becomes a performance limitation when working with vec-
+reranking (Zhuang et al., 2023; Stewart & Linsdell, 2024).              tor databases. Consumer GPUs in personal setups lack
+(4) Judgment dynamically determines the execution flow                  sufficient memory to accommodate large vector databases,
+(e.g., deciding whether further iteration is needed to enhance          whereas data-center GPUs must sacrifice KV cache space
+the response) using heuristics or LLMs.                                 (reducing throughput) to accommodate them (Kwon et al.,
+                                              T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+                       5                                       5
+                             LLM                                                                                                    CPU Retrieval
+                       4     CPU retrieval                     4                                                                    GPU Retrieval
+Ratio w.r.t LLM time
+
+
+
+                             GPU retrieval                                                                             300
+                       3                                       3                                                                    Data Transmission
+
+
+
+
+                                                                                                           Time (ms)
+                       2                                       2                                                       200
+                       1                                       1
+                                                                                                                       100
+                       0 HyDE SubQ Iter      IRG FLARE S-RAG   0 HyDE SubQ Iter   IRG FLARE S-RAG
+           (a) Batch = 1.                (b) Batch = 4.                                                                 0      CPU       GPU      CPU       GPU           CPU       GPU
+                                                                                                                              offload   fetch    offload   fetch         offload   fetch
+  Figure 4. Latency breakdown of six RAG pipelines on NQ                                                                           128
+                                                                                                                                    256         512
+  dataset (Kwiatkowski et al., 2019) with one H100 GPU.                                                                            Nprobe
+                                                                                                    Figure 5. Latency breakdown of CPU-offload and runtime-fetch
+                                                                                                    GPU retrieval, averaged over 512 random NQ queries.
+    2023). Consequently, vector databases are commonly stored
+    in the CPU memory instead. Unfortunately, this approach                                           Dataset                HyDE        SubQ       Iter           IRG       FLARE         S-RAG
+    increases retrieval latency whether IVF search operations
+                                                                                                      NQ                     73.1%       63.2%   91.5%         83.8%          79.1%        100.0%
+    are performed on the CPU or data is transferred between                                           HotpotQA               75.3%       62.5%   89.6%         89.4%          80.2%        100.0%
+    CPU and GPU (as explored in §3).                                                                  TriviaQA               73.1%       61.6%   86.2%         86.1%          81.7%        100.0%
+
+                                                                                                    Table 1. IVF cluster overlapping rate between the input and output
+    3                      A NALYZING RAG L ATENCY                                                  of the pre-retrieval generation, i.e., the average percentage of cor-
+                                                                                                    rectly predicted clusters among the clusters actually used. Since
+   In this section, we analyze the system challenges in state-of-
+                                                                                                    Self-RAG does not incorporate query transform, its coverage is
+   the-art RAG applications. We constructed a 61 GB vector                                          always 100%.
+   index with the Faiss library (Douze et al., 2024), and set
+   the IVF clusters to 4096 following common practice (Asai                                         capacity (Kwon et al., 2023). The index’s large memory
+   et al., 2023). Our analysis is conducted on an RTX4090                                           footprint reduces the available memory for this KV cache,
+   (24 GB) and H100 (80 GB) using Llama-3-8B (AI@Meta,                                              thereby limiting the effective batch size. This memory con-
+   2024). Further setup details are in §5.2.                                                        tention is exacerbated by RAG’s typically long contexts
+                                                                                                    (Jin et al., 2024a; Lu et al., 2024; Yao et al., 2024) and
+    3.1                     End-to-end Latency of RAG Pipelines                                     the growing size of models and indexes (Min et al., 2023;
+                                                                                                    Khandelwal et al., 2019; Borgeaud et al., 2022; Hardt &
+  We first analyze the end-to-end latency of six RAG pipelines                                      Sun, 2023; Quinn et al., 2025), necessitating offloading.
+  (§5.1) by comparing two scenarios: (1) LLM on GPU with
+  retrieval on CPU (low GPU memory), and (2) both LLM                                               Therefore, in the rest of this section, we try to answer the
+  and the vector index on GPU (low latency).                                                        following question: Is it possible to achieve the latency of
+                                                                                                    GPU-based retrieval while using much less GPU memory?
+  We set the nprobe to 256, a commonly used setting under
+  this index’s configuration (see §5.1 and §5.2 for details).
+                                                                                                    3.2   GPU-accelerated Retrieval with Runtime Transfer
+  As shown in Figure 4 (using randomly sampled 1024 NQ
+  queries (Kwiatkowski et al., 2019)), the CPU-based retrieval                                      A straightforward approach to enable GPU retrieval with
+  phase is a major bottleneck, consuming 41.1% and 60.5%                                            limited GPU memory is to fetch the necessary data from
+  of total latency for batch sizes 1 and 4, respectively. In                                        CPU to GPU on demand at runtime, leveraging the IVF in-
+  contrast, GPU-accelerated retrieval accounts for only 10.5%                                       dex to narrow the search space. While this enables fast GPU
+  and 28.3% of the latency, respectively. On average, GPU                                           search, the data transfer itself becomes the new bottleneck.
+  retrieval is 5.96× (batch size 1) and 3.87× (batch size 4)
+                                                                                                    Figure 5 compares the latency of the runtime fetching sys-
+  faster than its CPU counterpart, reducing overall end-to-end
+                                                                                                    tem against CPU retrieval on an RTX4090 GPU with three
+  latency by 1.5× and 1.8×. Thus, accelerating GPU-based
+                                                                                                    different nprobe values that determine the amount of data
+  retrieval is crucial for reducing end-to-end latency.
+                                                                                                    fetched. Overall, fetch time dominates latency due to the
+   However, GPU acceleration has a significant memory cost.                                         limited CPU–GPU PCIe bandwidth (32 GB/s). Although the
+   For instance, in our setting, with a 61 GB index and a 16 GB                                     GPU search is substantially faster, the fetch overhead results
+   Llama-3-8B model, GPU retrieval requires 77 GB of GPU                                            in a higher end-to-end latency (∼3% slower on average).
+   memory, far exceeding the 24 GB of a common RTX4090.                                             Thus, to achieve a meaningful speedup with this approach,
+   This makes GPU-accelerated retrieval often unfeasible on                                         the data-fetching latency must be effectively hidden.
+   lower-end GPUs or with large datastores.
+                                                                                                    To hide data-fetch costs, CPU-to-GPU transfers must occur
+    Even on large GPUs (e.g., H100), storing the full index                                         before the retrieval stage, which requires predicting which
+    in memory limits serving throughput. High-throughput                                            data will be accessed. Fortunately, modern RAG pipelines
+    batched inference is bottlenecked by the LLM’s KV cache                                         offer a valuable hint: the query from the previous step.
+                   T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+               Queries                  Batches        To other GPUs                   Refined
+                                                                                       Batches
+                                                             Pre-retrieval                                                   Post-retrieval
+                          Scheduler                                                                     Retrieval
+                                                             Generation                                                       Generation
+                                                   Identify & Predict                      Identify                 Search
+                 CPU Memory                           CPU Memory                             CPU Memory                      IVF Cluster
+                                                                                                                             Cached Cluster
+                                                                                                                             Prefetched Cluster
+      Vector
+                                                                                                                             Missed Cluster
+
+
+
+
+                                                                        Prefetch
+      Index              IVF Clusters
+                                                                                                                              Searched on CPU
+                 GPU                                 GPU                                     GPU                              (Missed Clusters)
+                                                                                                                              Searched on GPU
+                                   Retrieval                                                                                  (Overlapped Clusters)
+                                    Service                                                               de Clusters
+                Cached Clusters                               Prefetched Clusters                 Overlapped
+                                LLM Service                         LLM Service                             LLM Service
+
+
+                         ❶ Initial                ❷ Pre-retrieval Generation                          ❸ Retrieval
+Figure 6. The overview of T ELE RAG system. When queries arrive, some clusters are already cached on the GPU from previous requests.
+These queries are grouped into micro-batches based on semantic similarity. For each micro-batch, T ELE RAG prefetches the required
+clusters using lookahead retrieval in parallel with the pre-retrieval generation. During retrieval, T ELE RAG performs a hybrid search: the
+GPU processes cache hits directly from GPU memory, while the CPU handles cache misses. The retrieved documents are then passed to
+the post-retrieval generation stage.
+
+
+3.3     Overlapping of IVF Clusters                                                4      D ESIGN OF T ELE RAG
+While the exact data to be retrieved is only known after the                       Driven by the need for high-performance but memory-
+pre-retrieval generation is done, we observe high similarity                       efficient RAG inference, we propose T ELE RAG, an end-to-
+in the IVF cluster assignments between queries at different                        end system that accelerates retrieval through its core looka-
+stages.                                                                            head retrieval mechanism, which accelerates the retrieval
+                                                                                   process with a GPU but only requires a small fraction of the
+Similarity of queries at different stages. During RAG
+                                                                                   datastore on the GPU memory. Alongside this technique,
+pre-retrieval stages (e.g., query transformation (Gao et al.,
+                                                                                   T ELE RAG further designs optimizations on prefetching
+2023a; Zheng et al., 2023; Peng et al., 2024; Asai et al.,
+                                                                                   amount, caching, and scheduling algorithms for batching
+2024a)), an LLM refines an initial user query qin into a trans-
+                                                                                   and multi-GPU, forming a complete system for both local
+formed query qout for the actual retrieval. While this process
+                                                                                   and cloud use cases.
+often rewrites or simplifies the query, it intuitively preserves
+its core semantic content. Consequently, the embedding vec-                        This section details the lookahead retrieval mechanism
+tors of qin and qout are likely to be similar, suggesting their                    (§4.1), and then describes how T ELE RAG extends it with
+target IVF clusters will significantly overlap. Therefore, qin                     batching and multi-GPU support (§4.2), followed by other
+can serve as a valuable hint for predicting qout .                                 system-level optimizations (§4.3). Appendix D provides
+                                                                                   implementation details.
+Prediction coverage. To verify this hypothesis, we evalu-
+ated the average cluster coverage (predicted vs. actual) in
+three popular QA datasets (NQ (Kwiatkowski et al., 2019),                          4.1     Lookahead Retrieval Mechanism
+HotpotQA (Yang et al., 2018), and TriviaQA (Joshi et al.,                          The core mechanism of T ELE RAG, lookahead retrieval,
+2017)) and six RAG pipelines. As Table 1 shows, when                               is inspired by the observation in §3.3 that queries across
+prefetching 256 clusters, the overlap is consistently high.                        different RAG stages are highly correlated and therefore
+For instance, even the lowest reported coverage (for SubQ)                         select overlapping IVF clusters. Building on this insight,
+remains above 61.6%.                                                               lookahead retrieval predicts and prefetches likely-needed
+Opportunity. This data shows an opportunity to predict                             IVF clusters to the GPU during LLM generation, overlap-
+required clusters, hiding data transfer overhead during LLM                        ping data transfer with computation. During retrieval, T EL -
+generation. In this paper, we aim to leverage this observation                     E RAG leverages lookahead retrieval to coordinate the CPU
+to accelerate the inference latency for RAG.                                       and GPU so that prefetched data are processed on the GPU,
+                                                                                   while the CPU concurrently handles any missed clusters.
+                                                                                   This cooperative execution forms the foundation of T EL -
+                                                                                   E RAG’s low-latency, memory-efficient design.
+                  T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+Figure 6 shows the overview of T ELE RAG with lookahead                                    Prefetching                            Cache-aware
+retrieval. Let qin denote the query input to the pre-retrieval                             Scheduler                               Scheduler
+stage and qout denote the output passed to the retrieval stage.       Queries                               Batches of Queries
+The IVF clusters selected by qin and qout are highlighted with
+a green background (Cin ) and a purple background (Cout ),
+respectively. Due to the semantic similarity between qin and            GPU 0               GPU 1                GPU 2               GPU 3
+qout , there is substantial overlap between Cin and Cout .          Retrieval Service   Retrieval Service    Retrieval Service   Retrieval Service
+                                                                            cache               cache                cache               cache
+Guided by this correlation, lookahead retrieval operates in
+                                                                      LLM Service         LLM Service          LLM Service         LLM Service
+the following steps:
+1. Predict & prefetch: During LLM generation, prefetch            Figure 7. Overview of T ELE RAG’s multi-GPU system design.
+   IVF clusters likely to be used in retrieval to GPU mem-        The prefetching scheduler clusters semantically similar queries
+   ory, identified by their distance to qin . This transfer is    into micro-batches, while the cache-aware scheduler assigns these
+   performed asynchronously via GPU DMA, overlapping              batches to GPUs based on cache locality.
+   with ongoing LLM computation.
+2. GPU similarity search: Once qout is available, the GPU         Batching design. For batched scenarios, a challenge for
+   efficiently searches the predicted clusters (Coverlap ) al-    lookahead retrieval is that each query requires a different
+   ready resident in GPU memory.                                  set of IVF clusters. In our design, we apply the fixed total
+                                                                  prefetching budget as described in §4.1, and distribute it
+3. CPU similarity search: Concurrently, the CPU per-              equally among all queries in the batch. Although the per-
+   forms similarity search over the remaining clusters            query hit rate drops as the batch size grows, this strategy
+   (Cmiss ) that were not prefetched.                             provides balanced retrieval acceleration for each query.
+4. Merge: The search results from GPU and CPU are                 Multi-GPU support. In multi-GPU scenarios that serve a
+   merged on GPU. The retrieval documents are fed to              large number of RAG queries, T ELE RAG divides a global
+   LLM for post-retrieval generation on GPU.                      batch of queries into micro-batches and assigns them to each
+In summary, lookahead retrieval enables T ELE RAG to ac-          available GPU. Each GPU then independently processes the
+celerate retrieval by overlapping data prefetching with LLM       full RAG pipeline for its assigned micro-batches.
+generation and distributing the similarity search between         Scheduling optimization for prefetching. To compensate
+GPU and CPU. This design significantly reduces CPU com-           for the reduced hit rate in larger batches, we introduce a
+putation and data transfer latency, forming the backbone of       prefetching scheduler (see Figure 7). It operates by perform-
+T ELE RAG’s efficiency.                                           ing a greedy search on the global batch, grouping queries by
+Prefetching amount. Prefetching more clusters improves            the lowest L2 distance. While this scheduling adds latency,
+hit rate and retrieval speed, but also increases CPU–GPU          the greedy search is highly efficient on GPUs, incurring neg-
+transfer time. If this transfer exceeds the pre-retrieval gen-    ligible overhead. Our profiling shows that for batch sizes up
+eration window, the overlap advantage is lost and may add         to 256, the search latency is less than 0.1 s, which is minimal
+latency, though slight overruns are acceptable if retrieval       compared to the end-to-end batch latency.
+savings are substantial. Through analytical modeling and          Cache design. To improve performance, T ELE RAG imple-
+empirical profiling on modern hardware, we found prefetch-        ments a dynamic caching strategy for data clusters. Instead
+ing up to the pre-retrieval LLM generation time (tLLM )           of discarding all clusters after a request is served, it retains
+achieves the optimal balance between latency reduction and        the most frequently accessed ones in GPU memory. This
+transfer overhead. A detailed derivation of this result is        allows subsequent requests to reuse these cached clusters,
+provided in Appendix C. Since tLLM varies per query, for a        boosting the cache hit rate and prefetching efficiency.
+given pipeline and hardware bandwidth Blink , we estimate
+its average (tLLM ) on a calibration set and set the prefetch-    Cache-aware scheduling. To further exploit the benefits
+ing amount to Blink × tLLM .                                      of caching, we design a cache-aware scheduler (Figure 7)
+                                                                  that assigns micro-batches to GPUs based on cache locality.
+                                                                  The scheduler employs a greedy strategy: it first selects the
+4.2   Batching and Multi-GPU System
+                                                                  micro-batch with the greatest overlap across all GPU caches
+While §4.1 describes lookahead retrieval on a single-query        and assigns it to the best-matching GPU. It then iteratively
+and single-GPU basis, we now demonstrate how T ELE RAG            schedules the remaining micro-batches in descending order
+extends this mechanism to support batches and multi-GPU           of overlap with each GPU’s cached clusters. Although
+inference. The system’s multi-GPU architecture is illus-          this scheduling introduces minor overhead, the performance
+trated in Figure 7.                                               gains from improved cache locality outweigh the cost (§5.4).
+                  T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+4.3   System Optimizations                                          (1) HyDE Pipeline
+                                                                                                                                                  Pre-retrieval
+                                                                          Pre-retrieval       Retrieval       Post-retrieval                      Generation
+                                                                          Generation                           Generation
+GPU sorting. T ELE RAG accelerates the final sorting stage
+                                                                    (2) SubQuestion Pipeline                                                        Retrieval
+of IVF search by leveraging the GPU. To achieve this, T EL -
+                                                                                              Retrieval                                          Post-retrieval
+E RAG transfers the scalar distance values of Cmiss from                  Pre-retrieval                       Post-retrieval
+                                                                                                                                                  Generation
+                                                                          Generation                           Generation
+the CPU to the GPU. Unlike transferring full vector data,                                     Retrieval
+                                                                                                                                                   Judgment
+
+this operation is lightweight and incurs negligible overhead.       (3) Iterative Pipeline
+                                                                                                                                                   Non-LLM
+                                                                                                                                                   Operation
+The GPU then performs a global sort over the combined
+                                                                          Pre-retrieval                       Post-retrieval
+distances of Cmiss and Coverlap .                                         Generation
+                                                                                              Retrieval
+                                                                                                               Generation
+                                                                                                                                Judgment
+
+                                                                    (4) Iter-RetGen Pipeline
+Prefetching target. T ELE RAG prefetches a fixed byte
+budget (bp ), rather than a cluster count, to ensure predictable          Retrieval
+                                                                                           Post-retrieval
+                                                                                            Generation
+                                                                                                                  Max
+                                                                                                               Iteration?
+transfer times given highly uneven cluster sizes. The system        (5) FLARE Pipeline
+fills this budget by adding whole clusters sequentially based
+                                                                           Pre-retrieval                                       Post-retrieval          Max
+on query proximity. If the next closest cluster exceeds the                Generation
+                                                                                               Judgment         Retrieval
+                                                                                                                                Generation          iteration?
+
+remaining budget, it is skipped entirely, ensuring a clean          (6) Self-RAG Pipeline
+GPU/CPU processing split.
+                                                                                                            Post-retrieval                         Max
+                                                                          Judgment         Retrieval                           Critique         iteration?
+                                                                                                             Generation
+Prefetching for multi-round. For multi-round RAG involv-
+ing the same input query, the system performs a full prefetch         Figure 8. Overview of six RAG pipelines that we evaluate.
+(up to the budget) only in the first round, leveraging high
+cluster similarity across rounds. In subsequent rounds, it               the embedding of the generated paragraph.
+incrementally fetches only the additional required clusters        2. SubQuestion (SubQ) (Liu, 2022c) prompts LLM to
+that were not loaded previously, optimizing data transfer             generate multiple sub-questions and performs retrievals
+while respecting the memory budget.                                   for each generated sub-question.
+                                                                   3. Iterative (Iter) (Liu, 2022b) prompts LLM to generate
+5     E VALUATION                                                     narrower questions first and iteratively refine them based
+We conducted extensive experiments to evaluate the effec-             on previous answers. At the end of each iteration, it
+tiveness of T ELE RAG. In this section, we describe the nec-          prompts LLM to judge if the answer is good enough.
+essary details on evaluation setups, present experimental          4. Iter-RetGen (IRG) (Shao et al., 2023) iteratively does
+results, and provide in-depth analysis and discussions.               retrieval and LLM generation for 3 iterations.
+                                                                   5. FLARE (Jiang et al., 2023c) iteratively issues retrievals
+5.1   Evaluation Datasets and RAG Models                              based on the confidence (probability score) of predicted
+                                                                      tokens for the upcoming sentence.
+Datastore. We built a datastore based on the wiki dpr
+dataset (Karpukhin et al., 2020), a popular dataset that con-      6. Self-RAG (S-RAG) (Asai et al., 2023) uses the LLM to
+tains 2.1 billion tokens from Wikipedia. Following previous           judge for retrieval, generate responses, and self-critique
+works (Asai et al., 2023; Karpukhin et al., 2020; Min et al.,         on the responses. We use the fine-tuned model based
+2023), we chunked the passages by every 100 tokens, and               on Llama-2-7B from their official repository (Asai et al.,
+used Contriever (Izacard et al., 2021) to generate an em-             2024b) for trace generation.
+bedding for each chunk. The embeddings have a hidden
+                                                                   Evaluation datasets. We use three commonly used
+dimension of 768. The index size is 61 GB and we clustered
+                                                                   question-answering datasets, NQ (Kwiatkowski et al., 2019),
+the embeddings into 4096 IVF clusters. See Appendix E for
+                                                                   HotpotQA (Yang et al., 2018), and TriviaQA (Joshi et al.,
+detailed configurations of the index.
+                                                                   2017). For each dataset, we randomly sampled 1024 queries
+LLMs. We evaluated T ELE RAG on Llama-3.2-3B, Llama-               and reported the average. When cache is enabled, to ensure
+3-8B and Mistral-Small-22B to represent different use cases.       stable results and avoid an initial low hit rate from a cold
+                                                                   start, we use 512 queries for warming up the cache and
+RAG pipelines. We evaluated T ELE RAG with six popular
+                                                                   another different 512 queries for evaluation.
+RAG pipelines, as depicted in Figure 8. Note that even
+in pipelines lacking a pre-retrieval stage, the post-retrieval
+                                                                   5.2     Experiment Setups
+generation serves a similar function for the next retrieval
+iteration. Below are brief descriptions of these pipelines.        Hardware setups. We evaluated T ELE RAG on three hard-
+                                                                   ware environments, Desktop, Server1 and Server2,
+1. HyDE (Gao et al., 2023a) prompts LLM to generate a
+                                                                   which are equipped to represent the settings for the desktop
+   hypothetical paragraph and perform retrieval based on
+                                                                   and data center use cases. The Desktop has the RTX4090,
+                  T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+      Setup                                                                   2.5
+                      Desktop         Server1      Server2                              NQ     HotpotQA   TriviaQA
+      CPU         Threadripper 5975   EPYC 9554    EPYC 9534                  2.0
+
+
+
+
+                                                                       Speedup
+  CPU mem. size        512 GB           1.5 TB       1.5 TB                   1.5
+      GPU             RTX4090           H100        8×H200                    1.0
+  GPU mem. size        24 GB            80 GB       140 GB
+                                                                              0.5
+  CPU–GPU Bus           PCIe 4          PCIe 5       PCIe 5
+   Bandwidth           32 GB/s         64 GB/s      64 GB/s                   0.0  HyDE SubQ Iter       IRG FLARE S-RAG Avg
+        Table 2. Hardware specifications for our setups.                     (a) End-to-end latency speedup with Llama-3.2-3B.
+                                                                             2.5
+and we test with 3B and 8B models. Server1 and                                         NQ     HotpotQA    TriviaQA
+Server2 are equipped with H100 and H200 GPUs, and                            2.0
+
+
+
+
+                                                                    Speedup
+we evaluate with 8B and 22B models. We use Server1                           1.5
+for single GPU evaluation and Server2 (8 GPUs) for                           1.0
+multi-GPU evaluation. Table 2 summarizes the hardware
+                                                                             0.5
+configurations.
+                                                                             0.0      HyDE SubQ Iter       IRG FLARE S-RAG Avg
+Nprobe and top-k. A√common heuristic for the IVF index
+                                                                                 (b) End-to-end latency speedup with Llama-3-8B.
+is to set nprobe to 4 Nc (Zilliz, 2020). Given√our index
+size of Nc = 4096, we use nprobe = 256 (= 4 4096) by             Figure 9. End-to-end latency speedup of T ELE RAG and baseline
+default, unless otherwise specified. For retrieval, we use       on six RAG pipelines and three datasets, with an RTX4090 GPU.
+top-k = 3 for the number of documents to return, unless
+otherwise specified.                                             Max GPU memory for retrieval. We set a maximum GPU
+                                                                 memory limit for prefetching in each configuration. For
+RAG pipeline implementation. We implemented the RAG              Server1 and Server2, we allocated 12 GB and 24 GB,
+pipelines with the FlashRAG framework (Jin et al., 2024b).       respectively. For Desktop, we allocated up to 10 GB and
+For IRG, FLARE, and S-RAG, we used the framework’s               3.75 GB for the 3B and 8B models, respectively.
+default implementations. For the other pipelines, we reim-
+plemented them using FlashRAG’s APIs.                            Cache Setup. The memory allocated for retrieval is shared
+                                                                 between prefetching and caching. In our evaluation, we
+Benchmark methodology. We follow the benchmarking                set the cache proportion to 50% (i.e., the cache can use at
+methodology of SGLang (Zheng et al., 2024). Specifically,        most half of this memory). Since the benefit of caching is
+we use GPT-3.5-Turbo (OpenAI, 2023) to execute each              negligible on a single GPU (demonstrated in the ablation
+pipeline once and record the input and output text for every     study), we enabled it only for the multi-GPU experiments
+step.                                                            on Server2.
+During latency evaluation, we run real LLM inference with
+full KV cache allocated and perform actual autoregressive        5.3        Evaluation Results
+decoding, but stop generation once the number of output to-
+                                                                 Single-query latency on RTX4090. We evaluated the end-
+kens matches the recorded trace. This lets us measure real in-
+                                                                 to-end RAG latency for a single query on Desktop with
+ference performance while keeping the decoding workload
+                                                                 an RTX4090 GPU, representing the typical local usage. Fig-
+fixed, ensuring a fair latency comparison across different
+                                                                 ure 9 shows the latency reduction of T ELE RAG across three
+LLM models.
+                                                                 datasets and two LLMs (Llama-3.2-3B and Llama-3-8B).
+Baseline systems. To evaluate the latency of each pipeline,      As Figure 9 shows, T ELE RAG consistently outperforms the
+we constructed a clean execution flow in Python that only        CPU-offload baseline across all evaluated configurations.
+contains LLM generation, datastore retrieval, and other nec-     With Llama-3.2-3B, T ELE RAG achieves average speedups
+essary logical operations to fulfill each pipeline. For LLM      of 1.55×, 1.54×, and 1.49× on NQ, HotpotQA, and Trivi-
+generation, we used SGLang (Zheng et al., 2024), which is        aQA, respectively.
+a state-of-the-art LLM inference engine. For retrieval, we
+                                                                 Among the test pipelines, the best speedup of 2.11× is
+used the industry standard retrieval library, Faiss (Douze
+                                                                 achieved in the Iter-RetGen pipeline on HotpotQA. It’s be-
+et al., 2024), as the CPU-offloaded baseline.
+                                                                 cause Iter-RetGen involves frequent retrieval operations
+Prefetching budget setups. Based on the methodology we           and has generally short LLM outputs, which enhances the
+described in §4.1, we profiled each RAG pipeline with 64         relative impact of retrieval acceleration. Another notable im-
+random samples from NQ (Kwiatkowski et al., 2019) and            provement is in the SubQuestion pipeline, where T ELE RAG
+derived the prefetching budget of each pipeline. Since H100      achieves approximately 1.85× speedup across all datasets.
+and H200 have the same CPU–GPU bandwidth, we set the             This pipeline uses LLM-generated sub-questions and per-
+same prefetch budget for Server1 and Server2.                    forms batched retrievals of 3 to 4 queries in its retrieval
+                                                             T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+                     12                  HyDE                 3.0 12                SubQ                 3.0 12                            Iter                3.0 12              IRG               3.0 12          FLARE                         3.0 12          S-RAG          3.0 12               Avg        3.0
+                                         Baseline
+ Throughput (Req/s)
+                     10                  TeleRAG              2.5 10                                     2.5 10                                                2.5 10                                2.5 10                                        2.5 10                         2.5 10                          2.5
+                                         Speedup
+                        8                                     2.0 8                                      2.0 8                                                 2.0 8                                 2.0 8                                         2.0 8                          2.0 8                           2.0
+
+
+
+
+                                                                                                                                                                                                                                                                                                                      Speedup
+                        6                                     1.5 6                                      1.5 6                                                 1.5 6                                 1.5 6                                         1.5 6                          1.5 6                           1.5
+                        4                                     1.0 4                                      1.0 4                                                 1.0 4                                 1.0 4                                         1.0 4                          1.0 4                           1.0
+                        2                                     0.5 2                                      0.5 2                                                 0.5 2                                 0.5 2                                         0.5 2                          0.5 2                           0.5
+                        0                                     0.0 0                                      0.0 0                                                 0.0 0                                 0.0 0                                         0.0 0                          0.0 0                           0.0
+                                1        2       4       8                 1        2       4       8                 1                2           4       8            1          2   4    8                   1    2    4          8                      1      2   4     8               1      2     4   8
+                                    Batch Size                                 Batch Size                                   Batch Size        Batch Size       Batch Size                                                                                       Batch Size                       Batch Size
+                                                                                                                             (a) End-to-end throughput on Llama-3-8B.
+                  8                  HyDE                    2.0 8              SubQ                    2.0 8                 Iter     2.0 8    IRG      2.0 8  FLARE                                                                              2.0 8           S-RAG          2.0 8             Avg           2.0
+                                    Baseline
+Throughput (Req/s)
+
+
+
+
+                                    TeleRAG
+                  6                 Speedup                  1.5 6                                      1.5 6                                                  1.5 6                               1.5 6                                           1.5 6                          1.5 6                           1.5
+
+
+
+
+                                                                                                                                                                                                                                                                                                                   Speedup
+                  4                                          1.0 4                                      1.0 4                                                  1.0 4                               1.0 4                                           1.0 4                          1.0 4                           1.0
+
+                  2                                          0.5 2                                      0.5 2                                                  0.5 2                               0.5 2                                           0.5 2                          0.5 2                           0.5
+
+                  0                                          0.0 0                                      0.0 0                                                  0.0 0                               0.0 0                                           0.0 0                          0.0 0                           0.0
+                            1        2       4       8                 1        2       4       8                 1               2            4       8                1     2        4    8                  1     2    4      8                          1      2   4     8               1     2     4    8
+                                Batch Size                                 Batch Size                               Batch Size        Batch Size       Batch Size                                                                                               Batch Size                       Batch Size
+                                                                                                                  (b) End-to-end throughput on Mistral-Small-22B.
+Figure 10. End-to-end throughput of T ELE RAG and the CPU-offload baseline across six RAG pipelines on the NQ dataset, evaluated at
+different batch sizes on an H100 GPU.
+                      60                                                                                                                   60                                                                                                  60
+                            1 GPU                             4 GPUs                                                                             1 GPU                      4 GPUs                                                                   1 GPU                 4 GPUs
+   Throughput (Req/s)
+
+
+
+
+                                                                                                                          Throughput (Req/s)
+
+
+
+
+                                                                                                                                                                                                                              Throughput (Req/s)
+                      50    2 GPUs                            8 GPUs                                                                       50    2 GPUs                     8 GPUs                                                             50    2 GPUs                8 GPUs
+                      40                                                                                                                   40                                                                                                  40
+                      30                                                                                                                   30                                                                                                  30
+                      20                                                                                                                   20                                                                                                  20
+                      10                                                                                                                   10                                                                                                  10
+                       0 HyDE SubQ                           Iter      IRG FLARE S-RAG Avg                                                  0 HyDE SubQ                     Iter       IRG FLARE S-RAG Avg                                      0 HyDE SubQ                Iter     IRG FLARE S-RAG Avg
+                            (a) End-to-end throughput on NQ.                                                                       (b) End-to-end throughput on HotpotQA.                                                                  (c) End-to-end throughput on TriviaQA.
+Figure 11. Throughput scaling of T ELE RAG across multiple H200 GPUs. Global batch fixed at 128; micro-batch fixed at 4.
+
+stage. CPU-based retrieval suffers from limited parallelism                                                                                                                                                8                                                                 Faiss Batch 1          TeleRAG Batch 1
+                                                                                                                                                                                                                                                                             Faiss Batch 2          TeleRAG Batch 2
+in such scenarios, but T ELE RAG efficiently utilizes GPU                                                                                                                                                  6                                                                 Faiss Batch 4          TeleRAG Batch 4
+                                                                                                                                                                                                                                                                             Faiss Batch 8          TeleRAG Batch 8
+parallelism, significantly enhancing performance.                                                                                                                                                                                                                            LLM                    Misc
+                                                                                                                                                                                                Time (s)
+
+
+
+
+                                                                                                                                                                                                           4
+When deploying Llama-3-8B, the speedups from T ELE RAG
+are slightly smaller than with Llama-3.2-3B, mainly because                                                                                                                                                2
+the larger LLM incurs higher inference latency and leaves
+less GPU memory available for prefetching. Nevertheless,                                                                                                                                                   0   base ours base ours base ours base ours base ours base ours
+T ELE RAG still delivers an average speedup of about 1.3×                                                                                                                                                          HyDE         SubQ                        Iter           IRG         FLARE            S-RAG
+across datasets, with a peak improvement of 1.82× for Iter-                                                                                                                                Figure 12. Latency breakdown for Llama-3-8B on NQ with an
+RetGen on HotpotQA. Notably, these gains are achieved                                                                                                                                      H100 GPU at different batch sizes. nprobe is 256.
+with only 3.75 GB of remaining GPU memory after account-
+ing for Llama-3-8B (16 GB), the embedding model (1 GB),                                                                                                                                    batch size 1 (equivalent to the single-query setting), T EL -
+the KV cache, and other miscellaneous tensors. This result                                                                                                                                 E RAG delivers an average throughput increase of 1.32×
+highlights T ELE RAG’s strong ability to accelerate RAG                                                                                                                                    and 1.15× for Llama-3-8B and Mistral-Small-22B over the
+inference even under tight GPU memory constraints.                                                                                                                                         Faiss baseline. As the batch size increases, T ELE RAG’s
+                                                                                                                                                                                           performance gains continue to grow. For batch sizes 2, 4,
+Multi-query throughput on H100. To examine T EL -                                                                                                                                          and 8, T ELE RAG delivers average throughput increases
+E RAG’s performance on batched inference, we evaluated
+                                                                                                                                                                                           of 1.55×, 1.78× and 1.98× for Llama-3-8B, and 1.26×,
+the end-to-end throughput on Server1 (H100) using batch                                                                                                                                    1.38× and 1.49× for Mistral-Small-22B over Faiss. These
+sizes 1, 2, 4, and 8. The results of six RAG pipelines with                                                                                                                                results show that T ELE RAG effectively utilizes the parallel
+Llama-3-8B and Mistral-Small-22B are presented in Fig-                                                                                                                                     compute of the GPU without overwhelming its memory,
+ure 10.                                                                                                                                                                                    while the CPU alternative fails to scale with a larger batch
+As shown in Figure 10, T ELE RAG consistently outperforms                                                                                                                                  size.
+the Faiss baseline across all pipelines and batch sizes. At                                                                                                                                Multi-GPU throughput. We evaluate T ELE RAG’s scal-
+                                               T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+                     60
+                               HyDE               60
+                                                              SubQ            60
+                                                                                         Iter            60
+                                                                                                                   IRG          60
+                                                                                                                                          FLARE       60
+                                                                                                                                                                S-RAG       60
+                                                                                                                                                                                      Avg
+                               w/o cache
+Throughput (Req/s)
+
+                     50        w/ cache           50                          50                         50                     50                    50                    50
+                     40                           40                          40                         40                     40                    40                    40
+                     30                           30                          30                         30                     30                    30                    30
+                     20                           20                          20                         20                     20                    20                    20
+                     10                           10                          10                         10                     10                    10                    10
+                      0                            0                           0                          0                      0                     0                     0
+                           1   2    4      8             1    2   4    8            1    2   4    8            1   2   4   8          1   2   4   8         1   2   4   8         1   2   4   8
+                          Number of GPUs                Number of GPUs             Number of GPUs             Number of GPUs         Number of GPUs        Number of GPUs        Number of GPUs
+                          Figure 13. Throughput of T ELE RAG on the NQ dataset with different numbers of H200 GPUs (with and without cache).
+
+
+        Pipeline
+                                H100 (Mst-22B)               H100 (Llm3-8B)         RTX4090 (Llm3-3B)                  guided approach on RTX4090 and H100 for NQ. It also
+                               Budget Hit Rate               Budget Hit Rate        Budget    Hit Rate
+                                                                                                                       presents the average cluster hit rate achieved with this
+         HyDE                  18 GB            95.1%        10 GB         93.2%     7 GB             87.3%
+         SubQ                  18 GB            85.2%         8 GB         79.1%     7 GB             76.4%
+                                                                                                                       prefetch budget. From the table, we can see that T ELE RAG
+           Iter                 7 GB            97.4%         5 GB         93.7%     3 GB             72.6%            generally achieves a high cluster hit rate (>50%) when it
+          IRG                  12 GB            65.4%         4 GB         59.1%    2.5 GB            45.1%            has a large prefetching budget. For cases where the bud-
+        FLARE                  12 GB            94.9%         6 GB         87.8%     3 GB             62.9%
+        S-RAG                  4.5 GB           95.0%         3 GB         72.6%    1.25 GB           31.0%
+                                                                                                                       get is less than 2 GB, we observe a relatively low hit rate
+                                                                                                                       (<50%), limiting the benefits of reducing the CPU’s search
+                          0%            20%            40%            60%          80%           100%                  workloads. However, as observed from Figure 9, T ELE RAG
+                                                                                                                       achieves from 1.2× to 1.6× end-to-end speedups for these
+Table 3. The prefetch budget and corresponding averaged cluster
+hit rate for each pipeline and hardware setup on NQ dataset. The
+                                                                                                                       pipelines, thanks to the combined benefit of reducing CPU
+target retrieval nprobe is 256.                                                                                        workload and utilizing the GPU to perform sorting on simi-
+                                                                                                                       larity distances.
+ability on Server2 (H200), a multi-GPU system. Fig-                                                                    We also conducted analysis on failure cases. Although
+ure 11 reports throughput for a global batch size of 128                                                               failure cases can occur (e.g., when the rewrite substantially
+with a micro-batch size of 4 across 1–8 GPUs, with both                                                                shifts embedding vectors), it is relatively rare. Even with the
+the prefetching and cache schedulers enabled. T ELE RAG                                                                lowest prefetch budget (3.75 GB for RTX4090 with Llama-
+scales well with the number of GPUs: on NQ, compared                                                                   3-8B) in our evaluation, the prefetching failures (<5% hit
+to the single-GPU case, the average speedups are 2.0×,                                                                 rate) occurred only on the FLARE pipeline with a small
+3.8×, and 6.5× on 2, 4, and 8 GPUs, respectively. The                                                                  number of instances (3, 14, and 9 out of 1024 samples for
+mild sub-linear scaling at higher GPU counts is attributed to                                                          NQ, HotpotQA, and TriviaQA, respectively).
+execution time variance across micro-batches—specifically,
+a long tail of higher-latency batches that create load im-                                                             Ablation on cache. Figure 13 illustrates the throughput
+balance. These results still demonstrate that the lookahead                                                            improvements enabled by caching on the NQ dataset. On
+retrieval technique in T ELE RAG can scale effectively.                                                                average, caching boosts throughput by 2%, 12%, 21%, and
+                                                                                                                       18% with 1, 2, 4, and 8 GPUs, respectively. The benefit on a
+                                                                                                                       single GPU is marginal because only a small cache space is
+5.4                       Analysis and Sensitivity Study
+                                                                                                                       used, and the limited cache capacity struggles to accommo-
+Latency breakdown. We further show the latency break-                                                                  date diverse requests. However, as the number of GPUs and
+down of running RAG pipelines with Llama-3-8B on a sin-                                                                overall cache space increases, the cache-aware scheduler
+gle H100 GPU at different batch sizes in Figure 12. From                                                               effectively assigns micro-batches to the appropriate GPUs
+Figure 12, we can observe that LLM latency grows sub-                                                                  to maximize cache overlap, thereby improving prefetching
+linearly with larger batch sizes. However, the latency for                                                             hit rates and yielding significant throughput gains.
+Faiss retrieval on CPU grows linearly with the batch size,
+                                                                                                                       Analysis on scheduling overhead. Figure 14 analyzes
+dominating the overall latency when the batch size is large.
+                                                                                                                       the benefits and overheads of the prefetching and cache-
+These results echo our findings in Figure 10, and show the
+                                                                                                                       aware schedulers. It reports the end-to-end latency for a
+limited scalability of CPU retrieval in serving scenarios.
+                                                                                                                       global batch of 128 queries with a micro-batch size of 4 on
+In contrast, T ELE RAG significantly accelerates across all
+                                                                                                                       4 H200 GPUs, comparing configurations that enable both
+batch sizes and achieves a higher speedup from 1.3× to
+                                                                                                                       schedulers, only the prefetching scheduler, or neither. As
+2.0× when the batch size increases from 1 to 8. The slight
+                                                                                                                       shown in Figure 14, the prefetching scheduler incurs only
+difference in the LLM latency between Faiss and T ELE RAG
+                                                                                                                       a minimal overhead of approximately 37 ms (thus almost
+is because the PyTorch copy operation we use for prefetch-
+                                                                                                                       invisible in the figure), while the cache-aware scheduler
+ing uses some of the GPU’s stream multiprocessors.
+                                                                                                                       adds a modest overhead of about 180 ms. Overall, both
+Prefetch budgets, cluster hit rates and failure cases. Ta-                                                             schedulers effectively reduce end-to-end latency in most
+ble 3 shows the prefetch budgets we set with the profile-                                                              cases, with minimal additional cost.
+                           T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+               20                                                       RAG is a specific type of application in this broader di-
+                      Schedule Overhead
+                      No Schedule                                       rection, and we propose systems techniques to optimize its
+               15     Prefetch Schedule Only                            execution latency, focusing on the characteristics of retrieval
+                      Prefetch & Cache Schedule
+    Time (s)
+
+
+                                                                        workload.
+               10
+                                                                        Vector index. A separate line of work focuses on optimiz-
+               5                                                        ing the vector index itself. This includes hardware-specific
+                                                                        acceleration (GPU (Johnson et al., 2019), FPGA (Jiang
+               0    HyDE   SubQ       Iter        IRG   FLARE S-RAG
+                                                                        et al., 2023b)) and hybrid memory-disk systems to scale be-
+                                                                        yond RAM (DiskANN (Jayaram Subramanya et al., 2019),
+Figure 14. Comparison of end-to-end latency for prefetching and         SPANN (Chen et al., 2021)). More recent systems scale
+cache-aware schedulers on 4 H200 GPUs. The overhead bars of             graph-based indexes beyond GPU memory (Karthik et al.,
+prefetch schedule only are too short to be visible.                     2025; Zhang et al., 2024a). These methods often require
+                                                                        significant algorithm modifications or remain bottlenecked
+6         R ELATED W ORK                                                by CPU–GPU bandwidth. T ELE RAG is complementary,
+Efficient RAG methods. Prior works have accelerated                     optimizing at the system-level by hiding transfer latency
+RAG by caching the LLM’s KV cache from retrieved                        within the RAG application’s context, without altering the
+documents (Jin et al., 2024a; Lu et al., 2024; Yao et al.,              underlying IVF algorithm.
+2024). However, these approaches primarily reduce prefill
+latency, failing to address the retrieval and decode latencies          7    D ISCUSSION
+which often dominate. Other techniques, like speculative re-
+trieval (Zhang et al., 2024b) or fine-grained pipelining (Jiang         Applicability beyond IVF indices. T ELE RAG is designed
+et al., 2024), target per-token retrieval, which is a different         for IVF-style retrieval indices, which are widely used in pro-
+RAG paradigm and does not apply to the modular pipelines                duction vector search systems (Douze et al., 2024; Milvus
+discussed in §2.1. Unlike these approaches, T ELE RAG                   team, 2025; Pgvector team, 2025). Here, we briefly discuss
+tackles the fundamental system challenges of long retrieval             how its design extends to two other popular index fami-
+latency and large memory requirements for modular RAG.                  lies: Locality-Sensitive Hashing (LSH) (Indyk & Motwani,
+                                                                        1998; Gionis et al., 1999; Datar et al., 2004) and Hierarchi-
+System optimizations for modular RAG. There are sev-                    cal Navigable Small World (HNSW) (Malkov & Yashunin,
+eral concurrent works to T ELE RAG that optimize system                 2020).
+efficiency for modular RAG. For increasing throughput,
+HedraRAG (Hu et al., 2025) leverages intra-request simi-                LSH partitions vectors into hash buckets and probes a small
+larity and inter-query skew to accelerate retrieval with com-           number of buckets at query time. Since this access pattern
+pute graph transformation, query reordering and dynamic                 resembles IVF list probing, T ELE RAG can be extended
+placement between CPU and GPU; RAGO (Jiang et al.,                      naturally by treating hash buckets as the prefetch unit.
+2025) designs a schema for modular RAG and enables auto-                HNSW, by contrast, relies on graph traversal and does not
+matic performance analysis and optimizations on top of the              naturally expose explicit prefetchable units, making it less
+schema; Hermes (Shen et al., 2025) distributes the datastore            naturally compatible with T ELE RAG. Nevertheless, the
+across multiple CPU nodes and proposes efficient search                 core ideas of T ELE RAG still apply to hybrid index struc-
+algorithms to accelerate retrieval across nodes.                        tures such as IVF-HNSW in FAISS (FAISS team, 2025). In
+For reducing memory, EdgeRAG (Seemakhupt et al., 2024)                  these indices, HNSW is used for coarse-grained routing to
+proposes to generate embeddings on-the-fly and offload                  identify relevant inverted lists. Because semantically similar
+embeddings to disk for the IVF index; LEANN (Wang et al.,               queries often traverse similar graph paths or reach the same
+2025) designs efficient embedding recomputation for the                 centroids, T ELE RAG can use the HNSW traversal of a pre-
+HNSW (Malkov & Yashunin, 2020) index. In contrast to                    retrieval query to anticipate and prefetch the corresponding
+these works, T ELE RAG achieves both acceleration and                   inverted lists before the retrieval query is issued. This pre-
+GPU memory saving for retrieval with the IVF index.                     serves the efficiency of graph-based routing while retaining
+                                                                        the prefetchability of the inverted-list structure.
+Systems for compound LLM applications. Apart from
+RAG, there is a growing interest in compound or agentic                 Applicability of emerging hardware. T ELE RAG tar-
+LLM applications, where multiple LLM calls and other                    gets the traditional GPU computing platform, where CPU
+applications are combined to serve complex functionali-                 and GPU have separate memory space and are connected
+ties (Zaharia et al., 2024; Berger & Zorn, 2024; Wang et al.,           through PCIe. On newer high-bandwidth systems such
+2024). AI Metropolis (Xie et al., 2024) accelerates LLM-                as NVIDIA Grace (NVIDIA Corporation, 2024), our de-
+based multi-agent simulations with out-of-order execution.              sign can leverage the increased bandwidth to prefetch more
+                  T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+clusters, thereby improving hit rates. For emerging uni-          porting efficient multi-GPU inference through specialized
+fied memory platforms such as Apple M-series or NVIDIA            scheduling. Our evaluation shows that T ELE RAG signif-
+Grace-Hopper, T ELE RAG is less useful as we can do GPU-          icantly improves performance compared to existing state-
+only retrieval on those. However, these systems currently         of-the-art solutions and scales effectively with increased
+still suffer from limited memory capacity (e.g., Apple M-         hardware resources.
+series) or are not as available as the traditional commodity
+DDR + discrete HBM servers.                                       ACKNOWLEDGMENTS
+Memory allocation tradeoff. T ELE RAG is designed so
+                                                                  We thank the reviewers and our shepherd for their helpful
+that retrieval does not compete with the LLM for KV-cache
+                                                                  comments and suggestions. This work is supported in part
+capacity. We reserve GPU memory for the LLM first and use
+                                                                  by PRISM, one of the seven centers in JUMP 2.0, a Semi-
+only the remaining memory for retrieval data. Accordingly,
+                                                                  conductor Research Corporation (SRC) program sponsored
+we enforce a hard cap on retrieval memory, as described in
+                                                                  by DARPA, as well as generous donations from NVIDIA,
+§5.2.
+                                                                  AMD, Intel, and Arm.
+In our evaluated workloads, this policy leaves sufficient
+KV-cache headroom and does not reduce LLM batch size              R EFERENCES
+or degrade LLM performance. In practice, the retrieval
+memory cap should be chosen only after reserving enough           AI@Meta.    Llama 3 model card.        https:
+memory for the target model’s KV cache at the desired               //github.com/meta-llama/llama3/blob/
+batch size and sequence length; retrieval should use only           main/MODEL_CARD.md, 2024. Accessed: 2026-04-
+the remaining GPU memory.                                           19.
+Multi-GPU and multi-node parallelism. In T ELE RAG,               Akkiraju, R., Xu, A., Bora, D., Yu, T., An, L., Seth, V.,
+data parallelism is the default strategy to extend to multi-        Shukla, A., Gundecha, P., Mehta, H., Jha, A., et al. Facts
+GPU and multi-node deployments, as it preserves the over-           about building retrieval augmented generation-based chat-
+lap between LLM generation and retrieval as in the single-          bots. arXiv preprint arXiv:2407.07858, 2024.
+GPU design. Here, we discuss other potential parallelism
+patterns.                                                         Asai, A., Wu, Z., Wang, Y., Sil, A., and Hajishirzi, H. Self-
+                                                                    rag: Learning to retrieve, generate, and critique through
+Another option to parallelize retrieval is to shard the data-       self-reflection. In The Twelfth International Conference
+store across GPUs for distributed GPU-resident retrieval.           on Learning Representations, 2023.
+This is most effective when the vector index fits in aggre-
+gate GPU memory without materially reducing the memory            Asai, A., He, J., Shao, R., Shi, W., Singh, A., Chang, J. C.,
+available to the LLM, especially the KV cache. When this            Lo, K., Soldaini, L., Feldman, S., D’arcy, M., et al. Open-
+condition does not hold, T ELE RAG is useful to reduce the          scholar: Synthesizing scientific literature with retrieval-
+retrieval memory usage to a smaller predicted set.                  augmented lms. arXiv preprint arXiv:2411.14199, 2024a.
+
+Furthermore, T ELE RAG’s retrieval and generation can be          Asai, A., Wu, Z., Wang, Y., Sil, A., and Hajishirzi, H. Orig-
+pipelined across nodes. A retrieval tier can start prefetching      inal implementation of self-rag: Learning to retrieve,
+as soon as it receives the pre-retrieval query or predicted         generate and critique through self-reflection. https:
+clusters, overlapping transfer with the pre-retrieval gener-        //github.com/AkariAsai/self-rag, 2024b.
+ation on another tier. While pipeline bubbles may arise if
+the stages are imbalanced, lookahead retrieval still improves     Asai, A., Zhong, Z., Chen, D., Koh, P. W., Zettlemoyer,
+efficiency by shortening the retrieval critical path and reduc-     L., Hajishirzi, H., and Yih, W.-t. Reliable, adaptable,
+ing GPU memory requirements for retrieval. We leave the             and attributable language models with retrieval. arXiv
+exploration of different parallelisms for future work.              preprint arXiv:2403.03187, 2024c.
+                                                                  Berger, E. and Zorn, B.    Ai software should
+8    C ONCLUSION                                                    be more like plain old software.    https:
+                                                                    //www.sigarch.org/ai-software-should-
+In this paper, we introduced T ELE RAG, an inference system         be-more-like-plain-old-software/, 2024.
+that improves RAG pipeline latency and throughput while             Accessed: 2026-04-19.
+imposing minimal GPU memory requirements. T ELE RAG
+achieves significant acceleration by employing lookahead          Borgeaud, S., Mensch, A., Hoffmann, J., Cai, T., Rutherford,
+retrieval, which hides CPU–GPU data transfer latency by             E., Millican, K., Van Den Driessche, G. B., Lespiau, J.-B.,
+overlapping it with pre-retrieval generation, and by sup-           Damoc, B., Clark, A., et al. Improving language models
+                                                                    by retrieving from trillions of tokens. In International
+                  T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+  conference on machine learning, pp. 2206–2240. PMLR,            Gionis, A., Indyk, P., Motwani, R., et al. Similarity search
+  2022.                                                             in high dimensions via hashing. In Vldb, volume 99, pp.
+                                                                    518–529, 1999.
+Chemmagate, B. Reducing rag pipeline latency for
+  real-time voice conversations. https://developer.               GM, A. and Dhar, G.    How apollo 24—7 lever-
+  vonage.com/en/blog/reducing-rag-                                 ages medlm with rag to revolutionize health-
+  pipeline-latency-for-real-time-voice-                            care.      https://cloud.google.com/blog/
+  conversations, 2024. Accessed: 2026-04-19.                       products/ai-machine-learning/how-
+                                                                   apollo-247-leverages-medlm-with-rag-
+Chen, Q., Zhao, B., Wang, H., Li, M., Liu, C., Li, Z., Yang,       to-revolutionize-healthcare, 2024.      Ac-
+  M., and Wang, J. Spann: Highly-efficient billion-scale           cessed: 2026-04-19.
+  approximate nearest neighbor search. arXiv preprint
+  arXiv:2111.08566, 2021.                                         Hardt, M. and Sun, Y. Test-time training on nearest
+                                                                    neighbors for large language models. arXiv preprint
+Databricks. Rag (retrieval augmented generation) on                 arXiv:2305.18466, 2023.
+  databricks. https://docs.databricks.com/                        Hu, Z., Murthy, V., Pan, Z., Li, W., Fang, X., Ding, Y.,
+  en/generative-ai/retrieval-augmented-                             and Wang, Y. Hedrarag: Co-optimizing generation and
+  generation.html, 2024. Accessed: 2026-04-19.                      retrieval for heterogeneous rag workflows. In Proceed-
+                                                                    ings of the ACM SIGOPS 31st symposium on operating
+Datar, M., Immorlica, N., Indyk, P., and Mirrokni, V. S.
+                                                                    systems principles, pp. 623–638, 2025.
+  Locality-sensitive hashing scheme based on p-stable dis-
+  tributions. In Proceedings of the twentieth annual sympo-       Ilin, I. Advanced rag techniques: an illustrated overview.
+  sium on Computational geometry, pp. 253–262, 2004.                 https://pub.towardsai.net/advanced-
+                                                                     rag-techniques-an-illustrated-
+Douze, M., Guzhva, A., Deng, C., Johnson, J., Szilvasy, G.,          overview-04d193d8fec6, 2023.                 Accessed:
+  Mazaré, P.-E., Lomeli, M., Hosseini, L., and Jégou, H.           2026-04-19.
+  The faiss library. arXiv preprint arXiv:2401.08281, 2024.
+                                                                  Indyk, P. and Motwani, R. Approximate nearest neigh-
+FAISS team. FAISS index factory - Non-exhaustive                    bors: towards removing the curse of dimensionality. In
+  search components.    https://github.com/                         Proceedings of the thirtieth annual ACM symposium on
+  facebookresearch/faiss/wiki/The-                                  Theory of computing, pp. 604–613, 1998.
+  index-factory#non-exhaustive-search-
+  components, 2025. Accessed: 2026-04-19.                         Izacard, G., Caron, M., Hosseini, L., Riedel, S., Bojanowski,
+                                                                     P., Joulin, A., and Grave, E. Unsupervised dense infor-
+Fan, W., Ding, Y., bo Ning, L., Wang, S., Li, H., Yin,               mation retrieval with contrastive learning. arXiv preprint
+  D., Chua, T.-S., and Li, Q. A survey on rag meet-                  arXiv:2112.09118, 2021.
+  ing llms: Towards retrieval-augmented large language
+  models. In Knowledge Discovery and Data Mining,                 Izacard, G., Lewis, P., Lomeli, M., Hosseini, L., Petroni,
+  2024. URL https://api.semanticscholar.                            F., Schick, T., Dwivedi-Yu, J., Joulin, A., Riedel, S., and
+  org/CorpusID:269740933.                                           Grave, E. Atlas: Few-shot learning with retrieval aug-
+                                                                    mented language models. Journal of Machine Learning
+Gao, L., Ma, X., Lin, J., and Callan, J. Precise zero-shot          Research, 24(251):1–43, 2023.
+  dense retrieval without relevance labels. In Proceed-           Jagerman, R., Zhuang, H., Qin, Z., Wang, X., and Bender-
+  ings of the 61st Annual Meeting of the Association for            sky, M. Query expansion by prompting large language
+  Computational Linguistics (Volume 1: Long Papers), pp.            models. arXiv preprint arXiv:2305.03653, 2023.
+ 1762–1777, 2023a.
+                                                                  Jayaram Subramanya, S., Devvrit, F., Simhadri, H. V., Kr-
+Gao, Y. Modular rag and rag flow: Part ii. https:                   ishnawamy, R., and Kadekodi, R. Diskann: Fast accurate
+ //medium.com/@yufan1602/modular-rag-                               billion-point nearest neighbor search on a single node.
+  and-rag-flow-part-ii-77b62bf8a5d3,                                Advances in Neural Information Processing Systems, 32,
+  2024. Accessed: 2026-04-19.                                       2019.
+Gao, Y., Xiong, Y., Gao, X., Jia, K., Pan, J., Bi, Y., Dai, Y.,   Jiang, H., Wu, Q., Luo, X., Li, D., Lin, C.-Y., Yang, Y., and
+  Sun, J., and Wang, H. Retrieval-augmented generation               Qiu, L. Longllmlingua: Accelerating and enhancing llms
+  for large language models: A survey. arXiv preprint                in long context scenarios via prompt compression. arXiv
+  arXiv:2312.10997, 2023b.                                           preprint arXiv:2310.06839, 2023a.
+                   T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+Jiang, W., Li, S., Zhu, Y., de Fine Licht, J., He, Z., Shi, R.,      Kim, J., Nam, J., Mo, S., Park, J., Lee, S.-W., Seo, M.,
+   Renggli, C., Zhang, S., Rekatsinas, T., Hoefler, T., et al.         Ha, J.-W., and Shin, J. Sure: Improving open-domain
+   Co-design hardware and algorithm for vector search. In              question answering of llms via summarized retrieval. In
+   Proceedings of the International Conference for High Per-           The Twelfth International Conference on Learning Repre-
+   formance Computing, Networking, Storage and Analysis,               sentations, 2023.
+   pp. 1–15, 2023b.
+                                                                     Klang, E., Tessler, I., Apakama, D. U., Abbott, E., Glicks-
+Jiang, W., Zhang, S., Han, B., Wang, J., Wang, B., and                 berg, B. S., Arnold, M., Moses, A., Sakhuja, A., Soroush,
+   Kraska, T. Piperag: Fast retrieval-augmented gener-                 A., Charney, A. W., et al. Assessing retrieval-augmented
+   ation via algorithm-system co-design. arXiv preprint                large language model performance in emergency de-
+   arXiv:2403.05676, 2024.                                             partment icd-10-cm coding compared to human coders.
+                                                                       medRxiv, 2024.
+Jiang, W., Subramanian, S., Graves, C., Alonso, G., Yazdan-
+   bakhsh, A., and Dadu, V. Rago: Systematic performance             Kwiatkowski, T., Palomaki, J., Redfield, O., Collins, M.,
+   optimization for retrieval-augmented generation serving.           Parikh, A., Alberti, C., Epstein, D., Polosukhin, I., De-
+   In Proceedings of the 52nd Annual International Sympo-             vlin, J., Lee, K., et al. Natural questions: A benchmark
+   sium on Computer Architecture, pp. 974–989, 2025.                  for question answering research. Transactions of the
+                                                                      Association for Computational Linguistics, 7:452–466,
+Jiang, Z., Xu, F. F., Gao, L., Sun, Z., Liu, Q., Dwivedi-Yu,          2019.
+   J., Yang, Y., Callan, J., and Neubig, G. Active retrieval         Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+   augmented generation. 2023c.                                       C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient
+Jin, C., Zhang, Z., Jiang, X., Liu, F., Liu, X., Liu, X., and Jin,    memory management for large language model serving
+   X. Ragcache: Efficient knowledge caching for retrieval-            with pagedattention. In Proceedings of the ACM SIGOPS
+   augmented generation. arXiv preprint arXiv:2404.12457,             29th Symposium on Operating Systems Principles, 2023.
+   2024a.                                                            Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V.,
+                                                                       Goyal, N., Küttler, H., Lewis, M., Yih, W.-t., Rocktäschel,
+Jin, J., Zhu, Y., Yang, X., Zhang, C., and Dou, Z. Flashrag:
+                                                                       T., et al. Retrieval-augmented generation for knowledge-
+   A modular toolkit for efficient retrieval-augmented gener-
+                                                                       intensive nlp tasks. Advances in Neural Information Pro-
+   ation research. arXiv preprint arXiv:2405.13576, 2024b.
+                                                                       cessing Systems, 33:9459–9474, 2020.
+Johnson, J., Douze, M., and Jégou, H. Billion-scale similar-        Liu, J.  LlamaIndex. https://github.com/
+  ity search with GPUs. IEEE Transactions on Big Data, 7               jerryjliu/llama_index, 11 2022a.
+  (3):535–547, 2019.
+                                                                     Liu, J.   MultiStep Query Engine LlamaIndex.
+Joshi, M., Choi, E., Weld, D. S., and Zettlemoyer, L. Trivi-           https://developers.llamaindex.ai/
+  aqa: A large scale distantly supervised challenge dataset            python/examples/workflow/multi_step_
+  for reading comprehension. In Proceedings of the 55th                query_engine/, 11 2022b.
+  Annual Meeting of the Association for Computational
+  Linguistics (Volume 1: Long Papers), pp. 1601–1611,                Liu, J.  Sub Question Query Engine LlamaIndex.
+  2017.                                                                https://developers.llamaindex.ai/
+                                                                       python/examples/query_engine/sub_
+Karpukhin, V., Oguz, B., Min, S., Lewis, P., Wu, L., Edunov,           question_query_engine/, 11 2022c.
+  S., Chen, D., and Yih, W.-t. Dense passage retrieval               Lu, S., Wang, H., Rong, Y., Chen, Z., and Tang, Y. Turborag:
+  for open-domain question answering. In Proceedings of                Accelerating retrieval-augmented generation with pre-
+  the 2020 Conference on Empirical Methods in Natural                  computed kv caches for chunked text. arXiv preprint
+  Language Processing (EMNLP), 2020.                                   arXiv:2410.07590, 2024.
+Karthik, V., Khan, S., Singh, S., Simhadri, H. V., and Vedu-         Ma, X., Gong, Y., He, P., Duan, N., et al. Query rewriting in
+  rada, J. Bang: Billion-scale approximate nearest neigh-             retrieval-augmented large language models. In The 2023
+  bour search using a single gpu. IEEE Transactions on                Conference on Empirical Methods in Natural Language
+  Big Data, 2025.                                                     Processing, 2023.
+Khandelwal, U., Levy, O., Jurafsky, D., Zettlemoyer, L., and         Malec, M. Rag in financial services: Use-cases, impact,
+  Lewis, M. Generalization through memorization: Nearest              & solutions. https://hatchworks.com/blog/
+  neighbor language models. In International Conference               gen-ai/rag-for-financial-services/,
+  on Learning Representations, 2019.                                  2024. Accessed: 2026-04-19.
+                 T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+Malkov, Y. A. and Yashunin, D. A. Efficient and ro-              of the 30th ACM International Conference on Archi-
+ bust approximate nearest neighbor search using hier-            tectural Support for Programming Languages and Op-
+ archical navigable small world graphs. IEEE Trans.              erating Systems, Volume 1, ASPLOS ’25, pp. 15–32,
+ Pattern Anal. Mach. Intell., 42(4), 2020. ISSN 0162-            New York, NY, USA, 2025. Association for Comput-
+ 8828. URL https://doi.org/10.1109/TPAMI.                        ing Machinery. ISBN 9798400706981. doi: 10.1145/
+ 2018.2889473.                                                   3669940.3707264. URL https://doi.org/10.
+                                                                 1145/3669940.3707264.
+Mallen, A. T., Asai, A., Zhong, V., Das, R., Khashabi,
+ D., and Hajishirzi, H. When not to trust language mod-        Ram, O., Levine, Y., Dalmedigos, I., Muhlgay, D., Shashua,
+ els: Investigating effectiveness of parametric and non-         A., Leyton-Brown, K., and Shoham, Y. In-context
+ parametric memories. In The 61st Annual Meeting Of              retrieval-augmented language models. Transactions of
+ The Association For Computational Linguistics, 2023.            the Association for Computational Linguistics, 11:1316–
+                                                                 1331, 2023.
+Milvus team. Milvus - The High-Performance Vector
+ Database Built for Scale. https://milvus.io/,                 Rapidsai. Rapidsai/raft: Raft contains fundamental widely-
+ 2025.                                                           used algorithms and primitives for data science, graph
+                                                                 and machine learning. https://github.com/
+Min, S., Gururangan, S., Wallace, E., Shi, W., Hajishirzi,       rapidsai/raft, 2022.
+ H., Smith, N. A., and Zettlemoyer, L. Silo language
+ models: Isolating legal risk in a nonparametric datastore.    Seemakhupt, K., Liu, S., and Khan, S. Edgerag: Online-
+ In The Twelfth International Conference on Learning             indexed rag for edge devices, 2024. URL https://
+ Representations, 2023.                                          arxiv.org/abs/2412.21023.
+
+                                                               Sella, A. Flash is driving scale in rag-based llms. In Proceed-
+MyScale. 4 key benefits of rag algorithmic trading in
+                                                                 ings of the Flash Memory Summit (FMS), August 2024.
+ financial markets. https://myscale.com/blog/
+                                                                 URL https://files.futurememorystorage.
+ benefits-rag-algorithmic-trading-
+                                                                 com/proceedings/2024/20240807_AIML-
+ financial-markets/, 2024. Accessed: 2026-04-
+                                                                 203-1_Sella.pdf. Session AIML-203-1.
+ 19.
+                                                               Shao, R., He, J., Asai, A., Shi, W., Dettmers, T., Min, S.,
+NVIDIA Corporation.  NVIDIA Grace CPU Super-                     Zettlemoyer, L., and Koh, P. W. Scaling retrieval-based
+ chip. https://www.nvidia.com/en-us/data-                        language models with a trillion-token datastore. Advances
+ center/grace-cpu-superchip/, 2024.     Ac-                      in Neural Information Processing Systems, 37:91260–
+ cessed: 2026-04-19.                                             91299, 2024.
+OpenAI. Gpt-3.5 turbo. https://platform.openai.                Shao, Z., Gong, Y., Shen, Y., Huang, M., Duan, N., and
+  com/docs/models/gpt-3-5-turbo, 2023. Ac-                       Chen, W. Enhancing retrieval-augmented large language
+  cessed: 2026-04-19.                                            models with iterative retrieval-generation synergy. In
+                                                                 Findings of the Association for Computational Linguis-
+Peng, W., Li, G., Jiang, Y., Wang, Z., Ou, D., Zeng, X., Xu,     tics: EMNLP 2023, pp. 9248–9274, 2023.
+  D., Xu, T., and Chen, E. Large language model based
+  long-tail query rewriting in taobao search. In Companion     Shen, M., Umar, M., Maeng, K., Suh, G. E., and Gupta,
+  Proceedings of the ACM on Web Conference 2024, 2024.           U. Hermes: Algorithm-system co-design for efficient
+                                                                 retrieval-augmented generation at-scale. In Proceedings
+Pgvector team. Pgvector - Open-source vector similar-            of the 52nd Annual International Symposium on Com-
+  ity search for Postgres. https://github.com/                   puter Architecture, pp. 958–973, 2025.
+  pgvector/pgvector, 2025.
+                                                               Sivic, J. and Zisserman, A. Video google: A text retrieval
+Press, O., Zhang, M., Min, S., Schmidt, L., Smith, N. A.,        approach to object matching in videos. In ICCV, pp.
+  and Lewis, M. Measuring and narrowing the composi-             1470–1477. IEEE Computer Society, 2003.
+  tionality gap in language models. In Findings of the As-
+  sociation for Computational Linguistics: EMNLP 2023,         Stewart, D. and Linsdell, J. Say hello to pre-
+  pp. 5687–5711, 2023.                                           cision:  How rerankers and embeddings boost
+                                                                 search.     https://cohere.com/blog/say-
+Quinn, D., Nouri, M., Patel, N., Salihu, J., Salemi,             hello-to-precision-how-rerankers-and-
+ A., Lee, S., Zamani, H., and Alian, M. Accelerat-               embeddings-boost-search, 2024. Accessed:
+  ing retrieval-augmented generation. In Proceedings             2026-04-19.
+                  T ELE RAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval
+
+Tung, K.       Enhancing user experience by over-                 Zhang, Z., Zhu, A., Yang, L., Xu, Y., Li, L., Phothilimthana,
+  coming latency in the ion iq chatbot.   https:                    P. M., and Jia, Z. Accelerating retrieval-augmented lan-
+  //www.ontinue.com/resource/enhancing-                             guage model serving with speculation. arXiv preprint
+  user-experience-by-overcoming-                                    arXiv:2401.14021, 2024b.
+  latency-in-the-ion-iq-chatbot/,           2024.
+  Accessed: 2026-04-19.                                           Zheng, H. S., Mishra, S., Chen, X., Cheng, H.-T., Chi, E. H.,
+                                                                    Le, Q. V., and Zhou, D. Take a step back: Evoking
+Wang, L., Ma, C., Feng, X., Zhang, Z., Yang, H., Zhang, J.,         reasoning via abstraction in large language models. arXiv
+ Chen, Z., Tang, J., Chen, X., Lin, Y., et al. A survey on          preprint arXiv:2310.06117, 2023.
+ large language model based autonomous agents. Frontiers
+ of Computer Science, 18(6):186345, 2024.                         Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+                                                                    Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+Wang, Y., Liu, S., Li, Z., Wu, Y., Mao, Z., Zhao, Y., Yan,          rett, C., and Sheng, Y. Sglang: Efficient execution
+ X., Xu, Z., Zhou, Y., Stoica, I., Min, S., Zaharia, M., and        of structured language model programs, 2024. URL
+ Gonzalez, J. E. Leann: A low-storage vector index, 2025.           https://arxiv.org/abs/2312.07104.
+ URL https://arxiv.org/abs/2506.08276.
+                                                                  Zhou, D., Schärli, N., Hou, L., Wei, J., Scales, N., Wang, X.,
+Wei, K. Advanced rag with azure ai search and llamain-              Schuurmans, D., Cui, C., Bousquet, O., Le, Q. V., et al.
+ dex.     https://techcommunity.microsoft.                          Least-to-most prompting enables complex reasoning in
+ com/t5/ai-azure-ai-services-blog/                                  large language models. In The Eleventh International
+ advanced-rag-with-azure-ai-search-                                 Conference on Learning Representations, 2022.
+ and-llamaindex/ba-p/4115007, 2024.               Ac-
+ cessed: 2026-04-19.                                              Zhuang, S., Liu, B., Koopman, B., and Zuccon, G. Open-
+                                                                    source large language models are strong zero-shot query
+Xie, Z., Kang, H., Sheng, Y., Krishna, T., Fatahalian, K.,          likelihood models for document ranking. In Findings of
+  and Kozyrakis, C. Ai metropolis: Scaling large language           the Association for Computational Linguistics: EMNLP
+  model-based multi-agent simulation with out-of-order              2023, pp. 8807–8817, 2023.
+  execution. arXiv preprint arXiv:2411.03519, 2024.
+                                                                  Zilliz.   How to select index parameters for ivf
+Yang, Z., Qi, P., Zhang, S., Bengio, Y., Cohen, W. W.,              index.   https://zilliz.com/blog/select-
+  Salakhutdinov, R., and Manning, C. D. HotpotQA: A                 index-parameters-ivf-index, 2020. Accessed:
+  dataset for diverse, explainable multi-hop question an-           2026-04-19.
+  swering. In Conference on Empirical Methods in Natural
+  Language Processing (EMNLP), 2018.
+Yao, J., Li, H., Liu, Y., Ray, S., Cheng, Y., Zhang, Q., Du,
+  K., Lu, S., and Jiang, J. Cacheblend: Fast large lan-
+  guage model serving for rag with cached knowledge fu-
+  sion, 2024. URL https://arxiv.org/abs/2405.
+  16444.
+Ye, F., Fang, M., Li, S., and Yilmaz, E. Enhancing conver-
+  sational search: Large language model-aided informative
+  query rewriting. In The 2023 Conference on Empirical
+  Methods in Natural Language Processing, 2023.
+Zaharia, M., Khattab, O., Chen, L., Davis, J. Q., Miller,
+  H., Potts, C., Zou, J., Carbin, M., Frankle, J., Rao, N.,
+  and Ghodsi, A. The shift from models to compound ai
+  systems. https://bair.berkeley.edu/blog/
+  2024/02/18/compound-ai-systems/, 2024.
+  Accessed: 2026-04-19.
+Zhang, Z., Liu, F., Huang, G., Liu, X., and Jin, X. Fast vector
+  query processing for large datasets beyond GPU memory
+  with reordered pipelining. In 21st USENIX Symposium
+  on Networked Systems Design and Implementation (NSDI
+  24), pp. 23–40, 2024a.
+

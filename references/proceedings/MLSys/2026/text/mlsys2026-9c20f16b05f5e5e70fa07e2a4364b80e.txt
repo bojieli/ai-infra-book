@@ -1,0 +1,1314 @@
+SHIP: SRAM- BASED H UGE I NFERENCE P IPELINES FOR FAST LLM S ERVING
+
+
+    Andrew Bitar 1 Aravind Vellora Vayalapra 1 Baorui Zhou 1 Matt Boyd 1 Charlie Wang 1 Sahil Parmar 1
+     Eugene Sha 1 Gautam Rayaprolu 1 Peter Hicks 1 Alex Bowe 1 Roberto DiCecco 1 Santosh Raghavan 1
+    Evan Patrick 1 Josip Smolcic 1 David Han 1 Kris Kang 1 Andy Rock 1 Josh Hay 1 Mohamed Eldafrawy 1
+           Mikhail Kandel 1 Daulet Zhanguzin 1 Omar Kilani 1 Liming Gong 1 Andrew Paprotskyi 1
+                             Arash Taheri-Dezfouli 1 Josh Fender 1 Andrew Ling 1
+
+                                                           A BSTRACT
+        The proliferation of large language models (LLMs) demands inference systems with both low latency and high
+        efficiency at scale. GPU-based serving relies on HBM for model weights and KV caches, creating a memory
+        bandwidth bottleneck during decode. To break through this bottleneck, we present the first large-scale, SRAM-
+        based LLM inference deployment—Groq’s public cloud—serving hundreds of billions of tokens daily. This paper
+        reviews Groq’s first-generation SRAM-based Huge Inference Pipelines (SHIP), highlighting: (1) a synchronous,
+        low-diameter interconnect enabling low-latency scaling across thousands of chips; (2) optimizations for LLM
+        serving under limited memory capacity; and (3) a large pipeline design that sustains efficiency and latency under
+        varying prefill-to-decode ratios and context lengths. Together, these yield state-of-the-art latency while maintaining
+        efficiency across diverse traffic scenarios—key to real-world LLM serving.
+
+1       I NTRODUCTION
+The rapid adoption of Large Language Models (LLMs) has
+placed unprecedented demands on compute infrastructure,
+
+
+
+                                                                                                                                          Moonshot AI Turbo
+                                                                                           DeepInfra (Turbo)
+
+
+
+
+                                                                                                                                                                                              Weights & Biases
+both in terms of latency and throughput. Today, NVIDIA
+                                                                                                                          Google Vertex
+GPUs are the primary platform for LLM serving, supported
+                                                                                Cerebras
+
+
+
+
+                                                                                                                                                                                                                 Cerebras
+                                                                                                                                                              Baseten
+
+
+
+
+                                                                                                                                                                                   Parasail
+                                                                                                                                                                        Friendli
+                                                                                                               Parasail
+
+
+
+by a mature software ecosystem and access to the latest
+generations of high-bandwidth memory (HBM). Competing
+accelerators—AMD’s Instinct GPU (Smith & Alla, 2025),
+Google’s TPU (Jouppi & Lakshmanamurthy, 2025), Meta’s                Figure 1. Average end-to-end request latency over a one-month
+                                                                     period (Sep 26–Oct 26, 2025) on Groq versus the next two fastest
+MTIA (Coburn et al., 2025) and Amazon’s Trainium (Fu
+                                                                     providers for each model. Data from (OpenRouter, 2025).
+et al., 2024) and Inferentia (Amazon Web Services, 2025)—
+likewise rely on off-chip DRAM to store model weights
+                                                                     tively scale the amount of compute allocated to a request
+and key-value (KV) cache during inference. This reliance
+                                                                     across many chips—important for long context prompts.
+on external memory is unsurprising: LLMs are indeed very
+“large”—growing to trillions of parameters—making dense              Decode—the generation of one token per forward pass—is
+off-chip memory a natural choice.                                    dominated by memory traffic: autoregressive generation’s
+                                                                     low operational intensity stresses weight and KV cache
+Yet the challenge of efficient serving extends beyond mem-
+                                                                     access. Batching can boost utilization on memory-bound
+ory density. LLM inference workloads divide into two
+                                                                     systems at the cost of TPOT. Effective batching, however,
+distinct regimes: prefill and decode. Prefill—the process-
+                                                                     is challenged by dynamic traffic, with context lengths and
+ing of a user’s prompt—is compute-bound and in princi-
+                                                                     prefill-to-decode token ratios in constant flux. Mixture-of-
+ple hardware-efficient. However, minimizing time-to-first-
+                                                                     Experts (MoE) architectures further stress memory band-
+token (TTFT) can conflict with other serving objectives, in-
+                                                                     width: because expert selection is data-dependent, batched
+cluding decode latency (time-per-output-token, TPOT) and
+                                                                     tokens no longer map cleanly across all compute resources,
+system throughput. The compute-bound nature of prefill
+                                                                     reducing the efficiency benefit of batching.
+offers opportunities to reduce TTFT if the system can effec-
+    1                                                                This tension is acute in practice. The latest LLM “killer
+    NVIDIA. Work done while at Groq. Correspondence to: An-
+drew Bitar <abitar@nvidia.com>.
+                                                                     apps,” such as coding assistants and multi-step task agents,
+                                                                     demand both fast prefill and fast decode. Reasoning models
+Proceedings of the 9 th MLSys Conference (Industry Track), Belle-    push 10! longer generations (Artificial Analysis, 2025),
+vue, WA, USA, 2026. Copyright 2026 by the author(s).                 further magnifying the importance of decode speed and
+                             SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+cost. The lag while a model “thinks” risks alienating users—    2     BACKGROUND
+Google measured drops in searches per user for page load
+time slowdowns as short as 100 ms (Brutlag, 2009).              2.1   LPU Architecture
+
+On-chip SRAM has long been the fastest memory technol-          At its core, the LPU is a tensor streaming processor ar-
+ogy, offering significantly higher bandwidth than HBM—          chitecture (Abts et al., 2020; 2022). Tensors—physically
+albeit at much lower density. Making SRAM-based infer-          represented as collections of vectors—stream across func-
+ence viable requires a rethinking of both architecture and      tional units (FUs) laid out horizontally across the chip. Each
+software. Throughput is achieved not by increasing batch,       FU type provides a distinct set of instructions while adher-
+but by minimizing latency. That is precisely the design         ing to a shared structural template: a SIMD unit operating
+point of Groq’s Language Processing Unit (LPU).                 on 320-element vectors, controlled by its own instruction
+                                                                dispatch unit (Bitar, 2022). FU types include the MXM
+At the time of publication, the next-gen LPU—fabricated on      for high-throughput matrix multiplications (MatMul), VXM
+Samsung’s 4 nm process—is in full production. In the spirit     units for non-MatMul operations, and MEM units for high-
+of prior retrospectives, such as Google’s TPU papers (Jouppi    bandwidth SRAM. Each FU is issued one instruction per
+et al., 2017; 2023), this work looks back on LPUv1, built       cycle, enabling pipelined, stall-free, deterministic execution.
+on GlobalFoundries 14 nm. Deploying LPUv1 (hereafter
+“LPU”) to build SRAM-based Huge Inference Pipelines             The LPU compiler statically schedules all instruction dis-
+(SHIP) yields state-of-the-art end-to-end LLM serving la-       patch across all FUs. It is empowered to do so by the
+tencies (Fig. 1). The success of SRAM serving rests on          deterministic and predictable nature of the architecture—
+three key pillars:                                              specifically: (i) all instruction latencies are statically known,
+                                                                (ii) on-chip SRAM accesses are deterministic and require
+  1. Low-Batch: High memory-to-compute bandwidth en-            no temperature-dependent refresh cycles, and (iii) the inter-
+     ables efficient inference at small batch sizes, making     connect consists of directional, arbitration-free buses that
+     latency optimization critical.                             move data eastward and westward. These properties give the
+  2. Scale: Model partitioning across thousands of LPUs         compiler a complete, cycle-accurate view of data movement
+     to overcome limited on-chip memory capacity.               throughout the program, offering optimization opportunities
+  3. Memory Capacity Efficiency: Software techniques            for both latency and power. In order to communicate with
+     that maximize utilization of the available capacity.       non-deterministic external components, such as accessing
+The LPU chip and system architecture scale to very large        host memory via PCIe, the LPU’s ISA provides a light-
+systems via a synchronous, low-latency chip-to-chip pro-        weight synchronization instruction to re-align functional
+tocol and a low-diameter topology. Thousands of LPUs            units to a common time domain.
+operate in lock-step to serve each token. Groq’s software
+                                                                Determinism in the LPU extends beyond a single chip to
+ecosystem—compiler and runtime—are co-designed for sys-
+                                                                encompass multi-chip systems, scaling from a single device
+tems where memory bandwidth is plentiful but capacity is
+                                                                to thousands cooperating on the same workload. Natural
+precious. Groq’s public LLM cloud was the first produc-
+                                                                clock drift across LPUs is deterministically accounted for by
+tion deployment of SRAM-based LLM inference, providing
+                                                                the LPU’s chip-to-chip (C2C) protocol using a combination
+a superior user experience by minimizing both TTFT and
+                                                                of shallow FIFOs and statically scheduled “deskew” instruc-
+TPOT (Fig. 1). These SHIP systems have grown rapidly
+                                                                tions, yielding a synchronous chip-to-chip communication
+in demand, serving hundreds of billions of tokens per day
+                                                                model visible to the compiler (Abts et al., 2022). No dedi-
+globally.
+                                                                cated router chips are used for inter-LPU communication—
+While extensive prior art exists for serving LLMs on DRAM-      the LPUs themselves act as both processor and router, al-
+based architectures, little has been published on the chal-     lowing the compiler to schedule both compute and network
+lenges and solutions for SRAM-based LLM serving. This           traffic. This enables the compiler to globally optimize net-
+work provides a comprehensive look at techniques and in-        work routing, achieving efficient collective communication
+novations deployed in Groq’s production systems, includ-        pipelined behind compute (§4.2).
+ing: (1) a synchronous, low-latency interconnect for small-
+                                                                Eight LPUs are packaged within a node, along with a dual-
+tensor collectives with fault-tolerant scaling (§4); (2) mem-
+                                                                socket host system connecting to each LPU via PCIe. The
+ory management techniques on systems of thousands of
+                                                                host system provides 1 TB of DDR4 DRAM per node. Fur-
+LPUs, including paged attention, prefix caching and spec-
+                                                                ther system hardware details are described in §7.1.1.
+ulative decoding (§5); (3) design and scheduling of large
+pipeline-parallel inference to maintain throughput and meet
+service-level objectives (SLOs) under dynamic traffic (§6);     2.2   LLM Serving
+and (4) a discussion on power, cost and synchronization         The Transformer architecture (Vaswani et al., 2017) under-
+differences compared to GPU systems (§7).                       lies nearly all production LLMs. During inference, these
+                                                   SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+                        20
+Prefill:Decode Token Ratio
+
+
+
+
+                                                                                     Operational Intensity (Weighted Average)
+
+
+
+
+                                                                                                                                                                           Operational Intensity (Weighted Average)
+                                                                                                                                200                                                                                   500
+                                                                                                                                          CL=2,048                                                                              CL=2,048
+                                 Model A (non-reasoning)   Model B (reasoning)
+                                                                                                                                          CL=8,192                                                                              CL=8,192
+                                                                                                                                                                                                                      400
+                        15                                                                                                      150       CL=32,768                                                                             CL=32,768
+                                                                                                                                          CL=131,072                                                                  300       CL=131,072
+                                                                                                                                100
+                        10
+                                                                                                                                                                                                                      200
+                                                                                                                                 50
+                             5                                                                                                                                                                                        100
+
+                                                                                                                                  0
+                             0                                                                                                                                                                                         0
+                                             Time (7-day window)
+
+
+
+
+                                                                                                                                      1
+
+
+
+                                                                                                                                              5
+                                                                                                                                             10
+
+
+
+                                                                                                                                                            50
+
+                                                                                                                                                              0
+
+
+
+                                                                                                                                                                       0
+                                                                                                                                                                       0
+                                                                                                                                                                                                                            1       10         100        1,000   10,000
+
+
+
+
+                                                                                                                                                           10
+
+
+
+                                                                                                                                                                    50
+                                                                                                                                                                    00
+                                                                                                                                                                     1,
+                                                                                                                                                       Batch Size                                                                            Batch Size
+
+
+Figure 2. 7-day sample from Groq Cloud of 10-minute moving                                   (a) Qwen3-32B                  (b) gpt-oss-120B
+average of ratio of prefill-to-decode tokens served.                                Figure 3. Average operational intensity per forward pass across
+                                                                                    batch sizes and context lengths (CL). Assumes uniform distribution
+ models operate in two distinct modes: prefill and decode.                          of tokens to experts in gpt-oss-120B.
+ Prefill processes the user’s prompt—an array of input to-
+ kens—to generate the first response token and produce the                          Ultimately, inference providers must adapt to varying model
+ cached key–value (KV) entries used during decode. Be-                              characteristics and dynamic traffic patterns. Prefill:decode
+ cause all prompt tokens can be processed in parallel, prefill                      (P:D) token ratios (Fig. 2) and context lengths (CL) fluctuate
+ is primarily compute-bound. A user’s input token through-                          constantly, making system adaptability critical to maintain
+ put (it/s/u) scales with compute allocated to the prompt. An                       efficiency.
+ architecture’s ability to dynamically allocate more compute
+ to long prompts is key to minimizing TTFT—a key SLO.                               3                                                 M OTIVATION : LLM S IN SRAM
+Decode, in contrast, is memory-bound. Each output token                             3.1                                               Latency
+depends on previously generated tokens, making decode
+inherently sequential and sensitive to memory bandwidth.                            Whether to address the “thinking” lag in reasoning mod-
+Per-user output token throughput (ot/s/u)—the inverse of                            els or the responsiveness of task agents, a key challenge
+time-per-output-token (TPOT)—is limited by how quickly                              in LLM serving remains how to overcome the memory-
+weights and KV cache can be fetched. Batching multiple                              bandwidth bottleneck of HBM. Reducing decode latencies
+users can improve FLOP utilization, but increases TPOT                              can also improve model intelligence by scaling “test-time
+due to the scaling latencies of self-attention, collective com-                     compute” (Snell et al., 2025) per unit time. While the
+munication, and normalization.                                                      potential latency benefits of serving LLMs using higher-
+                                                                                    bandwidth SRAM are clear, it is not immediately evident if
+Managing compute allocation across the dynamic mix of                               it can be done with sufficient efficiency to be economical.
+prefill and decode is a challenge in LLM serving. Mod-
+ern serving libraries like SGLang (Zheng et al., 2024),
+                                                                                    3.2                                               Efficiency
+vLLM (Kwon et al., 2023) and TensorRT-LLM (NVIDIA,
+2026) use techniques such as continuous batching (Yu                                The FLOP/s efficiency of a compute platform is funda-
+et al., 2022) and chunked prefill (Agrawal et al., 2023).                           mentally bounded by its compute-to-memory bandwidth
+While an improvement over request-level scheduling, these                           ratio and by the operational (or arithmetic) intensity of
+approaches still suffer from sub-optimal utilization with                           the workload being served, as captured by the roofline
+fluctuating context lengths and prefill-to-decode token ra-                         model (Williams et al., 2009). An analysis of memory tech-
+tios (Agrawal et al., 2023). Moreover, selecting a prefill                          nology for LLM inference therefore requires understanding
+chunk size forces serving platforms to tradeoff TTFT, TPOT                          not only the capacity needed to store model weights and KV
+and throughput, making it challenging to meet SLOs across                           caches, but also the operational intensity (OI)—measured
+diverse traffic shapes. Prefill-decode disaggregation (Zhong                        as the number of compute operations (commonly floating
+et al., 2024) addresses some of these conflicting SLOs but                          point operations, or FLOPs) per byte loaded from memory.
+introduces other challenges that we discuss in §7.3.
+                                                                                    In Transformer inference, the self-attention matrix multipli-
+ Reasoning models (Snell et al., 2025) introduce a new twist                        cations (QK→ and PV) exhibit batch-invariant OI during
+ to LLM serving SLOs: TTFT depends on both it/s/u and                               decoding and increasingly dominate total compute as batch
+ ot/s/u, as a user must wait for a model to finish “thinking”                       size and context length grow (see Appendix A). Figure 3a
+ before receiving the response. This amplifies the importance                       highlights how self-attention constrains decode OI in dense
+ of decode latency, and hence memory bandwidth of the                               models like Qwen3-32B, forming a ceiling on achievable
+ serving hardware. Further stressing inference providers                            efficiency. MoE models face an additional constraint on
+ are the longer contexts used by reasoning models, which                            OI: tokens within a batch can route to different experts,
+ generate 2–10→ more tokens for the same prompt compared                            thus requiring very large batch sizes to see significant im-
+ to non-reasoning models (Artificial Analysis, 2025).                               provements to OI. In the case of gpt-oss-120B (Fig. 3b),
+                              SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+the sliding-window-attention (SWA) layers help alleviate          ance. Large variations in pipeline stage latencies—whether
+the impact of self-attention on OI, but this is offset by the     from non-deterministic hardware performance, unbalanced
+reduced impact of batching in the routed expert MatMuls.          workload partitioning, or dynamic request traffic—can in-
+                                                                  troduce pipeline bubbles that degrade throughput. The
+HBM-based accelerators can require OIs in the hundreds to
+                                                                  LPU’s determinism (§2.1) allows the compiler to balance
+approach compute saturation. As seen in Figure 3, this is dif-
+                                                                  pipeline latencies at compile-time. Heterogeneous LLM
+ficult to achieve due to the scaling behavior of self-attention
+                                                                  architectures—such as combinations of SWA and standard
+and sparse MoEs. SRAM-based hardware overcomes this
+                                                                  attention, dense and sparse MoE—are balanced by allocat-
+bandwidth limitation by operating at low batch sizes, with
+                                                                  ing compute resources proportionally to each stage based on
+the LPU delivering over 10→ greater memory-to-compute
+                                                                  its compute and storage needs. Section 4.1 covers the LPU
+bandwidth compared to GPUs. As a result, the limiting
+                                                                  topology design to efficiently support such heterogeneous
+factor shifts from bandwidth to capacity.
+                                                                  pipelines. The dynamic nature of requests must still be man-
+While compute-to-memory bandwidth ratio is fixed by the           aged at runtime, with SHIP maintaining pipeline efficiency
+chip architecture, total memory capacity increases with           and avoiding bubbles as described in Section 6.
+scale. Spreading an inference workload across many chips
+does not improve the roofline performance set by the OI, but      4     V ERY L ARGE S CALING
+can improve efficiency when the performance limiter is stor-
+age capacity. Motivated by this insight, Groq has deployed        4.1   Network Topology
+a cloud of SHIPs—huge inference pipelines of hundreds
+                                                                  Thousands of LPUs are interconnected through Groq’s C2C
+to thousands of LPUs storing weights and KV cache in
+                                                                  topology, forming a low-latency, high-bandwidth fabric de-
+SRAM. SHIP combines tensor parallel and pipeline parallel
+                                                                  signed for pipelined, synchronous compute. The network
+techniques to scale compute to such large systems:
+                                                                  is organized as a linear sequence of LPU nodes, with each
+Tensor Parallelism. Tensor parallel (TP) partitioning             node containing eight fully-connected LPUs, forming an
+strategies—used here to encompass head parallel, context          intra-node K8 clique for single-hop, high-bandwidth local
+parallel, expert parallel, and self-attention data parallel—      communication. Each node then connects four links to its
+distribute each decoder layer across multiple chips to reduce     four nearest node neighbors forward and backward in the se-
+compute latency and increase available memory capacity for        quence (Fig. 4). This topology, named QuadFour, provides
+both weights and KV caches. Crucially, TP incurs overhead         properties that make it highly suitable for SHIP:
+from collective communication operations. Given the low
+                                                                  Designed for both TP and PP. As detailed in Section 3,
+batch sizes used in SRAM-based inference, there is limited
+                                                                  scaling to large system sizes necessary for SRAM-based
+opportunity to mask sequential dependencies, such as collec-
+                                                                  inference requires a combination of both TP and PP. A given
+tives, behind independent compute for different batch items.
+                                                                  model is broken up into a set of partitions, with each par-
+As a result, these exposed latencies are a larger fraction of
+                                                                  tition scaled across multiple adjacent LPU nodes using TP.
+the total execution (Davies et al., 2025). This increased
+                                                                  The groups of nodes forming each partition are then laid out
+latency-sensitivity necessitates innovation in both the scale-
+                                                                  in a pipeline across the network, as shown in Figure 5. Intra-
+out topology (§4.1) and the scheduling of collectives (§4.2)
+                                                                  and inter-node links within the partition provide high aggre-
+in SHIP systems. Moreover, reaching large TP sizes re-
+                                                                  gate C2C bandwidth (853 GB/s bisection bandwidth) for
+quires partitioning the model across multiple dimensions,
+                                                                  the collectives required by TP scaling, while inter-partition
+which in turn introduces new communication collectives
+                                                                  links are sufficiently provisioned for pipeline transfers. The
+that must be carefully optimized.
+                                                                  topology can also form pipelines of varying partition sizes
+Pipeline Parallelism. When the limits of efficient TP scal-       to balance pipeline stage latencies in heterogeneous model
+ing are reached, pipeline parallel (PP) partitioning enables      architectures. To prevent pipeline bubbles, the determinis-
+further expansion. PP provides access to additional mem-          tic LPU architecture (§2.1) allows the compiler to balance
+ory for weights with less communication overhead than TP,         pipeline stage latencies ahead of time by selecting TP strate-
+but offers limited improvement in KV cache storage: each          gies that match each partition’s compute needs.
+added pipeline stage requires additional KV cache alloca-
+                                                                  Low network diameter. The small batch sizes used in
+tion for another in-flight micro-batch to prevent pipeline
+                                                                  SRAM-based LLM inference are highly latency-sensitive,
+bubbles during decode (partially mitigated by speculative
+                                                                  rendering large-diameter topologies, such as a mesh or
+decoding; see §5.3). Prefill, on the other hand, does not
+                                                                  torus (Jouppi et al., 2023), unsuitable. The QuadFour topol-
+require multiple KV caches to saturate the pipeline, offering
+                                                                  ogy uses 32 external links per node to reach many LPUs
+the option to allocate the entire SHIP to a single prefill job.
+                                                                  within a small hop count, enabling low-diameter TP scaling.
+A critical factor in PP scaling is maintaining pipeline bal-      A 72-LPU TP partition with 16.56 GB of high-bandwidth
+                                                                      SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+                                                                                                                                                             Skipped Nodes (N)           0      1      2      3
+                                                                                                                                                             Inter-Part BW (GB/s)       427    256    128    43
+                                                                                                                                                       Table 1. Inter-partition bandwidth for two four-node partitions
+                                                                                                                          node = 8 LPUs
+                                                                                                                                                       communicating across N consecutive skipped nodes.
+                                                                                                                         fully-connected
+node       node     node             node     node      node     node   node               node    node      node
+             rack                                                                                              rack                                    Resilient. While LPU systems do not include HBM (the
+Figure 4. QuadFour Topology. Inter-node links are shown only for                                                                                       component with one of the highest rates of failure in GPU
+highlighted node; all other nodes have identical relative connec-                                                                                      systems (Grattafiori et al., 2024)), the sheer size of SHIPs
+tions: 32 C2C links distributed evenly to four forward and four                                                                                        necessitates an effective failure-handling mechanism to han-
+backward nodes.                                                                                                                                        dle a failure to any of the components used in the system.
+                                                                                                                                                       QuadFour’s inherent symmetry allows the system to shuffle
+                    Pt 2 (cnt’d)
+
+
+
+
+                                                       (cnt’d)
+                                                 Pt 3
+
+
+
+
+                                                                                                                            Pt 8 (cnt’d)
+                                   LPU Node             LPU Node                        LPU Node              LPU Node                     LPU Node
+                                                                                                                                                       partitions around failed nodes (Fig. 5). Any given partition
+                                                                        Pt 5 (cnt’d)
+
+
+
+
+                                   LPU Node             LPU Node                        LPU Node              LPU Node                     LPU Node
+                                                                                                                                                       has a reach of up to four nodes, allowing it to skip up to
+                                                Pt 4
+
+
+
+
+                                   LPU Node             LPU Node                        LPU Node              LPU Node                     LPU Node
+
+                                                                                                                                                       three adjacent “down” nodes while they are being serviced
+                                                                                                      Pt 7
+
+
+                                   LPU Node             LPU Node                        LPU Node              LPU Node                     LPU Node
+
+
+
+
+                                                                                                                            Pt 9
+                                   LPU Node             LPU Node                        LPU Node              LPU Node                     LPU Node
+                                                                                                                                                       for failures. Inter-partition bandwidth scales down with
+                    Pt 3
+Pt 1
+
+
+
+
+        LPU Node                   LPU Node             ofﬂine node                     LPU Node              LPU Node
+                                                                                                                                                       skip-distance, making it important to repair offline nodes
+                                                                        Pt 6
+
+
+
+
+        LPU Node                   LPU Node             LPU Node                        LPU Node              LPU Node
+
+                                                                                                                                                       and return them to production when ready (Table 1).
+                                                 Pt 5
+
+
+
+
+        LPU Node                   LPU Node             LPU Node                        LPU Node              LPU Node
+Pt 2
+
+
+
+
+                                                                                                      Pt 8
+
+
+
+
+        LPU Node                   LPU Node             LPU Node                        LPU Node              LPU Node
+       Groq Rack              Groq Rack                 Groq Rack                      Groq Rack             Groq Rack                     Groq Rack
+                                                                                                                                                       Transient node errors are handled by replaying the affected
+Figure 5. Mapping heterogeneous partitions to QuadFour on racks                                                                                        tokens. If the error persists, the node is taken offline and
+in Groq’s data centers. Arrows show direction of pipe transfers.                                                                                       partitions are rotated around it, leveraging the topology’s
+The node experiencing failures is skipped while being serviced.                                                                                        sequential symmetry. Fast rotation is enabled by caching the
+SRAM memory can be formed with a diameter of three hops,                                                                                               weights of multiple partitions in each node’s host-attached
+with each hop taking only 300 ns thanks to the LPU’s syn-                                                                                              DRAM. Once the node is repaired, partitions are rotated
+chronous C2C protocol (§2.1). For example, such capacity                                                                                               back to eliminate node skipping and restore the lost band-
+allocated to a single-layer pipelined partition of Qwen3-                                                                                              width. This design is motivated by empirical evidence that
+235B-A22B could store the weights and KV caches for                                                                                                    node failures are not a purely memoryless process; rather,
+decode of 1,380 concurrent users, each using 4,096 tokens                                                                                              once a node begins exhibiting errors, its near-term failure
+of context. Scaling to a larger 136-LPU TP partition with                                                                                              risk increases significantly. Thus, rapid node rotation and
+31.28 GB of SRAM yields a diameter of five hops.                                                                                                       repair was preferred over prolonged in-band error recovery.
+Scalable to thousands of LPUs. The sequential symmetry
+                                                                                                                                                       4.2   Efficient Collectives
+of the topology allows logical partitions to move fluidly
+across the physical topology, independent of rack bound-                                                                                               Network communication introduced when scaling must be
+aries. Laying out a model across thousands of LPUs can                                                                                                 low-latency to maintain efficiency in latency-sensitive SHIP
+be done without needing to be aware of the 72-LPU rack                                                                                                 systems (§3.2), requiring tight co-design of the scale-out
+package—a 72-LPU partition can be placed either within a                                                                                               hardware and compiler. The low-diameter topology de-
+single rack or straddle two racks (Fig. 5).                                                                                                            scribed in §4.1, together with the LPU’s synchronous C2C
+                                                                                                                                                       fabric, achieves efficient communication collectives at small,
+The deterministic architecture enables synchronous inter-
+                                                                                                                                                       low-batch tensor sizes. The LPU compiler’s static schedul-
+LPU communication across the entire model instance with-
+                                                                                                                                                       ing of network communication provides three distinct advan-
+out interaction with any host or router (§2.1). Maintaining
+                                                                                                                                                       tages: (1) minimal transfer overhead; (2) tight scheduling of
+network synchronization across such a large system requires
+                                                                                                                                                       pipelined operations; and (3) communication routes selected
+a distributed clock recovery scheme to account for clock
+                                                                                                                                                       to minimize hop count per transfer.
+drift. This is achieved in the QuadFour topology using prop-
+agated synchronization, where a wave of synchronization                                                                                                Low-latency transfers. The deterministic instruction sched-
+flows through the pipeline, during which: (1) a partition                                                                                              ule of LPUs enables lock-free chip-to-chip transfers, elimi-
+of LPUs synchronizes and performs compute; (2) the next                                                                                                nating cycles spent on memory acquire–release operations
+partition joins the synchronous domain, and receives inter-                                                                                            or cache management. As a result, the LPU’s C2C protocol
+mediate tensors through the inter-partition C2C links; then                                                                                            incurs minimal overhead for small data transfers, achieving
+(3) the first partition leaves the synchronous domain and                                                                                              sub-µs hop latency: 300 ns per LPU-to-LPU hop, compared
+begins computing the subsequent inference while the next                                                                                               to the 1–10 µs typically observed in GPU collectives such
+partition continues the current inference. This mechanism                                                                                              as NCCL, NCCLX, and UCCL (Hu et al., 2025; Si et al.,
+avoids pipeline bubbles and eliminates host overhead within                                                                                            2025; Zhou et al., 2025). Figure 6a shows collective per-
+the pipeline.                                                                                                                                          formance on an 8- and 64-LPU system generated with the
+                              SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+                                                          350
+                                                                80x15360 15360x1280 Matmul Throughput
+                                                                                                        split on its inner dimension across 8 chips, followed by an
+                                                          300   Max Multiply-and-Accumulate BW
+                                                                                                        AllReduce collective. Transfer operations for the AllReduce
+                                                          250                                           (“C2C”) are overlapped with nearly the entire duration of
+
+
+
+
+                                      Throughput (GB/s)
+                                                          200
+                                                                    Maximum Transfer BW
+                                                                                                        the compute (“MAC”). However, due to the inherent band-
+                                                          150                                           width mismatch between compute FLOPs and C2C, there
+                                                          100                                           still remain exposed C2C cycles. The compiler can mitigate
+                                                           50
+                                                                                            MAC
+                                                                                            C2C
+                                                                                                        this by overlapping with other operations in the program.
+                                                            0                                           Still, this bandwidth mismatch is a key challenge to scaling
+                                                                                                        regardless of batch size, and is a key focus of improvement
+
+
+
+                                                                0
+
+
+                                                                     00
+
+
+
+                                                                           0
+
+
+                                                                                0
+
+
+                                                                                      0
+
+
+                                                                                            0
+
+
+                                                                                                  0
+                                                                          00
+
+
+                                                                               00
+
+
+                                                                                     00
+
+
+                                                                                           00
+
+
+                                                                                                  00
+                                                                     50
+
+
+                                                                          10
+
+
+                                                                               15
+
+
+                                                                                    20
+
+
+                                                                                           25
+
+
+                                                                                                30
+                                                                           Time (cycles)
+                                                                                                        for next-generation LPUs.
+     (a) Collectives Bandwidth                  (b) MatMul+AllReduce
+
+Figure 6. Performance of collective operations on LPU systems,                                          5     M EMORY C APACITY M ANAGEMENT
+as generated by the compiler. For an AllReduce collective, LPU
+systems achieve 50% bandwidth saturation at a tensor size of                                            While the massive scale of SHIP provides access to signifi-
+32KiB, and 90% saturation at a tensor size of 80KiB.                                                    cant amounts of fast SRAM memory, capacity still remains
+                                                                                                        constrained relative to a DRAM-based solution. Here we
+LPU compiler, compared with an 8xB200 system using                                                      discuss the essential software strategies needed to manage
+NCCL collectives. While the LPU’s I/O bandwidth is con-                                                 these capacity-constrained systems in production.
+siderably lower (LPUv1 C2C: 235 GB/s; B200 NVLink:
+1,800 GB/s), the reduced latency overhead in the LPU’s net-                                             5.1   Paged Attention
+working architecture allows it to achieve greater collectives
+performance at small tensor sizes. Given that collective                                                We implement an in-house PagedAttention (Kwon et al.,
+tensor sizes during LLM inference on SHIPs typically range                                              2023) mechanism where the KV cache of the entire context
+from 32-256 KiB, the LPU architecture and software are                                                  length is dynamically allocated to optimize SRAM utiliza-
+well-suited for SRAM-based inference.                                                                   tion. A model’s context is generally underutilized for most
+                                                                                                        prompts, as observed from production samples from Groq
+The specific collective algorithm chosen varies based on                                                Cloud: 92% and 97% of requests from a reasoning and
+tensor size, as the compiler shifts between algorithms that                                             non-reasoning model, respectively, use fewer than 8Ki to-
+minimize hop-count or maximize bandwidth utilization.                                                   tal tokens (Appendix D.1). To leverage this fact, pages of
+For AllReduce operations, RedBcast, TiledRedBcast or                                                    SRAM are allocated on an as-needed basis as the prompt
+PAARD (Ma et al., 2021) are chosen. Figure 6a shows the                                                 size increases and additional tokens are generated.
+algorithms selected for a 64-chip AllReduce across tensor
+sizes. Full descriptions of each algorithm are in Appendix B.                                           Page allocation is managed by the runtime system per re-
+                                                                                                        quest. With every pipeline stage in SHIP having symmetric
+Compute-aware pipelining. Overlapping compute with                                                      memory allocation, the only interaction to control the al-
+tensor transfers recoups some efficiency otherwise lost to                                              location is from the host CPU attached to the front of the
+collective latency. On GPUs, various methods attempt this,                                              pipeline, which sends in a mask encoding—a vector of inte-
+including device initiation of communication using NVSH-                                                gers compactly representing the “active” KV cache pages
+MEM, kernel fusion and careful partitioning of communica-                                               for the current set of requests (Appendix C). The mask en-
+tion and compute (NVIDIA, 2025; Chang et al., 2024; Wang                                                coding is then forwarded from each stage to the next. The
+et al., 2022), offering substantive improvements. However,                                              size of the mask encoding scales with the number of pages,
+such approaches can have varied success: dynamic kernel                                                 increasing the transfer cost for finer-grained pages. Larger
+execution and transfer times lead to imperfect overlap of                                               page sizes reduce mask encoding size but increase mem-
+compute and collective (Chang et al., 2024). Some of this                                               ory fragmentation. Common page sizes used are 128–512
+latency overhead is amortized at high batch sizes seen in                                               tokens.
+GPUs, but can be catastrophic in low-batch SHIPs.
+Pipelined overlap of small-tensor operations requires tight                                             5.2   Prefix Caching on Large Systems
+scheduling, leaving no room for kernel-launch overhead,
+                                                                                                        While scaling systems large enough to fit weights and KV
+host intervention, or non-deterministic operation execution.
+                                                                                                        caches entirely in SRAM unlocks low-latency inference, ac-
+In a statically scheduled environment, the compiler can
+                                                                                                        cess to significantly more memory capacity provides a key
+opportunistically pipeline on a cycle-by-cycle basis to maxi-
+                                                                                                        advantage: prefix caching. Prefix caching is an inference
+mize overlap. The LPU compiler interleaves data transfer
+                                                                                                        optimization that stores prefixes of KV cache states from
+with compute; as the first chunks of tensor data are com-
+                                                                                                        previously completed inferences to avoid redundant com-
+puted, transfer instructions are issued at the earliest possible
+                                                                                                        putation. Implemented in most modern LLM serving sys-
+cycle. Figure 6b shows the execution profile of a MatMul
+                              SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+                                                                                                   100%
+ Memory Type     Memory Capacity (GB)    Memory BW (TB/s)
+
+
+
+
+                                                                  Prefix Cache Hit Rate (30m MA)
+                                                                                                                       Model A SRAM Cache    Model B DRAM Cache
+
+   SRAM                 69.7*               10,616**                                               75%
+
+   DDR4                72,000                  18.4                                                50%
+
+
+
+Table 2. Prefix cache memory options in a typical LPU SHIP in-                                     25%
+
+
+stance of gpt-oss-120B. *: memory capacity for weights removed                                      0%
+                                                                                                                                   Time (7-day window)
+
+from total. **: memory bandwidth shared with weights.
+                                                                  Figure 7. 7-day window of SRAM and DRAM prefix cache hit rate
+                                                                  on two different model instances in Groq’s public cloud.
+tems, including SGLang (Zheng et al., 2024), vLLM (Kwon
+et al., 2023) and TensorRT-LLM (NVIDIA, 2026), prefix
+caching can substantially improve efficiency and reduce
+TTFT. These gains are especially pronounced in multi-turn
+tool-use agents and coding assistants, where cache hit rates
+exceeding 90% have been reported. The performance bene-
+fits of prefix caching, however, are closely tied to the avail-
+able memory capacity and bandwidth for storing and retriev-
+ing cached prefixes.                                              Figure 8. Using SD with various draft models on SHIP vs. not
+                                                                  using SD. Target model: Llama3.3-70B. ω: number of accepted
+SHIP’s distributed LLM serving architecture provides ample        tokens. Speculation length = 6, CL = 4096, P:D = 4.
+capacity and bandwidth, making it particularly well-suited
+to exploit prefix caching at scale. A single model instance is    still observe high cache hit rates in the public cloud environ-
+partitioned across multiple LPU nodes (§4), each of which         ment, as illustrated in Figure 7. A HBM-based, non-SHIP
+provides 1 TB of DDR4 DRAM that is accessible to all eight        system could leverage data parallelism to scale to larger
+LPUs via the host system over PCIe (§7.1.1). SHIP’s scale-        DRAM capacities and therefore higher TTLs. However,
+out design thus enables access to a large pool of distributed     such an approach requires careful coordination of prefix
+memory, providing both high aggregate bandwidth and total         placement and routing to maintain load balance (Cao et al.,
+capacity. Two levels of distributed memory are leveraged for      2025), since the caches are distributed across many smaller
+prefix caching: on-chip SRAM and host-attached DRAM.              instances rather than a few large SHIP instances.
+In a typical deployment of gpt-oss-120B (Agarwal et al.,
+                                                                  5.3                                     Speculative Decoding for Reduced KV Cache Size
+2025) in Groq’s cloud, the model is partitioned across 72
+LPU nodes, yielding substantial SRAM and DRAM capac-              Speculative decoding (SD) (Leviathan et al., 2023; Xia et al.,
+ity for KV caches (Table 2). The abundant DRAM capacity,          2023; Chen et al., 2023) has been adopted in LLM serving
+in particular, allows the system to achieve cache time-to-        platforms to reduce TPOT—a key SLO (§2.2). In SD, a
+live (TTL) durations on the order of hours. Figure 7 shows        smaller draft model predicts multiple candidate tokens that
+SRAM and DRAM cache hit rates for two model instances             are then verified by a larger target model, enabling parallel
+in Groq’s cloud. The observed ↑50–75% DRAM cache hit              output token generation and thus lower decode latency. Prior
+rate highlights the benefit of large-scale distributed memory     work (Liu et al., 2024b; Su et al., 2023) has shown that for
+capacity for prefix reuse within a single instance.               GPU-based systems with high batch and short contexts,
+                                                                  SD can hurt efficiency due to its additional overhead and
+The runtime employs a space-efficient BlockTrie to track the
+                                                                  the already high operational intensity of non-SD. Long-
+prefix tree of the token space using rolling hashes of fixed
+                                                                  context scenarios, however, do see efficiency gains in some
+size token chunks. The block size in the BlockTrie matches
+                                                                  cases (Sadhukhan et al., 2025), as the memory-bound self-
+the page size used by our “PagedAttention” mechanism,
+                                                                  attention mechanism dominates runtime (§3.2).
+naturally compressing the representation compared to a tra-
+ditional trie. Prefix matches in SRAM are instantly prefill-      Memory capacity-constrained systems stand to gain fur-
+complete—if the matched prefix spans the full prompt, de-         ther from SD. By generating multiple tokens per KV cache
+code begins with a near-zero TTFT. For matches in DRAM,           stored, the total memory for KV caches to sustain a given
+the runtime schedules corresponding pages to be loaded into       FLOP/s efficiency is reduced. In a SHIP system, the draft
+on-chip SRAM before completing prefill on any unmatched           is inserted as an additional pipeline stage, which must be
+prompt tokens and then commencing decode. Pages in                adequately provisioned to avoid becoming a pipeline bot-
+SRAM and DRAM are retained until capacity is reached,             tleneck. SD thus introduces overhead from the extra draft
+then evicted using a LRU scheme.                                  LPUs, the additional latency of the draft itself, and from
+                                                                  mispredicted tokens that must be verified and discarded.
+To guarantee user privacy, Groq’s cloud enforces strict iso-
+lation of prefix caches between organizations, preventing         A sufficiently high token acceptance rate is therefore essen-
+cross-organization cache hits. Despite this restriction, we       tial for SD to provide a net efficiency gain. The threshold
+                              SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+at which SD outperforms a non-SD setup for a given accep-
+                                                                     P        P      P        D       P       P
+tance rate depends on the draft model’s size and architecture.                                                       P   Prefill compute
+                                                                     P        D      P        D       P       P
+As shown in Figure 8, for Llama3.3-70B on SHIP, using                                                                D   Decode compute
+                                                                     P               P        D       P       P
+Llama3.1-1B or Llama3.1-3B as drafts can yield substantial                    D
+                                                                                     P        P       P       P          Context-batch
+speedups, whereas a Llama3.3-8B draft struggles to match                                                             D
+                                                                                                                         fused decode
+non-SD efficiency even with high acceptance lengths (ω).                             P        P       P       P
+
+Careful tuning of the draft-target pairing is thus required          D
+                                                                              D
+                                                                                     P        P       P       P          Dynamically-
+                                                                                                                         sized chunked
+for optimal efficiency. Techniques like knowledge distilla-                          P        P       P       P
+                                                                                                                         prefill
+tion (Zhou et al., 2024) and EAGLE (Li et al., 2025) show                            P        P       P       P
+
+promise for constructing well-aligned drafts.
+                                                                  Figure 9. Six pipeline stages in a SHIP. Boxes filled with the same
+6    DYNAMIC AND BALANCED P IPELINE                               color belong to the same request.
+
+Two main factors determine the processing complexity of a         decode tokens. When needed, the scheduler can form larger
+given token: (1) whether it is a prefill or decode token, and     prefill chunks to reduce TTFT (Fig. 9). The pipeline ac-
+(2) its context position. Unlike decode tokens, prefill tokens    cepts “task IDs” from the runtime—tokens of the same task
+from a common prompt can share KV cache memory access,            are fused into a larger prefill chunk, with attention masks
+reducing their compute time during self-attention. Varia-         generated on-the-fly to ensure correct causality.
+tions in prompt sizes can introduce compute imbalance that
+is typically mitigated through chunked prefill (Agrawal et al.,   Dynamic chunked prefill thus allows chunk sizes to adapt
+2023), which partitions prompts into fixed-size chunks. This      at every pipeline step based on the observed prefill-to-
+strategy is then paired with decode piggybacking, wherein         decode ratio and prompt size distribution. The scheduler
+remaining compute capacity is utilized for decode tokens.         has the flexibility to span prefill chunks across multiple non-
+Although this improves over simpler allocation methods, it        adjacent pipeline stages, with the maximum possible chunk
+still faces inefficiencies. The chunk size that best balances     size able to consume the full pipeline’s compute capacity.
+system throughput, TPOT, and TTFT depends on context              Fused Context-Batch. To eliminate pipeline bubbles
+length and the prefill-to-decode token ratio, both of which       caused by variations in token context position, SHIP en-
+vary continuously with traffic conditions (§2.2).                 forces uniform pipeline stage latencies using a fused context-
+Moreover, token complexity increases with context position,       batch technique. This follows from two observations. First,
+as each token attends to all preceding tokens. Concurrently       as context and batch grow, self-attention increasingly domi-
+processing decode tokens at markedly varied context posi-         nates compute time. Since self-attention efficiency is batch-
+tions can thus underutilize compute resources. Continuous         invariant during decode, the benefits of batching at long
+batching (Yu et al., 2022) mitigates this by iteratively re-      context are reduced. Second, large context requests can
+constructing a batch to prevent short-context tokens from         run out of memory capacity to fit KV caches for increased
+being blocked by long-context tokens. However, this does          batch sizes, especially in SHIP systems where capacity is
+not avoid pipeline stalls in PP systems when a short-context      limited and KV caches can instead be used for more pipeline
+token trails a slower long-context token. In highly pipeline-     parallel decode tokens.
+parallel SHIPs, these token-level imbalances create pipeline      Given these observations, fused context-batch proceeds:
+bubbles that reduce efficiency. We thus employ the fol-             1. Given a TP→PP system, select a batch size (B) for the
+lowing techniques to maximize pipeline efficiency while                model’s maximum context length (C). This selection
+minimizing latencies:                                                  is governed by the available memory capacity2 and the
+Dynamic Chunked Prefill. SHIP employs dynamic chun-                    target TPOT.
+ked prefill, supporting high compute efficiency at chunk            2. Fuse B and C dimensions and partition into N chunks,
+sizes as small as one token, while dynamically scaling up              where N is the maximum batch for any context length.
+to larger chunks for improved TTFT. Due to the LPU’s fast           3. The pipeline receives an N →N mask from the runtime
+SRAM, prefill chunks of 1–2 tokens are sufficient to saturate          scheduler that specifies which context-batch chunks to
+self-attention compute, as the OI in self-attention can ap-            fuse into a unified context.
+proach or exceed the LPU’s compute-to-memory bandwidth            This mechanism maintains uniform pipeline latencies—
+ratio.1 Such fine-grained chunking enables the runtime            guaranteed by the determinism of the hardware—while
+scheduler to flexibly allocate compute between prefill and        dynamically adjusting batch and context length in tandem
+                                                                  based on the context positions of every token processed
+  1
+    Self-attention OI is 8 in Llama3.3-70B, 16 in Qwen3-235B-     (Fig. 9). From another perspective, fused context-batch re-
+A22B, and 128 in Deepseek-V3.
+                                                                     2
+                                                                         Bmax = ceil(num kv caches can f it/pipeline depth)
+                             SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+moves long-context-induced pipeline bubbles by filling idle     model, as it is a large, frontier MoE with mature support
+time for short-context tokens with additional batching.         in both the LPU and SGLang’s software ecosystem. The
+                                                                SHIP system is configured to be large (TP=16, PP=95, max
+Capacity-Filling Prefill. By default, the runtime scheduler
+                                                                concurrency=380) to highlight its ability to maintain SLOs
+prioritizes decode over prefill. This design choice stems
+                                                                across a large distributed deployment. SGB200 is config-
+from the KV-cache capacity constraint on decode: unused
+                                                                ured with TP=8 and, with mixed chunking enabled, is evalu-
+compute slots due to insufficient memory can be filled with
+                                                                ated under two mixed-batch token budget (MBTB) settings
+prefill tokens that can share KV-cache, thereby improving
+                                                                that cap the total number of tokens admitted to each GPU
+utilization. A prefill-prioritized policy would not only risk
+                                                                iteration. MBTB=16Ki, the default SGLang setting for
+starving compute under decode-heavy traffic, it also leads to
+                                                                B200s, is used as the high-throughput configuration, while
+unstable TPOT, as seen in §6.1. While decode prioritization
+                                                                MBTB=2Ki is used as the lower-latency configuration. For
+comes at some TTFT cost, SHIP’s immense scale enables
+                                                                completeness, we show additional results in Appendix D.2
+large prefill chunks to still be formed.
+                                                                for limiting client-side offered concurrency, as well as re-
+Expert Imbalance. MoE models introduce inherent im-             sults using vLLM (Kwon et al., 2023).
+balance in pipeline-parallel inference, as different token
+                                                                System Throughput. Figures 10a and 10d capture system
+batches may activate varying numbers of distinct experts at
+                                                                throughput trends as P:D and CL vary. At MBTB=16Ki,
+each decoder layer. Such imbalance also arises in expert
+                                                                SGB200 is able to achieve very high efficiency at high P:D.
+parallelism (EP) (Shazeer et al., 2017), with dynamic re-
+                                                                At lower P:D ratios, throughput declines because fewer pre-
+allocation of compute-to-experts necessary for maintaining
+                                                                fill chunks are available relative to decode demand, reducing
+efficient execution (Liu et al., 2024a). At very large batch
+                                                                decode piggybacking opportunities (Agrawal et al., 2023)
+sizes, this effect is dampened if a roughly uniform distri-
+                                                                and leaving execution increasingly dominated by memory-
+bution of expert usage is observed. At smaller batch sizes,
+                                                                bound decode attention. Throughput also decreases as CL
+however, executing each token’s experts independently can
+                                                                grows, since longer contexts increase KV-cache size, plac-
+better maintain pipeline balance in a SHIP system. This
+                                                                ing greater pressure on memory bandwidth. At sufficiently
+comes at the cost of low expert weight reuse, with the expert
+                                                                large context lengths, HBM capacity further constrains the
+MatMuls operating with an OI of 1. The high bandwidth pro-
+                                                                maximum achievable batch size. As in SHIP, increasing TP
+vided by SRAM substantially improves utilization under this
+                                                                can mitigate this capacity bottleneck when scaling remains
+scheme compared to HBM-based architectures. With the
+                                                                efficient. NVIDIA’s NVL72 architecture extends NVLink
+first-generation LPU, we observe that the improved pipeline
+                                                                across larger TP domains (Tirumala & Wong, 2024), in-
+balance from per-token expert execution outweighs the loss
+                                                                creasing effective HBM capacity for large-CL workloads.
+in expert compute efficiency. In future generations, how-
+ever, larger batch sizes enabled by higher capacity require a   In contrast, SHIP maintains system throughput at moderate-
+different strategy for managing pipeline imbalance.             to-high P:D (>8), with low P:D values also achieving
+                                                                good throughput at smaller CL (<4Ki). Dynamic chunked
+6.1   Results                                                   prefill—with efficient chunk-size=1 enabled by SRAM—
+                                                                continuously adjusts prefill and decode balance based on ob-
+To demonstrate the advantages of SHIP’s dynamic and bal-        served P:D, sustaining stable utilization. Memory capacity
+anced pipeline, we evaluate performance characteristics of      constraints in SHIP reduce system throughput with growing
+a real system for different prefill-to-decode token ratios      CL, but capacity-filling prefill mitigates this at higher P:D.
+(P:D) and context lengths (CL). To capture the system be-       Future generations of LPUs will significantly improve the
+havior across a range of request profiles, we measure system    low P:D, high CL regions by expanding on-chip SRAM ca-
+throughput (t/s) and per-user input and output throughput       pacity and increasing TP sizes with greater C2C bandwidth
+(it/s/u, ot/s/u) under different P:D and CL. We complement      and radix. Performance evaluations of next-gen LPUs are
+these controlled experiments with two production traffic        left for future retrospectives.
+samples from Groq Cloud: one from a reasoning model
+and another from a non-reasoning model. As expected, the        Under production traffic evaluations, both systems expe-
+reasoning model exhibits a higher average and wider dis-        rience lower throughput due to the presence of large-CL
+tribution of context lengths (0.07K–100K), coupled with a       requests. Because a request’s total compute and memory
+lower average P:D ratio. Full methodology and sampled           capacity demand grows quadratically with CL, even a few
+distribution details are in Appendix D.                         long-context requests disproportionately reduce throughput.
+                                                                This effect is particularly visible in capacity-bound systems.
+For comparison, we evaluate “SGB200”: a non-SHIP B200           Nevertheless, SHIP exhibits a smaller system throughput
+DGX system controlled by SGLang—a leading open-source           drop relative to its peak compared to SGB200, while achiev-
+LLM serving library (Zheng et al., 2024). Qwen3-235B-           ing higher absolute throughput in production traffic samples.
+A22B (Yang et al., 2025) is selected as a representative
+                               SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+
+
+
+       (a) LPU SHIP system throughput       (b) LPU SHIP decode ot/s/u                    (c) LPU SHIP prefill it/s/u
+
+
+
+
+   (d) B200 DGX system throughput          (e) B200 DGX decode ot/s/u                     (f) B200 DGX prefill it/s/u
+Figure 10. Measured throughput and latency of serving Qwen3-235B-A22B at varying prefill:decode token ratios (P:D) and context
+lengths (CL). B200 results measured using SGLang v0.5.8 at different mixed-batch token budgets (MBTB). Relative results normalized to
+the peak measured on each respective system. → points mark performance on sampled request size distributions (avg ctx, max ctx) from
+Groq Cloud’s production traffic. Non-reasoning model sample is (1.4Ki, 24.3Ki) and reasoning model sample is (3.4Ki, 98.9Ki).
+
+TPOT. The stability of TPOT (inverse of ot/s/u) con-                 fill lengths (< 8Ki) do not require a 16Ki budget; instead,
+trasts sharply between SHIP and SGB200 (Fig. 10b, 10e).              MBTB=16Ki mainly batches additional prefills from other
+SGLang’s scheduler prioritizes prefill tokens to maximize            requests, increasing iteration latency. This demonstrates
+overall GPU efficiency—reflecting the performance gap be-            that even under SGLang’s prefill-prioritized scheduling, a
+tween prefill and decode phases—and to maintain a stable             clear prefill-latency versus throughput tradeoff remains.
+TTFT. This comes at the cost of decode latency. Optimal
+                                                                     Despite prioritizing decode tasks, SHIP maintains stable
+MBTB size for TPOT is further complicated by differing
+                                                                     it/s/u under fixed traffic (Fig. 10c). High P:D traffic sees
+trends across low and high P:D. At low P:D, a higher frac-
+                                                                     consistently strong it/s/u, while the highest it/s/u occurs
+tion of GPU iterations contain only decode tokens, which
+                                                                     at low P:D and high context (8Ki). This reflects SHIP’s
+use decode-only kernels that run faster than mixed-batch
+                                                                     scheduler leveraging capacity-filling prefill: when large-CL
+kernels.3 In this regime, a larger MBTB drains prefill work
+                                                                     decode tasks leave pipeline “holes” due to KV-cache limits,
+more quickly and thus yields more decode-only forward-
+                                                                     the scheduler opportunistically forms larger prefill chunks.
+pass iterations, lowering TPOT. At high P:D, most decode
+tokens are served in mixed batches, so reducing MBTB re-             In production traffic, non-reasoning samples maintain stable
+sults in lower TPOT by shortening mixed-batch iterations.            it/s/u, whereas reasoning model samples show a pronounced
+Disaggregating prefill and decode can help mitigate these            drop in SHIP. We again see the quadratic cost of CL: while
+tradeoffs by eliminating prefill-decode interference (§7.3).         long-context requests leave “holes” for prefill, they also
+                                                                     rapidly consume compute capacity, limiting SHIP’s ability
+In contrast, SHIP’s decode-prioritized scheduling with
+                                                                     to form larger prefill chunks. Future systems should con-
+capacity-filling prefill sustains consistently high ot/s/u with-
+                                                                     sider adaptive scheduling heuristics to better balance decode
+out sacrificing system throughput. Decode latency is further
+                                                                     and prefill under such mixed workloads. Despite its drop in
+maintained across varying CL with fused context-batch. As
+                                                                     it/s/u, SHIP still achieves lower mean TTFT than SGB200
+shown in production experiments, SHIP maintains stable
+                                                                     across all experiments, including the reasoning sample.
+ot/s/u under real dynamic traffic scenarios, while achieving
+significantly higher absolute ot/s/u compared to SGB200.
+This stability is essential for meeting stringent TPOT SLOs          7     D ISCUSSION
+and reducing TTFT for reasoning models (§2.2).
+                                                                     7.1   Power and Cost
+TTFT. SGB200 achieves greater it/s/u stability compared
+                                                                    In §6, we demonstrated how SHIP can maintain TTFT and
+to ot/s/u (Fig. 10f) thanks to its prefill-prioritized schedul-
+                                                                    TPOT SLOs when faced with a wide range of traffic pro-
+ing. Reducing MBTB from 16Ki to 2Ki significantly im-
+                                                                    files. This robustness comes from leaning into SRAM’s high
+proves it/s/u in these experiments because the request pre-
+                                                                    bandwidth, which makes low-batch decode efficient and re-
+   3
+    POD-Attention (Kamath et al., 2025) has been proposed to        duces the tradeoffs that typically come from co-processing
+improve mixed-batch kernels, but is not yet adopted in SGLang.      prefill and decode.
+                             SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+SHIP’s absolute peak efficiency, however, is ultimately          need for any intermediate switches in the scale-up network.
+bounded by memory capacity and scalability. In SRAM-             In contrast, GPU systems require a substantial number of
+based inference, the limiting factor shifts from bandwidth       scale-up switches within the node or rack (typically one
+to capacity needed to store weights and KV cache, which          switch per two or four GPUs), adding cost and power over-
+typically requires partitioning across hundreds to thousands     heads at the system level. For the scale-out network, each
+of chips. When chip-to-chip bandwidth, radix, or hop la-         GPU has a dedicated NIC, yielding a 1:1 GPU-to-NIC ratio.
+tency are insufficient, communication operations introduced
+                                                                 Overall, the LPU system achieves lower provisioned power
+from scaling become exposed on the critical path, reducing
+                                                                 per accelerator because it reduces memory, scale-up, and
+achievable utilization (Fig. 6b).
+                                                                 scale-out overheads, amortizing fixed host-system compo-
+LPUv1 (GlobalFoundries 14 nm) integrates 230 MB of               nents (CPU, memory, and NICs) across eight LPUs per
+SRAM and provides 235 GB/s of aggregate chip-to-chip             node. As a result, the provisioned power of the LPUv1 sys-
+I/O bandwidth across 11 logical ports. This bandwidth and        tem is 388 W per LPU, compared with 1,788 W per GPU
+radix provisioning constrained the peak efficiency of SHIP       for a B200 DGX. Thus, minimizing system overheads helps
+deployments built from LPUv1, as it resulted in exposed          mitigate some of the efficiency lost in LPU systems.
+communication costs that hurt FLOPs utilization. Next-gen
+LPUs scale these key architecture properties significantly.      7.1.2    Power-Aware Scheduling
+While peak FLOP/s efficiency of SHIP systems does not            Further power efficiency is achieved through power-aware
+match NVIDIA GPU systems, other factors help reduce the          scheduling. To enable this, an instruction-level power model
+gap in performance per watt and per total cost of ownership.     was derived from RTL simulations and calibrated against
+                                                                 silicon measurements. Given LPU program execution is
+7.1.1   System BOM and Power Overheads                           deterministic, instruction traces can therefore be statically
+                                                                 converted to cycle-accurate power profiles using this model.
+As described in §2.1 and §4, the system hardware archi-
+                                                                 The model further accounts for statically inferrable sparsity
+tecture must facilitate the direct, point-to-point intercon-
+                                                                 and reduces activity estimates for zero-skipped operations.
+nection of a large number of LPUs. A single LPU node
+comprises eight dual-width, full-height, three-quarter-length    During scheduling, the compiler can predict the power pro-
+PCIe Gen4 x16 accelerator cards housed within a standard         file of candidate schedules and select ones that maximize
+4U server chassis. Each accelerator card integrates the pack-    compute and I/O utilization while staying within a target
+aged LPU chip, 12V-to-1V voltage regulator modules, four         power budget. It can also smooth current transients and re-
+QSFP cages for inter-node and inter-rack optical links, and      duce voltage droop by reordering independent instructions
+seven intra-node passive copper connectors. Within a node,       or inserting short NOP gaps when needed. Together, the
+the eight LPU cards are interconnected in an all-to-all topol-   improved utilization and tighter guard bands enabled by this
+ogy via passive twin-axial copper cables. Each LPU rack          static, compile-time approach improve power efficiency.
+contains nine such nodes. Inter-node LPU connectivity em-
+ploys commercial off-the-shelf quad-25G NRZ CDR QSFP             7.2     Benefits and Challenges of Synchronous Execution
+modules to realize the QuadFour topology (Fig. 4).
+                                                                 A key property of the LPU architecture is its determinism:
+The chassis features a standard motherboard equipped with        a compiler-visible, synchronous execution model that spans
+a dual-socket AMD CPU host and peripherals: 1 TB DDR4            the entire scale-up network of LPUs (§2.1). In building a
+DRAM, a 100GbE network interface card (NIC), 1 TB                high-performance LLM serving system on top of this archi-
+SSD for persistent storage, and a Baseboard Management           tecture, we leveraged that property in several ways, while
+Controller (BMC) for telemetry and administration. Unlike        also encountering challenges that required careful handling.
+conventional host-driven GPU systems, where the CPU              One important benefit was the elimination of data synchro-
+typically orchestrates kernel launches, SHIP systems use a       nization latencies across static dependencies, avoiding la-
+host only for the initial pipeline invocation and final output   tency overheads often seen in asynchronous communication,
+collection. Middle decoder partitions are invoked by the         which are especially costly in low-batch inference. Static
+LPUs themselves (§4.1), reducing host power overhead.            scheduling also enabled fine-grained overlap of compute
+The SRAM-centric design of the LPU eliminates the de-            and communication (§4.2), further reducing latency.
+pendency on expensive, supply-constrained HBM devices            Handling dynamic workload structures, however, came with
+and CoWoS interposers, which constitute a major portion          some overheads. Common dynamic structures in LLMs,
+of both the bill of materials (BOM) cost and the power           specifically variable context length and expert execution,
+consumption in GPU-based architectures. Additionally, the        were mapped to static shapes with runtime-provided masks
+direct point-to-point networking of LPUs circumvents the         (§5.1, §6) and dynamic data-access via the LPU’s mem-
+                             SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+ory gather/scatter instructions. Additional non-determinism      ware independently for the two dominant components of
+arose during prefix caching (§5.2), when cached KV pages         decode, each of which has distinct compute and memory re-
+were transferred to/from host-attached DRAM over PCIe.           quirements. This design can enhance SHIP systems, as was
+These transfers had to be carefully managed such that the        recently announced at NVIDIA’s GTC conference (Aubrey
+resulting re-synchronization overhead could be overlapped        & Ghodsian, 2026). In SHIP, a key bottleneck during decode
+with independent compute when possible.                          is limited KV-cache capacity, which increasingly constrains
+                                                                 throughput as context length grows (Fig. 10a). Disaggre-
+Execution determinism also made deterministic floating-
+                                                                 gating attention from FFNs allows high-capacity GPUs to
+point accumulation straightforward and, in our implementa-
+                                                                 store KV-cache while leveraging LPUs for memory-bound
+tion, incurred no additional performance penalty. This was
+                                                                 MoE-FFNs. The high SRAM bandwidth available to LPUs
+particularly useful for debugging accuracy issues when de-
+                                                                 reduces the batch size required to reach high utilization. As
+ploying new models. By contrast, GPU reduction libraries
+                                                                 a result, less KV state must be fetched from GPU HBM
+often pay a latency penalty to ensure floating-point repro-
+                                                                 per unit of useful compute, mitigating the cost of fetching
+ducibility (Al Awar & Singanaboina, 2026).
+                                                                 KV cache from HBM instead of SRAM. The net result is a
+Deterministic, statically scheduled execution further en-        system with both high ot/s/u and high t/s/W. Full evaluation
+abled power-aware scheduling (§7.1.2), improving system          of these systems is left for future retrospectives.
+power efficiency. In practice, however, accounting for dy-
+namic effects on power—such as chip-to-chip variation            8   R ELATED W ORK
+and live temperature—required extensive calibration and
+conservative margining against silicon measurements to           While Groq’s LPU-based SHIP was the first production de-
+cover worst-case behavior. This created some deployment          ployment of LLMs with weights and KV cache stored in
+headaches as the power model matured. Different compile-         SRAM, other work has also proposed leveraging SRAM’s
+time power-threshold settings needed to be evaluated to          greater memory bandwidth for inference. (Peng et al., 2023)
+identify the configuration that achieved the best power effi-    proposed a large system of chiplets performing SRAM-
+ciency without violating provisioned power limits.               based LLM inference. In terms of production deployments,
+                                                                 Cerebras has also employed SRAM-based LLM serving on
+7.3   Disaggregated Serving                                      their WSE-3, which employs a mesh network-on-wafer to
+                                                                 connect 900K small cores each containing 48 KiB of SRAM
+Disaggregated serving (Patel et al., 2024; Zhong et al., 2024)   memory, while using RDMA over Ethernet to scale to sys-
+is a popular mechanism for addressing the challenges of con-     tems of wafers (Lie, 2024). While some of the principles
+currently processing prefill and decode by separating them       described in this work are applicable to such a system, the
+onto different systems—allowing each system to be config-        networking approach stands out as a key difference. Prior
+ured optimally while avoiding the TTFT and TPOT latency          work has also shown success in SRAM-only inference for
+tradeoffs from aggregated serving. This approach comes           other machine learning workloads (Fowers et al., 2018; Abts
+with new challenges: (1) transfer of KV cache between            et al., 2020; Ahmed et al., 2022; Coburn et al., 2025).
+prefill and decode systems increases scale-out network de-
+mand, and (2) prefill and decode systems must be throughput
+matched based on P:D ratio—a traffic characteristic that is      9   C ONCLUSION
+in constant flux (Fig. 2). NVIDIA’s Dynamo (Mitra et al.,        By rethinking both architecture and software around the
+2026) addresses these challenges by orchestrating requests       properties of SRAM, we demonstrate that SRAM-based
+across specialized prefill and decode workers and coordinat-     Huge Inference Pipelines (SHIPs) can deliver state-of-the-
+ing KV-cache transfer between them, such that the handoff        art LLM user experience at scale—simultaneously optimiz-
+overhead is reduced. It also uses load signals of the prefill    ing for TTFT and TPOT. The LPU’s synchronous, low-
+and decode workers to detect saturation and independently        latency interconnect and compiler-driven execution model
+scale prefill/decode pools as traffic P:D token ratio shifts.    enable efficient scaling at low batch sizes—a key property
+Disaggregating prefill and decode offers a further oppor-        of fast-memory systems. Common LLM serving techniques,
+tunity to use specialized hardware for the two systems.          including paged attention, prefix caching and speculative
+Leveraging GPUs for compute-bound prefill and LPUs for           decoding, yield even greater benefits in SHIP systems when
+memory-bound decode is a natural fit.                            co-designed appropriately. The greater memory-to-compute
+                                                                 bandwidth in SHIP further enables large, balanced pipelines
+Attention-FFN disaggregation has been further leveraged          that adapt to dynamic workload conditions. Together, these
+to improve decode efficiency in large MoE models (Zhu            techniques deliver more stable latency and throughput across
+et al., 2025; StepFun Team, 2025). By separating attention       varying traffic dynamics compared to DRAM-based LLM
+and FFN execution, the serving system can provision hard-        serving solutions.
+                                 SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+R EFERENCES                                                              Al Awar, N. and Singanaboina, S. Y. Controlling floating-point de-
+                                                                            terminism in NVIDIA CCCL. NVIDIA Technical Blog, March
+Abts, D., Ross, J., Sparling, J., Wong-VanHaren, M., Baker, M.,             2026. URL https://developer.nvidia.com/blog/
+  Hawkins, T., Bell, A., Thompson, J., Kahsai, T., Kimmell, G.,             controlling-floating-point-determinism-
+  Hwang, J., Leslie-Hurd, R., Bye, M., Creswick, E., Boyd, M.,              in-nvidia-cccl/. Accessed: 2026-03-26.
+  Venigalla, M., Laforge, E., Purdy, J., Kamath, P., Maheshwari,
+  D., Beidler, M., Rosseel, G., Ahmad, O., Gagarin, G., Czekalski,       Amazon Web Services.     Inferentia2 architecture.
+  R., Rane, A., Parmar, S., Werner, J., Sproch, J., Macias, A., and       https://awsdocs-neuron.readthedocs-hosted.
+  Kurtz, B. Think fast: A tensor streaming processor (tsp) for            com/en/latest/about-neuron/arch/neuron-
+  accelerating deep learning workloads. In 2020 ACM/IEEE 47th             hardware/inferentia2.html, 2025.      Accessed:
+  Annual International Symposium on Computer Architecture                 2025-10-26.
+  (ISCA), pp. 145–158. IEEE, 2020.
+                                                                         Artificial Analysis.  Models — intelligence / output to-
+Abts, D., Kimmell, G., Ling, A., Kim, J., Boyd, M., Bitar, A.,             kens used to run artificial analysis intelligence index.
+  Parmar, S., Ahmed, I., DiCecco, R., Han, D., Thompson, J., Bye,          https://artificialanalysis.ai/models?
+  M., Hwang, J., Fowers, J., Lillian, P., Murthy, A., Mehtabuddin,         intelligence-tab=reasoning&output-tokens-
+  E., Tekur, C., Sohmers, T., Kang, K., Maresh, S., and Ross, J.           tab=tokensBar#output-tokens-used-to-run-
+  A software-defined tensor streaming multiprocessor for large-            artificial-analysis-intelligence-index,
+  scale machine learning. In Proceedings of the 49th Annual                2025. Accessed: 2025-10-07.
+  International Symposium on Computer Architecture, pp. 567–
+  580, 2022.                                                             Aubrey, K. and Ghodsian, F. Inside nvidia groq 3 lpx: The low-
+                                                                           latency inference accelerator for the nvidia vera rubin platform.
+Agarwal, S., Ahmad, L., Ai, J., Altman, S., Applebaum, A., Arbus,          https://developer.nvidia.com/blog/inside-
+  E., Arora, R. K., Bai, Y., Baker, B., Bao, H., Barak, B., Bennett,       nvidia-groq-3-lpx-the-low-latency-
+  A., Bertao, T., Brett, N., Brevdo, E., Brockman, G., Bubeck,             inference-accelerator-for-the-nvidia-
+  S., Chang, C., Chen, K., Chen, M., Cheung, E., Clark, A.,                vera-rubin-platform/, March 2026.                       NVIDIA
+  Cook, D., Dukhan, M., Dvorak, C., Fives, K., Fomenko, V.,                Technical Blog, accessed March 18, 2026.
+  Garipov, T., Georgiev, K., Glaese, M., Gogineni, T., Goucher,          Bitar, A. Groq’s software-defined hardware for dataflow com-
+  A., Gross, L., Gil Guzman, K., Hallman, J., Hehir, J., Heidecke,          pute. https://youtu.be/nP_9lkDsD-E, 2022. Invited
+  J., Helyar, A., Hu, H., Huet, R., Huh, J., Jain, S., Johnson,             presentation at the Crossroads 3D-FPGA Academic Research
+  Z., Koch, C., Kofman, I., Kundel, D., Kwon, J., Kyrylov, V.,              Center.
+  Le, E. Y., Leclerc, G., Park Lennon, J., Lessans, S., Lezcano-
+  Casado, M., Li, Y., Li, Z., Lin, J., Liss, J., Liu, L. X., Liu, J.,    Brutlag, J.     Speed matters for google web search.
+  Lu, K., Lu, C., Martinovic, Z., McCallum, L., McGrath, J.,               Technical report, Google, Inc., June 2009.   URL
+  McKinney, S., McLaughlin, A., Mei, S., Mostovoy, S., Mu,                 https://services.google.com/fh/files/
+  T., Myles, G., Neitz, A., Nichol, A., Pachocki, J., Paino, A.,           blogs/google_delayexp.pdf.
+  Palmie, D., Pantuliano, A., Parascandolo, G., Park, J., Pathak,
+  L., Paz, C., Peran, L., Pimenov, D., Pokrass, M., Proehl, E., Qiu,     Cao, S., Wang, Y., Mao, Z., Hsu, P.-L., Yin, L., Xia, T., Li, D., Liu,
+  H., Raila, G., Raso, F., Ren, H., Richardson, K., Robinson, D.,          S., Zhang, Y., Zhou, Y., Sheng, Y., Gonzalez, J., and Stoica, I.
+  Rotsted, B., Salman, H., Sanjeev, S., Schwarzer, M., Sculley,            Locality-aware fair scheduling in llm serving. arXiv preprint
+  D., Sikchi, H., Simon, K., Singhal, K., Song, Y., Stuckey, D.,           arXiv:2501.14312, 2025.
+  Sun, Z., Tillet, P., Toizer, S., Tsimpourlas, F., Vyas, N., Wallace,
+  E., Wang, X., Wang, M., Watkins, O., Weil, K., Wendling,               Chang, L.-W., Bao, W., Hou, Q., Jiang, C., Zheng, N., Zhong, Y.,
+  A., Whinnery, K., Whitney, C., Wong, H., Yang, L., Yang, Y.,             Zhang, X., Song, Z., Jiang, Z., Yao, C., Lin, H., Jin, X., and Liu,
+  Yasunaga, M., Ying, K., Zaremba, W., Zhan, W., Zhang, C.,                X. Flux: Fast software-based communication overlap on gpus
+  Zhang, B., Zhang, E., and Zhao, S. gpt-oss-120b & gpt-oss-               through kernel fusion. arXiv preprint arXiv:2406.06858, 2024.
+  20b model card. arXiv preprint arXiv:2508.10925, 2025. doi:
+                                                                         Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., and
+  10.48550/arXiv.2508.10925.
+                                                                           Jumper, J. Accelerating large language model decoding with
+                                                                           speculative sampling. arXiv preprint arXiv:2302.01318, 2023.
+Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani,
+  B. S., and Ramjee, R. Sarathi: Efficient llm inference by              Coburn, J., Tang, C., Abu Asal, S., Agrawal, N., Chinta, R., Dixit,
+  piggybacking decodes with chunked prefills. arXiv preprint               H., Dodds, B., Dwarakapuram, S., Firoozshahian, A., Gao, C.,
+  arXiv:2308.16369, 2023.                                                  Gondkar, K., Graf, T., Hu, J., Huang, J., Hughes, S., Hutchin, A.,
+                                                                           Jakka, B., Chen, G. J., Kalyanaraman, I., Kamath, A., Kansal, P.,
+Ahmed, I., Parmar, S., Boyd, M., Beidler, M., Kang, K., Liu,               Kazi, E., Levenstein, R., Maddury, M., Mastro, A., Medaiyese,
+  B., Roach, K., Kim, J., and Abts, D. Answer fast: Acceler-               S., Modi, P., Montgomery, J., Satish, N., Nagpal, A., Narasimha,
+  ating bert on the tensor streaming processor. In 2022 IEEE               A., Naumov, M., Ozer, E., Park, J., Ramani, P., Reddy, H.,
+  33rd International Conference on Application-specific Systems,           Reiss, D., Roy, D., Sekar, S., Sharma, A., Shetty, P., Sukumaran-
+  Architectures and Processors (ASAP), pp. 80–87. IEEE, 2022.              Rajam, A., Tal, E., Tsai, M., Varshini, S., Wareing, R., Wu,
+                                                                           O., Xie, X., Yang, J., Yu, H., Zargar, T., Zeng, Z., Zhang, F.,
+Ainslie, J., Lee-Thorp, J., De Jong, M., Zemlyanskiy, Y., Lebrón,         Mathews, A., Jiao, X., Zhang, J., Menage, E., Stokke, T. E., and
+  F., and Sanghai, S. Gqa: Training generalized multi-query                Sourouri, M. Meta’s second generation ai chip: Model-chip
+  transformer models from multi-head checkpoints. In Proceed-              co-design and productionization experiences. In Proceedings of
+  ings of the 2023 Conference on Empirical Methods in Natural              the 52nd Annual International Symposium on Computer Archi-
+  Language Processing, pp. 4895–4901, 2023.                                tecture, pp. 1689–1702, 2025.
+                                  SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+Davies, M., Crago, N., Sankaralingam, K., and Kozyrakis, C.                  Gangidi, A., Victoria, A., Goldstand, A., Menon, A., Sharma,
+  Efficient llm inference: Bandwidth, compute, synchronization,              A., Boesenberg, A., Baevski, A., Feinstein, A., Kallet, A., San-
+  and capacity are all you need. arXiv preprint arXiv:2507.14397,            gani, A., Teo, A., Yunus, A., Lupu, A., Alvarado, A., Caples, A.,
+  2025.                                                                      Gu, A., Ho, A., Poulton, A., Ryan, A., Ramchandani, A., Dong,
+                                                                             A., Franco, A., Goyal, A., Saraf, A., Chowdhury, A., Gabriel,
+Fowers, J., Ovtcharov, K., Papamichael, M., Massengill, T., Liu,             A., Bharambe, A., Eisenman, A., Yazdan, A., James, B., Maurer,
+  M., Lo, D., Alkalay, S., Haselman, M., Adams, L., Ghandi,                  B., Leonhardi, B., Huang, B., Loyd, B., Paola, B. D., Paranjape,
+  M., Heil, S., Patel, P., Sapek, A., Weisz, G., Woods, L., Lanka,           B., Liu, B., Wu, B., Ni, B., Hancock, B., Wasti, B., Spence, B.,
+  S., Reinhardt, S., Caulfield, A., Chung, E., and Burger, D. A              Stojkovic, B., Gamido, B., Montalvo, B., Parker, C., Burton, C.,
+  configurable cloud-scale dnn processor for real-time ai. In                Mejia, C., Liu, C., Wang, C., Kim, C., Zhou, C., Hu, C., Chu,
+  Proceedings of the 45th International Symposium on Computer                C.-H., Cai, C., Tindal, C., Feichtenhofer, C., Gao, C., Civin, D.,
+  Architecture, 2018. ACM, June 2018.                                        Beaty, D., Kreymer, D., Li, D., Adkins, D., Xu, D., Testuggine,
+                                                                             D., David, D., Parikh, D., Liskovich, D., Foss, D., Wang, D.,
+Fu, X., Zhang, Z., Fan, H., Huang, G., El-Shabani, M., Huang,                Le, D., Holland, D., Dowling, E., Jamil, E., Montgomery, E.,
+  R., Solanki, R., Wu, F., Diamant, R., and Wang, Y. Distributed             Presani, E., Hahn, E., Wood, E., Le, E.-T., Brinkman, E., Ar-
+  training of large language models on aws trainium. In Proceed-             caute, E., Dunbar, E., Smothers, E., Sun, F., Kreuk, F., Tian,
+  ings of the 2024 ACM Symposium on Cloud Computing, pp.                     F., Kokkinos, F., Ozgenel, F., Caggioni, F., Kanayet, F., Seide,
+  961–976, 2024.                                                             F., Florez, G. M., Schwarz, G., Badeer, G., Swee, G., Halpern,
+                                                                             G., Herman, G., Sizov, G., Zhang, G. J., Lakshminarayanan, G.,
+Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-          Inan, H., Shojanazeri, H., Zou, H., Wang, H., Zha, H., Habeeb,
+  Dahle, A., Letman, A., Mathur, A., Schelten, A., Vaughan, A.,              H., Rudolph, H., Suk, H., Aspegren, H., Goldman, H., Zhan, H.,
+  Yang, A., Fan, A., Goyal, A., Hartshorn, A., Yang, A., Mitra, A.,          Damlaj, I., Molybog, I., Tufanov, I., Leontiadis, I., Veliche, I.-E.,
+  Sravankumar, A., Korenev, A., Hinsvark, A., Rao, A., Zhang, A.,            Gat, I., Weissman, J., Geboski, J., Kohli, J., Lam, J., Asher, J.,
+  Rodriguez, A., Gregerson, A., Spataru, A., Roziere, B., Biron,             Gaya, J.-B., Marcus, J., Tang, J., Chan, J., Zhen, J., Reizenstein,
+  B., Tang, B., Chern, B., Caucheteux, C., Nayak, C., Bi, C.,                J., Teboul, J., Zhong, J., Jin, J., Yang, J., Cummings, J., Carvill,
+  Marra, C., McConnell, C., Keller, C., Touret, C., Wu, C., Wong,            J., Shepard, J., McPhie, J., Torres, J., Ginsburg, J., Wang, J., Wu,
+  C., Ferrer, C. C., Nikolaidis, C., Allonsius, D., Song, D., Pintz,         K., U, K. H., Saxena, K., Khandelwal, K., Zand, K., Matosich,
+  D., Livshits, D., Wyatt, D., Esiobu, D., Choudhary, D., Mahajan,           K., Veeraraghavan, K., Michelena, K., Li, K., Jagadeesh, K.,
+  D., Garcia-Olano, D., Perino, D., Hupkes, D., Lakomkin, E., Al-            Huang, K., Chawla, K., Huang, K., Chen, L., Garg, L., A, L.,
+  Badawy, E., Lobanova, E., Dinan, E., Smith, E. M., Radenovic,              Silva, L., Bell, L., Zhang, L., Guo, L., Yu, L., Moshkovich, L.,
+  F., Guzmán, F., Zhang, F., Synnaeve, G., Lee, G., Anderson,               Wehrstedt, L., Khabsa, M., Avalani, M., Bhatt, M., Mankus,
+  G. L., Thattai, G., Nail, G., Mialon, G., Pang, G., Cucurell,              M., Hasson, M., Lennie, M., Reso, M., Groshev, M., Naumov,
+  G., Nguyen, H., Korevaar, H., Xu, H., Touvron, H., Zarov, I.,              M., Lathi, M., Keneally, M., Liu, M., Seltzer, M. L., Valko,
+  Ibarra, I. A., Kloumann, I., Misra, I., Evtimov, I., Zhang, J.,            M., Restrepo, M., Patel, M., Vyatskov, M., Samvelyan, M.,
+  Copet, J., Lee, J., Geffert, J., Vranes, J., Park, J., Mahadeokar,         Clark, M., Macey, M., Wang, M., Hermoso, M. J., Metanat, M.,
+  J., Shah, J., van der Linde, J., Billock, J., Hong, J., Lee, J., Fu,       Rastegari, M., Bansal, M., Santhanam, N., Parks, N., White,
+  J., Chi, J., Huang, J., Liu, J., Wang, J., Yu, J., Bitton, J., Spisak,     N., Bawa, N., Singhal, N., Egebo, N., Usunier, N., Mehta, N.,
+  J., Park, J., Rocca, J., Johnstun, J., Saxe, J., Jia, J., Alwala,          Laptev, N. P., Dong, N., Cheng, N., Chernoguz, O., Hart, O.,
+  K. V., Prasad, K., Upasani, K., Plawiak, K., Li, K., Heafield, K.,         Salpekar, O., Kalinli, O., Kent, P., Parekh, P., Saab, P., Balaji,
+  Stone, K., El-Arini, K., Iyer, K., Malik, K., Chiu, K., Bhalla, K.,        P., Rittner, P., Bontrager, P., Roux, P., Dollar, P., Zvyagina, P.,
+  Lakhotia, K., Rantala-Yeary, L., van der Maaten, L., Chen, L.,             Ratanchandani, P., Yuvraj, P., Liang, Q., Alao, R., Rodriguez,
+  Tan, L., Jenkins, L., Martin, L., Madaan, L., Malo, L., Blecher,           R., Ayub, R., Murthy, R., Nayani, R., Mitra, R., Parthasarathy,
+  L., Landzaat, L., de Oliveira, L., Muzzi, M., Pasupuleti, M.,              R., Li, R., Hogan, R., Battey, R., Wang, R., Howes, R., Rinott,
+  Singh, M., Paluri, M., Kardas, M., Tsimpoukelli, M., Oldham,               R., Mehta, S., Siby, S., Bondu, S. J., Datta, S., Chugh, S., Hunt,
+  M., Rita, M., Pavlova, M., Kambadur, M., Lewis, M., Si, M.,                S., Dhillon, S., Sidorov, S., Pan, S., Mahajan, S., Verma, S.,
+  Singh, M. K., Hassan, M., Goyal, N., Torabi, N., Bashlykov, N.,            Yamamoto, S., Ramaswamy, S., Lindsay, S., Lindsay, S., Feng,
+  Bogoychev, N., Chatterji, N., Zhang, N., Duchenne, O., Çelebi,            S., Lin, S., Zha, S. C., Patil, S., Shankar, S., Zhang, S., Zhang,
+  O., Alrassy, P., Zhang, P., Li, P., Vasic, P., Weng, P., Bhargava,         S., Wang, S., Agarwal, S., Sajuyigbe, S., Chintala, S., Max, S.,
+  P., Dubal, P., Krishnan, P., Koura, P. S., Xu, P., He, Q., Dong,           Chen, S., Kehoe, S., Satterfield, S., Govindaprasad, S., Gupta,
+  Q., Srinivasan, R., Ganapathy, R., Calderer, R., Cabral, R. S.,            S., Deng, S., Cho, S., Virk, S., Subramanian, S., Choudhury,
+  Stojnic, R., Raileanu, R., Maheswari, R., Girdhar, R., Patel, R.,          S., Goldman, S., Remez, T., Glaser, T., Best, T., Koehler, T.,
+  Sauvestre, R., Polidoro, R., Sumbaly, R., Taylor, R., Silva, R.,           Robinson, T., Li, T., Zhang, T., Matthews, T., Chou, T., Shaked,
+  Hou, R., Wang, R., Hosseini, S., Chennabasappa, S., Singh, S.,             T., Vontimitta, V., Ajayi, V., Montanez, V., Mohan, V., Kumar,
+  Bell, S., Kim, S. S., Edunov, S., Nie, S., Narang, S., Raparthy,           V. S., Mangla, V., Ionescu, V., Poenaru, V., Mihailescu, V. T.,
+  S., Shen, S., Wan, S., Bhosale, S., Zhang, S., Vandenhende,                Ivanov, V., Li, W., Wang, W., Jiang, W., Bouaziz, W., Constable,
+  S., Batra, S., Whitman, S., Sootla, S., Collot, S., Gururangan,            W., Tang, X., Wu, X., Wang, X., Wu, X., Gao, X., Kleinman,
+  S., Borodinsky, S., Herman, T., Fowler, T., Sheasha, T., Geor-             Y., Chen, Y., Hu, Y., Jia, Y., Qi, Y., Li, Y., Zhang, Y., Zhang,
+  giou, T., Scialom, T., Speckbacher, T., Mihaylov, T., Xiao, T.,            Y., Adi, Y., Nam, Y., Wang, Y., Zhao, Y., Hao, Y., Qian, Y., Li,
+  Karn, U., Goswami, V., Gupta, V., Ramanathan, V., Kerkez,                  Y., He, Y., Rait, Z., DeVito, Z., Rosnbrick, Z., Wen, Z., Yang,
+  V., Gonguet, V., Do, V., Vogeti, V., Albiero, V., Petrovic, V.,            Z., Zhao, Z., and Ma, Z. The llama 3 herd of models. arXiv
+  Chu, W., Xiong, W., Fu, W., Meers, W., Martinet, X., Wang,                 preprint arXiv:2407.21783, 2024.
+  X., Wang, X., Tan, X. E., Xia, X., Xie, X., Jia, X., Wang, X.,
+  Goldschlag, Y., Gaur, Y., Babaei, Y., Wen, Y., Song, Y., Zhang,          Hu, Z., Shen, S., Bonato, T., Jeaugey, S., Alexander, C., Spada,
+  Y., Li, Y., Mao, Y., Coudert, Z. D., Yan, Z., Chen, Z., Papakipos,         E., Dinan, J., Hammond, J. R., and Hoefler, T. Demystifying
+  Z., Singh, A., Srivastava, A., Jain, A., Kelsey, A., Shajnfeld, A.,        nccl: An in-depth analysis of gpu communication protocols and
+                                 SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+  algorithms. In 2025 IEEE Symposium on High-Performance                   Li, J., Song, J., Dong, K., Hu, K., Gao, K., Guan, K., Huang,
+  Interconnects (HOTI), pp. 48–59, San Jose, CA, USA, 2025.                K., Yu, K., Wang, L., Zhang, L., Zhao, L., Wang, L., Zhang, L.,
+  IEEE.                                                                    Zhang, M., Zhang, M., Tang, M., Huang, P., Wang, P., Wang,
+                                                                           Q., Zhu, Q., Chen, Q., Du, Q., Ge, R., Zhang, R., Pan, R., Wang,
+Jouppi, N. P. and Lakshmanamurthy, S. Ironwood: Delivering best            R., Xu, R., Zhang, R., Lu, S., Zhou, S., Chen, S., Ye, S., Ma, S.,
+  in class perf, perf/tco and perf/watt for reasoning model training       Wang, S., Yu, S., Zhou, S., Pan, S., Yun, T., Pei, T., Zeng, W.,
+  and serving. In 2025 IEEE Hot Chips 37 Symposium (HCS), pp.              Zhao, W., Liu, W., Liang, W., Gao, W., Yu, W., Zhang, W., Bi,
+  1–26. IEEE Computer Society, 2025.                                       X., Liu, X., Wang, X., Chen, X., Zhang, X., Nie, X., Cheng, X.,
+                                                                           Liu, X., Xie, X., Liu, X., Yu, X., Yang, X., Li, X., Su, X., Lin,
+Jouppi, N. P., Young, C., Patil, N., Patterson, D., Agrawal, G.,           X., Li, Y., Wang, Y., Wei, Y., Zhang, Y., Xu, Y., Li, Y., Zhao,
+  Bajwa, R., Bates, S., Bhatia, S., Boden, N., Borchers, A., Boyle,        Y., Sun, Y., Wang, Y., Yu, Y., Zhang, Y., Shi, Y., Xiong, Y., He,
+  R., Cantin, P.-L., Chao, C., Clark, C., Coriell, J., Daley, M.,          Y., Piao, Y., Wang, Y., Tan, Y., Ma, Y., Liu, Y., Guo, Y., Wu,
+  Dau, M., Dean, J., Gelb, B., Ghaemmaghami, T. V., Gottipati,             Y., Ou, Y., Wang, Y., Gong, Y., Zou, Y., He, Y., Xiong, Y., Luo,
+  R., Gulland, W., Hagmann, R., Ho, C. R., Hogberg, D., Hu, J.,            Y., You, Y., Liu, Y., Zhou, Y., Wu, Z., Ren, Z., Ren, Z., Sha,
+  Hundt, R., Hurt, D., Ibarz, J., Jaffey, A., Jaworski, A., Kaplan,        Z., Fu, Z., Xu, Z., Xie, Z., Zhang, Z., Hao, Z., Gou, Z., Ma, Z.,
+  A., Khaitan, H., Koch, A., Kumar, N., Lacy, S., Laudon, J.,              Yan, Z., Shao, Z., Wu, Z., Li, Z., Gu, Z., Zhu, Z., Liu, Z., Li,
+  Law, J., Le, D., Leary, C., Liu, Z., Lucke, K., Lundin, A.,              Z., Xie, Z., Song, Z., Gao, Z., Pan, Z., Feng, B., Li, H., Cai, J.,
+  MacKean, G., Maggiore, A., Mahony, M., Miller, K., Nagarajan,            Ni, J., Xu, L., Li, M., Tian, N., Chen, R., Jin, R., Chen, R., Li,
+  R., Narayanaswami, R., Ni, R., Nix, K., Norrie, T., Omernick,            S., Zhou, S., Sun, T., Li, X., Jin, X., Shen, X., Chen, X., Sun,
+  M., Penukonda, N., Phelps, A., Ross, J., Ross, M., Salek, A.,            X., Wang, X., Song, X., Zhou, X., Zhu, Y., Huang, Y., Li, Y.,
+  Samadiani, E., Severn, C., Sizikov, G., Snelham, M., Souter, J.,         Zheng, Y., Zhu, Y., Ma, Y., Huang, Z., Xu, Z., Zhang, Z., Ji, D.,
+  Steinberg, D., Swing, A., Tan, M., Thorson, G., Tian, B., Toma,          Liang, J., Chen, J., Xia, L., Wang, M., Li, M., Zhang, P., Wu,
+  H., Tuttle, E., Vasudevan, V., Walter, R., Wang, W., Wilcox,             S., Wang, T., Xiao, W., An, W., Wang, X., Shan, X., Tang, Y.,
+  E., and Yoon, D. H. In-datacenter performance analysis of                Zha, Y., Yan, Y., and Zhang, Z. Deepseek-v3 technical report.
+  a tensor processing unit. In Proceedings of the 44th Annual              arXiv preprint arXiv:2412.19437, 2024a.
+  International Symposium on Computer Architecture, pp. 1–12,
+  2017.                                                                  Liu, X., Daniel, C., Hu, L., Kwon, W., Li, Z., Mo, X., Cheung,
+Jouppi, N. P., Kurian, G., Li, S., Ma, P. C., Nagarajan, R., Nai,          A., Deng, Z., Stoica, I., and Zhang, H. Optimizing speculative
+  L., Patil, N., Subramanian, S., Swing, A., Towles, B., Young,            decoding for serving large language models using goodput.
+  C., Zhou, X., Zhou, Z., and Patterson, D. A. Tpu v4: An opti-            arXiv preprint arXiv:2406.14066, 2024b.
+  cally reconfigurable supercomputer for machine learning with
+  hardware support for embeddings. In Proceedings of the 50th            Ma, J., Dong, D., Li, C., Wu, K., and Xiao, L. Paard: Proximity-
+  Annual International Symposium on Computer Architecture, pp.            aware all-reduce communication for dragonfly networks. In
+  1–14, 2023.                                                             2021 IEEE Intl Conf on Parallel & Distributed Processing with
+                                                                          Applications, Big Data & Cloud Computing, Sustainable Com-
+Kamath, A. K., Prabhu, R., Mohan, J., Peter, S., Ramjee, R.,              puting & Communications, Social Computing & Networking
+  and Panwar, A. Pod-attention: Unlocking full prefill-decode             (ISPA/BDCloud/SocialCom/SustainCom), pp. 255–262. IEEE,
+  overlap for faster llm inference. In Proceedings of the 30th            2021.
+  ACM International Conference on Architectural Support for
+  Programming Languages and Operating Systems, Volume 2, pp.             Mitra, T., Borkar, R., Bhatia, N., Raj, S., Zhou, H., Pei, Y. R.,
+  897–912, 2025.                                                           Venkatesan, V., Kranen, K., Matas, R., Mudigere, D., Zhao, R.,
+                                                                           Golub, M., Dutta, A., Nambi, S., Madduri, S., Jani, D., Pharris,
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H.,             B., Neeman, I., and Darvish Rouhani, B. Beyond the buzz: A
+  Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient memory              pragmatic take on inference disaggregation. Proceedings of
+  management for large language model serving with pagedatten-             Machine Learning and Systems, 2026.
+  tion. In Proceedings of the ACM SIGOPS 29th Symposium on
+ Operating Systems Principles, 2023.                                     NVIDIA. Nvshmem. https://developer.nvidia.com/
+                                                                           nvshmem, 2025. Accessed: 2025-10-27.
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference from
+  transformers via speculative decoding. In International Confer-        NVIDIA. TensorRT-LLM, 2026. URL https://github.
+  ence on Machine Learning, pp. 19274–19286. PMLR, 2023.                   com/NVIDIA/TensorRT-LLM/releases/tag/v1.2.
+                                                                           0. GitHub repository, version v1.2.0.
+Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle-3: Scaling up in-
+   ference acceleration of large language models via training-time
+   test. In Advances in Neural Information Processing Systems,           OpenRouter. Openrouter: The unified interface for llms. https:
+   2025.                                                                   //openrouter.ai/, 2025. Accessed: 2025-10-26.
+
+Lie, S. Wafer-scale ai: Gpu impossible performance. In 2024 IEEE         Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í., Maleki, S.,
+  Hot Chips 36 Symposium (HCS), pp. 1–71. IEEE Computer                    and Bianchini, R. Splitwise: Efficient generative llm infer-
+   Society, 2024.                                                          ence using phase splitting. In 2024 ACM/IEEE 51st Annual
+                                                                           International Symposium on Computer Architecture (ISCA), pp.
+Liu, A., Xue, B., Wang, B., Wu, B., Lu, C., Zhao, C., Deng, C.,            118–132. IEEE, 2024.
+  Zhang, C., Ruan, C., Dai, D., Guo, D., Yang, D., Chen, D., Li,
+  E., Lin, F., Dai, F., Luo, F., Hao, G., Chen, G., Li, G., Zhang, H.,   Peng, H., Davidson, S., Shi, R., Song, S. L., and Taylor, M. Chiplet
+  Bao, H., Xu, H., Wang, H., Zhang, H., Ding, H., Xin, H., Gao,            cloud: Building ai supercomputers for serving large generative
+  H., Qu, H., Guo, J., Li, J., Wang, J., Chen, J., Yuan, J., Qiu, J.,      language models. arXiv preprint arXiv:2307.02666, 2023.
+                                SHIP: SRAM-based Huge Inference Pipelines for Fast LLM Serving
+
+Sadhukhan, R., Chen, J., Chen, Z., Tiwari, V., Lai, R., Shi, J., Yen,   Xia, H., Ge, T., Wang, P., Chen, S.-Q., Wei, F., and Sui, Z. Specula-
+  I., May, A., Chen, T., and Chen, B. Magicdec: Breaking the              tive decoding: Exploiting speculative execution for accelerating
+  latency-throughput tradeoff for long context generation with            seq2seq generation. In Findings of the Association for Compu-
+  speculative decoding. In International Conference on Learning           tational Linguistics: EMNLP 2023, pp. 3909–3925, Singapore,
+  Representations (ICLR), 2025.                                           December 2023. Association for Computational Linguistics.
+                                                                          doi: 10.18653/v1/2023.findings-emnlp.257. URL https://
+SGLang Documentation. Server arguments.    https:                         aclanthology.org/2023.findings-emnlp.257/.
+  //docs.sglang.ai/advanced_features/
+  server_arguments.html, 2025.    Accessed: 2025-                       Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B., Yu, B.,
+  10-29.                                                                  Gao, C., Huang, C., Lv, C., Zheng, C., Liu, D., Zhou, F., Huang,
+                                                                          F., Hu, F., Ge, H., Wei, H., Lin, H., Tang, J., Yang, J., Tu, J.,
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hin-         Zhang, J., Yang, J., Yang, J., Zhou, J., Zhou, J., Lin, J., Dang,
+  ton, G., and Dean, J. Outrageously large neural networks: The           K., Bao, K., Yang, K., Yu, L., Deng, L., Li, M., Xue, M., Li,
+  sparsely-gated mixture-of-experts layer. In International Con-          M., Zhang, P., Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S.,
+  ference on Learning Representations (ICLR), 2017.                       Luo, S., Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang,
+                                                                          X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan, Y., Liu,
+Si, M., Balaji, P., Chen, Y., Chu, C.-H., Gangidi, A., Hasan, S.,         Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and Qiu, Z. Qwen3
+   Iyengar, S., Johnson, D., Liu, B., Ren, R., Shah, D., Shetty,          technical report. arXiv preprint arXiv:2505.09388, 2025. doi:
+   A. J., Steinbrecher, G., Wang, Y., Wu, B., Xie, X., Yang, J.,          10.48550/arXiv.2505.09388.
+   Yang, M., Yu, K., Yu, M., Zhao, C., Bland, W., Boyda, D.,
+   Gumudavelli, S., Kannan, P., Lumezanu, C., Miao, R., Qu, Z.,         Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-G.
+   Ramesh, V., Samoylov, M., Seidel, J., Sundaresan, S., Tian, F.,        Orca: A distributed serving system for {Transformer-Based}
+   Tan, Q., Zhang, S., Zhao, Y., Zheng, S., Zhu, A., and Zeng,            generative models. In 16th USENIX Symposium on Operating
+   J. H. Collective communication for 100k+ gpus. arXiv preprint          Systems Design and Implementation (OSDI 22), pp. 521–538,
+   arXiv:2510.20171, 2025.                                                2022.
+Smith, A. and Alla, V. K. Amd instinct™ mi300x: A generative ai         Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H., Cao,
+  accelerator and platform architecture. IEEE Micro, 2025.                S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Barrett, C., and
+                                                                          Sheng, Y. Efficiently programming large language models using
+Snell, C., Lee, J., Xu, K., and Kumar, A. Scaling llm test-time           sglang. In Advances in Neural Information Processing Systems,
+  compute optimally can be more effective than scaling param-             volume 37, pp. 62557–62583, 2024.
+  eters for reasoning. In International Conference on Learning
+  Representations (ICLR), 2025.                                         Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X.,
+                                                                          and Zhang, H. {DistServe}: Disaggregating prefill and decod-
+StepFun Team.      Step-3 is large yet affordable: Model-                 ing for goodput-optimized large language model serving. In
+   system co-design for cost-effective decoding. arXiv preprint           18th USENIX Symposium on Operating Systems Design and
+   arXiv:2507.19427, 2025.                                                Implementation (OSDI 24), pp. 193–210, 2024.
+Su, Q., Giannoula, C., and Pekhimenko, G. The synergy of specu-         Zhou, Y., Lyu, K., Rawat, A. S., Menon, A. K., Rostamizadeh,
+  lative decoding and batching in serving large language models.          A., Kumar, S., Kagy, J.-F., and Agarwal, R. Distillspec: Im-
+  arXiv preprint arXiv:2310.18813, 2023.                                  proving speculative decoding via knowledge distillation. In
+                                                                          International Conference on Learning Representations (ICLR),
+Tirumala, A. and Wong, R. Nvidia blackwell platform: Advancing            2024.
+   generative ai and accelerated computing. In 2024 IEEE Hot
+   Chips 36 Symposium (HCS), pp. 1–33. IEEE Computer Society,           Zhou, Y., Chen, Z., Mao, Z., Lao, C., Yang, S., Kannan, P. G.,
+   2024.                                                                  Gao, J., Zhao, Y., Wu, Y., You, K., Ren, F., Xu, Z., Raiciu, C.,
+                                                                          and Stoica, I. An extensible software transport layer for gpu
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L.,           networking. arXiv preprint arXiv:2504.17307, 2025.
+  Gomez, A. N., Kaiser, "., and Polosukhin, I. Attention is all
+  you need. Advances in neural information processing systems,          Zhu, R., Jiang, Z., Jin, C., Wu, P., Stuardo, C. A., Wang, D., Zhang,
+  30, 2017.                                                               X., Zhou, H., Wei, H., Cheng, Y., Xiao, J., Zhang, X., Liu, L.,
+                                                                          Lin, H., Chang, L.-W., Ye, J., Yu, X., Liu, X., Jin, X., and Liu,
+vllm project. vllm: A high-throughput and memory-efficient infer-         X. Megascale-infer: Efficient mixture-of-experts model serving
+   ence engine. https://github.com/vllm-project/                          with disaggregated expert parallelism. In Proceedings of the
+   vllm, 2025.                                                            ACM SIGCOMM 2025 Conference, pp. 592–608, 2025.
+Wang, S., Wei, J., Sabne, A., Davis, A., Ilbeyi, B., Hechtman, B.,
+  Chen, D., Murthy, K. S., Maggioni, M., Zhang, Q., Kumar, S.,
+  Guo, T., Xu, Y., and Zhou, Z. Overlap communication with de-
+  pendent computation via decomposition in large deep learning
+  models. In Proceedings of the 28th ACM International Confer-
+  ence on Architectural Support for Programming Languages and
+ Operating Systems, Volume 1, pp. 93–106, 2022.
+
+Williams, S., Waterman, A., and Patterson, D. Roofline: an in-
+  sightful visual performance model for multicore architectures.
+  Communications of the ACM, 52(4):65–76, 2009.
+

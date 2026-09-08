@@ -1,0 +1,1334 @@
+     T RI I NFER : H YBRID D ISAGGREGATED S CHEDULING FOR M ULTIMODAL
+                        L ARGE L ANGUAGE M ODEL S ERVING
+
+
+    Xianzhe Dong 1 Tongxuan Liu 1 2 Yuting Zeng 1 Weizhe Huang 2 Xiaoyang Zhao 2 Siyu Wu 3 Liangyu Liu 1
+                          Yang Liu 1 Yu Wu 1 Hailong Yang 3 Ke Zhang 2 Jing Li 1
+
+
+                                                          A BSTRACT
+      Existing MLLM inference systems are typically designed based on the architecture of language models, coupling
+      image processing and language processing. This design struggles to accommodate the heterogeneous demands of
+      different stages in terms of computational resources, memory access patterns, and service-level objectives (SLOs),
+      leading to low resource utilization and high request latency, ultimately failing to meet the service requirements of
+      diverse inference scenarios. To address these challenges, we propose TriInfer, an efficient MLLM inference
+      system that adopts a Hybrid Encode-Prefill-Decode (EPD) Disaggregation architecture. By scheduling the three
+      stages — encode, prefill, and decode — onto separate heterogeneous inference instances, the system flexibly
+      reallocates resources across stages, significantly reducing idle computation, alleviating resource bottlenecks, and
+      improving overall system throughput and scalability. In addition, TriInfer supports a stage-level batching
+      strategy that enhances load balancing, enables parallel execution of visual and language models, and further
+      optimizes inference performance. Experiments under real multimodal inference workloads demonstrate that
+      TriInfer can achieve up to 2.4× higher inference throughput compared to state-of-the-art systems (e.g., vLLM,
+      SGLang) while meeting the 90th percentile request SLO. The source code of TriInfer will be released at
+      https://github.com/dongxianzhe/triinfer.
+
+1     I NTRODUCTION                                                 There are now many studies aimed at improving the per-
+                                                                    formance of multimodal inference systems. Firstly, current
+In recent years, Multimodal Large Language Models                   systems such as vLLM (Kwon et al., 2023), SGLang (Zheng
+(MLLMs) (Bai et al., 2023; Li et al., 2023a; Liu et al., 2023;      et al., 2024), TGI (Face, 2023) performs vision and lan-
+Team et al., 2023; Zhu et al., 2023; Hu et al., 2024c; Lu et al.,   guage processing sequentially, failing to exploit inherent
+2024; Wang et al., 2024; Bai et al., 2025) have demonstrated        cross-modal parallelism. This results in suboptimal hard-
+impressive capabilities across various domains, including           ware utilization. Secondly, although techniques such as
+image understanding and visual question answering. The              continuous batching (Yu et al., 2022), chunked prefill and
+typical inference process of MLLMs typically consists of            stall-free scheduling (Agrawal et al., 2024) optimize lan-
+three stages: the image encode stage extracts visual features       guage model scheduling for throughput and latency, they
+from input images; the prefill stage feeds visual features          prevent stage-specific optimization crucial for multimodal
+and the text prompt into the language model to generate the         inference. As shown in Figure 3, different stages have differ-
+first output token; and the decode stage iteratively generates      ent characteristics. Consequently, these methods struggle to
+subsequent tokens based on the cache (Yin et al., 2024).            trade off throughput and latency, frequently violating Time-
+Notably, input images are converted into hundreds or even           between-Tokens (TBT) Service Level Objectives (SLOs).
+thousands of tokens during inference (Cai et al., 2024), re-        Thirdly, current large-scale inference systems deploy dis-
+quiring significantly more GPU resources compared to large          aggregated architecture across multiple inference instances
+language models (Chen et al., 2024). Consequently, reduc-           (Zhong et al., 2024; Singh et al., 2025; Qiu et al., 2025;
+ing the inference cost of MLLMs has emerged as a critical           Guo et al., 2025). Although disaggregation methods such
+research topic.                                                     as E+P+D (encode, prefill, decode all separated), EP+D
+    1
+      University of Science and Technology of China 2 JD.com        (encode, prefill co-located, separated with decode), and
+3
+ Beihang University. Correspondence to: Hailong Yang <hai-          ED+P (encode, decode co-located, separated with prefill)
+long.yang@buaa.edu.cn>, Ke Zhang <zhangke323@jd.com>,               have specific advantages, existing systems use a single and
+Jing Li <lj@ustc.edu.cn>.                                           fixed disaggregation method regardless of varying scenarios,
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,
+                                                                    resulting in low goodput.
+2026. Copyright 2026 by the author(s).
+                 TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+To address these limitations, we introduce TriInfer, a                   Encode                Prefill                 Decode
+novel MLLM inference system designed and implemented                                        KVCache[1:s]
+                                                                     image tokens[1:n]                                 STOP
+from the ground up. Firstly, we propose a dual-stream                                        token[s+1]
+architecture that allocates image encoding tasks to the vi-
+sion stream while processing prefill and decode tasks in               vision tower &         language              KV Cache[s+1]
+                                                                          projector             model             token[s+2] = EOF
+the language stream. This enables parallel execution of
+heterogeneous stages across requests, significantly improv-                                                           language
+                                                                       pixel_values          tokens[1:s]
+ing hardware utilization and system throughput. Secondly,                                                               model
+we propose a Stage-level Schedule strategy, which decom-
+                                                                                          image tokens[1:n]         KVCache[1:s]
+pose each request into fine-grained stages. By applying                   START
+                                                                                           text tokens[1:m]          token[s+1]
+stage-specific scheduling and batching optimizations, this
+strategy eliminates bottlenecks inherent in coarse-grained
+                                                                 Figure 1: Vision-language model autoregressive inference
+scheduling while enabling precise execution time control.
+                                                                 process.
+Thirdly, we propose a Hybrid Encode-Prefill-Decode dis-
+aggregation architecture, which enables each instance to         2      BACKGROUND
+execute configurable stage subsets with automatically adjust
+the appropriate disaggregation method based on historical        2.1     MLLM Autoregressive Inference
+trace, maximizing the system’s goodput.                          As shown in Figure 1, the inference process of a transformer-
+To validate the effectiveness of TriInfer , we conduct           based (Vaswani et al., 2017) vision-language model can be
+comprehensive evaluations across various MLLMs and rep-          divided into three distinct stages (Yin et al., 2024). The first
+resentative tasks, including image captioning (Sidorov           stage is the encode stage, where the model’s vision tower
+et al., 2020), visual question answering (Gurari et al., 2018;   and projector process the image of request to obtain the
+Singh et al., 2019), model evaluation (Li et al., 2023b; Fu      image tokens I[a1 , a2 , . . . , an ]. The second stage is the pre-
+et al., 2024). The results of experiments demonstrate that       fill stage. During this stage, the request prompt is encoded
+TriInfer consistently outperforms state-of-the-art infer-        into text tokens T [b1 , b2 , . . . , bm ], and then are concatenated
+ence frameworks including vLLM and SGLang. Specifi-              with image tokens to form the final input X[x1 , x2 , . . . , xs ],
+cally, under different SLO constraints, TriInfer achiev-         where s = n + m. This input X is fed into the large
+ing up to 1.2x, 1.5x, 2.4x, 1.8x, and 1.7x goodput improve-      language model to generate a token xs+1 and a series of
+ments on MME (Fu et al., 2024), POPE (Li et al., 2023b),         kvcache used for the decode stage. The third stage is the
+TextCaps (Sidorov et al., 2020), TextVQA (Singh et al.,          decode stage to generate tokens iteratively until the gener-
+2019), and VizWiz (Gurari et al., 2018) datasets, respec-        ated token is <eos> or the maximum token limit is reached.
+tively. Our main contributions are as follows:                   Due to the data dependencies in the decode stage, this stage
+                                                                 is executed sequentially.
+   • We identify and analyze key challenges in existing
+                                                                 2.2     Inference Engine Performance Metrics
+     inference systems for MLLMs, particularly in par-
+     allelism, scheduling granularity, and disaggregation        TTFT (Time-to-First-Token) measures the time from when
+     method selection.                                           a request arrives at the system until the first output token
+                                                                 is produced, reflecting the system’s responsiveness. TBT
+   • We design Hybrid Encode-Prefill-Decode disaggrega-          (Time-between-Tokens) measures the interval between con-
+     tion architecture, and automatically selects the optimal    secutive output tokens for a request, indicating the overall
+     disaggregation method based on workload and SLO             smoothness of the response. Throughput refers to the num-
+     profiles for flexible resource allocation.                  ber of requests processed per second. Requests are associ-
+                                                                 ated with TTFT SLOs and TBT SLOs. If a request’s TTFT
+   • We propose a stage-level scheduling strategy, which         is less than its TTFT SLO and 90% of its TBT values are
+     applies batching optimizations at different inference       below the TBT SLO, the request is considered to have met
+     stages and incorporates a multi-stream parallel execu-      the SLO (Service Level Objective). SLO attainment is de-
+     tion model to improve system throughput and resource        fined as the percentage of requests that meet their SLOs out
+     efficiency.                                                 of all requests. Goodput is defined as the maximum request
+                                                                 rate at which the SLO attainment reaches at least 90%. Our
+   • Comprehensive evaluation across diverse models and          optimization objective is to maximize the per-GPU goodput.
+     scenarios demonstrating strong generality and signifi-
+     cant service capacity improvements, substantially ad-
+     vancing the state of multimodal inference systems.
+                   TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+Table 1: Symbols related to the architecture of the model
+and the batch of requests.
+                                                                                                                             8 0 0                                      C o m p u te B o u n d R e g io n
+
+
+
+
+                                                                      a r ith m e tic in te n s ity (F L O P s /b y te s )
+       Notation    Description                                                                                               7 0 0
+
+       B           The number of batched requests                                                                            6 0 0
+
+       S           The length of prompt                                                                                      5 0 0                                                                                                    b e tte r
+                                                                                                                                                                                     c o m p -m e m         b a la n c e d
+       T           The number of tokens per image
+                                                                                                                             4 0 0
+       H           Input dimension of the hidden layer                                                                                                                                          e n c o d e = 0
+       M           The number of attention heads                                                                             3 0 0                                                               e n c o d e = 1
+                                                                                                                                                                                                  e n c o d e = 2
+                                                                                                                             2 0 0                                                                 e n c o d e = 4
+                                                                                                                                                                                                    e n c o d e = 8
+Table 2: Arithmetic intensity and Memory Acceess of pri-                                                                                                                                             e n c o d e = 1 6
+                                                                                                                             1 0 0        M e m o r y B o u n d R e g io n
+mary operations in MLLMs.
+                                                                                                                                 0
+                                                                                                                                     0      5 0 0   1 0 0 0   1 5 0 0   2 0 0 0   2 5 0 0   3 0 0 0         3 5 0 0         4 0 0 0
+    Operation     E/P/D     FLOPS        Memory Access
+                                                                                                                                         D + E                N u m b e r o f T o k e n s                                P + E
+                  encode     8BT H 2      8BT H + 4H 2
+    QKVO Proj.    prefill    8BSH 2        8BSH + 4H 2
+                  decode       8BH          8BH + 4H 2           Figure 2: Arithmetic intensity trend for LLaMA1.5-7B lin-
+                  encode    16BT H 2      10BT H + 8H 2          ear operations with different number of images and tokens.
+    FFN           prefill   16BSH 2       10BSH + 8H 2
+                  decode     16BH 2        10BH + 8H 2           across multiple requests (Agrawal et al., 2024; Yu et al.,
+                  encode     4BT 2 H     4BT H + 2BT 2 M         2022). Figure 3 shows how throughput changes with batch
+    Attention     prefill    4BS 2 H     4BSH + 2BS 2 M          size. We observe that the encode stage reaches saturation at
+                  decode      4BSH     4BSM + 2BH(S + 1)         a batch size of around 6. The prefill stage achieves saturation
+                                                                 even with a single request. The decode stage shows roughly
+3      M OTIVATION                                               linear throughput improvement with increasing batch size,
+                                                                 saturating at around 512. Once the batch size exceeds the
+3.1     Insufficient Parallelism
+                                                                 saturation point for each stage, increasing it further does not
+Diverse Compute and Memory Characteristics. The pre-             lead to additional throughput gains, while latency increases
+fill stage is primarily compute-bound, while the decode          linearly.
+stage is memory-bound. To optimize resource utilization,
+                                                                 Takeaway-2: Different stages achieve their maximum
+it is crucial to balance compute-intensive and memory-
+                                                                 throughput at different batch sizes. Beyond that point, larger
+intensive operations (Agrawal et al., 2024). Our theoretical
+                                                                 batch sizes lead to a linear increase in latency.
+analysis of FLOPs and memory access patterns for key oper-
+ations in MLLMs, detailed in Appendix B, with the results        Trading off Throughput and TBT Latency. Batch pro-
+summarized in Tables 1 and 2, shows that the encode stage        cessing enhances throughput but can lead to high tail TBT
+has characteristics that lie between those of the prefill and    latency when decode tasks are included, a phenomenon
+decode stages in terms of computational and memory us-           known as generation stall (Agrawal et al., 2024). Fig-
+age. Figure 2 illustrates the relationship between arithmetic    ure 4 illustrates different scheduling strategies with four
+intensity and token count under varying image batch sizes.       requests (A, B: decode stage; C, D: new arrivals) on a time-
+When the token count is small (i.e., during the decode stage),   line. Prefill-prioritized scheduling increases throughput by
+the operations are memory-bound; in this region, increasing      prioritizing the prefill stage of new requests, but causes de-
+the number of images in the batch raises arithmetic inten-       code requests to stall, thereby increasing tail TBT latency.
+sity. Conversely, when the token count is large (i.e., during    In contrast, stall-free scheduling (Agrawal et al., 2024), used
+prefill stage), the workload is compute-bound, and batching      by Sarathi Serve, prioritizes decode tasks to reduce tail TBT
+encode with prefill reduces arithmetic intensity.                latency, though it slightly lowers throughput. This method
+                                                                 batches both prefill and decode requests together, allowing
+Takeaway-1: The distinct compute and memory character-
+                                                                 continuous decoding as new requests arrive. To mitigate
+istics of each stage suggest the potential for optimization
+                                                                 the impact of new prefill requests, chunked prefill technol-
+through parallel execution of vision and language models.
+                                                                 ogy segments prompts for partial processing. Additionally,
+                                                                 stall-free scheduling also limits the maximum token count
+3.2     Suboptimal Scheduling Granularity                        per batch to control execution time and ensure TBT latency
+Batching. To improve GPU utilization, large language             guarantees. However, this approach is less effective for
+model serving systems employ batching techniques to pro-         MLLMs, as it does not account for image encoding latency.
+cess multiple requests simultaneously. A larger batch size       Takeaway-3: Existing scheduling strategies for language
+helps amortize the cost of accessing model parameters
+                                                                         TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+                                                                      H Q F R G H                                                       H Q F R G H                                                                    Timeline
+
+
+                                                    .
+    7 K U R X J K S X W   W R N H Q  V 
+                                                                                                                                                                                   C,D enter                                                         Decodes for A,B stalled
+                                                                                                                       
+                                                                                                                                                                                                                                                                               prefill
+                                                    .
+
+
+
+
+                                                                                          / D W H Q F \   V 
+                                                                                                                                                                                                                                                                          prioritized
+                                                                                                                                                                TPOT without                                   TPOT with                                                       schedules
+                                                                                                                                                          any interference                      image embed and prefill interference
+                                                    .
+                                                                                                                                                                               C,D enter                                         No stalls but not optimal for LVLM
+                                                                                                                                                                                                                                                                          decode
+                                                                                                                                                                                                                                                                               prioritized
+                                                    .
+                                                                                                                                                                                                                  A exits                            B exits
+                                                                                                                                                                                                                                                                               schedules
+                                                                                                                                                                                 TPOT with
+                                                                                                                                                            image embed and chunked prefill interference
+                                                                                                                                                                                                                                                                               stage-level
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+
+
+
+
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                                                                                         Ours
+                                                                   % D W F K  6 L ] H                                               % D W F K  6 L ] H                       C,D enter                                                             Nostalls
+                                                                                                                                                                                                                                                                               scheduling
+
+
+                                                                        S U H I L O O                                                     S U H I L O O                                                  A exits                    B exits
+
+                                                                                                                           
+                                                          .
+             7 K U R X J K S X W   W R N H Q  V 
+
+
+
+
+                                                                                                                                                             Figure 4: Comparison of the generation stall problem under
+                                                                                                                           
+                                                                                                                                                             different scheduling strategies. A, B, C, and D represent
+                                                                                               / D W H Q F \   V 
+                                                          .
+
+                                                          .                                                                                            different requests. The subscript ”e” denotes the image en-
+                                                                                                                                                             code stage, ”p” denotes the complete prefill stage, and ”d”
+                                                          .                                                              
+                                                                                                                                                             denotes the decode stage. ”ep” represents the serial execu-
+                                                                                                                                                        tion of encode and prefill, while ”p1” and ”p2” represent
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+                                                                 
+
+
+
+
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                                                                                   
+                                                                   % D W F K  6 L ] H                                               % D W F K  6 L ] H     chunked prefill.
+                                                                      G H F R G H                                                       G H F R G H                                                  TTFT                                         TBT
+                                                                                                                                                                          Latency with varying EP/D ratio.                                    Latency with varying ED/P ratio.
+             7 K U R X J K S X W   W R N H Q  V 
+
+
+
+
+                                                                                                                           
+                                                          .                                                                                                              25
+                                                                                                                                                                                                                         0.35                                                 0.028
+                                                                                               / D W H Q F \   V 
+
+
+
+
+                                                                                                                                                                              20                                                                25
+                                                                                                                                                                                                                             0.30                                                 0.026
+                                                                                                                                                               Avg TTFT (s)
+
+
+
+
+                                                                                                                                                                                                                                 Avg TTFT (s)
+                                                                                                                           
+
+
+
+
+                                                                                                                                                                                                                                 Avg TBT (s)
+
+
+
+
+                                                                                                                                                                                                                                                                                       Avg TBT (s)
+                                                          .                                                                                                                                                                                   20
+                                                                                                                                                                              15                                             0.25                                                 0.024
+                                                                                                                                                                                                                         0.20               15                                0.022
+                                                          .                                                                                                                 10                                             0.15
+                                                                                                                                                                                                                                            10                                0.020
+                                                                                                                                                                              5                                              0.10
+                                                                                                                                                                                                                        0.05               5                                 0.018
+                                                                                                                                                                              0                                              0.00                                                 0.016
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                      
+                                                                      
+                                                                      
+                                                                     
+                                                                     
+                                                                    
+                                                                    
+                                                                      
+
+
+
+
+                                                                                                                                         
+                                                                                                                                         
+                                                                                                                                         
+                                                                                                                                         
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                      
+                                                                                                                                      
+                                                                                                                                        
+                                                                    
+
+
+
+
+                                                                                                                                      
+
+
+
+
+                                                                   % D W F K  6 L ] H                                               % D W F K  6 L ] H
+                                                                                                                                                                                   D
+                                                                                                                                                                                         D
+                                                                                                                                                                                               D
+                                                                                                                                                                                                    D
+                                                                                                                                                                                                          D
+                                                                                                                                                                                                                   D
+                                                                                                                                                                                                                       D
+
+
+
+
+                                                                                                                                                                                                                                                 2E P
+                                                                                                                                                                                                                                                 3E P
+                                                                                                                                                                                                                                                 4E P
+                                                                                                                                                                                                                                                 5E P
+                                                                                                                                                                                                                                                 6E P
+                                                                                                                                                                                                                                                 7E P
+                                                                                                                                                                                                                                                      P
+                                                                                                                                                                                                                                                   D7
+                                                                                                                                                                                                                                                   D6
+                                                                                                                                                                                                                                                   D5
+                                                                                                                                                                                                                                                   D4
+                                                                                                                                                                                                                                                   D3
+                                                                                                                                                                                                                                                   D2
+                                                                                                                                                                                                                                                   D1
+                                                                                                                                                                               P7
+                                                                                                                                                                                       P6
+                                                                                                                                                                                               P5
+                                                                                                                                                                                                    P4
+                                                                                                                                                                                                         P3
+                                                                                                                                                                                                                P2
+                                                                                                                                                                                                                     P1
+                                                                                                                                                                              1E
+                                                                                                                                                                                     2E
+                                                                                                                                                                                           3E
+                                                                                                                                                                                                4E
+                                                                                                                                                                                                     5E
+                                                                                                                                                                                                            6E
+                                                                                                                                                                                                                   7E
+
+
+
+
+                                                                                                                                                                                                                                                1E
+                                                                                                                                                                                                         Latency with varying E/P/D ratio.
+Figure 3: The performance of the LLaVA-1.5-7B model                                                                                                                       22.5
+                                                                                                                                                                          20.0                                                                                                    0.25
+under varying batch sizes. For both the prefill and decode                                                                                                                17.5
+                                                                                                                                                           Avg TTFT (s)
+
+
+
+
+                                                                                                                                                                                                                                                                                  0.20
+
+
+
+
+                                                                                                                                                                                                                                                                                     Avg TBT (s)
+stages, we use a prompt length of 1024 tokens. For the                                                                                                                    15.0
+                                                                                                                                                                          12.5                                                                                                    0.15
+encode stage, the input image resolution is 336×336, corre-                                                                                                               10.0                                                                                                    0.10
+                                                                                                                                                                           7.5
+sponding to 576 visual tokens per image.                                                                                                                                   5.0                                                                                                    0.05
+                                                                                                                                                                               1E P5D
+                                                                                                                                                                               2E P6D
+                                                                                                                                                                               1E P5D
+                                                                                                                                                                               3E P4D
+                                                                                                                                                                               4E P4D
+                                                                                                                                                                               1E P3D
+                                                                                                                                                                               1E P3D
+                                                                                                                                                                               2E P2D
+                                                                                                                                                                               5E P4D
+                                                                                                                                                                               2E P2D
+                                                                                                                                                                               3E P3D
+                                                                                                                                                                               2E P3D
+                                                                                                                                                                               1E P2D
+                                                                                                                                                                               4E P1D
+                                                                                                                                                                               6E P2D
+                                                                                                                                                                               3E P1D
+                                                                                                                                                                               5E P2D
+                                                                                                                                                                               4E P1D
+                                                                                                                                                                               2E P1D
+                                                                                                                                                                               3E P1D
+                                                                                                                                                                                     1D
+models struggle to precisely control execution time in mul-
+
+
+
+                                                                                                                                                                                  4P
+                                                                                                                                                                                  2
+                                                                                                                                                                                  1
+                                                                                                                                                                                  1
+                                                                                                                                                                                  3
+                                                                                                                                                                                  1
+                                                                                                                                                                                  1
+                                                                                                                                                                                  4
+                                                                                                                                                                                  5
+                                                                                                                                                                                  2
+                                                                                                                                                                                  1
+                                                                                                                                                                                  3
+                                                                                                                                                                                  2
+                                                                                                                                                                                  4
+                                                                                                                                                                                  6
+                                                                                                                                                                                  2
+                                                                                                                                                                                  1
+                                                                                                                                                                                  3
+                                                                                                                                                                                  2
+                                                                                                                                                                                  3
+                                                                                                                                                                                  5
+                                                                                                                                                                               1E
+
+
+
+
+timodal inference, frequently resulting in violations of TBT
+SLOs.                                                                                                                                                       Figure 5: The effect of instance ratios on average TBT and
+                                                                                                                                                            TTFT under the three disaggregation methods.
+3.3                                           Difficulty in Disaggregation Method Selection
+                                                                                                                                                            ture, a low number of EP instances (e.g., 1EP+7D) leads to
+Various Disaggregated Architures. In multimodal infer-                                                                                                      high computational loads and increased TTFT. Conversely,
+ence, some possible existing disaggregation methods in-                                                                                                     more D instances yield lower TBT, but as EP instances in-
+clude: (1) E+P+D: This design frees the encode instance                                                                                                     crease and D instances decrease, TBT rises. Specifically,
+from storing the KV cache and loading the language model,                                                                                                   at 7EP+1D, the lack of D instances causes decode bottle-
+allowing for a larger image cache. This increases throughput                                                                                                necks, increasing queuing delays and TTFT. In the ED+P
+by maximizing batch size without execution time constraints                                                                                                 disaggregated architecture, insufficient ED instances lead to
+and improves cache hit rates for repeated images. (2) EP+D:                                                                                                 bottlenecks in both the encode and decode stages, negatively
+Only one KV cache transfer is required, helping to reduce                                                                                                   impacting both TTFT and TBT. When P instances are in-
+transfer overhead. And both the vision model and the lan-                                                                                                   sufficient, the prefill stage becomes the primary bottleneck,
+guage model can be processed in parallel. (3) ED+P: The                                                                                                     similarly resulting in increased TTFT. For the fully disag-
+vision model and language model can be processed in par-                                                                                                    gregated E+P+D architecture, results indicate a negative
+allel, with the prefill stage remaining independent, which                                                                                                  correlation between TBT and the number of D instances.
+helps reduce TTFT.                                                                                                                                          Additionally, certain E-to-P instance ratios can significantly
+                                                                                                                                                            reduce TTFT for a given number of D instances.
+Effect of Different Instance Ratios. Figure 5 shows
+how different instance ratios affect performance using the                                                                                                  Takeaway-4: Optimal instances ratios of different disaggre-
+TextCaps dataset (8 requests/sec). In the EP+D architec-                                                                                                    gation methods depends on the requirements of the SLO.
+                                      TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+                          MME                                     POPE                               TextCaps       Algorithm 1 Stage-level Batching.
+                0.25                                    0.25                                  0.25
+                 0.5                                     0.5                                   0.5                  Input: Instance type T , maximum TTFT required for
+TTFT SLOs (s)
+
+
+
+
+                                        TTFT SLOs (s)
+
+
+
+
+                                                                              TTFT SLOs (s)
+                   1                                       1                                     1                      SLO T T F Tmax , maximum TBT required for SLO
+                   2                                       2                                     2
+                   4                                       4                                     4                      T BTmax , the queue for waiting requests Qwaiting , the
+                   8                                       8                                     8                      set for running requests Srunning .
+                                                                                                                    Output: batch of requests B.
+                  0.04
+                  0.06
+                   0.8
+                  0.11
+                  0.12
+                      4
+
+
+
+                                                          0.04
+                                                          0.06
+                                                           0.8
+                                                          0.11
+                                                          0.12
+                                                              4
+
+
+
+                                                                                                0.04
+                                                                                                0.06
+                                                                                                 0.8
+                                                                                                0.11
+                                                                                                0.12
+                                                                                                    4
+                  0.0
+
+
+
+
+                                                          0.0
+
+
+
+
+                                                                                                0.0
+                       TBT SLOs (s)                            TBT SLOs (s)                          TBT SLOs (s)    1: if T in {“E”, “EP”, “P”} then
+                        TextVQA                                  VizWiz                                              2:    LAT EN CYmax ← α ∗ T T F Tmax
+                0.25                                    0.25
+                 0.5                                     0.5                                                         3: else if T in {“ED”, “EPD”, “D”, “PD”} then
+TTFT SLOs (s)
+
+
+
+
+                                        TTFT SLOs (s)
+
+
+
+
+                   1                                       1                                                         4:    LAT EN CYmax ← T BTmax
+                   2                                       2                                            E+P+D
+                   4                                       4                                            EP+D         5: Initialize τt , τe ← search budget(LAT EN CYmax )
+                   8                                       8                                            ED+P         6: Initialize nt ← 0, ne ← 0, B ← ∅
+                                                                                                                     7: for R in Srunning do
+                  0.04
+                  0.06
+                   0.8
+                  0.11
+                  0.12
+                      4
+
+
+
+                                                          0.04
+                                                          0.06
+                                                           0.8
+                                                          0.11
+                                                          0.12
+                                                              4
+                  0.0
+
+
+
+
+                                                          0.0
+
+
+
+
+                       TBT SLOs (s)                            TBT SLOs (s)                                          8:    if is decode stage(R) then
+                                                                                                                     9:       nt ← nt + 1; B ← B ∪ {R}
+Figure 6: The effect of workload and SLOs on optimal                                                                10: for R in Srunning do
+disaggregation method selection.                                                                                    11:    if is prefill stage(R) and nt < τt then
+Effect of Different Disaggregation Methods. Existing                                                                12:       nt ← nt + get chunked size(R);
+systems (Singh et al., 2025; Qiu et al., 2025; Guo et al.,                                                          13:        B ← B ∪ {R}
+2025) rely on a single, static disaggregation method that                                                           14:    if is encode stage(R) and ne < τe then
+does not adapt to different scenarios, leading to suboptimal                                                        15:       ne ← ne + get image number(R);
+goodput performance. To investigate this, we conducted                                                              16:       B ← B ∪ {R}
+experiments using the LLaVA-Next-7B model, examining                                                                17: while nt < τt do
+how different workload characteristics and SLO thresholds                                                           18:    R ← get next text request(Qwaiting )
+(TBT/TTFT) influence the selection of disaggregation meth-                                                          19:    nt ← nt + get chunked prefill size(R);
+ods. As shown in Figure 6, the fully disaggregated E+P+D                                                            20:    B ← B ∪ {R}
+architecture shows significant advantages under stringent                                                           21: while ne < τe do
+TTFT constraints. In contrast, ED+P and EP+D show su-                                                               22:    R ← get next multi media request(Qwaiting )
+perior performance in other scenarios.                                                                              23:    ne ← ne + get image number(R);
+                                                                                                                    24:    B ← B ∪ {R}
+Takeaway-5: In multimodal large models, various disaggre-                                                           25: Return B
+gation methods such as E+P+D, EP+D, and ED+P should
+be weighed against load characteristics and SLOs to achieve                                                         4.1   Request Processor
+the maximization of resource utilization.
+                                                                                                                    To enable a stage-level scheduling strategy, we introduce a
+                                                                                                                    Request Processor that preprocess incoming requests. The
+4                 D ESIGN AND I MPLEMENTATION                                                                       Request Processor first performs tokenization and image pro-
+                                                                                                                    cessing before passing the requests to the Stage Processor,
+As illustrated in Figure 7, we present TriInfer to address
+                                                                                                                    which then transforms it into a sequence of tasks (encode,
+the aforementioned challenges with its core component, Hy-
+                                                                                                                    prefill, decode, or migrate) and proactively prepares con-
+brid EPD Disaggregation (§ 4.4), which dynamically selects
+                                                                                                                    trol parameters for these tasks. Finally, these tasks are dis-
+the optimal disaggregation method and instance configura-
+                                                                                                                    patched to the Batch Scheduler for intra-instance scheduling.
+tions. The system receives client requests via the API Server,
+                                                                                                                    This design is motivated by the following considerations:
+which forwards them to the Request Scheduler. Based on
+                                                                                                                    By offloading part of the request scheduling computation to
+request types, the scheduler performs load balancing and
+                                                                                                                    the Request Processor ahead of time, we reduce the CPU
+dispatches them to the corresponding Encode or Prefill in-
+                                                                                                                    overhead during subsequent autoregressive inference. This
+stances. Each type of instance loads specific model on de-
+                                                                                                                    preprocessing can be parallelized, mitigating the bottleneck
+mand and allocates its own cache space accordingly. Within
+                                                                                                                    caused by CPU-intensive tasks (e.g., generating control pa-
+each instance, a Batch Scheduler (§ 4.2) aggregates requests
+                                                                                                                    rameters for inference) and I/O-intensive operations (e.g.,
+to improve processing parallel efficiency, while the Migrate
+                                                                                                                    image processing). Additionally, this architecture enhances
+Scheduler (§ 4.3) manages request migration between in-
+                                                                                                                    system extensibility, allowing for the easy integration of
+stances to achieve dynamic load balancing. Additionally, the
+                                                                                                                    additional stages and token pruning optimizations.
+Request Processor (§ 4.1) handles preprocessing of newly
+received requests.
+                                                                                                                    4.2   Batch Scheduler
+                            TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+  TPOT&TBT SLO Target                      Historical Trace
+
+ ④ Hybrid EPD Disaggregation                          Requests                                                           Request Scheduler
+                                                                              API Server
+            Profiler
+                                                                            Multi-Modal Requests                                       Text Requests
+  Profile Disaggregation Methods
+  and Instance Number                                              Encode Instance                                      Prefill Instance                                 Decode Instance
+                                                                                                                            Language                                          Language
+            +                                                          Vision Model                                                                                            Model
+    ED          P                                                                                                            Model
+                                                                                                 async transfer                                      async transfer
+                                                                     Image Cache                                  KV Cache             Image Cache                            KV Cache
+    EP      +   D
+                                                       Request           Batch             Migrate            Request        Batch          Migrate                     Batch              Migrate
+                                                      Processor        Scheduler          Scheduler          Processor     Scheduler       Scheduler                  Scheduler           Scheduler
+     E      +   P       +     D
+
+
+① Request Processor                                              ② Batch Scheduler                                                        ③ Migrate Scheduler
+                  Multi-Modal Requests                                                         Profile Token Budget                                                       Source        a: send block table
+                                                                                               Profile Image Budget                                                       Instance      b: request to pull cache
+            Tokenizer                                                                                                                                                                   c: async transfer cache
+                                                                                                                                             a       b      c   d
+                                                                                                                                                                                        d: notify to free cache
+                                                                                                                                                                          Destination
+         Image Processor                                                                                                                                                  Instance
+
+                                  Encode    Migrate    Prefill   Migrate   Decode   ...                                      Migrate
+         Stage Processor                                                                       Stage-level Scheduling                                    LoadBalancePolicy
+
+                                                                           Figure 7: TriInfer system architecture.
+
+Stage-level Scheduling. We propose a unified scheduling                                                           kernel-level parallelism between the vision model and the
+strategy utilizing a Stage-level batching algorithm, which                                                        language model. Specifically, one vision stream is dedi-
+is designed for different types of instances and operates at                                                      cated to image encoding task, the other language stream
+the stage granularity in an iterative manner, enabling intra-                                                     is allocated for prefill and decode tasks. In sequential ex-
+instance request scheduling. As illustrated in Algorithm 1,                                                       ecution, low compute utilization during the decode stage
+the Stage-level scheduling first sets the image budget for                                                        or low memory utilization during prefill stage results in un-
+vision model and the token budget for language model based                                                        derutilized GPU resources; instead, parallel multi-stream
+on the user-defined SLO. Specifically, for the E, EP, and                                                         execution enhances throughput for both the language model
+P instances, we ensure the TTFT SLOs of the requests by                                                           and the vision model, thereby optimizing GPU resource
+limiting the execution time of each batch to α ∗ T T F Tmax                                                       utilization.
+(line 1-2), where α is a constant. In our scheduling strategy,
+we set it to 0.5, as each request must go through at least                                                        4.3     Migrate Scheduler
+two iterations to output the first token: the first iteration
+completes the image encoding and the second one finalizes                                                         The Migrate Scheduler is responsible for request migration
+the prefill stage. For ED, EPD, D, PD instances, we limit                                                         using a pull-based model to prevent cache overflows at the
+the execution time of each batch to T BTmax to meet the                                                           receiving instance, mitigating issues such as KV cache or
+TBT SLOs (line 3-4). As the excution latency of a batch                                                           image cache exhaustion. The migration process consists of
+generally increases monotonically with the batch size (Fig-                                                       four steps. Firstly, the Migrate Scheduler at the source in-
+ure 3), we use binary search to profile the maximum encode                                                        stance sends the request’s control information, including KV
+batch size (also called image budget) and maximun token                                                           and image cache page tables, to the target instance, which en-
+batch size (also called token budget) during system initial-                                                      queues the request at the head of Qwaiting . Secondly, when
+ization (line 5). This design ensures the maximization of                                                         the request is scheduled, the target instance creates new
+system throughput while adhering to the TTFT and TBT                                                              page tables and requests the cache blocks from the source.
+SLOs defined by user requirements. As shown in Figure 4,                                                          Thirdly, the source instance asynchronously transfers the
+after system initialization, each iteration first includes all                                                    KV and image caches to the target instance. Finally, after
+ongoing decode requests into the current batch (line 7-9).                                                        the migration is complete, the target instance notifies the
+Then, we check if there are any partially computed chunked                                                        source instance to release the resources associated with the
+prefill tasks or encode tasks and include them in the batch                                                       request. Additionally, the Migrate Scheduler manages load
+if available (line 10-16). Finally, new requests are added to                                                     balancing across multiple target instances by employing a
+fill τt and τe , in order to maximize throughput (line 17-24).                                                    default round-robin strategy, which also supports customiz-
+                                                                                                                  able options such as random selection, least-load priority,
+Dual-stream Parallelism. Inspired by NanoFlow (Zhu                                                                and prioritization of instances with higher prefix cache hit
+et al., 2024), we employ dual CUDA streams to achieve                                                             rates.
+                  TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+Algorithm 2 Hybrid EPD Disaggregation Profiler.                   batch under full load, it then estimates the throughput (to-
+Input: Historical trace H and its number of requestsNr ,          kens per second) of E, P, and D instances to calculate the
+    number of instances N , GPU memory capacity C,                execution time required for these workloads. Specificallly,
+    model weight memory cost Cmodel , TTFT SLO                    we first binary search the image budget and token budget
+    T T F Tmax , TBT SLO T BTmax                                  for different instances based on the SLOs of TTFT and TBT
+Output: a mapping from instance type to number S.                 (line 6-8), where α and β are empirical parameters set to
+ 1: Initialize workload We ← 0,Wp ← 0,Wd ← 0                      0.5. Using historical trace, we then estimate the cache re-
+ 2: for each request R in H do                                    quired for each request to calculate the maximum number of
+ 3:    We ← We + get visual token number(R)                       concurrent requests that can be executed in the D instance
+ 4:    Wp ← Wp + get prompt and visual token number(R)            (line 9), with memory utilization used for cache γ set to 0.9.
+ 5:    Wd ← Wd + get decode token number(R)                       The minimum value of the token budge and the maximum
+ 6: τe ← search image budget(α ∗ T T F Tmax )                     number of concurrent requests determines the maximum
+ 7: τp ← search token budget(β ∗ T T F Tmax )                     batch size per iteration under full load (line 10). Next, we
+ 8: τd ← search token budget(T BTmax )                            obtain the throughput under full load for different instances
+ 9: τd ← min(τd , γ ∗
+                         (C−Cmodel )∗Nr
+                                        )                         through profiling (line 11). We then partition the entire clus-
+                              Wp +Wd
+                                                                  ter based on the ratio of the three execution times, rounding
+10: tpe , tpp , tpd ← profile throughput(τe , τp , τd )
+                       Wp          Wd                             the values to ensure that there is at least one instance is
+11: te ← W  tpe ; tp ← tpp ; td ← tpd
+               e
+                                                                  allocated for each stage(line 12). Finally, we test these three
+12: Ne , Np , Nd ← partition(N, te , tp , td )                    disaggregation methods by replaying the historical request
+13: Initialize best goodput ← 0                                   trace, measuring the goodput, and determining the optimal
+14: Let E P D ← {“E” : Ne , “P ” : Np , “D” : Nd }                disaggregation method (line 13-22).
+15: Let EP D ← {“EP ” : Ne + Np , “D” : Nd }
+                                                                                                                     1
+16: Let ED P ← {“ED” : Ne + Nd , “P ” : Np }                      Complexity. Since both EP+D and ED+P have CN         −1 com-
+                                                                                                      2
+17: for each method in {E P D, EP D, ED P } do                    bination ways, and E+P+D has CN −1 combination ways,
+18:    start inference server(method)                             the total search space for our heuristic search algorithm is
+                                                                               1         2
+19:    goodput ← replay trace(H)                                  given by 2CN   −1 + CN −1 , where N is the total number of
+20:    if goodput > best goodput then                             instances. In comparison to brute force search, our heuristic
+21:        best goodput ← goodput                                 search is theoretically 2C 1 3+C 2    times faster. In actual
+                                                                                            N −1   N −1
+22:        best method ← method                                   measurements, the time required to estimate throughput is
+23: Return best method                                            approximately one minute. Since we can reuse the profiling
+                                                                  results during system startup from the batch scheduler, this
+4.4   Hybrid EPD Disaggregation                                   time is negligible. For request replay, we only sample re-
+To achieve an efficient disaggregated inference system, we        quests for a few minutes, so the total execution time of the
+design a hybrid EPD disaggregation architecture, as illus-        algorithm is approximately serveral minutes.
+trated in Figure 7. Built on a general-purpose inference en-      Redeploy. The disaggregation method and number of in-
+gine, the system flexibly generates specialized instances (E,     stances are fine-tuned for a particular workload pattern.
+P, D, EP, ED) by configuring parameters such as the number        However, this setup may become inefficient if the workload
+of KV cache blocks and image cache blocks. Each instance          evolves over time. To address this, TriInfer performs
+internally adopts a unified task batching and scheduling          periodic adjustments. We regularly analyze historical re-
+strategy, as detailed in Algorithm 1.                             quest traces, and whenever a noticeable shift in the workload
+At the deployment level, instances are composed into dif-         pattern is detected, TriInfer triggers a rerun of the algo-
+ferent disaggregation methods based on task functionalities,      rithm using the latest trace. This process is highly efficient,
+such as EP+D, ED+P, and E+P+D, to support diverse                 with the algorithm completing in several minutes and reload-
+inference workflows. Initially, the system runs with the          ing model weights taking only a few minutes—much faster
+default disaggregation method, with general EPD instance,         than the hourly intervals typically observed in real-world
+while collecting a period of request trace that include image     workload fluctuations. We assume that workload charac-
+resolution, prompt length, decode length, and timestamps.         teristics do not change abruptly over very short timescales.
+Under the assumption of a stable workload, we design a            Under sudden and extreme workload shifts, the system may
+heuristic search algorithm (Algorithm 2) to perform work-         temporarily make suboptimal scheduling decisions. How-
+load analysis and request replay on historical data to find the   ever, such behavior is typically short-lived, and its impact
+optimal disaggregation method. The algorithm begins by            remains bounded when the workload shift persists only for
+calculating the total number of tokens for all request stages     a brief duration. We also assume that the total instance
+(line 1-5). By calculating the maximum batch size for each        number is determined by resource constraints. While a
+                                                                  planner-based approach similar to those used in training sys-
+                  TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+tems could be built on top of TriInfer using its per-role                      MME              POPE                     TextCaps                  TextVQA                  VizWiz
+                                                                         1.0                                 1.0                                        1.0
+throughput profiles, we intentionally adopt a lightweight                0.8                                 0.8                                        0.8
+heuristic to avoid the overhead of online global planning in             0.6                                 0.6                                        0.6
+
+
+
+
+                                                                   CDF
+
+
+
+
+                                                                                                       CDF
+
+
+
+
+                                                                                                                                                  CDF
+latency-sensitive inference settings. As future work, we plan            0.4                                 0.4                                        0.4
+to explore mechanisms such as fast role switching among in-              0.2                                 0.2                                        0.2
+                                                                         0.0                                 0.0                                        0.0
+stances and dynamic scaling of instance counts, enabling the                   104 105 106 107                     103        2 × 103   3 × 103                 101   102      103
+system to adapt more quickly to abrupt workload changes.                             # Pixels                        # Input Tokens                           # Output Tokens
+
+Stage-Centric Abstraction and Generality. TriInfer                 Figure 8: The workload of the LLaVA-NeXT-7B model
+introduces a stage-centric abstraction for multimodal in-          across different datasets.
+ference, in which encode, prefill, and decode are treated
+                                                                   (non-disaggregated) configurations. In addition, we include
+as first-class stages with heterogeneous resource and SLO
+                                                                   EPDServe (Singh et al., 2025) and DistServe (Zhong et al.,
+characteristics. By decoupling stage semantics from fixed
+                                                                   2024) as baselines that explicitly adopt disaggregated archi-
+instance roles, this abstraction provides a flexible foundation
+                                                                   tectures.
+for organizing and scheduling inference pipelines. Impor-
+tantly, the abstraction is inherently general: it is not limited   Models. We test various models to demonstrate the gen-
+to image–text MLLMs or a fixed three-stage pipeline, and           eralization ability of our system. Specifically, we evaluate
+can naturally accommodate additional stages such as video          LLaVA-1.5-7B (Liu et al., 2023), LLaVA-NeXT-7B (Li
+or audio processing. While our evaluation focuses on im-           et al., 2024), and Qwen2-VL-7B (Bai et al., 2023).
+age–text models, the design of TriInfer generalizes by             The number of tokens generated for the same image varies
+construction to richer and evolving multimodal inference           across these models, which in turn impacts the request load.
+pipelines.                                                         LLaVA-1.5 encodes each image into 576 tokens, while
+                                                                   LLaVA-NeXT and Qwen2-VL employ different methods to
+4.5   Implementation                                               adjust the number of tokens based on the image resolution.
+                                                                   Workloads. We use diverse datasets to encompass var-
+TriInfer is an efficient online inference system for               ious application scenarios: TextCaps (Sidorov et al.,
+MLLMs, comprising approximately 10K lines of Python                2020), POPE (Li et al., 2023b), MME (Fu et al., 2024),
+code and 3K lines of C++ and CUDA code. The frontend               TextVQA (Singh et al., 2019), VizWiz (Gurari et al., 2018).
+and inference engine are implemented in Python, while the          We extract one-tenth of the dataset as historical traces to pro-
+data transmission modules and model computation kernels            file the disaggregation method, and then use the remaining
+are implemented in C++ and CUDA. It adopts a RESTful               data for performance evaluation. To ensure consistent load
+API frontend that connects to multiple parallel inference          across different baselines, we first perform inference on the
+engine instances, compatible with OpenAI-style APIs. We            datasets and record the number of tokens generated during
+build the multi-instance inference system using Ray (Moritz        decoding. For subsequent tests, we set the max tokens pa-
+et al., 2018), where each instance is implemented as a Ray         rameter and the ignore eos parameter to fix the number of
+actor. Data transfer for the image cache and KV cache              output tokens. Different datasets have varying workloads.
+is enabled through CUDA IPC memory handles (Corpora-               The results obtained from LLaVA-NeXT-7B inference are
+tion, 2007) and NCCL (Corporation, 2016). We utilize the           shown in Figure 8. To ensure realistic workload distribution,
+FlashAttention (Dao, 2023) and FlashInfer (Ye et al., 2024)        we adopt the inter-arrival timestamps of requests from the
+kernels to implement page attention (Kwon et al., 2023). Ad-       production inference trace (Qin et al., 2024), scaling the
+ditionally, to facilitate request migration and cache reuse be-    timestamps to achieve different request rates (requests per
+tween requests, we employ a paged management approach              second).
+for image caching like kv cache.                                   Details. The testing environment uses CUDA version 12.4.
+                                                                   The KV cache block size is 16, while image cache block size
+5     E VALUATION                                                  is 576. All models, along with intermediate variables, KV
+                                                                   cache, and image cache, are set to fp16 precision. vLLM
+5.1   Experiments Setup                                            runs in eager mode. All inference engines employ the same
+Cluster Testbed. We deploy TriInfer on 4 servers, each             chat template. Since different systems adopt prefix cache
+equipped with 8 NVIDIA H20 GPUs (141 GB), 2×200Gbps                and CUDA Graph optimizations in different ways, which
+InfiniBand NICs, connected with NVLink, 96-CPU cores,              may obscure the benefits of our approach, we disable prefix
+and 2TB of RAM.                                                    cache and CUDA Graph to ensure fairness in the experimen-
+Baselines. We use vLLM (version 0.11.0) (Kwon et al.,              tal evaluation. Due to differences in the models supported
+2023) and SGLang (version 0.5.3) (Zheng et al., 2024)              by existing open-source implementations, it is non-trivial
+as high-performance serving baselines in their standard            to directly evaluate EPDServe and DistServe under a uni-
+                                TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+                                                        ours           vLLM             SGLang                         DistServe             EPDServe
+
+                 100                             100                             100                                      100                                    100
+SLO Attainment
+ Qwen2-VL-7B
+
+
+
+                  80                              80                              80                                       80                                     80
+                  60                              60                              60                                       60                                     60
+                  40                              40                              40                                       40                                     40
+                  20                              20                              20                                       20                                     20
+                   0   2    4    6    8       10   0   2    4    6    8       10   0   1    2     3        4            5   0      2     4       6   8        10   0   1    2    3    4       5
+                 100                             100                             100                                      100                                    100
+SLO Attainment
+ LLaVA-1.5-7B
+
+
+
+
+                  80                              80                              80                                       80                                     80
+                  60                              60                              60                                       60                                     60
+                  40                              40                              40                                       40                                     40
+                  20                              20                              20                                       20                                     20
+                   0   4    6    8    10      12   0   4    6    8    10      12   0   4    6     8       10           12   0      4     6       8   10       12   0   4    6    8    10      12
+                 100                            100                             100                                       100                                   100
+SLO Attainment
+LLaVA-NeXT-7B
+
+
+
+
+                  80                             80                              80                                        80                                    80
+                  60                             60                              60                                        60                                    60
+                  40                             40                              40                                        40                                    40
+                  20                             20                              20                                        20                                    20
+                   0   1    2    3    4       5   0    1    2    3    4       5   0    1    2     3        4            5   0      1     2       3   4        5   0    1    2    3    4       5
+                       Request Rate (req/s)            Request Rate (req/s)            Request Rate (req/s)                        Request Rate (req/s)                Request Rate (req/s)
+                              MME                            POPE                           TextCaps                                    TextVQA                              VizWiz
+                                Figure 9: Comparison of SLO attainment, the Request Rate is the average load per-GPU.
+
+ fied experimental setup. To enable a fair comparison, we                                                              ours                  ours w/o hybrid EPD
+ implement their core disaggregation methods (E+P+D and                                                                                      ours w/o hybrid EPD and sched
+ EP+D, respectively) within our system and use them as
+ baselines.                                                                                                            100
+                                                                                                      SLO Attainment
+
+
+
+                                                                                                                        80
+ 5.2             SLO Attainment Evaluation
+                                                                                                                        60
+ In this section, We compare the SLO attainment of different
+ methods at various request rates across different workloads.                                                           40
+ The SLO settings are detailed in Appendix A. For the vLLM
+                                                                                                                        20
+ and SGLang baselines, we deploy 32 instances with round-
+ robin scheduling. For EPDServe and DistServe, we use                                                                    0         1         2            3        4        5
+ configurations of 4E8P20D and 12EP20D, respectively.                                                                                  Request Rate (req/s)
+ The experimental results are presented in Figure 9. The
+                                                                                                Figure 10: Ablation study of hybrid EPD disaggregation
+ gray dashed line indicates the 90% SLO attainment thresh-
+                                                                                                and batch schedule policy.
+ old, while the vertical dashed line marks the request rate
+ at which each inference system achieves 90% SLO attain-                                        the optimization effect of our scheduling method on TBT.
+ ment, measured as goodput. It is evident that our system                                       Nevertheless, the hybrid disaggregation architecture and
+ consistently achieves significantly higher goodput than the                                    multi-stream parallelism still contribute to some throughput
+ other systems. Specifically, for the Qwen2-VL-7B model,                                        optimization.
+ our system outperforms SGLang by 2.0x to 7.9x in goodput.
+ For the LLaVA-1.5-7B and LLaVA-NeXT-7B models, we                                              5.3       Ablaion Study
+ achieve goodput improvements of 1.3x–3.7x and 1.2x-2.1x
+ compared to vLLM, respectively. This performance gain is                                       To validate the effectiveness of our scheduling strategy (Al-
+ attributed to our Hybrid EPD Disaggregation architecture,                                      gorithm 1) and Hybrid EPD Disaggregation (§ 4.4) in con-
+ which effectively selects appropriate disaggregation meth-                                     trolling TBT and improving the SLO achievement rates, we
+ ods and reduces interference between different execution                                       conducte a comparative experiment on the TextCaps dataset
+ stages, thereby lowering TBT for requests and increasing                                       using the LLaVA-Next-7B model. As shown in Figure 10,
+ the SLO attainment rate. However, the improvement is                                           we first disable the Hybrid EPD Disaggregation method and
+ smallest for the MME dataset, as the requests in this dataset                                  use a E+P+D disaggregation architecture with the cluster
+ require a minimal number of tokens to be output, limiting                                      instances evenly partitioned into three parts. In this configu-
+                  TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+Table 3: Average Rank of Heuristic-Selected Deployment                                           Encode Queuing      EP Migration         Prefill Execution       Decode Queuing
+                                                                                                 Encode Execution    Prefill Queuing      PD Migration            Decode Execution
+Strategies                                                                                3.50                                                  1.0
+
+
+
+
+                                                                  Latency Breakdown (s)
+                                                                                          0.50
+                                                                                          0.40                                                  0.8
+                     Qwen2      LLaVA        LLaVA                                        0.35
+       Dataset                                                                            0.30                                                  0.6
+
+
+
+
+                                                                                                                                          CDF
+                     VL-7B      1.5-7B      NeXT-7B                                       0.25
+                                                                                          0.20                                                  0.4
+       MME             1.70       1.42         1.64                                       0.15
+                                                                                          0.10                                                  0.2
+       POPE            1.82       1.31         1.68                                       0.05                                                  0.0
+                                                                                          0.00
+       TextCaps        1.42       1.53         1.77                                                 1 2 3 4 5 6 7 8 9 10 11 12                        0 5 10 15 20 25 30 35 40
+                                                                                                           Per-GPU Rate (req/s)                               Latency (ms)
+       TextVQA         1.98       1.43         1.64
+       VizWiz          1.62       1.32         1.78                   Figure 11: Latency breakdown when serving llava1.5-7B
+                                                                      on textcaps dataset.
+ration, we observed a drop in goodput from 3.9 to 2.6 req/s,
+highlighting that an appropriately selected disaggregation           Table 4: SLO Violations and Migration Latency under Dif-
+strategy can significantly improve resource utilization and          ferent Settings
+SLO satisfaction. Subsequently, we disable the stage-level
+                                                                                                                                       1E3P4D                 4E12P16D
+scheduling policy. This further reduction in goodput, from
+2.6 to 2.2 req/s, demonstrates that our stage-level scheduling                               Req. Rate (req/s)                     16 / 80                  64 / 320
+strategy effectively limits the execution time of each batch,                                TTFT Violation                       0% / 0%                   0% / 0%
+leading to tighter adherence to TBT.                                                         EP Mig. P95 (ms)                     1.2 / 1.8                 2.6 / 4.2
+                                                                                             TBT Violation                      0.1% / 0.1%               0.4% / 0.9%
+5.4   Optimality Analysis                                                                    PD Mig. P95 (ms)                     6.4 / 7.6                8.4 / 14.4
+
+Providing formal optimality guarantees for our heuristic al-          istics of the scheduling problem rather than overfitting to
+gorithm 2 is challenging due to the combinatorial nature of           specific SLO values.
+the search space. The problem jointly considers disaggrega-
+tion methods and instance ratios, whose combinations grow             5.5                        Latency Breakdown
+quadratically with instance number. As a result, exhaustive
+enumeration becomes infeasible in large-scale clusters, and         To better understand the performance characteristics of
+the global optimum is generally unknown. Instead of pur-            TriInfer and identify potential system bottlenecks, we
+suing analytical optimality proofs, we focus on empirically         conduct a detailed latency breakdown analysis of service re-
+evaluating how close our heuristic comes to the optimal             quests. We divide the lifecycle of each request into multiple
+solution in settings where exhaustive search is tractable. We       stages: encode queueing, encode execution, EP migration,
+perform an exhaustive search on small-scale clusters where          prefill queueing, prefill execution, PD migration, decode
+the global optimum can be explicityly computed. Specifi-            queueing, and decode execution. We measure the average
+cally we consider a cluster with 8 instances. We enumerate          latency for each stage using the LLaVA-1.5-7B model on
+all candidate deployment strategies by combining differ-            the TextCaps dataset with a 1E3P4D disaggregation config-
+ent disaggregation methods and instance ratios, resulting in        uration. The latency distribution across stages is shown in
+35 deployment strategies in total. For each model-dataset           Figure 11, indicating that the majority of the request latency
+pair and each SLO setting(like figure 6), we evaluate all           is concentrated in the decode stage, followed by the prefill
+strategies and rank them according to the goodput. The              and encode stages. The overhead introduced by image cache
+deployment strategy selected by our heuristic algorithm 2 is        and KV cache migration is minimal, accounting for less than
+then compared against the exhaustive ranking. This allows           1% of the total latency. Specifically, 95% of image cache
+us to quantify how well the heuristic performs relative to          migration complete within 2ms, and 95% of KV cache mi-
+the optimal solution and other candidate strategies.                gration complete within 8ms — both typically shorter than
+                                                                    the execution time of a single decode batch. Therefore, their
+Table 3 reports the average rank of the deployment strate-
+                                                                    impact on TBT can be considered negligible.
+gies selected by our heuristic across different models and
+datasets. We observe that the heuristic consistently iden-           We also conduct a detailed latency breakdown analysis of
+tifies high-quality solutions, with the selected strategies          migration overhead under various conditions, as summa-
+ranking near the top among all candidates. Notably, the              rized in Table 4. We first clarify that migration events in
+high-ranking performance is not incidental. Across differ-           TriInfer are inherently infrequent and tightly bounded:
+ent SLO settings, the disaggregation methods and instance            for each multimodal request, at most one EP migration and
+ratios selected by the heuristic remain well-balanced and            one PD migration can occur. The two types of migrations
+closely aligned with stage-level workload demands. This              affect different latency metrics. EP migration only impacts
+indicates that the heuristic captures the structural character-      the TTFT, while PD migration affects only the TBT of the
+                                           TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+
+                            120         vision model (encode)                                        et al., 2025) proposed EPD disaggregation to optimize re-
+                                        language model (decode)
+Throughput (iterations/s)
+                                                                                                     source allocation. Qiu et al. (Qiu et al., 2025) conducted
+                            100                                                                      a comprehensive performance analysis of MLLM serving
+    Overall Per-GPU
+
+
+
+                             80                                                                      characteristics and proposed a decoupled architecture con-
+                             60                                                                      cept with separate Image Nodes and Text Nodes. Zhonget
+                             40                                                                      al. (Guo et al., 2025) utilizes EPD disaggregation and or-
+                                                                                                     chestrates both intra- and inter-reauest pipelines to minimize
+                             20
+                                                                                                     latency and optimize paralelism. However, these works only
+                              0                                                                      consider the methods where the vision model and language
+                                    ial s)            ial s)            ial s)            ial s)
+                              q uent el (our   q u ent el (our   q u ent el (our   q u ent el (our   model are either disaggregated or co-located but executed
+                            Se Parall        Se Parall         Se Parall         Se Parall
+                                                                                                     sequentially, overlooking the potential GPU efficiency gains
+                                  encode bs=4 encode bs=4 encode bs=4 encode bs=2                    from co-locating and executing them in multi-stream par-
+                                  decode bs=8 decode bs=32 decode bs=256 decode bs=32
+                                                                                                     allel. We comprehensively assess both decoupled and co-
+Figure 12: Overall per-GPU throughput when executing                                                 located multi-stream parallel strategies to identify the opti-
+LLaVA-1.5-7B’s vision model (encode) and language model                                              mal model disaggregation method, including designs within
+(decode) sequential or parallel under different batch size.                                          the subset of E+P+D disaggregation methods. Our findings
+The KV cache length of decode is 1024.                                                               indicate that these approaches are not optimal in many sce-
+                                                                                                     narios. Notably, we did not directly evaluate these specific
+first decoded token and does not influence steady-state de-                                          methods, as they are not open-sourced or implemented. On
+coding throughput. In multi-node deployments, intra-node                                             the other hand, works like Inf-MLLM (Ning et al., 2024)
+transfers leverage NVLink, for which our experiments show                                            and Elastic Cache (Liu et al., 2024) reduce computational
+migration latency to be negligible. For inter-node commu-                                            overhead or memory footprint through KV cache approxi-
+nication, we use InfiniBand, and our deployment strategy                                             mate reuse or pruning. These model-level approaches trade
+preferentially colocates different instance roles within the                                         off model performance to reduce performance overhead,
+same node whenever possible, thereby minimizing cross-                                               which is orthogonal to our system-level and scheduling-
+node migrations. When inter-node migration is unavoidable,                                           level optimizations that unchanged model performance. The
+the system prioritizes placing EP migrations across nodes, as                                        widely used SOTA LLM inference frameworks, including
+image cache sizes are significantly smaller than KV caches.                                          SGLang (Zheng et al., 2024), vLLM (Kwon et al., 2023),
+As shown in Table 4, across different cluster scales and                                             TGI (Face, 2023) and xLLM (Liu et al., 2025), also extended
+workload settings, the SLO violations caused by migration                                            themselves to support MLLM model inference. However,
+remain negligible.                                                                                   all of them mix Encode, Prefill, and Decode within the same
+                                                                                                     instances, leading to potential interference among the three
+5.6                         Dual-stream Parallelism                                                  stages, which can impact SLO guarantees adversely. Very
+In this section, we investigate the impact of dual-stream par-                                       recently, Cornserve (Ma et al., 2025) and vLLM-Omni (Yin
+allelism on throughput during encode and decode stages us-                                           et al., 2026) propose general-purpose serving systems for
+ing LLaVA-1.5-7B. As shown in Figure 12, the dual-stream                                             any-to-any multimodal models, representing model architec-
+parallelism significantly improves throughput of both the                                            tures as heterogeneous computation graphs and executing
+vision model and the language model compared to sequen-                                              them in a disaggregated manner.
+tial execution across various batch sizes. This improvement                                          LLM scheduling optimization. Numerous works have ex-
+arises from the simultaneous processing of the encode and                                            plored optimizations for LLM scheduling. Early works (Yu
+decode stages in separate CUDA streams, which optimizes                                              et al., 2022; Kwon et al., 2023) proposed continuous batch-
+resource utilization and minimizes idle time. In contrast,                                           ing to improve GPU utilization. However, the co-located
+the Sequential executes the stages in a round-robin manner,                                          sequential execution of prefill and decode stages create a
+with each stage taking 50% share of the execution time.                                              trade-off between TTFT and TBT. Sarathi-Serve introduced
+This approach inherently limits throughput, as it forces the                                         chunked-prefill (Agrawal et al., 2024), attempting to bal-
+system to wait for one stage to complete before starting the                                         ance TTFT and TBT by splitting long prefill stages into
+next, leading to increased idle periods and reduced overall                                          chunks and interleaving them with decode tasks. Nonethe-
+efficiency.                                                                                          less, this approach inherently sacrifices TTFT for TBT with-
+                                                                                                     out fundamentally eliminating prefill-decode interference.
+6                           R ELATED W ORK                                                           DistServe (Zhong et al., 2024) proposed a decoupled archi-
+                                                                                                     tecture that isolates prefill and decode stages on separate
+MLLM serving systems. Several works have focused on                                                  GPUs to avoid interference entirely, but introduces chal-
+optimizing MLLM serving systems. Singh et al. (Singh                                                 lenges of reduced GPU utilization and KV cache transfer
+                 TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+overhead. While these works are not directly applicable           modal models understand arbitrary visual prompts, 2024.
+to MLLM inference, their decoupling philosophy inspired           URL https://arxiv.org/abs/2312.00784.
+subsequent multimodal research. Concurrently, works on
+KV cache reuse (Qin et al., 2024; Hu et al., 2024a), KV         Chen, L., Zhao, H., Liu, T., Bai, S., Lin, J., Zhou, C., and
+cache migration optimization (Patel et al., 2024; Jin et al.,     Chang, B. An image is worth 1/2 tokens after layer
+2024), and placement dynamic adjustment (Hu et al., 2024b;        2: Plug-and-play inference acceleration for large vision-
+Patel et al., 2024) are orthogonal to our approach.               language models, 2024. URL https://arxiv.org/
+                                                                  abs/2403.06764.
+7   C ONCLUSION                                                 Corporation, N.    Memory Management, 2007.
+                                                                  URL        https://docs.nvidia.com/cuda/
+This paper proposes TriInfer, an efficient system archi-
+                                                                  cuda-runtime-api/index.html.
+tecture for multimodal large model inference tasks. To ad-
+dress issues such as coupling during image-text processing      Corporation, N. NVIDIA Collective Communications Li-
+and inflexible scheduling in existing systems, TriInfer           brary (NCCL), 2016. URL https://developer.
+introduces the Hybrid Encode-Prefill-Decode Disaggrega-           nvidia.com/nccl.
+tion design, enabling efficient scheduling and utilization
+of resources across different stages. TriInfer supports         Dao, T. Flashattention-2: Faster attention with better par-
+stage-level batch processing and parallel execution mech-         allelism and work partitioning, 2023. URL https:
+anisms, improving the system’s throughput. Experimental          //arxiv.org/abs/2307.08691.
+results demonstrate that the system can effectively handle
+diverse multimodal inference workloads while ensuring ser-      Face,    H.      Text  generation  inference.
+vice quality, showcasing strong generality and performance        https://github.com/huggingface/
+advantages.                                                       text-generation-inference, 2023. Accessed:
+                                                                  2025-05-04.
+8   ACKNOWLEDGEMENTS                                            Fu, C., Chen, P., Shen, Y., Qin, Y., Zhang, M., Lin, X.,
+                                                                  Yang, J., Zheng, X., Li, K., Sun, X., Wu, Y., and Ji,
+We sincerely thank our shepherd and the anonymous re-
+                                                                  R. Mme: A comprehensive evaluation benchmark for
+viewers for their valuable feedback. This work is sup-
+                                                                  multimodal large language models, 2024. URL https:
+ported by the National Natural Science Foundation of China
+                                                                  //arxiv.org/abs/2306.13394.
+(62322201). This research is carried out in collaboration
+with USTC-CloudLab (Cloud Computing Laboratory, Uni-            Guo, T., Xu, T., Chen, X., Chen, J., Xiao, N., and Zhang,
+versity of Science and Technology of China) and Beihang-         X. Rserve: Overlapping encoding and prefill for efficient
+HiPO (HiPO Research Group, Beihang University), and               lmm inference, 2025. URL https://arxiv.org/
+JD.com. Hailong Yang, Ke Zhang, and Jing Li are corre-            abs/2509.24381.
+sponding authors.
+                                                                Gurari, D., Li, Q., Stangl, A. J., Guo, A., Lin, C., Grauman,
+R EFERENCES                                                       K., Luo, J., and Bigham, J. P. Vizwiz grand challenge: An-
+                                                                  swering visual questions from blind people, 2018. URL
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N.,        https://arxiv.org/abs/1802.08218.
+  Gulavani, B. S., Tumanov, A., and Ramjee, R. Taming
+  throughput-latency tradeoff in llm inference with sarathi-    Hu, C., Huang, H., Hu, J., Xu, J., Chen, X., Xie, T., Wang,
+  serve, 2024.                                                    C., Wang, S., Bao, Y., Sun, N., et al. Memserve: Con-
+                                                                  text caching for disaggregated llm serving with elastic
+Bai, J., Bai, S., Yang, S., Wang, S., Tan, S., Wang, P.,          memory pool. arXiv preprint arXiv:2406.17565, 2024a.
+  Lin, J., Zhou, C., and Zhou, J. Qwen-vl: A versa-
+  tile vision-language model for understanding, localiza-       Hu, C., Huang, H., Xu, L., Chen, X., Xu, J., Chen, S.,
+  tion, text reading, and beyond, 2023. URL https:                Feng, H., Wang, C., Wang, S., Bao, Y., Sun, N., and
+  //arxiv.org/abs/2308.12966.                                     Shan, Y. Inference without interference: Disaggregate
+                                                                  llm inference for mixed downstream workloads, 2024b.
+Bai, S., Chen, K., Liu, X., Wang, J., Ge, W., Song, S., Dang,     URL https://arxiv.org/abs/2401.11181.
+  K., Wang, P., Wang, S., Tang, J., et al. Qwen2. 5-vl
+  technical report. arXiv preprint arXiv:2502.13923, 2025.      Hu, S., Tu, Y., Han, X., He, C., Cui, G., Long, X., Zheng, Z.,
+                                                                  Fang, Y., Huang, Y., Zhao, W., et al. Minicpm: Unveiling
+Cai, M., Liu, H., Park, D., Mustikovela, S. K., Meyer, G. P.,     the potential of small language models with scalable train-
+  Chai, Y., and Lee, Y. J. Vip-llava: Making large multi-         ing strategies. arXiv preprint arXiv:2404.06395, 2024c.
+                  TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+Jin, Y., Wang, T., Lin, H., Song, M., Li, P., Ma, Y., Shan, Y.,   Moritz, P., Nishihara, R., Wang, S., Tumanov, A., Liaw, R.,
+   Yuan, Z., Li, C., Sun, Y., et al. P/d-serve: Serving disag-     Liang, E., Elibol, M., Yang, Z., Paul, W., Jordan, M. I.,
+   gregated large language model at scale. arXiv preprint          and Stoica, I. Ray: A distributed framework for emerging
+   arXiv:2408.08147, 2024.                                         ai applications, 2018. URL https://arxiv.org/
+                                                                   abs/1712.05889.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+ C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Ef-            Ning, Z., Zhao, J., Jin, Q., Ding, W., and Guo, M.
+ ficient memory management for large language model                 Inf-mllm: Efficient streaming inference of multimodal
+ serving with pagedattention, 2023. URL https://                    large language models on a single gpu. arXiv preprint
+ arxiv.org/abs/2309.06180.                                          arXiv:2409.09086, 2024.
+
+Li, F., Zhang, R., Zhang, H., Zhang, Y., Li, B., Li, W.,          Patel, P., Choukse, E., Zhang, C., Shah, A., Íñigo Goiri,
+  Ma, Z., and Li, C. Llava-next-interleave: Tackling multi-         Maleki, S., and Bianchini, R. Splitwise: Efficient gen-
+  image, video, and 3d in large multimodal models, 2024.            erative llm inference using phase splitting, 2024. URL
+  URL https://arxiv.org/abs/2407.07895.                             https://arxiv.org/abs/2311.18677.
+                                                                  Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng,
+Li, J., Li, D., Savarese, S., and Hoi, S. Blip-2: Bootstrapping
+                                                                    W., and Xu, X. Mooncake: A kvcache-centric disag-
+   language-image pre-training with frozen image encoders
+                                                                    gregated architecture for llm serving. arXiv preprint
+   and large language models, 2023a. URL https://
+                                                                    arXiv:2407.00079, 2024.
+   arxiv.org/abs/2301.12597.
+                                                                  Qiu, H., Biswas, A., Zhao, Z., Mohan, J., Khare, A.,
+Li, Y., Du, Y., Zhou, K., Wang, J., Zhao, W. X., and Wen,           Choukse, E., Goiri, Í., Zhang, Z., Shen, H., Bansal, C.,
+  J.-R. Evaluating object hallucination in large vision-            et al. Towards efficient large multimodal model serving.
+  language models, 2023b. URL https://arxiv.                        arXiv preprint arXiv:2502.00937, 2025.
+  org/abs/2305.10355.
+                                                                  Sidorov, O., Hu, R., Rohrbach, M., and Singh, A. Textcaps:
+Liu, H., Li, C., Wu, Q., and Lee, Y. J. Visual instruction tun-     a dataset for image captioning with reading comprehen-
+  ing, 2023. URL https://arxiv.org/abs/2304.                        sion, 2020. URL https://arxiv.org/abs/2003.
+  08485.                                                            12462.
+
+Liu, T., Peng, T., Yang, P., Zhao, X., Lu, X., Huang, W., Liu,    Singh, A., Natarajan, V., Shah, M., Jiang, Y., Chen, X.,
+  Z., Chen, X., Liang, Z., Xiong, J., Jin, D., Zhang, M.,           Batra, D., Parikh, D., and Rohrbach, M. Towards vqa
+  Guo, J., Deng, Y., Zhang, X., Dong, X., Wang, S., Wu, S.,         models that can read, 2019. URL https://arxiv.
+  Wu, Y., Tang, Z., Zeng, Y., Wang, Y., Liu, J., Kang, M., Li,      org/abs/1904.08920.
+  M., Wang, Y., Liu, Y., Ma, X., Wang, Y., Zhang, Y., Yin,
+                                                                  Singh, G., Wang, X., Hu, Y., Yu, T., Xing, L., Jiang, W.,
+  J., Zheng, K., Yin, J., Zhang, J., Wang, Z., Lin, X., Liu,
+                                                                    Wang, Z., Bai, X., Li, Y., Xiong, Y., Zhang, Y., and Fan,
+  L., Lan, L., Liu, Y., Peng, C., Liu, H., Ren, S., Wang, X.,
+                                                                    Z. Efficiently serving large multimodal models using epd
+  Shen, Y., Wang, Y., Liu, G., Chen, H., Yang, T., Yang, H.,
+                                                                    disaggregation, 2025. URL https://arxiv.org/
+  Li, J., Ding, G., and Zhang, K. xllm technical report, 2025.
+                                                                    abs/2501.05460.
+  URL https://arxiv.org/abs/2510.14686.
+                                                                  Team, G., Anil, R., Borgeaud, S., Alayrac, J.-B., Yu, J., Sori-
+Liu, Z., Liu, B., Wang, J., Dong, Y., Chen, G., Rao,                cut, R., Schalkwyk, J., Dai, A. M., Hauth, A., Millican,
+  Y., Krishna, R., and Lu, J. Efficient inference of vi-            K., et al. Gemini: a family of highly capable multimodal
+  sion instruction-following models with elastic cache. In          models. arXiv preprint arXiv:2312.11805, 2023.
+  European Conference on Computer Vision, pp. 54–69.
+  Springer, 2024.                                                 Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+                                                                    L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+Lu, H., Liu, W., Zhang, B., Wang, B., Dong, K., Liu, B.,            tention is all you need. Advances in neural information
+  Sun, J., Ren, T., Li, Z., Yang, H., et al. Deepseek-vl:           processing systems, 30, 2017.
+  towards real-world vision-language understanding. arXiv
+  preprint arXiv:2403.05525, 2024.                                Wang, P., Bai, S., Tan, S., Wang, S., Fan, Z., Bai, J., Chen,
+                                                                   K., Liu, X., Wang, J., Ge, W., Fan, Y., Dang, K., Du,
+Ma, J. J., Chung, J.-W., Ahn, J., Liang, Y., Jajoo, A., Lee,       M., Ren, X., Men, R., Liu, D., Zhou, C., Zhou, J., and
+ M., and Chowdhury, M. Cornserve: Efficiently serving              Lin, J. Qwen2-vl: Enhancing vision-language model’s
+ any-to-any multimodal models, 2025. URL https://                  perception of the world at any resolution, 2024. URL
+ arxiv.org/abs/2512.14098.                                         https://arxiv.org/abs/2409.12191.
+                  TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+Ye, Z., Chen, L., Lai, R., Zhao, Y., Zheng, S., Shao, J., Hou,
+  B., Jin, H., Zuo, Y., Yin, L., Chen, T., and Ceze, L. Ac-
+  celerating self-attentions for llm serving with flashinfer,
+  February 2024. URL https://flashinfer.ai/
+  2024/02/02/introduce-flashinfer.html.
+Yin, P., Zhu, J., Gao, H., Zheng, C., Huang, Y., Zhou, T.,
+  Yang, R., Liu, W., Chen, W., Guo, C., Deng, D., Mo,
+  Z., Wang, C., Cheng, J., Wang, R., and Liu, H. vllm-
+  omni: Fully disaggregated serving for any-to-any mul-
+  timodal models, 2026. URL https://arxiv.org/
+  abs/2602.02204.
+Yin, S., Fu, C., Zhao, S., Li, K., Sun, X., Xu, T., and
+  Chen, E. A survey on multimodal large language models.
+  National Science Review, 11(12), November 2024. ISSN
+  2053-714X. doi: 10.1093/nsr/nwae403. URL http:
+  //dx.doi.org/10.1093/nsr/nwae403.
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  G. Orca: A distributed serving system for Transformer-
+  Based generative models. In 16th USENIX Sympo-
+  sium on Operating Systems Design and Implementa-
+  tion (OSDI 22), pp. 521–538, Carlsbad, CA, July
+  2022. USENIX Association. ISBN 978-1-939133-28-1.
+  URL https://www.usenix.org/conference/
+  osdi22/presentation/yu.
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+  rett, C., and Sheng, Y. Sglang: Efficient execution
+  of structured language model programs, 2024. URL
+  https://arxiv.org/abs/2312.07104.
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X.,
+  and Zhang, H. Distserve: Disaggregating prefill and de-
+  coding for goodput-optimized large language model serv-
+  ing, 2024. URL https://arxiv.org/abs/2401.
+  09670.
+
+Zhu, D., Chen, J., Shen, X., Li, X., and Elhoseiny, M.
+  Minigpt-4: Enhancing vision-language understanding
+  with advanced large language models, 2023. URL
+  https://arxiv.org/abs/2304.10592.
+
+Zhu, K., Zhao, Y., Zhao, L., Zuo, G., Gu, Y., Xie, D., Gao,
+  Y., Xu, Q., Tang, T., Ye, Z., Kamahori, K., Lin, C.-Y.,
+  Wang, S., Krishnamurthy, A., and Kasikci, B. Nanoflow:
+  Towards optimal large language model serving through-
+  put, 2024. URL https://arxiv.org/abs/2408.
+  12757.
+                 TriInfer: Hybrid Disaggregated Scheduling for Multimodal Large Language Model Serving
+
+A    SLO S ETTINGS                                               and write the outputs, the memory access amount is:
+                                                                    qkvoproj
+                                                                 Mencode      = 4(H 2 + BT H + BT H) = 8BT H + 4H 2
+     Table 5: SLO settings under different workloads.
+                                                                                                                           (2)
+  Model                  Dataset        TTFT (s)      TBT (s)    For the feed forward layer, there are up projection and down
+                                                                 projection, we assume intermediate size is 4H. The arith-
+  LLaVA-1.5-7B           VizWiz                 4        0.08    metic intensity is:
+  LLaVA-1.5-7B           TextVQA                4        0.08
+                                                                          ffn
+  LLaVA-1.5-7B           MME                    4        0.08            Cencode = 2 ∗ BT H ∗ 2 ∗ 4H = 16BT H              (3)
+  LLaVA-1.5-7B           POPE                   4        0.08
+  LLaVA-1.5-7B           TextCaps               4        0.08    The memory access amount is:
+  LLaVA-NeXT-7B          VizWiz                 8        0.60      ffn
+  LLaVA-NeXT-7B          TextVQA                8        0.60    Mencode   = 2(4H 2 + BT H + BT 4H) = 10BT H + 8H 2
+  LLaVA-NeXT-7B          MME                    8        0.60                                                           (4)
+  LLaVA-NeXT-7B          POPE                   8        0.30    The fused attention kernel involves multiplying the query
+  LLaVA-NeXT-7B          TextCaps               8        0.30    with the key and multiplying the value, and we ignore soft-
+  Qwen2-VL-7B            VizWiz                 8        0.60    max. The arithmetic intensity is approximately:
+  Qwen2-VL-7B            TextVQA                8        0.60                                            H
+                                                                   attention
+  Qwen2-VL-7B            MME                    8        0.60     Cencode    = 2 ∗ (B ∗ M ∗ T 2 ∗ 2 ∗      ) = 4BT 2 H (5)
+                                                                                                         M
+  Qwen2-VL-7B            POPE                   8        0.10
+  Qwen2-VL-7B            TextCaps               8        0.10    The reading of the query, key, and value, as well as the read-
+                                                                 ing and writing of the attention scores and output, involve
+                                                                 memory access. The amount is:
+As different models encode the same image into varying
+                                                                               attention
+numbers of tokens, this leads to different prefill and de-                    Mencode    = 4BT H + 2BT 2 M                 (6)
+code workloads, which in turn affect the SLO configura-
+tion. Therefore, we define separate SLO thresholds for each      The prefill stage and decode stage are similar to the encode
+model and dataset, as detailed in Table 5.                       stage, except that the token count is BS and B, respectively.
+                                                                 Additionally, the decode stage needs to read the previous KV
+                                                                 cache. Based on the above calculations, we summarize the
+B    C OMPUTATION AND M EMORY ACCESS                             computational and memory access requirements at different
+     IN MLLM S                                                   stages in Table 2.
+Table 2, shows the symbol definitions. To simplify the           Through this analysis, we can roughly determine whether
+model, we assume that all requests have the same prompt,         an operator is a computational bottleneck or a memory bot-
+and each request corresponds to a single image, with the         tleneck, which in turn guides our scheduling design.
+image having the same token count. Different H, M should
+been applied according to different model (vision or lan-
+guage).
+In modern serving systems (Kwon et al., 2023; Zheng et al.,
+2024), some operations like softmax and layernorm are
+usually fused with matrix multiplication kernels for effi-
+ciency (Dao, 2023; Ye et al., 2024). Therefore, attention and
+matrix multiplication in both feed-forward layers and atten-
+tion layers dominate the overall computation and memory
+access, and our analysis focuses on them.
+For the encode stage, the batch has BT tokens. For QKVO
+projection in the attention layer, each matrix multiplication
+has one multiply and one add operation, so the arithmetic
+intensity is:
+
+         qkvoproj
+        Cencode   = 4 ∗ BT H ∗ 2 ∗ H = 8BT H 2            (1)
+
+Since it is necessary to read the model parameters and inputs,
+

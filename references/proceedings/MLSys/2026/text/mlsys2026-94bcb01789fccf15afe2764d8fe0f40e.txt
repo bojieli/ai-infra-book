@@ -1,0 +1,1132 @@
+F LEXI C ACHE : L EVERAGING T EMPORAL S TABILITY OF ATTENTION H EADS
+                 FOR E FFICIENT KV C ACHE M ANAGEMENT
+
+
+
+                      Nazmul Takbir 1 Hamidreza Alikhani 1 Nikil Dutt 1 Sangeetha Abdu Jyothi 1
+
+
+                                                          A BSTRACT
+        Large Language Model (LLM) serving is increasingly constrained by the growing size of the key-value (KV)
+        cache, which scales with both context length and generation length. Prior work shows that attention is dominated
+        by a small subset of critical tokens, yet existing systems struggle to exploit this efficiently without degrading
+        accuracy, especially in long generation. We make a key observation: the temporal stability of these critical tokens
+        varies significantly across KV heads. Some heads consistently focus on the same tokens, while others shift
+        frequently. Building on this insight, we introduce FlexiCache, a hierarchical KV-cache management system that
+        leverages the temporal stability of KV heads to reduce GPU memory usage and computation overhead, while
+        preserving model accuracy. FlexiCache classifies KV heads as stable or unstable: it retains all KV-cache pages
+        from unstable heads in GPU memory, whereas for stable heads, it keeps only the top-K pages on the GPU and
+        offloads the rest to host memory. By exploiting temporal stability, FlexiCache performs periodic reranking for
+        stable heads to fetch newly promoted top pages. Implemented atop vLLM, FlexiCache reduces GPU memory
+        footprint for long-context requests by up to 70%, improves offline serving throughput by 1.38–1.55×, and lowers
+        online token latency by 1.6–2.1×, all while maintaining accuracy in long-context, long-generation scenarios.
+
+1       I NTRODUCTION                                                prove GPU utilization is to increase batch size (Kwon et al.,
+                                                                     2023). However, large KV caches quickly exhaust GPU
+The rapid adoption of Large Language Models (LLMs) has               memory, limiting the achievable batch size and reducing
+created an urgent need for efficient and scalable serving            overall throughput.
+systems. As use cases grow in complexity, LLMs continue
+to improve at processing longer contexts and generating              Prior work has observed that, at each decoding step, a
+longer outputs. Context lengths of 32k–128k tokens are               small subset of tokens dominates the attention output.
+standard in open-source models (Dubey et al., 2024; Yang             StreamingLLM (Xiao et al., 2023) retains a sliding win-
+et al., 2025a; Jiang et al., 2024a), with the latest state-of-the-   dow of recent tokens and the first few tokens, but this static,
+art systems exceeding million tokens (Comanici et al., 2025;         request-independent strategy degrades accuracy on long-
+Yang et al., 2025b). Meanwhile, tasks such as large-scale            context tasks. SnapKV (Li et al., 2024) and MorphKV
+code synthesis and long-form research writing have pushed            (Ghadia et al., 2025) improve on this by using attention
+generation lengths into the range of several thousand tokens,        scores to identify and discard the KV cache of less impor-
+with recent benchmarks evaluating LLMs on outputs as long            tant tokens in a request-dependent manner. While effective
+as 32k tokens (Wu et al., 2025; Bai et al., 2025).                   for long contexts, they underperform in long generations
+                                                                     because discarded KV cannot be reused even if it later be-
+Serving requests with long contexts introduces significant           comes important. Quest (Tang et al., 2024) mitigates this
+systems challenges, primarily due to the large size of the           by re-selecting top-K KV pages at each step through query-
+key–value (KV) cache. These challenges are further exacer-           aware scoring, reducing attention computation and I/O but
+bated when long contexts are combined with long genera-              not GPU memory use. Finally, LServe (Yang et al., 2025c)
+tions: not only is each request’s KV cache large, but it must        leverages DuoAttention (Xiao et al., 2025) to convert some
+also remain resident in GPU memory for extended periods              heads into streaming heads whose attention is mostly lo-
+and be repeatedly accessed at every decoding step. Since the         cal or Λ-shaped, discarding their KV pages while keeping
+decode phase is memory-bound, a common strategy to im-               full KV for others. This achieves a better balance between
+    1
+     Department of Computer Science, University of California,       efficiency and accuracy, but permanently discarding large
+Irvine. Correspondence to: Nazmul Takbir <ntakbir@uci.edu>.          portions of the KV cache for half of the heads can degrade
+                                                                     accuracy on long-context, long-generation workloads.
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,
+2026. Copyright 2026 by the author(s).                               We make a key observation: KV heads exhibit varying tem-
+             FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+poral stability in their set of top-K KV pages across decode    2     BACKGROUND & M OTIVATION
+steps. We analyze the overlap of top-K KV page sets be-
+tween consecutive decode steps for each head independently      LLMs based on the transformer architecture (Vaswani et al.,
+and observe a distinct pattern: some heads (stable heads)       2017) perform inference in two stages: prefill and decode.
+exhibit high overlap that decays slowly, while others (un-      In the prefill stage, all input tokens are processed in parallel,
+stable heads) show consistently low overlap. Importantly,       and the model produces query (Q), key (K), and value (V)
+these stability patterns are model-intrinsic: a head that is    vectors for each token. The K and V vectors are stored in the
+stable in one task remains stable across other tasks.           KV cache for later use. In the decode stage, the model gen-
+                                                                erates one token at a time, appending a new K/V pair at each
+Leveraging the temporal stability of KV heads, we present       step. The decode stage is memory-bound, and a common
+FlexiCache, a hierarchical KV-cache management system           strategy to increase decode throughput is to use a higher
+for efficient LLM serving. FlexiCache applies sparse atten-     batch size. However, batch size is ultimately constrained
+tion over the top-K KV pages across all heads to reduce         by the GPU memory available to hold all active requests’
+the computational cost of attention during decoding. To         KV caches. Moreover, GPU memory fragmentation further
+minimize GPU memory usage, FlexiCache first performs            limits the effective batch size. PagedAttention (Kwon et al.,
+a one-time offline classification of KV heads as stable or      2023) addresses this by storing KV in fixed-size pages deref-
+unstable. During serving, it retains only the top-K pages       erenced via a block table, which minimizes fragmentation
+from stable heads in GPU memory and offloads the rest           and enables larger batch sizes.
+to host memory. FlexiCache periodically re-ranks the KV
+pages of stable heads, fetching only newly promoted top-K       Since the KV cache grows linearly with context length, a
+pages from host memory, thereby reducing I/O overhead.          large context length not only limits batch size but also in-
+For unstable heads, whose top-K sets change frequently,         creases the compute and I/O overhead of self-attention, as
+all KV pages remain in GPU memory to avoid repeated             each decode step fetches the entire KV cache. Prior work
+host–GPU transfers. By combining sparse attention with          has shown that, at each decoding step, a small subset of
+head-level temporal stability, FlexiCache effectively reduces   KV cache pages dominates attention. Quest (Tang et al.,
+computation, GPU memory footprint, and host–GPU data            2024) introduced a method to identify these subsets inde-
+movement while maintaining high language performance.           pendently for each attention head at each decoding step.
+                                                                While selecting new top-K pages at every step preserves
+We implement FlexiCache atop vLLM and evaluate it across        language-modeling accuracy, it incurs substantial compu-
+a broad suite of long-context, long-generation language         tational overhead and requires the full KV cache to remain
+modeling tasks. We also assess system performance un-           resident on the GPU. To alleviate this cost, LServe(Yang
+der diverse scenarios, including offline serving, online        et al., 2025c) reranked only half of the heads, updating them
+serving, and microbenchmarks targeting key optimizations.       periodically (every four decoding steps). However, this
+FlexiCache achieves 99% of the baseline model’s accuracy        partial reranking strategy can lead to accuracy degradation,
+across tasks while reducing the GPU memory footprint by         particularly in long-generation scenarios, since heads that
+up to 70% for long-context requests and accelerating the        are not reranked may permanently discard KV entries that
+decode kernel by up to 4× in large batched decode settings.     later become relevant.
+These improvements translate into 1.38–1.55× higher end-
+to-end throughput in offline serving and 1.6–2.1× lower         2.1   Temporal Stability in Top-K Selection
+token latency in online serving.
+                                                                We make the key observation that many KV heads exhibit
+In summary, we make the following contributions:                temporal stability in their top-K page selections: the same
+• We identify that KV heads exhibit model-intrinsic tempo-      pages tend to remain among the most attended across consec-
+  ral stability in selecting their top KV pages for attention   utive decoding steps. Moreover, within a given model, the
+  computation.                                                  degree of stability varies systematically across heads—some
+• We develop FlexiCache, an LLM serving system with             remain highly stable, whereas others are persistently unsta-
+  hierarchical KV-cache management that leverages the           ble. In the following analysis, we (i) formalize a quanti-
+  temporal stability of KV heads.                               tative measure of this temporal stability, (ii) identify the
+• We show that FlexiCache, built atop vLLM, reduces GPU         least stable heads for each model and demonstrate that their
+  memory usage by up to 70%, increases offline serving          instability pattern is model-intrinsic and consistent across
+  throughput by up to 1.55×, reduces token latency in on-       tasks, and (iii) leverage these insights to design an efficient
+  line serving by up to 2.1×, and preserves model accuracy      KV-cache management mechanism.
+  in long-context, long-generation settings.
+• The FlexiCache repository is available as open-source at:
+  https://github.com/NazmulTakbir/FlexiCache
+                    FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+                                                            1.0
+         0                                                              Table 1. Cross-task overlap of unstable heads. The values are
+                                                            0.9         the intersection size normalized by the unstable-head set size
+         1
+                                                            0.8         (|Ai ∩ Aj |/64), in Llama-3.1-8B-Instruct. GovReport is from
+         2                                                              LongBench (Bai et al., 2024); the rest from L-Eval (An et al.,
+                                                            0.7         2024).
+Head Index
+
+
+
+
+                                                             Mean RCO
+         3                                                                           Open- Big- Multi- QM- Gov- SP- CU- Summ-
+                                                            0.6         Dataset
+                                                                                     review Patent News Sum Report ACE AD Screen
+         4
+                                                            0.5         Openreview    1.00   0.81   0.78   0.89   0.92   0.83   0.73   0.81
+         5                                                              BigPatent     0.81   1.00   0.72   0.86   0.83   0.75   0.77   0.77
+                                                            0.4         Multi-News    0.78   0.72   1.00   0.80   0.80   0.77   0.78   0.80
+         6                                                              QMSum         0.89   0.86   0.80   1.00   0.92   0.84   0.75   0.86
+                                                            0.3         GovReport     0.92   0.83   0.80   0.92   1.00   0.84   0.80   0.83
+         7                                                              SPACE         0.83   0.75   0.77   0.84   0.84   1.00   0.70   0.91
+             1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16         0.2         CUAD          0.73   0.77   0.78   0.75   0.80   0.70   1.00   0.67
+                  Offset from Reference Decode Step                     SummScreen    0.81   0.77   0.80   0.86   0.83   0.91   0.67   1.00
+
+
+ Figure 1. Temporal stability patterns of KV heads. In the Llama-
+ 3.1-8B-Instruct layer 4, some heads maintain high RCO across           define a temporal stability score for each KV head as:
+ offsets, while others show persistently low values.
+                                                                                                   1     X−1
+                                                                                                       s+W
+                                                                                  T Sℓ,h (s) =               RCOℓ,h (s, t)
+                                                                                                 W − 1 t=s+1
+  2.2        Quantifying Temporal Stability of KV Heads
+  We begin by collecting the set of top-K page indices at                Lower stability values indicate greater variation in a head’s
+  each decode step for samples from several long-context,               attention focus across decoding steps within the window.
+  long-generation tasks in LongBench (Bai et al., 2024) and             Figure 1 illustrates this behavior for the eight KV heads of
+  L-Eval (An et al., 2024). Concretely, for a given sample, we          layer 4 in Llama-3.1-8B-Instruct on the SPACE (hotel review
+  store the data in a tensor of shape [D, L, H, K], where D             summarization) task from L-Eval. For each offset from the
+  denotes the number of decoding steps, L the layer index, H            reference decoding step, we plot the mean RCO averaged
+  the KV-head index within the layer, and K the number of               across all windows and samples. Some heads consistently
+  selected top-K pages. In other words, for each sample and             exhibit low RCO (unstable), while others maintain high
+  each layer–head pair, we record the indices of the top-K              RCO that gradually decays with offset (stable).
+  pages attended to at every decoding step.
+  For layer ℓ, head h, and decoding step s, let Sℓ,h (s) denote         2.3   Identifying Model-Intrinsic Stability Patterns
+  the set of top-K page indices for a particular sample. We             Given the per-window temporal stability scores for every
+  compute the degree of overlap between Sℓ,h (s) and the sub-           KV head, we classify the heads into two categories—stable
+  sequent top-K selections of the same head in the same layer           and unstable—by selecting the least stable 25% of heads
+  within a fixed window of W steps. We set the stability win-           as unstable and the remaining 75% as stable. Concretely,
+  dow size W to match the stable-head reranking interval (see           across all decoding windows within and across all samples,
+  section 3.2). To isolate genuine temporal persistence from            we sort the KV heads by their stability scores and designate
+  overlap due to random chance, we compute the random-                  the most frequent heads in the bottom quartile as unstable,
+  corrected overlap (RCO) between the page selections at                while the remainder are considered stable.
+  step s and step t = s + ∆ (1 ≤ ∆ < W ) as:
+                                                                        We perform the procedure independently on each evaluation
+                                 (s)     (t)                            task, resulting in one set of unstable heads per task for a
+                                                           !
+                               |Sℓ,h ∩ Sℓ,h |/K − K/Nt
+     RCOℓ,h (s, t) = max 0,                                             given model. Each of these sets has the same cardinality
+                                       1 − K/Nt
+                                                                        (25% of the total heads), enabling direct comparison across
+                                                                        tasks. To assess whether head instability is an intrinsic prop-
+   where Nt is the number of candidate pages available at step
+                                                                        erty of the model, we measure pairwise overlap between
+  t. This formulation subtracts the expected overlap under a
+                                                                        the unstable head sets across different tasks for the same
+  hypergeometric random-draw model (K/Nt ) and normal-
+                                                                        model. The resulting cross-task overlap matrix for Llama-
+  izes by the maximum value 1 − K/Nt , which represents the
+                                                                        3.1-8B-Instruct is presented in Table 1. The overlaps are
+  gap between random-chance overlap and perfect overlap. In-
+                                                                        consistently high, with a mean overlap of 0.83 across tasks
+  tuitively, the RCO quantifies how much better the observed
+                                                                        and several pairs reaching close to 0.90, demonstrating that
+  overlap is than random chance. An RCO of 0 indicates
+                                                                        the identity of unstable heads is largely preserved across
+  random-level overlap, and 1 indicates perfect overlap.
+                                                                        tasks. Thus, head instability is a model-intrinsic charac-
+  We aggregate RCO values across all pairs in a window and              teristic: certain heads inherently exhibit volatile KV-page
+              FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+                                    Controller                          GPU Memory                                           Host Memory
+                                                                                                                Full
+                                     FlexiCache                     Model             KV Cache                                 KV Cache
+                                                                                                               Pages
+                                     Scheduler                   Parameters
+                                                                 Block Tables         All KV for                                 All KV for
+                                                                                    Unstable Heads                             Stable Heads
+                                   FlexiCache Block             MinMax Cache         Top-K KV for
+                                       Allocator                                                              Promoted
+                                                                                     Stable Heads
+                                                                Top-K Set Data                                 Pages
+
+                                                KV
+                         Scheduled
+                                              Transfer
+                           Batch
+                                              Metadata
+
+
+                                                      Select Top-K        Sparse Decode                                  KV Transfer
+
+
+
+
+                                                                                                 FFN Layers
+                                        Q
+                          Worker
+
+
+
+
+                                                      Stability Aware                                                    Page Offloader
+                                        K                                   Attention on
+                                                        Reranker            Top-K Pages
+                                                                                                                         Page Reloader
+                                        V
+                                                                                                                x L layers
+
+
+
+Figure 2. FlexiCache system architecture. At the worker, the top-K selector identifies the most relevant KV pages for each head and
+updates them at different frequencies based on head stability. The sparse decode kernel attends only to these selected pages. GPU memory
+stores the full KV cache of unstable heads and only the top-K pages of stable heads, with the rest in host memory. The block allocator
+manages this hierarchical KV layout, while the KV transfer module and scheduler pipeline host–GPU KV transfers with computation.
+
+
+selection behavior across decoding steps. Furthermore, be-                           3.1     FlexiCache System Overview
+cause unstable heads are consistent across tasks, a single
+                                                                                     FlexiCache employs a multi-pronged design to meet its
+offline profiling 1 run per model suffices to identify them
+                                                                                     objectives. Leveraging the temporal stability of critical
+for subsequent online serving. We observe similarly high
+                                                                                     KV-page selection, it first classifies the heads as stable or
+cross-task overlaps for other models (Mistral-7B, Mistral-
+                                                                                     unstable. To reduce computational load (G1), FlexiCache
+Small-24B, and Qwen2.5-32B); detailed in section 4.2.
+                                                                                     employs sparse attention, using only the top-K KV pages
+While stability scores of heads form a continuous spectrum,                          for attention computation across all heads during the decode
+we adopt a binary classification (stable vs. unstable) for                           phase. To improve GPU memory efficiency (G2), it keeps
+system simplicity. In principle, a finer-grained categoriza-                         only the top-K KV pages from stable heads in GPU memory,
+tion (e.g., multiple stability tiers with different reranking                        while retaining all KV pages from unstable heads on the
+intervals or top-K budgets) could further specialize KV                              GPU. The remaining KV pages of stable heads are stored
+management policies. However, such designs introduce                                 in host memory. To minimize host–GPU data transfer (G3),
+additional control complexity in block-table management,                             FlexiCache controls the frequency of re-ranking: unstable
+scheduling, and KV transfers. By restricting the design to                           heads are re-ranked at every step, but since all their KV
+two classes, we keep the control-plane overhead minimal.                             pages reside on the GPU, no transfers are needed; stable
+                                                                                     heads are re-ranked only periodically, and after each re-
+3    F LEXICACHE                                                                     ranking, only the newly promoted top-K pages are fetched
+                                                                                     from host memory. Finally, by jointly exploiting KV-head
+We present FlexiCache, an LLM-serving system that lever-                             stability and attention sparsity, FlexiCache ensures that the
+ages the inherent sparsity and temporal stability of KV                              top-K page selection operates over the entire KV cache
+heads to manage KV cache efficiently. The key goals of                               (since no pages are permanently discarded), thereby sustain-
+FlexiCache are (i) G1: reduce attention computation over-                            ing high language modeling performance (G4).
+head, (ii) G2: optimize GPU memory usage, (iii) G3: min-
+                                                                                     FlexiCache is implemented on top of vLLM, and its main
+imize I/O transfers, and (iv) G4: maintain high language
+                                                                                     components are illustrated in Figure 2. The stability-aware
+modelling quality. FlexiCache achieves these goals simulta-
+                                                                                     re-ranker identifies the top-K KV pages for each head inde-
+neously, even under long context and long generation sce-
+                                                                                     pendently and at different frequencies based on their stabil-
+narios, by prioritizing and retaining only the most critical
+                                                                                     ity. The sparse decode module performs attention compu-
+KV cache pages in GPU memory.
+                                                                                     tation using only the top-K KV pages for each head. The
+   1
+     Profiling on GovReport takes ∼2 hours for Llama-3.1-8B,                         KV transfer module manages data movement between GPU
+dominated by per-step, per-head logging of top-K page indices. As                    and host memory: it offloads all KV pages of stable heads
+a one-time offline step per model, it is not on the critical path of                 to host memory and periodically reloads only the newly
+online serving.
+                                                                                     promoted top-K pages after each re-ranking.
+             FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+The FlexiCache controller orchestrates request execution                             GPU KV Cache
+
+at the workers and includes two key components. The                        Stable                    L1H1      Not on GPU. Non-Top-K
+                                                                                                               On GPU. Non-Top-K
+FlexiCache Scheduler efficiently pipelines computation and                Unstable                   L1H2      On GPU. Top-K
+                                                                           Stable                    L2H1      On GPU. Top-K. Not Full
+KV reloads across batched requests to maximize GPU uti-
+lization. The FlexiCache Block Allocator extends vLLM’s                    Stable                    L2H2
+                                                                           Logical
+allocator with hierarchical memory awareness, allocating                             0   1   2   3
+                                                                            Block
+                                                                                     Host KV Cache
+just enough GPU KV blocks for the top-K KV pages of
+                                                                           Stable                    L1H1      Offloaded
+stable heads and for the entire KV cache of unstable heads,                                                    To be Offloaded
+                                                                          Unstable                   L1H2      Never Offloaded
+while assigning host KV blocks to store the full KV cache
+                                                                           Stable                    L2H1
+of stable heads.
+                                                                           Stable                    L2H2
+                                                                           Logical
+                                                                                     0   1   2   3           L1H1 L1H2 L2H1 L2H2
+3.2   KV-Page Scoring Mechanism                                             Block
+
+                                                                                                     Top-K   0,3   2,3   1,3     0,3
+FlexiCache uses a page importance scoring mechanism
+similar to that in Quest (Tang et al., 2024) and LServe
+(Yang et al., 2025c). For each KV page, we maintain two           Figure 3. Hierarchical KV-cache placement. The diagram illus-
+                                                                  trates the mapping of a request with four logical KV pages running
+vectors—the per-dimension minimum and maximum key
+                                                                  on a two-layer, two-head model.
+values within that page. Given the current query vector q,
+the importance of a page p is estimated as the maximum
+possible dot product between q and any key in that page:
+                 X                                                example of a model with two layers and two KV heads
+                                min         max
+            sp =      max(qi · kp,i , qi · kp,i )                 per layer. The request contains four logical pages, three of
+                   i                                              which are full, with a top-K size of two. For stable heads,
+                                                                  only the two top-K pages reside in GPU memory, while
+However, FlexiCache differs in two key ways. First, page
+                                                                  the host memory stores all three full KV pages. The last
+scoring operates at different frequencies for stable and unsta-
+                                                                  partially filled page, which is always in the top-K since it is
+ble heads: unstable heads are scored at every step, whereas
+                                                                  being appended to, will be offloaded to host memory once
+stable heads are scored periodically (every 16 steps). Ow-
+                                                                  it becomes full. For the unstable head, all four KV pages
+ing to their temporal stability, stable heads reuse the most
+                                                                  remain in GPU memory and are never offloaded.
+recently computed top-K page set between reranking steps.
+If a layer consists solely of stable heads, scoring for that      To make hierarchical KV-cache management practical,
+layer can often be skipped entirely. Second, FlexiCache           FlexiCache minimizes the overhead of moving KV pages
+decouples the min–max vectors from the KV cache pages             between host and GPU memory in the following ways:
+by storing them in a dedicated MinMax cache that remains
+on the GPU even when the corresponding KV pages are of-           Minimizing Transfer Size. In the host-to-GPU direction,
+floaded to host memory. This enables the system to evaluate       we transfer only the newly promoted pages—those that
+the importance of an offloaded page and reload it to GPU          were not in the previous top-K set but appear in the current
+memory when necessary. The MinMax cache maintains its             one—after the periodic reranking of top-K pages for stable
+own block manager and allocates large blocks, each con-           heads. This reduces the frequency and size of transfers, as
+taining min–max vectors for up to 128 KV cache blocks,            the top-K set itself represents only a fraction of the total KV
+to minimize allocation overhead. Together, these optimiza-        cache, while temporal stability further reduces the difference
+tions substantially reduce the overhead of page scoring and       between top-K sets. To minimize GPU-to-host transfers,
+ranking.                                                          each KV page of a stable head is offloaded exactly once. A
+                                                                  large offload occurs after the prefill phase, followed by small
+                                                                  incremental offloads as newly filled pages are completed
+3.3   Hierarchical KV Cache Management
+                                                                  during decoding. Consequently, host memory always holds
+The hierarchical management of the KV cache builds on             the full KV cache for stable heads, while the GPU retains
+the temporal stability of KV heads (§ 2.2) in selecting their     only the top-K pages.
+top-K KV pages. We classify the least stable 25% of heads
+                                                                  Overlapping Transfer with Compute. To prevent KV
+as unstable and the remaining heads as stable. For stable
+                                                                  cache movement from stalling the compute pipeline, trans-
+heads, FlexiCache keeps only the top-K most important KV
+                                                                  fers between GPU and host memory are carefully over-
+pages in GPU memory, while offloading the rest to host
+                                                                  lapped with computation, as shown in Figure 4. After the
+memory. In contrast, for unstable heads, it retains the entire
+                                                                  prefill phase, the initial GPU→host offload begins asyn-
+KV cache on the GPU.
+                                                                  chronously on a low-priority background stream while the
+Figure 3 illustrates this hierarchical placement using a toy      main stream continues decoding. Once complete, the block
+                 FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+
+     GPU                        Prefill   D1   D2   D3    D4        D5   D6    SM occupancy low; and (3) splitting large transfers into mul-
+    Compute
+                           D1    D2       D3   D4         D5   D6   D7   D8
+                                                                               tiple smaller chunks, launching a sequence of short kernels.
+                 Prefill
+                                                                               These strategies reduce per-launch stall time and give the
+                                                                               CUDA scheduler opportunities to interleave high-priority
+                                          PO                             IO    compute kernels between low-priority transfer kernels.
+  DeviceToHost
+    Transfer
+                           PO                                  IO
+
+                                                                               3.4   Efficient Block Table Management
+                                                               R
+  HostToDevice                                                                 Paged attention maintains a block table that maps each re-
+    Transfer
+                                                    R                          quest’s logical indices to physical blocks in GPU mem-
+                                                                               ory. In standard dense attention, the KV cache across all
+                  Request 01      PO: Prompt KV offload                        heads and layers grows uniformly, allowing a single shared
+                  Request 02      IO: Incremental KV offload during decoding
+                                                                               block table for the entire model. FlexiCache breaks this
+                                  R: Reload KV for promoted pages
+                                                                               assumption because each head–layer pair independently pro-
+                                  DN: Decode step N
+                                                                               motes and evicts KV pages based on its own top-K selection.
+                                                                               Hence, their memory layouts diverge, and a single shared
+Figure 4. FlexiCache Pipeline. KV offloading is overlapped with
+                                                                               block table cannot accurately represent them. FlexiCache
+the computation of the same request, while KV reloading is over-
+lapped with the computation of other requests in the batch.
+                                                                               therefore performs independent block allocation, dealloca-
+                                                                               tion, and mapping for each head–layer pair. To keep this
+                                                                               design efficient, we introduce three key optimizations:
+manager releases GPU blocks for pages no longer in the                         Dirty Tracking. Adopting a per-head–layer block map-
+top-K. This significantly reduces per-request GPU memory                       ping scheme expands the block table tensor from (B, N )
+usage and enables larger batch sizes, as more requests can                     to (B, L, H, N ), where B, L, H, and N denote the batch
+now fit in GPU memory. Subsequent incremental offloads,                        size, number of layers, number of heads, and maximum
+triggered as pages become full, are similarly overlapped.                      number of blocks per sequence, respectively. Typically, this
+Overlapping host→GPU transfers are more challenging                            block table is constructed and updated in host memory and
+since promoted KV pages modify the GPU-resident cache.                         then copied to GPU memory at each decoding step. The
+Concurrent decoding of the same request could cause                            resulting L × H increase in table size makes this frequent
+inconsistent reads, particularly when physical block re-                       PCIe transfer a significant performance bottleneck. To miti-
+cycling (Section 3.4) is enabled. To prevent this, the                         gate this overhead, FlexiCache tracks which regions of the
+FlexiCache scheduler temporarily pauses only the request                       CPU-side block table have been modified since the last GPU
+being reloaded while other requests continue decoding. The                     synchronization and transfers only these “dirty” segments.
+performance impact is minimal: reload sizes are small (Sec-                    Because the dirty regions are often fragmented, we employ a
+tion 3.3) and typically complete within one decode step.                       custom CUDA kernel, similar to the approach in Section 3.3,
+Since different requests pause at different times, only a small                to efficiently transfer the updated segments while avoiding
+fraction of the batch (about 1/16 for a rerank frequency of                    host-side gather overhead.
+16) is idle at any point, keeping overall throughput high.
+                                                                               Physical Block Reuse During Reranking. During peri-
+Reducing Fragmentation Overhead. Paged attention scat-                         odic top-K reranking for stable heads, naively deallocating
+ters the KV cache of each request across the memory pool. A                    physical blocks of evicted pages and allocating new ones for
+naive GPU↔host transfer (e.g., using PyTorch advanced in-                      promoted pages leads to excessive block churn. Frequent
+dexing) would first gather the scattered chunks at the source,                 calls to the CPU-based block allocator make this process pro-
+copy a contiguous buffer, and then scatter them again at the                   hibitively expensive. To eliminate this overhead, FlexiCache
+destination. The CPU-side gather/scatter dominates latency                     instead recycles physical blocks. Concretely, we implement
+in this process.                                                               a fused CUDA kernel that (i) identifies the sets of evicted
+                                                                               and promoted logical blocks, (ii) reassigns physical blocks
+To eliminate this overhead, we implement a custom CUDA                         from the evicted set to the promoted set while updating the
+kernel that directly reads from or writes to the pinned host                   GPU-side block table in place, and (iii) generates a mapping
+KV cache via Unified Virtual Addressing (UVA), avoiding                        from host KV blocks to GPU KV blocks for the subsequent
+CPU-side gather/scatter entirely. However, host-mapped                         host-to-GPU KV-cache transfer.
+reads and writes are limited by PCIe bandwidth, so they oc-
+cupy GPU Streaming Multiprocessors (SMs) while stalling                        Uniformity Through Null Block. Evicting non-critical
+on I/O. To reduce contention with main compute kernels, we                     blocks from GPU memory can create a jagged block table
+employ three techniques: (1) launching transfers on a low-                     structure, which degrades performance by making simple
+priority background stream; (2) capping grid size to keep                      operations, such as appending new blocks, difficult to vec-
+              FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+torize. Moreover, locating a slot in the table by layer, head,     discards the KV cache of less important tokens, whereas
+and logical index becomes more complex when the layout             FlexiCache offloads them to host memory for potential reuse.
+is irregular. To address this, we enforce a uniform, dense         LServe, built atop QServe (Lin* et al., 2024), uses quantiza-
+logical structure in the block table using a special null block.   tion by design. To isolate the effect of sparsity on accuracy,
+When a logical block is deallocated, its physical block is         we compare its quantized-sparse configuration against its
+returned to the pool, but its table entry is preserved and redi-   quantized-only baseline and report the relative drop in ac-
+rected to the null block. Because these entries are excluded       curacy. A direct system-level comparison would conflate
+from attention computation, they are never dereferenced,           speedups from quantization and sparsity; hence, we use the
+making the scheme both safe and efficient.                         vLLM baseline for system performance evaluation.
+
+4     E VALUATION                                                  Table 2. Cross-task overlap of unstable heads. Values are the
+                                                                   intersection size normalized by the unstable-head set size. GovRe-
+4.1   Setup                                                        port is from LongBench (Bai et al., 2024); the rest from L-Eval
+                                                                   (An et al., 2024).
+Implementation. FlexiCache is built atop vLLM (Kwon
+et al., 2023), which has key features such as paged KV-                              (a) Mistral-7B-Instruct-v0.2
+cache management and iteration-level scheduling. We mod-                          Open- Big- Multi- QM- Gov- SP- CU- Summ-
+                                                                    Dataset
+ify vLLM’s Triton-based Flash-Decoding (Dao et al., 2023)                         review Patent News Sum Report ACE AD Screen
+kernel to perform decode attention only on the top-K pages          Openreview 1.00       0.89   0.81   0.88   0.84   0.77 0.83   0.81
+per head. We implement the specialized KV-transfer ker-             BigPatent  0.89       1.00   0.78   0.86   0.81   0.78 0.77   0.86
+                                                                    Multi-News 0.81       0.78   1.00   0.86   0.84   0.75 0.78   0.75
+nels in CUDA and compile them as PyTorch extensions for
+                                                                    QMSum      0.88       0.86   0.86   1.00   0.89   0.80 0.84   0.83
+seamless integration with vLLM.                                     GovReport  0.84       0.81   0.84   0.89   1.00   0.77 0.80   0.80
+                                                                    SPACE      0.77       0.78   0.75   0.80   0.77   1.00 0.73   0.86
+Testbed. All experiments are conducted on an NVIDIA                 CUAD       0.83       0.77   0.78   0.84   0.80   0.73 1.00   0.70
+H100 GPU with 94 GB of HBM memory. The host system                  SummScreen 0.81       0.86   0.75   0.83   0.80   0.86 0.70   1.00
+is equipped with 2 AMD EPYC 9554 64-core processors and
+1.1 TB of DDR5 system memory. Unless otherwise stated,                           (b) Mistral-Small-24B-Instruct-2501
+we allocate 180 GB of host memory for the KV cache. The                           Open- Big- Multi- QM- Gov- SP- CU- Summ-
+GPU is connected via PCIe 5.0 with a peak bidirectional             Dataset
+                                                                                  review Patent News Sum Report ACE AD Screen
+bandwidth of 64 GB/s. Our software environment consists             Openreview 1.00       0.78   0.78   0.86   0.89   0.69 0.72   0.75
+of PyTorch 2.7.0 with CUDA 12.8 and cuDNN 9.5                       BigPatent  0.78       1.00   0.72   0.80   0.76   0.60 0.56   0.75
+                                                                    Multi-News 0.78       0.72   1.00   0.78   0.80   0.70 0.66   0.75
+Models. We evaluate FlexiCache on models from two fam-              QMSum      0.86       0.80   0.78   1.00   0.86   0.71 0.66   0.79
+ilies: Llama-3.1-8B-Instruct (Grattafiori et al., 2024) and         GovReport  0.89       0.76   0.80   0.86   1.00   0.69 0.68   0.79
+Mistral-7B-Instruct-v0.2 (Jiang et al., 2023).                      SPACE      0.69       0.60   0.70   0.71   0.69   1.00 0.68   0.66
+                                                                    CUAD       0.72       0.56   0.66   0.66   0.68   0.68 1.00   0.61
+Metrics. For model accuracy, we report the ratio between            SummScreen 0.75       0.75   0.75   0.79   0.79   0.66 0.61   1.00
+the benchmark score with FlexiCache and that with dense
+attention for the same model, providing a uniform measure                             (c) Qwen2.5-32B-Instruct
+of performance retention across benchmarks and models                             Open- Big- Multi- QM- Gov- SP- CU- Summ-
+                                                                    Dataset
+despite sparse attention. For system performance, we use                          review Patent News Sum Report ACE AD Screen
+total token throughput for offline inference and time per out-      Openreview 1.00       0.78   0.82   0.81   0.88   0.79 0.83   0.77
+put token (TPOT) for online serving. Although FlexiCache            BigPatent  0.78       1.00   0.77   0.78   0.77   0.76 0.77   0.77
+primarily optimizes the decode stage, we also analyze its           Multi-News 0.82       0.77   1.00   0.77   0.83   0.73 0.78   0.73
+                                                                    QMSum      0.81       0.78   0.77   1.00   0.81   0.80 0.79   0.82
+impact on time-to-first-token (TTFT) in online settings.            GovReport  0.88       0.77   0.83   0.81   1.00   0.80 0.79   0.77
+                                                                    SPACE      0.79       0.76   0.73   0.80   0.80   1.00 0.74   0.80
+Baselines. For system performance, we use vLLM’s (Kwon              CUAD       0.83       0.77   0.78   0.79   0.79   0.74 1.00   0.70
+et al., 2023) Triton-based Flash-Decoding backend as our            SummScreen 0.77       0.77   0.73   0.82   0.77   0.80 0.70   1.00
+primary baseline, isolating the impact of FlexiCache’s hier-
+archical KV placement and stability-aware reranking.
+For accuracy retention under sparse attention, we compare
+against LServe (Yang et al., 2025c), the most conceptually
+                                                                   4.2   Model-intrinsic unstable heads
+related system. Both frameworks support paged attention
+and leverage sparsity to reduce the effective token budget         Table 2 reports the pairwise cross-task overlap of unstable
+for attention computation; however, LServe permanently             heads for three models—Mistral-7B-Instruct-v0.2, Mistral-
+                                                                   Small-24B-Instruct-2501, and Qwen2.5-32B-Instruct—with
+               FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+
+Table 3. Accuracy retention on LongBench (Bai et al., 2024)      Table 4. L-Eval task statistics: Average prompt and generation
+                    Llama-3.1-8B       Mistral-7B-v0.2           lengths, and promoted KV size (Llama-3.1-8B, token budget of
+  Task           Dense FlexiCache Dense FlexiCache               2048, 192 stable heads)
+  NarrativeQA      29.88     29.62     20.97      20.33                               Prompt      Generation TopK-Delta
+  Qasper           45.41     45.73     29.41      29.49                  Task        # Tokens      # Tokens        MB
+  MultiField-en    54.81     55.20     47.16      46.91                 LongFQA        5257           81            46.7
+  HotpotQA         55.97     55.06     36.99      35.39                 GovReport     6125           377            45.0
+  2WikiMQA         45.46     45.71     21.82      22.24                  CUAD         24906          195            66.7
+  Musique          30.18     31.22     19.29      18.56                  QMSum        15103          132            66.3
+  GovReport        34.78     34.28     33.17      31.94                Multi-News      6002          367            43.6
+  QMSum            25.27     25.01     24.10      22.94                Openreview     10084          390            55.2
+  MultiNews        27.35     27.09     27.03      26.99                 BigPatent      6363          159            49.5
+  TREC             72.50     72.50     71.00      71.50                  SPACE        17933          136            67.1
+  TriviaQA         91.65     91.49     85.98      86.16                SummScreen      8882          128            59.2
+  SAMSum           43.99     42.94     43.25      43.20
+  PCount            7.10      6.92      3.21       3.24
+  PRe              99.50     99.50     89.33      86.04
+  Lcc              54.50     54.48     49.24      49.32          covers a diverse range of tasks, it has a key limitation in eval-
+  RB-P             51.65     51.88     48.61      48.90          uating sparse attention: most tasks generate short outputs.
+  Avg. Ratio         –       1.00        –        0.99           Except for a few tasks such as GovReport and MultiNews,
+                                                                 the average generation length is below 50 tokens, with some
+                                                                 tasks averaging fewer than 10. As a result, sparse decod-
+                                                                 ing methods that permanently discard the KV cache of less
+mean overlaps of 0.83, 0.76, and 0.81, respectively. These       important tokens can still perform well on LongBench be-
+results, along with those in Table 1, show that the task-        cause those tokens are rarely needed later in the generation.
+unaware instability of certain KV heads in selecting top KV      To address this limitation, we further evaluate FlexiCache
+pages across decode steps generalizes well across models         on L-Eval (An et al., 2024), which includes several tasks
+from different families and sizes, consistent with the ob-       with long prompts and long generations (as summarized in
+servations reported in the main paper for Llama. For each        Table 4). To prevent task-specific leakage, we use the KV-
+model, we classify 25% of the heads as unstable, corre-          head stability profile computed from the GovReport task of
+sponding to 64, 80, and 128 heads for Mistral-7B-Instruct-       LongBench. Unlike permanent-eviction-based sparse de-
+v0.2, Mistral-Small-24BInstruct-2501, and Qwen2.5-32B-           coding, FlexiCache never discards tokens: it retains the full
+Instruct, respectively.                                          KV cache in host memory and dynamically promotes the
+                                                                 newly important pages to GPU memory, preserving model
+4.3   Accuracy                                                   performance during long generation.
+Long Context. We evaluate the accuracy retention of              Table 5 compares FlexiCache and LServe (Yang et al.,
+FlexiCache relative to the dense attention baseline across 16    2025c) across L-Eval tasks. For FlexiCache, we progres-
+diverse tasks from LongBench (Bai et al., 2024), as shown        sively introduce reranking, stability-aware reranking, and
+in Table 3. The average ratio of FlexiCache to dense atten-      larger token budgets. The final configuration (token bud-
+tion scores indicates that FlexiCache effectively preserves      get of 2048, rerank frequency of 16, 64 unstable heads)
+model performance across both architectures. In this experi-     achieves strong retention of dense-attention accuracy across
+ment, the top-K page budget is 64 pages (equivalent to 1,024     all models. For LServe, we follow the default configuration
+tokens with a page size of 16), the 64 least stable heads are    with a token budget of 384 for streaming heads and 4096 for
+classified as unstable, and the reranking frequency for sta-     retrieval heads. As LServe is built on top of QServe (Lin*
+ble heads is set to 16. To prevent task-specific leakage, we     et al., 2024) and employs a quantized KV cache by design,
+compute a single KV-head stability profile on one held-out       it cannot be directly compared to a non-quantized dense
+task and reuse the same stable/unstable head partition for all   baseline. To isolate the effect of sparsity, we therefore
+other tasks. Concretely, we use the KV-head stability profile    compare LServe’s quantized-sparse configuration against
+from the GovReport task for all other LongBench tasks, and       its quantized-only baseline and report the relative drop re-
+for GovReport itself, we substitute a profile derived from an    sulting from adding sparsity.
+L-Eval (An et al., 2024) task (Openreview). The strong per-
+formance retention further highlights the cross-task stability   4.4    End-to-end Efficiency
+profile consistency, enabling a single offline profiling step
+                                                                 We evaluate FlexiCache under long-context and long-
+that can be reused at inference time.
+                                                                 generation scenarios in both offline and online serving set-
+Long Context & Long Generation. While LongBench                  tings. For the workload, we randomly sample prompts from
+              FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+
+                                   Table 5. Accuracy retention on L-Eval (An et al., 2024)
+                                               A     por
+                                                         t
+                                                                                       ews eview atent                  en atio
+                                             FQ            D             Sum                                 E       cre
+     Task
+                                       Lon
+                                           g     ovRe CUA            QM         u lti-N penr BigP      S PAC     m mS Avg. R
+                                                G                              M        O                      Su
+                                                         Llama-3.1-8B-Instruct
+     Dense                            49.61       27.19     37.20   17.95      17.45   21.18   33.61   16.76   15.46
+     FlexiCache W/O Reranking         43.28       26.74     22.63   16.85      17.27   19.22   23.12   16.40   15.58   0.89
+     FlexiCache W/O Unstable Heads    49.05       26.18     29.38   17.72      17.14   20.40   30.92   16.71   16.52   0.96
+     FlexiCache 1024                  51.90       28.89     37.74   17.53      17.69   20.97   31.69   16.75   13.79   0.99
+     FlexiCache 2048                  50.78       26.24     38.07   17.38      17.95   20.78   33.04   16.48   14.50   0.99
+                                                     Mistral-7B-Instruct-v0.2
+     Dense                            48.48       27.46     35.31   14.79      15.44   21.13   31.70   15.73   15.22
+     FlexiCache W/O Reranking         41.13       24.72     28.34   14.27      15.89   18.20   22.77   14.72   13.40   0.88
+     FlexiCache W/O Unstable Heads    45.96       27.69     29.18   13.63      16.43   19.78   29.06   15.84   13.48   0.95
+     FlexiCache 1024                  47.45       28.32     31.78   14.27      17.14   20.65   27.43   15.70   13.47   0.97
+     FlexiCache 2048                  46.58       28.23     34.39   14.42      16.77   20.45   30.33   16.00   13.72   0.99
+                                               Mistral-Small-24B-Instruct-2501
+     Dense                            48.4        24.7      33.8    16.1       16.5    21.5    28.0    15.4    14.9
+     FlexiCache W/O Reranking         46.7        25.5      25.9    15.5       15.9    20.5    25.9    15.2    14.2    0.944
+     FlexiCache W/O Unstable Heads    47.4        24.2      31.0    15.8       17.3    21.4    26.2    15.1    14.8    0.978
+     FlexiCache 1024                  48.6        25.9      29.3    16.3       16.3    21.7    26.6    15.1    14.5    0.981
+     FlexiCache 2048                  48.1        26.1      33.1    16.7       16.1    21.9    27.7    15.5    14.3    1.001
+                                                         Qwen2.5-32B-Instruct
+     Dense                            51.8        25.2      37.8    16.1       16.3    22.0    28.1    14.6    15.8
+     FlexiCache W/O Reranking         49.3        23.4      28.9    15.6       15.6    21.3    25.3    13.9    16.0    0.934
+     FlexiCache W/O Unstable Heads    52.1        23.0      33.6    16.2       15.4    21.6    26.0    14.5    16.6    0.967
+     FlexiCache 1024                  50.0        24.2      36.9    16.0       15.5    21.9    26.8    14.3    15.9    0.976
+     FlexiCache 2048                  50.9        24.7      37.7    16.0       16.2    22.0    27.9    14.4    16.6    0.998
+                                                         Llama-3-8B-Instruct
+     Dense                            45.45       34.52     33.55   15.54      16.53   18.92   31.69   15.84   14.92
+     LServe                           45.39       32.38     28.09   14.46      16.76   18.75   29.72   16.53   11.51   0.94
+
+
+the L-Eval benchmark rather than using synthetic tokens,             randomly sampled requests from L-Eval, with input lengths
+since the size of the promoted KV cache during reranking             between 10k–30k and output lengths ranging from 50–1500.
+depends on workload characteristics. Using real prompts              The 1024-token budget generally attains higher throughput,
+ensures realistic promoted-cache behavior. For Llama-3.1-            with minor fluctuations caused by the randomness of request
+8B-Instruct with 192 stable heads, fp16 KV cache, and a              preemptions. On average across different output lengths,
+2048-token budget, the top-K KV cache for stable heads               FlexiCache improves token throughput by 1.38–1.55× for
+is 192 MB. The size of the promoted KV varies between                Llama and 1.44–1.46× for Mistral. On the other hand, as
+44–67 MB (23–35%) across tasks (shown in Table 4). This              shown in Figure 5(c), FlexiCache also achieves up to 1.46×
+suggests that temporal stability keeps the promoted set rel-         (1024) and 1.41× (2048) end-to-end request throughput
+atively small yet not negligible, underscoring the need for          speedups over vLLM for an output length of 500. Figure 7
+reranking as token importance evolves. All experiments use           shows that for larger models—MistralSmall-24B-Instruct-
+64 unstable heads, a stable head rerank frequency of 16, and         2501 and Qwen2.5-32B-Instruct—FlexiCache achieves end-
+a token budget of 1024 or 2048.                                      to-end throughput gains of 1.37× and 1.33×, respectively.
+Offline Throughput. Figure 5 shows the end-to-end                    Online Serving. Figure 6 compares the end-to-end online
+throughput of FlexiCache compared to the vLLM baseline.              serving performance of FlexiCache and the vLLM baseline
+For both Llama-3.1-8B and Mistral-7B, FlexiCache con-                in terms of mean time per output token (TPOT) and time
+sistently achieves higher total token throughput (prompt +           to first token (TTFT). The workload consists of 500 ran-
+output tokens per second). Since FlexiCache primarily op-            domly sampled L-Eval requests with input lengths between
+timizes the decode phase, the improvement becomes more               10k–30k and output lengths between 20–2000, arriving ac-
+pronounced as output length increases and decoding dom-              cording to a Poisson process at varying request rates.
+inates the overall latency. The workload comprises 500
+                                              FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+
+                                                       vLLM               FlexiCache 1024                                       FlexiCache 2048
+                                                                                                                                                                                                                    0.80                                 vLLM
+                                                                                                                 12k
+Throughput (tokens/s)
+
+
+
+
+                                                                                         Throughput (tokens/s)
+                        12k                                                                                                                                                                                                                              FlexiCache 1024
+                                                                                                                                                                                                                    0.70          1.46×                  FlexiCache 2048
+                                                                                                                 10k                                                                                                                      1.35×
+                        10k
+
+
+
+
+                                                                                                                                                                                                       Requests/s
+                                                                                                                                                                                                                    0.60                                      1.44× 1.41×
+                                                                                                                  8k
+                            8k
+                                                                                                                                                                                                                    0.50
+
+                            6k                                                                                    6k
+                                                                                                                                                                                                                    0.40
+
+
+                                 0      250      500    750     1000    1250     1500                                  0      250      500   750     1000                               1250   1500                 0.30
+                                                                                                                                                                                                                           Llama-3.1-8B-Instruct     Mistral-7B-Instruct
+                                                  Output Lengths                                                                        Output Lengths                                                                                         Model
+
+                        (a) Token Throughput for Llama-3.1-8B                                                     (b) Token Throughput for Mistral-7B                                                                        (c) Request Throughput
+
+Figure 5. End-to-end throughput. FlexiCache consistently outperforms vLLM on both Llama-3.1-8B and Mistral-7B in token throughput,
+with gains increasing as output length grows. Similar improvements are observed for request throughput with an output length of 500.
+
+
+                                                       vLLM                   FlexiCache 1024                                       FlexiCache 2048
+                                                                                                                  30                                                                                                 1.0
+           Mean TPOT (ms)
+
+
+
+
+                            60                                                                                                                                                                                       0.8
+                                                                                                  Mean TTFT (s)
+
+
+
+
+                                                                                                                  20
+                                                                                                                                                                                                                     0.6
+
+
+
+
+                                                                                                                                                                                                              CDF
+                            40
+                                                                                                                                                                                                                     0.4
+                                                                                                                  10                                                                                                                                 vLLM
+                                                                                                                                                                                                                     0.2                             FlexiCache 1024
+                            20                                                                                                                                                                                                                       FlexiCache 2048
+                                                                                                                   0                                                                                                 0.0
+                                 0.20          0.25      0.30          0.35       0.40                                 0.20          0.25     0.30                                  0.35        0.40                               5          10         15         20
+                                                Request Rate (req/s)                                                                  Request Rate (req/s)                                                                                    TTFT (s)
+
+                                 (a) Mean Time Per Output Token                                                            (b) Mean Time to First Token                                                                (c) CDF of Time to First Token
+
+Figure 6. Online serving. FlexiCache reduces mean TPOT across all arrival rates. By lowering per-request GPU memory usage, it delays
+TTFT degradation caused by queue buildup at high load, enabling higher sustained request rates while keeping tail TTFT lower.
+
+
+As shown in Figure 6(a), FlexiCache consistently outper-                                                                                                                           6k
+                                                                                                                                                                                                                1.37×                              vLLM
+                                                                                                                                                     Token Throughput (tokens/s)
+
+
+
+
+forms the baseline in mean TPOT, with performance gains                                                                                                                                                                                            FlexiCache
+                                                                                                                                                                                   5k
+becoming more pronounced at higher request rates. At
+0.4 req/s, FlexiCache-1024 achieves a mean TPOT of 34.6                                                                                                                            4k
+compared to 71.5 for the baseline—a 2.1× improvement—                                                                                                                                                                                                 1.33×
+                                                                                                                                                                                   3k
+while FlexiCache-2048 reaches 44.9, representing a 1.6×
+improvement. Figure 6(b) shows that TTFT remains similar                                                                                                                           2k
+across systems up to 0.35 req/s, but the baseline collapses
+                                                                                                                                                                                   1k
+beyond this point as GPU memory becomes fully occu-
+pied, forcing new requests to wait in the queue and causing                                                                                                                        0k
+                                                                                                                                                                                           Mistral-Small-24B                                Qwen2.5-32B
+TTFT to spike sharply. FlexiCache, by contrast, reduces per-                                                                                                                                                                  Model
+request GPU memory usage during decoding, preventing
+memory saturation and queue buildup, and thereby main-                                                                                       Figure 7. Throughput gain for larger models. FlexiCache
+taining stable TTFT even under higher load. As shown in                                                                                      achieves up to 1.37× improvement in throughput for larger mod-
+Figure 6(c), even at moderate load (0.35 req/s), FlexiCache                                                                                  els, with input length randomly selected from 10k–30k tokens and
+exhibits a shorter tail in TTFT, reflecting fewer queued re-                                                                                 output length set to 500.
+quests. Overall, FlexiCache sustains higher request rates
+than the baseline and delivers lower TPOT at any given
+request rate.                                                                                                                                4.5      Microbenchmarks
+                                                                                                                                             We conduct microbenchmark experiments using the Llama-
+                                                                                                                                             3.1-8B-Instruct model and FlexiCache configured with a
+                                                                                                                                             rerank frequency of 16, unless otherwise specified.
+                           FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+                                                                                                                     0.60
+Decode Only Speedup. Figure 8 compares the layer-wise
+                                                                                                                                                   FlexiCache 1024
+
+
+
+
+                                                                                          Fraction of All KV Cache
+decode latency for dense decode and FlexiCache’s sparse
+decode with token budgets of 1024 and 2048, at different                                                                                           FlexiCache 2048
+                                                                                                                     0.50
+batch sizes with 10k prompt tokens per input. For dense
+decode, latency reflects the decode kernel execution time,
+while for FlexiCache, it includes both the top-K selection                                                           0.40
+and sparse decode kernels. Here, top-K selection measures
+the time to produce the top-K page indices from the MinMax
+                                                                                                                     0.30
+cache and the current query vector. It runs every step for
+unstable heads and periodically (e.g., every 16 steps) for
+stable heads, and we report the time averaged over decoding                                                          0.20
+steps. As batch size increases, FlexiCache achieves greater                                                                 5k     10k      15k     20k    25k      30k
+speedups (up to 4× at batch size 40 for FlexiCache-1024).                                                                                Sequence Length
+At smaller batch sizes, kernel launch overhead dominates,
+whereas at larger ones, the growing total KV-cache size                                Figure 10. GPU Memory Savings. FlexiCache achieves over 70%
+amplifies the benefit of sparse decoding.                                              GPU memory savings at sequence lengths >20k with a token
+                                                                                       budget of 1024.
+               0.9
+                          Dense Decode
+               0.8
+                          Sparse Decode (1024)
+               0.7        Top-K Selector (1024)
+               0.6        Sparse Decode (2048)                                         Impact of Rerank Frequency and Unstable Head Frac-
+Latency (ms)
+
+
+
+
+                          Top-K Selector (2048)
+               0.5                                                                     tion. Table 6 reports the average accuracy retention across
+               0.4                                                                     L-Eval tasks for Llama-3.1-8B as we vary the unstable head
+               0.3                                                                     fraction and the rerank interval for stable heads. Accuracy
+               0.2
+                                                                                       retention improves as we increase the unstable head fraction
+               0.1
+                                                                                       and decrease the rerank interval. With 25% unstable heads
+               0.0
+                                                                                       and a rerank interval of 16, retention remains consistently
+                      5       10       15      20      25      30      35      40      high. As the rerank interval increases or the unstable head
+                                               Batch size
+                                                                                       fraction decreases, accuracy degrades gradually rather than
+                                                                                       catastrophically. We use these same values for other models
+Figure 8. Decode Speed vs. Batch Size. FlexiCache achieves
+greater speedups as the batch size increases. Each input has 10k                       and retain accuracy without model- or benchmark-specific
+tokens.                                                                                tuning (Tables 3 and 6), suggesting that these hyperparam-
+                                                                                       eters act as robust, tunable knobs with graceful trade-offs.
+Impact of Stability Aware Reranking. Figure 9 shows                                    Further model- or workload-specific tuning could likely
+that stability-aware reranking is 2.44× faster than naive                              yield additional throughput gains.
+reranking at a batch size of 40, with each input containing
+10k tokens. In naive reranking, all heads are reranked at
+every step. In contrast, stability-aware reranking updates
+only the 25% unstable heads at each step and periodically                              Table 6. Average accuracy retention on L-Eval across rerank inter-
+                                                                                       vals and unstable head fractions.
+re-ranks the stable ones, keeping the average MinMax cache
+smaller and reducing latency.                                                                                                             Unstable Heads Fraction
+                                                                                                                                         0.0625    0.125    0.25
+               0.25
+                           Stability Aware Reranking                           2.44×                                    Rerank     16    0.9692   1.0028   0.9932
+                           Naive Reranking                             2.37×
+                                                                                                                        Interval
+               0.20
+                                                               2.32×
+                                                                                                                                   32    0.9628   0.9729   0.9936
+Latency (ms)
+
+
+
+
+                                                       2.25×
+               0.15                            2.14×
+                                       1.94×
+               0.10            1.65×
+                      1.24×
+               0.05
+                                                                                       GPU Memory Savings. On the GPU, FlexiCache stores
+                                                                                       the full KV cache for only 25% of heads and the top-K KV
+               0.00
+                      5        10      15      20      25      30      35      40
+                                                                                       cache for the rest. Figure 10 shows the relative GPU memory
+                                               Batch size                              savings for a single request across sequence lengths with
+                                                                                       token budgets of 1024 and 2048. As sequence length grows,
+Figure 9. Benefit of Stability-Aware Reranking. Performance                            memory savings asymptotically approach 75%, reaching
+gains increase with larger batch sizes. Each input has 10k tokens.                     about 70% at 20k tokens and beyond.
+             FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+5    D ISCUSSION AND F UTURE W ORK                                cache for a batch of requests exceeds GPU memory, a com-
+                                                                  mon solution is to offload part of it to host memory or
+Integration with Other Serving Optimizations.                     even disk and reload it later. Systems such as FlexGen
+FlexiCache optimizes the decode phase, with up to 4×              (Sheng et al., 2023) and MoE-Lightning (Cao et al., 2025)
+speedup when focusing on the decode kernel (Figure 8).            adopt this strategy by carefully pipelining data transfers
+We expect larger end-to-end gains when FlexiCache is              with computation—for example, prefetching the KV cache
+combined with complementary techniques that optimize              or weights for the next batch or layer while the current one
+other parts of the workflow, such as disaggregating prefill       executes. However, unlike FlexiCache, these designs treat
+and decode (Zhong et al., 2024), kernel fusion, and               the KV cache within the same layer as uniform; no part is
+speculative decoding (Leviathan et al., 2023).                    considered more critical for decoding than another. Some
+Beyond GPU–CPU hierarchy. FlexiCache currently as-                of their optimizations, such as layer-wise loading, are or-
+sumes a two-level GPU–CPU memory hierarchy. This de-              thogonal to FlexiCache and can be used to further augment
+sign can be extended to multi-tier hierarchies involving          it. LMCache (Cheng et al., 2025) offloads KV cache across
+NVMe or distributed memory pools. Efficient KV cache              the memory hierarchy to reuse common prefix KV across
+transfer in multi-node environments remains an open chal-         requests and to support prefill–decode disaggregation. This
+lenge, and page-criticality and head-stability–aware KV           reduces redundant prefill overhead and lowers TTFT, but it
+cache management has the potential to improve existing            does not target offloading the KV cache of requests that are
+solutions further (Liu et al., 2024; Cheng et al., 2025).         already in the decode phase. NEO (Jiang et al., 2024b) uses
+                                                                  CPU offloading of KV cache for online serving in order to
+Joint Memory Management and Cluster Scheduling. In                improve performance over GPU-only systems. However, its
+large-scale production serving systems, efficient scheduling      offload granularity is sub-batch rather than head-level.
+and load balancing across GPU clusters remain active chal-
+lenges. The large KV cache size makes rapid load balancing
+and task migration difficult (Sun et al., 2024). Temporal         7   C ONCLUSION
+stability of heads opens the door for jointly optimizing re-      We observe that KV heads in LLMs exhibit varying degrees
+quest batching, KV placement, and prefetch timing using           of temporal stability in their selection of critical KV pages
+head-level stability signals.                                     across decoding steps. Building on this insight, we classify
+                                                                  heads into two categories—stable and unstable—and pro-
+6    R ELATED W ORK                                               pose FlexiCache, a stability-aware hierarchical KV cache
+                                                                  management strategy. FlexiCache dynamically places KV
+Sparse Attention. Prior work shows that a small subset of         pages across GPU and host memory based on their criti-
+critical tokens dominates the attention output at each decode     cality, with periodic query-aware promotion of previously
+step. Different heuristics are used to identify this subset.      non-critical pages. This design reduces the GPU’s KV
+These methods fall into two main categories. One class            footprint without permanently discarding potentially im-
+permanently discards less important tokens’ KV entries,           portant tokens—an essential property for long-context, long-
+such as StreamingLLM (Xiao et al., 2023) and SnapKV (Li           generation workloads.
+et al., 2024). These methods reduce GPU memory, com-
+pute, and I/O but risk accuracy loss in long generations
+since dropped tokens may later become important. The sec-
+                                                                  R EFERENCES
+ond class retains the full KV cache but attends only to the       An, C., Gong, S., Zhong, M., Zhao, X., Li, M., Zhang,
+most relevant tokens at each step. Quest (Tang et al., 2024)       J., Kong, L., and Qiu, X. L-eval: Instituting standard-
+exemplifies this approach by augmenting each KV cache               ized evaluation for long context language models. In
+page with per-channel min–max metadata and scoring them             Ku, L.-W., Martins, A., and Srikumar, V. (eds.), Pro-
+against the current query, fetching only the Top-K pages.           ceedings of the 62nd Annual Meeting of the Associa-
+This reduces compute and I/O while mostly preserving ac-            tion for Computational Linguistics (Volume 1: Long
+curacy, though memory use remains unchanged. A hybrid              Papers), pp. 14388–14411, Bangkok, Thailand, Au-
+approach, LServe (Yang et al., 2025c), converts about half of       gust 2024. Association for Computational Linguistics.
+the heads to streaming masks (dropping long-range KV for            doi: 10.18653/v1/2024.acl-long.776. URL https:
+those heads) and applies dynamic, query-aware selection for        //aclanthology.org/2024.acl-long.776/.
+the rest. This balances efficiency and accuracy better than
+pure eviction but still risks accuracy loss in long generations
+                                                                  Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z., Du,
+due to permanent KV eviction for half the heads.
+                                                                    Z., Liu, X., Zeng, A., Hou, L., Dong, Y., Tang, J., and Li,
+Hierarchical KV Cache Management. When the KV                       J. LongBench: A bilingual, multitask benchmark for long
+                                                                    context understanding. In Ku, L.-W., Martins, A., and
+             FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+  Srikumar, V. (eds.), Proceedings of the 62nd Annual Meet-        Vaughan, A., et al. The llama 3 herd of models. arXiv
+  ing of the Association for Computational Linguistics (Vol-       preprint arXiv:2407.21783, 2024.
+  ume 1: Long Papers), pp. 3119–3137, Bangkok, Thailand,
+  August 2024. Association for Computational Linguis-            Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A., Savary,
+  tics. doi: 10.18653/v1/2024.acl-long.172. URL https:              B., Bamford, C., Chaplot, D. S., Casas, D. d. l., Hanna,
+  //aclanthology.org/2024.acl-long.172/.                            E. B., Bressand, F., et al. Mixtral of experts. arXiv
+                                                                    preprint arXiv:2401.04088, 2024a.
+Bai, Y., Zhang, J., Lv, X., Zheng, L., Zhu, S., Hou, L.,
+  Dong, Y., Tang, J., and Li, J. Longwriter: Unleashing          Jiang, D., Liu, Y., Liu, S., Zhao, J., Zhang, H., Gao, Z.,
+  10,000+ word generation from long context LLMs. In                Zhang, X., Li, J., and Xiong, H. From clip to dino: Visual
+  The Thirteenth International Conference on Learning               encoders shout in multi-modal large language models.
+  Representations, 2025. URL https://openreview.                    arXiv preprint arXiv:2310.08825, 2023.
+  net/forum?id=kQ5s9Yh0WI.
+                                                                 Jiang, X., Zhou, Y., Cao, S., Stoica, I., and Yu, M. Neo:
+Cao, S., Liu, S., Griggs, T., Schafhalter, P., Liu, X.,             Saving gpu memory crisis with cpu offloading for online
+  Sheng, Y., Gonzalez, J. E., Zaharia, M., and Sto-                 llm inference. arXiv preprint arXiv:2411.01142, 2024b.
+  ica, I. Moe-lightning: High-throughput moe infer-
+                                                                 Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  ence on memory-constrained gpus. In Proceedings of
+                                                                  C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  the 30th ACM International Conference on Architec-
+                                                                  memory management for large language model serving
+  tural Support for Programming Languages and Oper-
+                                                                  with pagedattention. In Proceedings of the 29th sym-
+  ating Systems, Volume 1, ASPLOS ’25, pp. 715–730,
+                                                                  posium on operating systems principles, pp. 611–626,
+  New York, NY, USA, 2025. Association for Comput-
+                                                                  2023.
+  ing Machinery. ISBN 9798400706981. doi: 10.1145/
+  3669940.3707267. URL https://doi.org/10.                       Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+  1145/3669940.3707267.                                            from transformers via speculative decoding. In Inter-
+                                                                   national Conference on Machine Learning, pp. 19274–
+Cheng, Y., Liu, Y., Yao, J., An, Y., Chen, X., Feng, S.,
+                                                                   19286. PMLR, 2023.
+  Huang, Y., Shen, S., Du, K., and Jiang, J. Lmcache:
+  An efficient KV cache layer for enterprise-scale LLM           Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A., Ye,
+  inference. https://lmcache.ai/tech_report.                        H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm knows
+  pdf, 2025. White paper.                                          what you are looking for before generation. Advances
+                                                                    in Neural Information Processing Systems, 37:22947–
+Comanici, G., Bieber, E., Schaekermann, M., Pasupat, I.,
+                                                                    22970, 2024.
+  Sachdeva, N., Dhillon, I., Blistein, M., Ram, O., Zhang,
+  D., Rosen, E., et al. Gemini 2.5: Pushing the frontier         Lin*, Y., Tang*, H., Yang*, S., Zhang, Z., Xiao, G., Gan,
+  with advanced reasoning, multimodality, long context,            C., and Han, S. Qserve: W4a8kv4 quantization and
+  and next generation agentic capabilities. arXiv preprint         system co-design for efficient llm serving. arXiv preprint
+  arXiv:2507.06261, 2025.                                          arXiv:2405.04532, 2024.
+Dao, T., Haziza, D., Massa, F., and Sizov, G. Flash-decoding     Liu, Y., Li, H., Cheng, Y., Ray, S., Huang, Y., Zhang,
+  for long-context inference. https://pytorch.org/                 Q., Du, K., Yao, J., Lu, S., Ananthanarayanan, G.,
+  blog/flash-decoding/, October 2023. Accessed:                    Maire, M., Hoffmann, H., Holtzman, A., and Jiang, J.
+  2025-10-27.                                                      Cachegen: Kv cache compression and streaming for fast
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,           large language model serving. In Proceedings of the
+ A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,          ACM SIGCOMM 2024 Conference, ACM SIGCOMM
+ A., et al. The llama 3 herd of models. arXiv e-prints, pp.        ’24, pp. 38–56, New York, NY, USA, 2024. Associa-
+  arXiv–2407, 2024.                                                tion for Computing Machinery. ISBN 9798400706141.
+                                                                   doi: 10.1145/3651890.3672274. URL https://doi.
+Ghadia, R., Kumar, A., Jain, G., Nair, P. J., and Das, P. Dia-     org/10.1145/3651890.3672274.
+  logue without limits: Constant-sized KV caches for ex-
+  tended response in LLMs. In Forty-second International         Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,
+  Conference on Machine Learning, 2025. URL https:                 B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen:
+ //openreview.net/forum?id=SuYO70ZxZX.                             high-throughput generative inference of large language
+                                                                   models with a single gpu. In Proceedings of the 40th In-
+Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian,        ternational Conference on Machine Learning, ICML’23.
+  A., Al-Dahle, A., Letman, A., Mathur, A., Schelten, A.,          JMLR.org, 2023.
+              FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y.,
+  and Lin, W. Llumnix: Dynamic scheduling for large
+  language model serving. In 18th USENIX symposium on
+  operating systems design and implementation (OSDI 24),
+  pp. 173–191, 2024.
+Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han,
+  S. Quest: query-aware sparsity for efficient long-context
+  llm inference. In Proceedings of the 41st International
+  Conference on Machine Learning, ICML’24. JMLR.org,
+  2024.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+  L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+  tention is all you need. Advances in neural information
+  processing systems, 30, 2017.
+Wu, Y., Hee, M. S., Hu, Z., and Lee, R. K.-W. Longgen-
+ bench: Benchmarking long-form generation in long con-
+ text LLMs. In The Thirteenth International Confer-
+ ence on Learning Representations, 2025. URL https:
+ //openreview.net/forum?id=3A71qNKWAS.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+  ficient streaming language models with attention sinks.
+  arXiv preprint arXiv:2309.17453, 2023.
+
+Xiao, G., Tang, J., Zuo, J., junxian guo, Yang, S., Tang, H.,
+  Fu, Y., and Han, S. Duoattention: Efficient long-context
+  LLM inference with retrieval and streaming heads. In
+  The Thirteenth International Conference on Learning
+  Representations, 2025. URL https://openreview.
+  net/forum?id=cFu7ze7xUm.
+
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+  Yu, B., Gao, C., Huang, C., Lv, C., et al. Qwen3 technical
+  report. arXiv preprint arXiv:2505.09388, 2025a.
+Yang, A., Yu, B., Li, C., Liu, D., Huang, F., Huang, H.,
+  Jiang, J., Tu, J., Zhang, J., Zhou, J., et al. Qwen2. 5-
+  1m technical report. arXiv preprint arXiv:2501.15383,
+  2025b.
+Yang, S., Guo, J., Tang, H., Hu, Q., Xiao, G., Tang, J., Lin,
+  Y., Liu, Z., Lu, Y., and Han, S. LServe: Efficient long-
+  sequence LLM serving with unified sparse attention. In
+  Eighth Conference on Machine Learning and Systems,
+  2025c. URL https://openreview.net/forum?
+  id=KQ4pJFFqT1.
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X.,
+  and Zhang, H. {DistServe}: Disaggregating prefill and
+  decoding for goodput-optimized large language model
+  serving. In 18th USENIX Symposium on Operating Sys-
+  tems Design and Implementation (OSDI 24), pp. 193–210,
+  2024.
+              FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+A     A RTIFACT A PPENDIX                                              • Publicly available?: Yes.
+                                                                       • Code licenses (if publicly available)?: Apache License
+A.1    Abstract                                                          2.0.
+This artifact contains the source code, build scripts, and             • Data licenses (if publicly available)?: MIT
+evaluation scripts needed to reproduce two crucial results             • Workflow framework used?:       Bash scripts and Python
+for FlexiCache. To run the experiments, an x86 64 Linux                  evaluation code.
+machine with an NVIDIA GPU (80GB minimum), at least                    • Archived                   (provide              DOI)?:
+256GB of host memory, and PCIe Gen5 CPU–GPU inter-                       https://doi.org/10.5281/zenodo.18918856
+connect is required. All results are based on an NVIDIA
+H100 GPU (94GB memory). A working CUDA devel-                       A.3     Description
+opment environment is also required to build FlexiCache,
+which is implemented on top of vLLM, from source.                   A.3.1    How delivered
+                                                                    The artifact is delivered through the public GitHub repos-
+A.2    Artifact check-list (meta-information)                       itory:     https://github.com/NazmulTakbir/
+    • Algorithm: Stability-aware hierarchical KV-cache manage-      FlexiCache
+      ment and sparse decode attention.
+                                                                    The repository contains FlexiCache implementation and
+    • Program: LongBench evaluation scripts and throughput          the evaluation scripts. Reviewers are expected to clone
+      benchmarking scripts for FlexiCache and vLLM.
+                                                                    the repository, build the project, and run the provided shell
+    • Compilation: Python package build via pip install
+     -e ., compiling custom CUDA, Triton, and C++ extensions
+                                                                    scripts.
+      for FlexiCache on top of vLLM.
+    • Model: meta-llama/Llama-3.1-8B-Instruct, downloaded           A.3.2    Hardware dependencies
+      automatically from Hugging Face by the scripts; requires
+                                                                    The artifact is intended to run on a single x86 64 Linux
+      Internet access and a configured Hugging Face account.
+                                                                    machine with:
+    • Data set: zai-org/LongBench, downloaded automatically
+      from Hugging Face when running the scripts; requires Inter-      • 1× NVIDIA H100 GPU (94GB recommended, 80GB
+      net access.
+                                                                         minimum),
+    • Run-time environment: Linux, Conda, Python 3.12, Py-
+      Torch 2.6.0+cu124, Triton 3.2.0, Transformers 4.50.0, CUDA       • at least 256GB of host DRAM, able to allocate 180GB
+      compatible NVIDIA driver.                                          of pinned host-memory for KV cache offloading
+    • Hardware: An x86 64 Linux machine with an NVIDIA
+      GPU (80GB minimum), at least 256GB of host memory,            A.3.3    Software dependencies
+      and PCIe Gen5 CPU–GPU interconnect. NVIDIA H100
+      recommended.                                                     • Linux (we tested on Ubuntu 24.04.2 LTS),
+    • Run-time state: For reliable throughput measurements,            • Anaconda (we used 24.9.2),
+      experiments should be run on an idle machine without other       • Python 3.12,
+      workloads contending for the GPU, CPU, RAM, or host–             • PyTorch 2.6.0+cu124,
+      device bandwidth.                                                • Triton 3.2.0,
+    • Execution: Single-GPU execution via automated bash               • Transformers 4.50.0,
+      scripts. The artifact uses a large pinned host-memory pool       • Datasets 3.6.0,
+      (about 180GB by default) and frequent host–device KV-cache
+      transfers during execution.                                      • CUDA NVIDIA driver (we tested on CUDA 12.8).
+    • Metrics: LLM generation throughput (tokens/second).
+      Long-context benchmarks accuracy.                             A.3.4    Data sets
+    • Output: Accuracy numbers and generation throughput            zai-org/LongBench. Publicly available. Downloaded au-
+      presented in 2 CSV files.                                     tomatically from Hugging Face when running the scripts;
+    • Experiments: (1) LongBench accuracy retention compared        requires Internet access.
+      to dense attention baseline (2) end-to-end throughput gain
+      compared to vLLM baseline.
+    • How much disk space required (approximately)?:
+                                                                    A.4     Installation
+      100GB.                                                        We recommend using Anaconda to isolate the software de-
+    • How much time is needed to prepare workflow (approxi-         pendencies. Installation takes approximately 1 hour.
+      mately)?: Around 1 hour to build FlexiCache (implemented
+      on top of vLLM) from source.                                  # 1. Clone the repository
+    • How much time is needed to complete experiments (ap-          git clone https://github.com/NazmulTakbir/
+      proximately)?: Around 2 hours for the accuracy retention          FlexiCache.git
+      experiment. Around 3 hours for the throughput experiment.     cd FlexiCache
+             FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+
+                                                              A.6     Evaluation and expected result
+# 2. Create and activate a Conda
+    environment                                               In this section, we provide reference results for compari-
+conda create -n FlexiCache python=3.12 -y                     son. Due to differences in machine environments, absolute
+conda activate FlexiCache
+                                                              throughput values may vary. However, the relative speedup
+# 3. set CUDA environment variables so nvcc                   of FlexiCache over the vLLM baseline should remain con-
+     is found during build (paths may vary                    sistent. Accuracy results may also show small deviations
+    by machine)                                               from the reported numbers due to the inherent stochastic-
+export CUDA_HOME=/usr/local/cuda-12.8                         ity of LLM generation and minor floating-point differences
+export CUDACXX=/usr/local/cuda-12.8/bin/
+    nvcc                                                      across hardware.
+export PATH=/usr/local/cuda-12.8/bin:$PATH
+                                                              A.6.1    Accuracy on LongBench
+# 4. Build from source (30min to 1 hour)
+export MAX_JOBS=10                                                         Task             Dense   FlexiCache
+pip install -e .                                                           Qasper           45.23      45.92
+                                                                           MultiField-en    54.93      54.94
+# 5. Install additional dependencies                                       2WikiMQA         45.45      45.32
+pip install -r flexicache_requirements.txt                                 Musique          30.18      31.22
+                                                                           GovReport        34.98      34.22
+# 6. Authenticate with Hugging Face (                                      MultiNews        27.18      27.10
+    Required for Llama 3.1). Must accept                                   TriviaQA         91.64      91.49
+    the model agreement on Hugging Face                                    RB-P             49.43      49.70
+pip install huggingface_hub                                                Avg. Ratio         –         1.00
+huggingface-cli login
+                                                                         Table 7. Accuracy Retention on LongBench
+
+A.5     Experiment workflow
+                                                              A.6.2    Throughput (tokens/second)
+We provide two push-button bash scripts to reproduce
+the primary accuracy and throughput results for meta-           Output Length      vLLM      FlexiCache-1024     Speedup
+llama/Llama-3.1-8B-Instruct. Both commands should be            100               11178.7        12433.1          1.11×
+run from the repository root after installation.                500               7742.1         11480.2          1.48×
+                                                                1000               5609.9         9965.4          1.78×
+                                                                1500               4549.0         9444.9          2.08×
+A.5.1    Accuracy on LongBench
+This script evaluates FlexiCache on a subset of 8 LongBench                      Table 8. Throughput Gain
+tasks. This workflow takes approximately 2 hours.
+# Run                                                         A.7     Experiment customization
+bash FlexiCache/LongBench.sh Llama8b
+                                                              # Run LongBench & Throughput for other
+# Results are written to benchmarks/                              models
+    FlexiCache/Language_Modelling/LongBench                   bash FlexiCache/LongBench.sh Mistral7b
+    /longbench_table.csv                                      bash FlexiCache/LongBench.sh Mistral24b
+                                                              bash FlexiCache/Throughput.sh Mistral7b
+                                                              bash FlexiCache/Throughput.sh Mistral24b
+A.5.2    Throughput
+This script benchmarks end-to-end throughput (tokens/sec)     A.8     Methodology
+of FlexiCache (with a 1024-token budget) against baseline
+vLLM for output lengths of 100, 500, 1000, and 1500 to-       Submission, reviewing and badging methodology:
+kens, using input prompts randomly sampled between 10k           • http://cTuning.org/ae/
+and 30k tokens. This workflow also takes approximately 3           submission-20190109.html
+hours.                                                           • http://cTuning.org/ae/
+# Run                                                              reviewing-20190109.html
+bash FlexiCache/Throughput.sh Llama8b                            • https://www.acm.org/publications/
+                                                                   policies/artifact-review-badging
+# Results are written to benchmarks/
+    FlexiCache/Throughput/throughput_table.
+    csv
+

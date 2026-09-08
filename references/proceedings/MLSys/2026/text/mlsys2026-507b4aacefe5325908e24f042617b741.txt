@@ -1,0 +1,868 @@
+                  R AID S ERVE : H IGH - PERFORMANCE R ESILIENT S ERVING
+
+
+                            Ziyi Xu 1 Zhiqiang Xie 2 Swapnil Gandhi 2 Christos Kozyrakis 2 3
+
+
+                                                         A BSTRACT
+        Tensor parallelism (TP) enables large language models (LLMs) to scale inference efficiently across multiple GPUs,
+        but its tight coupling makes systems fragile: a single GPU failure can halt execution, trigger costly KVCache
+        recomputation, and introduce long-term compute and memory imbalance. We present RaidServe, a fault-tolerant
+        TP serving system that sustains high performance under irregular GPU availability. RaidServe introduces three
+        techniques to balance computation and memory across GPUs: (1) Cyclic KVCache Placement for even memory
+        utilization, (2) Hybrid Attention combining tensor- and data-parallel attention to eliminate stragglers, and (3)
+        Fine-Grained Load-Aware Routing to dynamically balance requests. It further employs proactive KVCache backup
+        and on-demand weight recovery to avoid expensive recomputation and redundant data transfers. We implement
+        these techniques in a lightweight serving engine compatible with existing LLM infrastructures. Evaluated on
+        an 8×H100 DGX system with real-world fault traces and representative workloads, RaidServe achieves up to
+        2× higher throughput and two orders of magnitude lower recovery latency compared to standard fault-handling
+        approaches. Even with up to three GPU failures, RaidServe sustains high throughput and balanced utilization,
+        demonstrating robust and efficient LLM serving under dynamic and unreliable hardware conditions.
+
+1       I NTRODUCTION                                              the affected scale-up domain. With scale-up domain sizes
+                                                                   steadily increasing—with current deployments reaching up
+Modern Large Language Models (LLMs) have significantly             to 72 GPUs (NVIDIA, 2025a) — the probability and im-
+advanced capabilities across diverse applications, including       pact of GPU failures both intensify. Recent studies (He
+conversational agents (OpenAI, 2022), search engines (Gem-         et al., 2023; Hu et al., 2024; Kokolis et al., 2025; Jiang et al.,
+ini), code generation (Github, 2024), and scientific discov-       2024) underline the rising frequency of GPU failures, at-
+ery. As these models scale rapidly — now comprising                tributing them to hardware degradation, thermal instability,
+hundreds of billions or even trillions of parameters—their         and unpredictable preemptions. These failures impose sub-
+computational and memory requirements have risen dra-              stantial hurdles for maintaining reliable, high-performance
+matically (DeepSeek-AI, 2024). Consequently, deploying             inference services, critically affecting user experience and
+LLM inference workloads increasingly demands aggrega-              overall system efficiency. Typically, GPU failures introduce
+tion of compute and memory resources across multiple               two primary types of overhead:
+GPUs, often distributed over several nodes. Tensor par-
+allelism (TP) has emerged as a prominent solution for effi-        Challenge #1: Recovery Overhead. When a GPU fails,
+ciently scaling these workloads by tightly coupling GPUs           several immediate complications arise in reassigning infer-
+using high-bandwidth interconnects such as NVIDIA’s                ence workloads. First, the KVCache for all inflight requests
+NVLink (NVIDIA), AMD’s infinity fabric link (AMD) or               previously managed by the failed GPU is irrecoverably lost,
+Google’s TPU Pods (Google).                                        requiring expensive and time-consuming recomputation be-
+While TP enables efficient scaling within a scale-up               fore inference can continue. Additionally, the surviving
+domain—a set of GPUs connected via high-bandwidth                  GPUs must reshard and rebalance model weights (stored in
+interconnects—it also inherently couples all participating         CPU DRAM or persistent storage), resulting in substantial
+devices (Shoeybi et al., 2019). This tight coupling creates        data movement and traffic over PCIe. Collectively, these
+a double-edged sword: a single GPU failure can render              recovery tasks—KVCache reconstruction and model weight
+the entire TP execution unavailable across all GPUs within         resharing—trigger significant latency spikes, stall in-flight
+    1
+                                                                   requests, and severely degrade the quality of experience for
+    Shanghai Jiao Tong University 2 Stanford University 3 NVIDIA   clients, as depicted in Figure 13.
+Research. Correspondence to: Ziyi Xu <xzy2022@sjtu.edu.cn>,
+Christos Kozyrakis <kozyraki@stanford.edu>.
+                                                                   Challenge #2:Persistent Imbalance Overhead. After recov-
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,    ery, the system continues with fewer GPUs than originally
+2025. Copyright 2025 by the author(s).                             provisioned (e.g., from 8 to 7), breaking the symmetry as-
+                                             High-performance Resilient Serving
+
+sumptions under which serving pipelines are tuned. The           2     R ESILIENT M ODEL S ERVING
+result is enduring compute and memory skew. Compute
+imbalance occurs primarily due to uneven workload distri-        2.1     Background
+bution, notably within attention layers partitioned by dis-      2.1.1    LLM Inference
+crete attention heads. This imbalance leads to some GPUs
+idling, awaiting heavily loaded GPUs to complete their tasks,    Most popular LLMs are based on the Transformer ar-
+resulting in stalled resources and significantly diminished      chitecture, comprising multiple stacked transformer lay-
+throughput. Concurrently, memory imbalance arises from           ers (Vaswani et al., 2017). Each layer consists of an attention
+unequal distribution of KVCache utilization across GPUs.         mechanism and a feed-forward network (FFN). Attention
+This memory imbalance limits available cache capacity,           layers enable tokens within a request to interact, while FFN
+forcing smaller batch sizes and further constraining through-    layers process tokens independently. Most LLMs adopt the
+put due to increased overhead from frequent kernel launches      auto-regressive decoding mechanism, leading to an incre-
+and reduced parallelism. These persistent imbalances, de-        mental inference process consisting of several iterations (Yu
+picted in Figures 1 and 2, consistently impose performance       et al., 2022). At each inference iteration, the model predicts
+bottlenecks and cause severe underutilization of valuable        the next token based on all previously generated tokens.
+GPU resources.                                                   To optimize performance and avoid redundant computa-
+                                                                 tion, LLM serving systems cache intermediate token states—
+                                                                 known as the KVCache—for reuse in subsequent token
+To address these challenges, we propose RaidServe, a sys-        generation steps (Zheng et al., 2025; Kwon et al., 2023).
+tem designed to provide high-performance yet resilient TP        This caching strategy divides the inference process into two
+serving under irregular GPU availability. RaidServe intro-       distinct phases: the prefill phase, which processes all input
+duces three key techniques to sustain efficiency and bal-        tokens simultaneously in a single iteration to construct the
+ance under irregular GPU availability: (1) Cyclic KVCache        initial key-value cache and generate the first output token;
+Placement, which rotates KVCache placement across layers         and the decoding phase, where only the newly generated
+to evenly distribute memory usage and preserve effective         token requires computation to update the KVCache.
+batch size; (2) Hybrid Attention, which integrates TP- and
+DP-style attention to balance computation across GPUs            2.1.2    Multi-GPU LLM Inference
+and eliminate stragglers; and (3) Fine-Grained Load-Aware
+Routing, which dynamically dispatches requests based on          Modern LLMs frequently exceed the memory capacity and
+real-time GPU load to reduce intra-batch workload imbal-         performance capabilities of single GPUs, necessitating dis-
+ance. In addition, RaidServe incorporates proactive KV-          tributed execution strategies. Inference parallelism differs
+Cache backup to eliminate time-consuming recomputation           fundamentally from training parallelism, as it involves only
+during recovery, and on-demand weight restoration to min-        forward-pass computations—without gradients—and intro-
+imize I/O overhead. During normal operation, KVCache             duces specific challenges such as efficient management of
+backups are asynchronously maintained in the background.         the key-value (KV) cache. Effective parallelism schemes
+Upon failure, each GPU restores only the necessary sub-          typically aim either to minimize latency for individual in-
+set of lost KVCache and model weights in a joint, non-           ference requests or to maximize the overall throughput of
+redundant manner, thereby avoiding excessive PCIe data           concurrent workloads. Common parallelism strategies in-
+transfers and accelerating recovery.                             clude data parallelism (DP), where the model is replicated
+                                                                 across multiple nodes to independently handle separate re-
+We implement these mechanisms in a lightweight serving
+                                                                 quests, and pipeline parallelism (PP), where model layers
+engine that integrates seamlessly with existing LLM infras-
+                                                                 are distributed sequentially across nodes to balance com-
+tructures. Evaluated on an 8×H100 DGX system using
+                                                                 putational load and memory usage. Among these methods,
+real-world fault traces and representative serving workloads,
+                                                                 tensor parallelism (TP)—which partitions model parameters
+RaidServe demonstrates strong performance across both of-
+                                                                 and KVCache evenly across all GPUs within a node—stands
+fline throughput-optimized and online latency-constrained
+                                                                 out. TP uniquely leverages high-bandwidth interconnects
+scenarios. It achieves up to 2× higher throughput and up
+                                                                 within a node to reduce inference latency by splitting large
+to two orders of magnitude lower recovery latency com-
+                                                                 matrix operations across GPUs. Hybrid Parallelism com-
+pared to standard fault-handling practices. Further analysis
+                                                                 bines TP and PP, often using TP within compute nodes and
+shows that RaidServe continues to deliver substantial per-
+                                                                 PP across nodes, to scale to larger models and GPU counts.
+formance benefits even when up to three of eight GPUs fail,
+highlighting its robustness and scalability under severe fault
+                                                                 2.1.3    Frequent Failures in Large-Scale Clusters
+conditions.
+                                                                 Modern inference-serving clusters routinely consist of thou-
+                                                                 sands of GPUs interconnected by sophisticated network-
+                                              High-performance Resilient Serving
+
+ing, storage, and power infrastructures. At this scale,           experiments (Section 4.3.3), recomputing the lost KVCache
+hard failures—complete, sudden, and persistent hardware           alone takes over 20 seconds, during which all affected re-
+disruptions—occur frequently and inevitably. Common               quests undergo severe stalls. Moreover, this backlog prop-
+sources of these hard failures include GPU overheating,           agates through the serving pipeline, introducing queuing
+ECC errors, CUDA errors, and GPU driver errors leading to         delays that further impact subsequent requests. The result is
+abrupt termination of system software running on them (Hu         a sharp latency spike and widespread SLO violations, sig-
+et al., 2024). For instance, Alibaba Cloud (He et al., 2023)      nificantly degrading user-perceived quality of service. This
+reported abnormal termination rates as high as 44% for its        phenomenon highlights the urgent need for fast recovery
+top 5% most resource-intensive workloads. Similar relia-          mechanisms. Instead of recomputing from scratch, a more
+bility challenges have been echoed by Meta (Kokolis et al.,       effective strategy is needed to speed up this entire recovery
+2025), ByteDance (Jiang et al., 2024), LAION (Beaumont,           process.
+2022), and Google (Zu et al., 2024).
+                                                                  3     D ESIGN AND I MPLEMENTATION
+2.2     Motivation and Challenges
+                                                                  To enable model execution on an irregular number of GPUs,
+2.2.1    Imbalanced Load over Irregular Hardware                  we first implement a vanilla form of non-uniform tensor
+         Configurations                                           parallelism for model serving, originally proposed in prior
+When deploying LLMs on an irregular number of GPUs,               work on fault-tolerant LLM training (Arfeen et al., 2025).
+for example, seven instead of the ideal eight due to GPU          Non-uniform tensor parallelism allows model weights and
+availability issed discussed in §2.1.3, it becomes challeng-      computations to be distributed unevenly across GPUs by ad-
+ing to maintain balanced computation and memory usage             justing synchronization among tensor-parallel workers. This
+across devices. For feed-forward (FFN) layers, weights are        enables flexible tensor-parallel configurations under partial
+typically partitioned along the intermediate dimension, al-       GPU availability. To address the load imbalance and latency
+lowing relatively even distribution even across fewer GPUs,       spikes discussed in §2.2, we further introduce a memory and
+since the intermediate dimension is large enough to divide        computation balancer and a lighting recovery mechanism
+smoothly. In contrast, attention layers are divided by at-        for higher throughput and better SLO attainment.
+tention heads, which are usually limited to only tens per
+layer, leading to severe imbalance when sharded across an         3.1   Memory and Computation Balancer
+irregular number of GPUs.
+For instance, when sharding a LLaMA-3.1-70B model
+(Meta-AI, 2024) with 8 key-value heads across seven GPUs,
+some ranks inevitably host two heads while others hold only
+one, resulting in up to a 2× slowdown in attention-layer
+computation (Figure 2). This imbalance is further exacer-
+bated in long-context scenarios, where each attention head
+contributes not only to computation but also to the KVCache
+memory footprint. As a result, certain ranks may consume
+up to twice as much KVCache memory as others. Due to the
+synchronized nature of tensor parallelism, such imbalance
+effectively reduces the usable batch size of the entire system,
+leading to substantial throughput degradation, as shown in
+Figure 1.
+                                                                  Figure 1. Illustration of the proposed cyclic placement for balanc-
+2.2.2    Latency Spike due to State Loss                          ing KVCache memory usage across GPUs. In this example, the
+                                                                  model has 4 key-value heads and deploys non-uniform TP3. KVi
+When a GPU suddenly fails or becomes temporarily un-              stands for the KVCache for i-th key value head. Cyclic placement
+available, all model parameters and KVCache residing on           (bottom) improves overall KVCache capacity by approximately
+it are immediately lost. While static model weights can           50%, compared with a naı̈ve placement (top).
+be reloaded from persistent storage such as host memory
+or disk with moderate cost, the KVCache represents the            Cyclic Placement. To mitigate memory imbalance, we
+dynamic per-request state that must be recomputed from            propose a simple yet effective cyclic placement strategy.
+scratch. This recomputation requires rerunning the entire         Specifically, attention heads and their corresponding KV-
+prefill phase for all affected in-flight requests, which is an    Cache blocks are distributed cyclically across GPUs. As
+extremely compute-intensive process. In our online serving        illustrated in Figure 1, naı̈ve placement can lead to signif-
+                                             High-performance Resilient Serving
+
+icant KVCache skew, where some GPUs accumulate sub-
+stantially larger memory footprints. In contrast, our cyclic
+scheme rotates attention-head assignments layer by layer,
+ensuring that across every contiguous n layers in a TPn
+configuration, the aggregate KVCache allocation remains
+well balanced. Because modern LLMs typically contain
+tens or even hundreds of layers—far exceeding the usual
+tensor-parallel world size (often below ten)—this cyclic
+distribution effectively smooths out KVCache memory uti-
+lization across all GPUs.
+Hybrid Attention. Cyclic placement primarily addresses
+memory imbalance. It does not, by itself, eliminate intra-
+layer computation imbalance. Each attention layer still re-
+quires collective synchronization before and after attention     Figure 2. Illustration of the proposed hybrid attention. In this ex-
+computation, so GPUs with less assigned work may remain          ample, the model has 4 key-value heads and deploys non-uniform
+temporarily stalled. To further mitigate intra-layer computa-    TP3. Ai stands for the i-th head’s computation for request A. Re-
+tion imbalance, we introduce Hybrid Attention, which main-       quest A is routed to GPU0 , B to GPU1 , and C to GPU2 . Hybrid
+tains a balanced workload among tensor-parallel workers          attention (bottom) combine TP attention with DP attention, signifi-
+by assigning each the same number of attention heads and         cantly reducing GPU idle time and improving GPU utilization.
+leveraging data parallelism (DP) to handle the remaining
+heads. Hybrid Attention can be viewed as a generalization
+of TP and DP.                                                    surviving GPUs, the KVCache (and corresponding DP at-
+                                                                 tention weight and computation) of layer i is placed on
+For example, in the LLaMA-3 70B model with eight at-             (r + i) mod n.
+tention heads, a deployment with eight TP workers evenly
+distributes the heads, behaving identically to a standard TP-    Hybrid Attention mitigates intra-layer computation imbal-
+8 configuration. However, when only seven GPUs—and               ance by distributing replicated-head computation across
+hence seven TP workers—are available, each TP worker             GPUs. As a side effect, it can also improve memory bal-
+receives one head, while the remaining head is replicated        ance when DP scheduling is well balanced. However, this
+across all seven GPUs. Each GPU thus also acts as a DP           effect is inherently workload-dependent and does not pro-
+worker, processing the replicated head for different requests.   vide a worst-case guarantee: under skewed DP assignment,
+This design enables the computation of the extra head to         KVCache may still concentrate on a subset of GPUs. In
+be parallelized across GPUs through data parallelism, dis-       contrast, cyclic placement provides a deterministic lower
+tributing requests to balance the workload effectively. As       bound on memory balance. Regardless of request distribu-
+shown in Figure 2, naı̈ve non-uniform tensor parallelism         tion, each request contributes approximately a n1 fraction of
+often results in straggler GPUs during attention computa-        its KVCache to every GPU, ensuring near-uniform memory
+tion, causing under-utilization. In contrast, Hybrid Attention   usage even in the worst case.
+distributes the computation of replicated heads for differ-      Still, these two mechanisms can not guarantee perfect load
+ent requests across multiple GPUs, significantly reducing        balance due to workload skewness.
+intra-layer imbalance, minimizing idle time, and improving
+overall utilization.                                             First, the input workload itself can be inherently imbalanced,
+                                                                 with requests exhibiting highly variable input lengths. Under
+Notably, the widely adopted DP attention design (SGLang-         naı̈ve scheduling policies (e.g., round-robin), even if each
+Team, 2024)—used for serving multi-head latent atten-            DP replica is assigned the same number of requests, GPUs
+tion (MLA) (DeepSeek-AI et al., 2024) models such as             may experience significantly different execution times.
+DeepSeek-V3 (DeepSeek-AI, 2024)—is a special case of
+our Hybrid Attention. While DP attention duplicates a single     Second, even with a perfectly balanced workload, skewness
+attention head across all GPUs, Hybrid Attention general-        can still arise from system-level constraints. In long-context
+izes this approach to flexibly support both partitioned (TP)     scenarios where the input length exceeds the prefill token
+and replicated (DP) heads within the same layer.                 budget (e.g., 2K for vLLM (Kwon et al., 2023), 8K for
+                                                                 SGLang (Zheng et al., 2025)), modern LLM serving en-
+Combination of Hybrid Attention and Cyclic placement.            gines employ chunked prefill (Agrawal et al., 2024). In this
+Hybrid Attention and cyclic placement serve complemen-           case, only one single request chunk can be scheduled within
+tary roles but operate on the same execution path. Specif-       the token budget at a time, effectively restricting DP paral-
+ically, for a request assigned to base rank r and with n         lelism and leading to an extreme form of imbalance, where
+                                              High-performance Resilient Serving
+
+Algorithm 1 DP-aware Adaptive Chunked Prefill
+  Input: Token budget N , rank set R, schedulable tokens
+  {Sr }, workloads {Wr }
+  Output: Next Prefill batch B
+  Lr ← 0 {* initialize load per rank}
+  B ← ∅ {* initialize current prefill batch}
+  H ← ∅ {* initialize candidate batch set}
+  while |B| < N and ∃r : Sr ̸= ∅ do
+    r∗ ← arg minr∈R, Sr ̸=∅ Lr {* least-loaded rank}
+    t ← first(Sr∗ ), Sr∗ ← Sr∗ \{t} {* schedule 1 token}
+    B ← B ∪{t}, Lr∗ ← Lr∗ + cost(t), H ← H ∪ {B}
+  end while
+  return choose best batch(H)
+
+                                                                  Figure 3. Illustration of the load-aware router and scheduler. In
+                                                                  this example, request 0 has 4 tokens, request 1 and 2 has 1 token,
+only one GPU performs the DP attention computation while          and a new request 3 with 1 token arrives. In the naı̈ve setting
+others remain idle.                                               (top), a round-robin router combined with a FIFO chunked prefill
+                                                                  scheduler results in an highly unbalanced prefill batch: within
+Fine-grained, Load-aware Routing To further mitigate              the prefill token budget (which is 3), only a chunk of request 0 is
+the load imbalance caused by skewed input request distri-         scheduled in the prefill batch. In contrast, our load-aware router
+butions, we introduce a fine-grained, load-aware routing          (bottom) dynamically redirects new requests to the least-loaded
+mechanism that dynamically balances the workload among            GPU, and our adaptive chunked prefill mechanism helps form a
+DP workers across GPUs. Our scheduler design addresses            balanced batch.
+two complementary aspects: (1) routing DP ranks, and (2)
+forming compute-balanced batches.                                 As shown in Figure 3, naı̈ve routing and chunked prefill lead
+                                                                  to highly skewed batches and unbalanced GPU workloads.
+Load-Aware DP-Rank Routing. We observe that the DP-rank           In the example, GPU0 becomes overloaded because the
+scheduling problem can be modeled as an instance of the           vanilla scheduler includes only the first chunk of request 0
+classical online makespan minimization problem (Dwibedy           within the prefill budget, leaving other GPUs underutilized.
+& Mohanty, 2022; 2020; Wang et al., 2025). To achieve             In contrast, our load-aware router dynamically assigns DP
+low scheduling overhead while maintaining balance, we             ranks based on real-time GPU load, while the adaptive chun-
+adopt a simple yet effective greedy strategy: each incoming       ked prefill scheduler constructs balanced batches in a best-
+request is assigned to the GPU with the smallest estimated        effort manner. Together, these two mechanisms significantly
+remaining workload. Here, the workload is defined as the          improve GPU utilization and overall system throughput un-
+total pending DP computation (in token units) currently           der dynamic and skewed request patterns.
+queued on each GPU. This dynamic routing policy continu-
+ously adapts to runtime variations in request arrival patterns,
+                                                                  3.2   Lightning Recovery
+preventing load concentration on specific GPUs.
+                                                                  As discussed in §2.2.2, rapid recovery is critical to pre-
+Fine-Grained Chunked Prefill. To complement routing, we
+                                                                  vent request backlogs and maintain SLO compliance. We
+design a Fine-Grained Chunked Prefill mechanism for the
+                                                                  identify two dominant sources of recovery latency: recom-
+prefill stage. Unlike conventional chunked prefill, which
+                                                                  putation of the lost KVCache and reloading of re-sharded
+allows only one chunk per request in a batch. Our approach
+                                                                  model weights. To mitigate both, we propose a Lightning Re-
+permits chunks from multiple requests to be executed jointly
+                                                                  covery framework comprising two components—Proactive
+within the same batch. Since the computational cost of
+                                                                  KVCache Backup and On-Demand Weight Recovery—that
+prefill attention grows quadratically with sequence length,
+                                                                  together minimize downtime by avoiding redundant recom-
+the cost of processing a chunk of size N after L processed
+                                                                  putation and restoring only essential model data.
+tokens is O(N 2 + N L + N ). To maintain balanced GPU
+workloads and prevent out-of-memory errors, we define a           Proactive KVCache Backup. When a GPU fails, its lo-
+global prefill token budget N representing the maximum            cal KVCache is lost, and recomputing it through re-prefill
+number of tokens per batch. Tokens are then iteratively           can be costly. To enable fast recovery, RaidServe proac-
+allocated to the least-loaded GPU until the budget is reached,    tively backs up KVCache to host memory. The backup is
+ensuring balanced computation and bounded intermediate            incremental and asynchronous: newly generated KVCache
+memory usage. Algorithm 1 outlines the adaptive chunked           pages are copied to CPU memory in the background during
+prefill procedure.                                                normal execution, avoiding an additional blocking step on
+                                               High-performance Resilient Serving
+
+the critical path. After a request finishes, its corresponding     ing aggregate PCIe bandwidth and minimizing end-to-end
+CPU-side KVCache backup is simply discarded.                       recovery latency.
+Upon failure, surviving GPUs directly reuse their local KV-
+Cache, while only the missing portion is restored from host
+memory. If the locality of surviving KVCache no longer
+matches the new parallel configuration of our Hybrid Atten-
+tion, RaidServe further migrates KVCache to the appropri-
+ate GPUs. Since NVLink is significantly faster than PCIe,
+the migration overhead is small and can also be overlapped
+with ongoing KVCache loading from host. Finally, under
+Hybrid Attention and the cyclic KV placement optimiza-
+tion in §3.1, the KVCache originally stored on the failed
+rank is partitioned across the surviving ranks, so that each
+rank reloads only a disjoint subset of the lost KVCache
+from host memory. The restored KVCache is then evenly              Figure 4. On-demand Recovery mechanism. In this example, the
+redistributed across GPUs, balancing host-to-device transfer       FFN weights are divided into 12 shards and there’re 4 attention
+traffic during recovery.                                           heads with corresponding KVCache. The system starts with nor-
+                                                                   mal TP4. When GPU 3 fails, we will restore all the lost state
+On-demand Weight Recovery. Reusing and restoring the               (weights and KVCache) via PCIe. Our on-demand recovery mech-
+KVCache avoids expensive re-prefill, but weight recovery           anism eliminate all redundant PCIe transfer.
+can still become a bottleneck after reconfiguration. To ad-
+dress this, RaidServe recovers weights on demand: after a          Figure 4 illustrates the recovery process under an original
+GPU failure, each surviving rank keeps its currently resi-         TP4 configuration. The FFN intermediate dimension is
+dent weights, and reloads only the missing weight blocks           divided into 12 shards, while attention has 4 heads and KV-
+required by the new parallel layout, rather than reconstruct-      Cache is partitioned into 4 slices across 4 GPUs. Under the
+ing an entire shard from scratch.                                  original TP4 layout, GPU0 holds shards {0, 1, 2}, GPU1
+                                                                   holds {3, 4, 5}, GPU2 holds {6, 7, 8}, and GPU3 holds
+For FFN layers, RaidServe first partitions the intermediate        {9, 10, 11}. After GPU3 fails, a standard TP3 re-sharding
+dimension into a set of fixed-size shards, whose granularity       would assign GPU0 to {0, 1, 2, 3}, GPU1 to {4, 5, 6, 7},
+is independent of the TP world size. A conventional TP             and GPU2 to {8, 9, 10, 11}, forcing the surviving GPUs to
+layout assigns contiguous shards to each rank. When the TP         reload many weights despite already holding valid shards.
+degree changes after a failure (e.g., from 8 to 7), naı̈vely re-   In contrast, RaidServe preserves the resident weights on
+sharding the model would require each rank to reload a new         GPU1 –GPU3 and assigns only the missing shards cycli-
+contiguous shard, even though most of the previously loaded        cally, resulting in the new layout {3, 4, 5, 0} , {6, 7, 8, 1},
+weights are still valid. RaidServe instead preserves all sur-      and {9, 10, 11, 2}. As a result, each surviving GPU reloads
+viving shards in place and redistributes only the missing          exactly one missing shard, and no already-resident FFN
+shards across the remaining ranks. This is correct because         weight is redundantly transferred. For attention, the lost
+FFN hidden channels can be permuted arbitrarily, as long           head weights are similarly recovered on demand: each rank
+as the corresponding columns of the up-projection/gating           loads a disjoint subset from host memory and exchanges the
+weights and rows of the down-projection weight are per-            remaining pieces over NVLink. At the same time, each rank
+muted consistently. Therefore, RaidServe can form a new            restores only the required subset of the missing KVCache
+valid FFN layout without enforcing contiguous shard bound-         from host memory, enabling fast and parallel recovery.
+aries, allowing each rank to fetch only the weight blocks
+that are absent locally.                                           Backup Overhead Analysis. Both Proactive KVCache
+                                                                   Backup and On-demand Weight Recovery rely on host mem-
+For attention layers, RaidServe leverages the DP-based             ory to preserve recovery state. This design is practical on
+placement in its hybrid attention design. After a failure,         modern GPU servers, which typically provide large and
+the lost attention weights are recovered on demand in a            persistent host memory. In our testbed with one node of
+distributed manner: each surviving rank loads a distinct           8×H100 GPUs, the host memory is 1.5 TB, far exceeding
+subset of the missing weights from host memory, and the re-        the aggregate GPU HBM capacity (80 GB × 8 = 640 GB).
+maining segments are exchanged among peers via NVLink.             This capacity is sufficient to maintain backups for both the
+This design minimizes redundant PCIe traffic and utilizes          model weights and the KVCache of ongoing requests in our
+the much higher NVLink bandwidth to complete recovery              setting. Moreover, once a request finishes, its corresponding
+efficiently. Together, these two mechanisms ensure that all        host-side KVCache backup is discarded, so no additional
+surviving ranks participate evenly in recovery, maximiz-           eviction policy is needed.
+                                             High-performance Resilient Serving
+
+Under this design, recovery is primarily bounded by host-        across layers.
+to-device bandwidth rather than recomputation cost. Prior
+                                                                 During model forward execution, KVCache is continuously
+work shows that loading/writing KVCache from/to host
+                                                                 backed up to host memory in the background. In case of
+memory can be substantially faster than prefill again when
+                                                                 failures, recovery is triggered by restoring missing KVCache
+PCIe bandwidth is effectively utilized (Xie et al., 2025).
+                                                                 and weights from host while reusing all surviving states.
+We therefore maintain KVCache backup incrementally and
+asynchronously during normal execution, so the backup traf-
+fic is largely overlapped with serving rather than introducing   4     E VALUATION
+an additional blocking step on the critical path.
+                                                                 We evaluate RaidServe on a server equipped with eight
+Assuming PCIe 5.0×16, which provides around 50 GB/s per          NVIDIA H100 GPUs (80 GB each). The GPUs are inter-
+GPU in practice, the recovery overhead is small in our set-      connected via 4th-generation NVLink and each GPU is con-
+ting. For example, for LLaMA-3.1-70B on 8×H100 GPUs, a           nected to the CPU via a PCIe 5.0 x16 link. We measure both
+batch of 56 requests with 16K context requires about 280 GB      system offline throughput as well online throughput latency
+of KVCache in total. In this case, each GPU stores roughly       characterization to demonstrate the overall effectiveness of
+280                                          140
+  8 = 35 GB of KVCache, together with 8 = 17.5 GB                our system. To ensure a comprehensive evaluation, we ex-
+of model weights. The total KVCache backup traffic per           periment with two representative large language models that
+GPU is therefore about 35 GB, corresponding to roughly           typically utilize a whole node of GPUs to serve: a dense
+35
+50 = 0.7 s of PCIe transfer; this cost is incurred incremen-     model, LLaMA-3.1-70B-Instruct (Meta-AI, 2024), and a
+tally in the background rather than as a one-time pause.         mixture-of-experts (MoE) model, Mixtral-8x22B-Instruct-
+After a single GPU failure, each surviving GPU reloads           v0.1 (Mistral-AI, 2024). We implemented RaidServe on top
+only about 35+17.5
+                7    = 7.5 GB of lost state from host mem-       of a light-weight customized LLM serving engine, which
+ory, leading to a recovery time of less than 0.2 s. In con-      is implemented using around 7k lines of code and achieves
+trast, recomputing the lost KVCache through re-prefill alone     performance on par with state-of-the-art open-source LLM
+would take more than 20 s in the same setting, highlighting      inference frameworks such as vLLM and SGLang.
+the benefit of incremental backup and host-memory-based
+recovery.                                                        4.1   Offline Throughput under Faulty Environments
+
+3.3   System Overview and Execution Workflow
+
+
+
+
+                                                                 Figure 6. GPU availability from GCP cloud availability traces.
+         Figure 5. End to end workflow of RaidServe
+                                                                 Failure Model. We simulate failure and recovery events
+We now describe the end-to-end execution workflow and
+                                                                 on an 8 × 8 H100 cluster using a real-world failure trace
+implementation details of RaidServe, focusing on how rout-
+                                                                 derived from the GCP cloud availability dataset, which
+ing, scheduling, memory placement, and recovery interact
+                                                                 has been widely adopted in prior studies such as Bam-
+during real-world serving.
+                                                                 boo (Thorpe et al., 2023), Oobleck (Jang et al., 2023), and
+For each incoming request, RaidServe first assigns a base        Recycle (Gandhi et al., 2024). The trace is scaled such that
+data-parallel (DP) rank through a load-aware router based        full availability corresponds to 64 GPUs, as illustrated in
+on real-time GPU workload. The scheduler then constructs         Figure 6.
+compute-balanced batches using fine-grained chunked pre-
+                                                                 Our target failure model focuses on single or multiple GPU
+fill.
+                                                                 failures within DGX nodes, which may arise from GPU-side
+Given the assigned DP rank, attention computation and KV-        errors or spot-instance preemption. During the simulation,
+Cache placement are jointly determined by our cyclic place-      each failure event randomly disables one GPU, while each
+ment strategy and Hybrid Attention design, which together        recovery event randomly restores one previously failed GPU.
+define both the execution location and memory placement          Upon each GPU failure, the system reconfigures itself to
+                                                 High-performance Resilient Serving
+
+    Available GPUs        1    2    3   4    5     6   7   8            Available GPUs        1    2   3    4    5   6     7   8
+    Standard TP           –    –    –   4    4     4   4   8            Standard TP           –    –   –    –    –   –     –   8
+   Non-uniform TP         –    –    3   4    5     6   7   8           Non-uniform TP         –    –   –    –    5   6     7   8
+     RaidServe            –    –    3   4    5     6   7   8             RaidServe            –    –   –    –    5   6     7   8
+
+
+
+
+             Figure 7. (a) LLaMA-3.1-70B-Instruct                              Figure 8. (b) Mixtral-8x22B-Instruct-v0.1
+
+Figure 9. The tables above summarize the tensor-parallel configurations adopted by each system under different numbers of available
+GPUs per node. The figures below show the corresponding real-time throughput of different systems during fault-injection experiments.
+Dashed lines in each figure represent the average throughput over time.
+
+
+continue operating with the remaining available GPUs.               a fault-tolerant system with Non-Uniform TP (3) a fault-
+                                                                    free system that assumes no GPU failures and serves as the
+We assume that when a GPU fails, the other GPUs in the
+                                                                    performance upper bound, and (4) a fault-scale system that
+same DGX node, as well as the NVLink connections among
+                                                                    linearly scales the throughput of the fault-free case based
+the surviving GPUs, remain operational. We do not model
+                                                                    on GPU availability. We use a single 8-GPU machine to
+driver-level failures that prevent any GPU kernels from run-
+                                                                    emulate eight independent 8-GPU nodes and report aggre-
+ning before recovery. For simplicity, we fix the reconfig-
+                                                                    gated throughput across all simulated nodes. All systems
+uration latency to 10 seconds for all systems, since this
+                                                                    employ tensor parallelism within each node. In the Stan-
+overhead has negligible impact on end-to-end throughput in
+                                                                    dard TP system, the per-node TP configurations are limited
+our evaluation. A more fine-grained failure and interconnect
+                                                                    to 1, 2, 4, 8 GPUs, consistent with the implementations of
+model is left to future work.
+                                                                    state-of-the-art serving engines such as SGLang and vLLM.
+Dataset. We use OpenThoughts-114k (Guha et al., 2025),              Consequently, when a GPU fails within a node, the Standard
+a large-scale, high-quality “thinking” dataset composed of          TP system must fall back to the next supported configuration,
+114,000 multi-turn reasoning and instruction-following ex-          resulting in reduced resource utilization. In contrast, both
+amples curated from diverse sources. This dataset is widely         Non-Uniform TP and RaidServe support flexible TP con-
+used for evaluating and post-training LLMs on reflective and        figurations with arbitrary GPU counts, provided sufficient
+logical reasoning tasks, making it representative of realistic      memory is available for model weights and KVCache. As
+LLM-serving workloads. Its key input-output characteris-            shown in Figure 9, the minimum number of GPUs required
+tics are summarized in Table 1. We adopt this dataset to            to serve the dense LLaMA-3.1-70B-Instruct model is 3. For
+emulate long-context, multi-turn interactions that commonly         the Mixture-of-Experts model Mixtral-8x22B-Instruct-v0.1,
+arise in RL-based training and inference workloads (Ouyang          the larger memory footprint raises this minimum to 5 GPUs.
+et al., 2022).
+                                                                    Performance Analysis.
+Baselines. We compare RaidServe against three configu-
+                                                                    As shown in Figure 9, RaidServe consistently outperforms
+rations: (1) a non-fault-tolerant Standard TP system, (2)
+                                                                    the Standard TP baseline across both dense and MoE mod-
+                                                                    els. For LLaMA-3.1-70B, RaidServe delivers 1.28× higher
+                                                                    average throughput, achieving 95% of the Fault-scaled per-
+   Metric                      Mean      Median        Max          formance, demonstrating the effectiveness of its memory
+                                                                    and compute balancing optimization. For Mixtral-8x22B,
+   Input length (tokens)         422        352        7633
+                                                                    the throughput gain increases to 1.71×, reaching 92% of
+   Output length (tokens)       7295        5583       37817
+                                                                    the Fault-scaled performance. Even compared to Non-
+                                                                    Uniform TP, a stronger baseline, RaidServe still achieves
+Table 1. Input-output characteristics of OpenThought dataset.
+                                                 High-performance Resilient Serving
+
+
+
+
+Figure 10. Throughput-latency curves when serving the Mooncake trace. The TP4 baseline is omitted for the Mixtral-8x22B model due
+to insufficient memory to accommodate both model weights and KVCache on only 4 GPUs.
+
+
+additional speedups of 20% and 17% on LLaMA and Mix-                  conversation trace, a popular open-source trace with arrival
+tral, respectively. The larger throughput improvement over            timestamps of requests as well as anonymized input and
+the standard baseline stems from Mixtral’s higher memory              output sequence lengths. We randomly sampled 3,000 re-
+footprint, where the TP4 configuration becomes infeasible,            quests out of the complete traces and scale the timestamp
+leading to greater resource underutilization that RaidServe           for scanning different request rates. Table 2 summarizes
+effectively mitigates.                                                the input and output characteristics of the selected trace.
+                                                                      Requests are issued according to the scaled timestamps, and
+4.2   Online Throughput-Latency after Failures                        we record TTFT, TBT, and token throughput for each sys-
+                                                                      tem. By varying the scaling ratio, we obtain the complete
+We further evaluate the throughput-latency characteristics            throughput-latency curves.
+of RaidServe under online serving scenarios. To ensure con-
+sistency, we measure throughput and latency by varying the            Baselines. We compare RaidServe against three baselines:
+input request rate in stable environments, i.e., the system op-       (1) Standard-TP4, the default fallback tensor-parallel con-
+erates with a fixed number of available GPUs and no runtime           figuration activated upon GPU failure, serving as the pri-
+reconfiguration. We separately analyze the prefill and de-            mary baseline; (2) Standard-TP8, the fault-free configu-
+code stages, as prefill-decode (P-D) disaggregation (Zhong            ration representing the upper-bound performance; and (3)
+et al., 2024) is a standard practice in modern LLM serving            NonUniform-TP7, a naı̈ve implementation that operates on
+for improved latency SLO attainment (NVIDIA, 2025b). La-              7 GPUs but suffers from significant load imbalance. Our
+tency is reported using Time to First Token (TTFT) for prefill        proposed RaidServe adopts the optimized RaidServe-TP7
+instances and Time Between Tokens (TBT) for decode in-                configuration, which integrates all key components — cyclic
+stances. Throughput is measured as input-token throughput             memory placement, hybrid attention, and load-aware rout-
+for prefill and generated-token throughput for decode.                ing with fine-grained scheduling We focus on the 7-GPU
+                                                                      setting as it represents the most common failure scenario in
+Dataset. We use the real-world Mooncake (Qin et al., 2025)            practice; additional experiments under higher failure rates
+                                                                      are presented in §4.3.1. Note that the Standard-TP4 baseline
+                                                                      is omitted for the Mixtral-8x22B experiment, as the model
+  Metric                       Mean       Median        Max           weights and KVCache for the longest requests cannot fit
+  Input length (tokens)       13,516       8,001      12,3192         within the memory capacity of only four GPUs.
+  Output length (tokens)       349          362        2,000          Performance Analysis. Figure 10 presents the throughput-
+  Total requests                           3,000                      latency characteristics of RaidServe compared with all base-
+                                                                      lines across both the prefill and decode stages. For both the
+Table 2. Input-output characteristics of our scaled Mooncake trace.
+                                              High-performance Resilient Serving
+
+
+
+
+Figure 11. Performance comparison of RaidServe optimization
+with NonUniform-TP. Throughput is normalized to Standard-TP4.
+                                                                  Figure 12. Breakdown of RaidServe optimization attributions in
+                                                                  both prefill stage and decode stage on Llama-70B model with 7
+dense LLaMA-3.1-70B and the MoE Mixtral-8x22B mod-                GPUs.
+els, RaidServe consistently outperforms Standard-TP4 and
+NonUniform-TP7 under all request rates. At low request
+rates, it achieves near-optimal performance comparable to
+the fault-free Standard-TP8 configuration.
+In the prefill stage, RaidServe attains up to 2× and 1.28×        nounced — RaidServe improves throughput by 16%, 51%,
+higher throughput than Standard-TP4 and NonUniform-               and 78% for TP5, TP6, and TP7, respectively. These results
+TP7, respectively, under the same 10s TTFT constraint             demonstrate that the proposed design effectively alleviate
+for LLaMA-3.1-70B, and achieves a 1.14× gain over                 imbalance and scales efficiently under non-uniform GPU
+NonUniform-TP7 for Mixtral-8x22B.                                 configurations.
+In the decode stage, where balanced memory and com-
+pute utilization becomes more critical, the benefits are even     4.3.2   Memory and Compute Balancing
+more pronounced. Under a 40ms TBT constraint, Raid-               Without memory balancing, certain GPUs store dispropor-
+Serve achieves up to 2× and 1.60× higher throughput               tionately larger portions of the KVCache and model weights,
+than Standard-TP4 and NonUniform-TP7 for LLaMA-3.1-               constraining the maximum batch size during the decode
+70B, and a 1.85× improvement over NonUniform-TP7 for              stage and leading to suboptimal GPU utilization. To quan-
+Mixtral-8x22B.                                                    tify the impact of memory balancing, we first augment the
+                                                                  baseline NonUniform-TP7 configuration with cyclic mem-
+4.3     Performance Breakdown Analysis                            ory placement, ensuring even distribution of KVCache and
+                                                                  model weights across GPUs. To further highlight the effect
+4.3.1    RaidServe with Less GPUs
+                                                                  of computation balancing introduced by our hybrid attention
+To further evaluate the effectiveness of our proposed mech-       mechanism, we compare the peak throughput of four system
+anism, we measure system throughput across different              configurations on the Mooncake trace using the LLaMA-3.1-
+TP configurations. We compare RaidServe against the               70B model: (1) Standard-TP4 (baseline), (2) +NonUniform-
+NonUniform-TP baseline under TP4 – TP8 settings and               TP7, (3) +Memory-balancing (NonUniform-TP7 with cyclic
+report the peak throughput on the Mooncake trace using the        memory placement), and (4) +Compute-balancing, which
+LLaMA-3.1-70B model.                                              integrates all proposed optimizations.
+As shown in Figure 11, when running with 4 or 8 GPUs,             As shown in Figure 12, memory and compute balancing
+both systems degenerate to standard uniform tensor par-           contribute differently across stages. In the prefill stage,
+allelism and therefore exhibit identical performance. As          the compute-balancing mechanism alleviates straggler ef-
+the tensor-parallel world size becomes irregular (beyond          fects and improves peak throughput by 25%, while memory
+4 GPUs), computation and memory imbalance intensifies,            balancing provides negligible benefit since prefill is pri-
+and RaidServe begins to demonstrate clear advantages. In          marily compute-bound. In contrast, the decode stage is
+the prefill stage, RaidServe achieves performance gains of        memory-bound: larger batch sizes enabled by memory bal-
+0%, 16%, and 25% over NonUniform-TP for TP5, TP6,                 ancing significantly improve GPU utilization, yielding a
+and TP7 configurations, respectively. The limited improve-        34% throughput increase. Finally, applying compute balanc-
+ment under TP5 arises because compute imbalance at this           ing on top of memory balancing further mitigates inter-GPU
+scale is inherently harder to mitigate. In contrast, during the   workload skew, boosting overall decode throughput by an
+memory-bound decode stage, the benefits become more pro-          additional 43%.
+                                               High-performance Resilient Serving
+
+                                                                  KVCache backup eliminates expensive recomputation, re-
+   Table 3. GPU state recovery latency of different systems.
+                                                                  ducing P90 and P99 TBT from over 10s to under 1s. With
+  System       Recompute        Host       Full      Oracle       on-demand weight loading, P99 TBT further drops from
+  Latency          22 s       530 ms      120 ms      15 ms       572ms to 229ms, a 2.5× improvement and approaching
+  Speedup         1.00×       41.5×        183×        N/A        the oracle’s lower bound. Together, these results confirm
+                                                                  that host-based KVCache backup and on-demand recovery
+                                                                  are highly effective in minimizing recovery latency during
+                                                                  online serving.
+
+                                                                  5    R ELATED W ORK
+                                                                  Fault tolerance in distributed training has been extensively
+                                                                  studied by numerous systems. Redundancy-based methods
+                                                                  such as Bamboo (Thorpe et al., 2023) incorporate redun-
+                                                                  dant computations to handle preemptions common in cloud
+                                                                  spot instances. Oobleck (Jang et al., 2023) employs het-
+                                                                  erogeneous pipelines to facilitate failure recovery without
+Figure 13. CDF of Max TBT per request of RaidServe under dif-     requiring additional spare resources, while ReCycle (Gandhi
+ferent recovery method. Dashed vertical lines shows the P90/P99   et al., 2024) dynamically reroutes computations to redun-
+TBT of each system.                                               dant data-parallel peers to seamlessly continue processing
+                                                                  after failures. Checkpoint-based approaches include Check-
+                                                                  Freq (Mohan et al., 2021), CPR (Maeng et al., 2021), and
+4.3.3   Recovery Latency                                          Gemini (Wang et al., 2023), which respectively mitigate
+To evaluate the efficiency of our recovery mechanism, we          checkpoint overhead by dynamically adjusting checkpoint
+conduct a detailed breakdown of recovery latency under            frequency, quantizing embedding tables, and strategically
+online serving workloads, where latency sensitivity is most       scheduling checkpoint traffic across the storage hierarchy.
+critical. We use the LLaMA-3.1-70B model and replay a             Megascale (Jiang et al., 2024) addresses storage bottlenecks
+contiguous 500-request window from the Mooncake con-              during recovery by efficiently sharing data between corre-
+versation trace. The system initially runs with a standard        sponding GPU workers across data-parallel groups. Unlike
+TP8 decode instance, and a GPU failure is injected 100ms          these training-focused systems, RaidServe specifically em-
+after the 250th request (i.e., halfway through the trace). We     ploys hybrid attention mechanism with non-uniform tensor
+report the maximum Time Between Tokens (TBT) per request          parallelism to achieve fault-tolerant distributed inference.
+as the latency metric, since a request is considered to vio-      In the context of fault-tolerant distributed inference, recent
+late its decode SLO if any of its TBTs exceed the specified       efforts such as SpotServe (Miao et al., 2024), Llumnix (Sun
+threshold.                                                        et al., 2024), DejaVu (Strati et al., 2024), and Medusa (Zeng
+All configurations enable memory and compute balancing            et al., 2025) enable live migration of KVCaches and model
+optimizations. We compare the following recovery methods:         weights. However, these systems do not address the persis-
+(1) Recompute, which regenerates the lost KVCache and             tent throughput degradation arising from compute and mem-
+reloads all re-sharded model weights when transitioning to        ory imbalances inherent in non-uniform tensor parallelism.
+a TP7 configuration; (2) RaidServe-Host, which proactively        To overcome these challenges, RaidServe integrates a hybrid
+backs up the KVCache in host memory and restores the lost         attention mechanism and a dynamic scheduler alongside
+cache from backup instead of recomputation; (3) RaidServe-        KVCache migration, ensuring both high-performance and
+Full, which builds upon RaidServe-Host and further avoids         robust resilience for distributed inference workloads.
+redundant PCIe transfers through joint on-demand weight
+loading; and (4) RaidServe-Oracle, which represents an            6    D ISCUSSION
+idealized setting that restores only necessary metadata to the
+GPU without performing any weight or KVCache loading.             Having demonstrated the advantages of RaidServe, we now
+                                                                  discuss its applicability, limitations, and directions for future
+Table 3 summarizes GPU recovery latencies across settings.        work.
+Compared to Recompute, restoring backed-up KVCache
+from host memory is 41.5× faster, while RaidServe-Full fur-       While tensor parallelism remains the dominant approach
+ther reduces recovery latency by an additional 4.4×. These        for scaling large models across multiple GPUs, it is not
+improvements translate directly into user-perceived latency       the only viable strategy. Other parallelism techniques offer
+reductions. As shown in Figure 13, proactive host-side            inherent fault tolerance and may better suit specific model
+                                             High-performance Resilient Serving
+
+architectures. For instance, recent studies show that ex-       R EFERENCES
+pert parallelism can achieve performance comparable to
+                                                                Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N.,
+TP (SGLang-Team, 2025) for large MoE models, while
+                                                                  Gulavani, B. S., Tumanov, A., and Ramjee, R. Taming
+exhibiting stronger resilience to partial GPU loss.
+                                                                  throughput-latency tradeoff in llm inference with sarathi-
+RaidServe is largely orthogonal to memory-saving tech-            serve. Proceedings of 18th USENIX Symposium on Oper-
+niques such as parameter or KVCache offloading. In our            ating Systems Design and Implementation, 2024, Santa
+target setting – where the model fits in GPU memory under         Clara, 2024.
+a practical TP degree on DGX-class systems – parameter of-
+floading is primarily intended for more memory-constrained      AMD.  Amd infinity fabric link. https://www.
+regimes and would introduce non-trivial runtime overhead.        amd.com/content/dam/amd/en/documents/
+If KVCache offloading is enabled, the CPU-resident KV-           instinct-tech-docs/other/56978.pdf.
+Cache can naturally act as a recovery source, suggesting        Arfeen, D., Mudigere, D., More, A., Gopireddy, B., Inci,
+that these approaches can be complementary.                       A., and Ganger, G. R. Nonuniform-tensor-parallelism:
+Although our focus has been on fault-tolerant serving,            Mitigating gpu failure impact for scaled-up llm training.
+RaidServe can also facilitate finer-grained resource shar-        arXiv preprint arXiv:2504.06095, 2025.
+ing among concurrent jobs, mitigating starvation caused by
+                                                                Beaumont, R. Large Scale OpenCLIP: L/14, H/14 and G/14
+rigid gang scheduling (Jeon et al., 2018). Integrating Raid-
+                                                                  Trained on LAION-2B. https://laion.ai/blog/
+Serve with dynamic GPU resource allocation represents a
+                                                                  large-openclip/, 2022.
+promising direction for future exploration.
+                                                                DeepSeek-AI. Deepseek-v3 technical report, 2024. URL
+Our current evaluation adopts a simplified failure model
+                                                                  https://arxiv.org/abs/2412.19437.
+that focuses on GPU-level failures within a node, assuming
+that the remaining GPUs and interconnects remain func-          DeepSeek-AI, Liu, A., Feng, B., Wang, B., Wang, B., Liu,
+tional. This abstraction does not capture more complex            B., Zhao, C., Dengr, C., Ruan, C., Dai, D., Guo, D., Yang,
+failure modes, such as driver failures or interconnect degra-     D., Chen, D., Ji, D., Li, E., Lin, F., Luo, F., Hao, G.,
+dation, which require additional detection and recovery           Chen, G., Li, G., Zhang, H., Xu, H., Yang, H., Zhang,
+mechanisms. Extending RaidServe to handle such scenarios          H., Ding, H., Xin, H., Gao, H., Li, H., Qu, H., Cai, J. L.,
+remains future work.                                              Liang, J., Guo, J., Ni, J., Li, J., Chen, J., Yuan, J., Qiu, J.,
+As hardware platforms continue to scale, we expect Raid-          Song, J., Dong, K., Gao, K., Guan, K., Wang, L., Zhang,
+Serve to become increasingly relevant for large multi-GPU         L., Xu, L., Xia, L., Zhao, L., Zhang, L., Li, M., Wang,
+systems such as NVL72 (NVIDIA, 2025a). While our eval-            M., Zhang, M., Zhang, M., Tang, M., Li, M., Tian, N.,
+uation focuses on single-node configurations, extending           Huang, P., Wang, P., Zhang, P., Zhu, Q., Chen, Q., Du,
+memory and compute balancing beyond NUMA boundaries               Q., Chen, R. J., Jin, R. L., Ge, R., Pan, R., Xu, R., Chen,
+remains an important avenue for future work.                      R., Li, S. S., Lu, S., Zhou, S., Chen, S., Wu, S., Ye, S.,
+                                                                  Ma, S., Wang, S., Zhou, S., Yu, S., Zhou, S., Zheng, S.,
+                                                                 Wang, T., Pei, T., Yuan, T., Sun, T., Xiao, W. L., Zeng,
+7   C ONCLUSION                                                  W., An, W., Liu, W., Liang, W., Gao, W., Zhang, W.,
+We present RaidServe, a high-performance yet resilient            Li, X. Q., Jin, X., Wang, X., Bi, X., Liu, X., Wang, X.,
+serving system for tensor-parallel LLM inference under            Shen, X., Chen, X., Chen, X., Nie, X., Sun, X., Wang,
+irregular GPU availability. RaidServe tackles the recovery        X., Liu, X., Xie, X., Yu, X., Song, X., Zhou, X., Yang,
+overhead by introducing proactive KVCache backup and on-          X., Lu, X., Su, X., Wu, Y., Li, Y. K., Wei, Y. X., Zhu,
+demand weight recovery, accelerating the recovery process        Y. X., Xu, Y., Huang, Y., Li, Y., Zhao, Y., Sun, Y., Li, Y.,
+by 183× and thus avoiding a devastating latency spike in         Wang, Y., Zheng, Y., Zhang, Y., Xiong, Y., Zhao, Y., He,
+online serving. RaidServe also introduces cyclic KVCache         Y., Tang, Y., Piao, Y., Dong, Y., Tan, Y., Liu, Y., Wang,
+placement, hybrid attention, and fine-grained load-aware         Y., Guo, Y., Zhu, Y., Wang, Y., Zou, Y., Zha, Y., Ma, Y.,
+router to eliminate the memory and computation imbalance         Yan, Y., You, Y., Liu, Y., Ren, Z. Z., Ren, Z., Sha, Z.,
+between GPUs, achieving higher memory and computation             Fu, Z., Huang, Z., Zhang, Z., Xie, Z., Hao, Z., Shao, Z.,
+utilization and up to 2× higher throughput and two orders        Wen, Z., Xu, Z., Zhang, Z., Li, Z., Wang, Z., Gu, Z., Li,
+of magnitude faster recovery than standard fault-handling         Z., and Xie, Z. Deepseek-v2: A strong, economical, and
+methods.                                                          efficient mixture-of-experts language model, 2024. URL
+                                                                  https://arxiv.org/abs/2405.04434.
+                                                                Dwibedy, D. and Mohanty, R. Online scheduling with
+                                                                 makespan minimization: State of the art results, research
+                                           High-performance Resilient Serving
+
+  challenges and open problems, 2020. URL https://            Jang, I., Yang, Z., Zhang, Z., Jin, X., and Chowdhury, M.
+  arxiv.org/abs/2001.04698.                                     Oobleck: Resilient Distributed Training of Large Models
+                                                                Using Pipeline Templates. In Proceedings of the 29th
+Dwibedy, D. and Mohanty, R. Online list scheduling for
+                                                                Symposium on Operating Systems Principles, SOSP ’23,
+ makespan minimization: A review of the state-of-the-art
+                                                                pp. 382–395, New York, NY, USA, 2023. Association for
+ results, research challenges and open problems. SIGACT
+                                                                Computing Machinery. ISBN 9798400702297. doi: 10.
+ News, 53(2):84–105, July 2022. ISSN 0163-5700. doi: 10.
+                                                                1145/3600006.3613152. URL https://doi.org/
+ 1145/3544979.3544993. URL https://doi.org/
+                                                                10.1145/3600006.3613152.
+ 10.1145/3544979.3544993.
+                                                              Jeon, M., Venkataraman, S., Qian, J., Phanishayee, A., Xiao,
+Gandhi, S., Zhao, M., Skiadopoulos, A., and Kozyrakis,
+                                                                W., and Yang, F. Multi-tenant gpu clusters for deep
+  C. ReCycle: Resilient Training of Large DNNs using
+                                                                learning workloads: Analysis and implications. Technical
+  Pipeline Adaptation. In Proceedings of the ACM SIGOPS
+                                                                report, Microsoft Research, 2018.
+ 30th Symposium on Operating Systems Principles, SOSP
+ ’24, pp. 211–228, New York, NY, USA, 2024. Associa-
+                                                 Jiang, Z., Lin, H., Zhong, Y., Huang, Q., Chen, Y., Zhang,
+  tion for Computing Machinery. ISBN 9798400712517. Z., Peng, Y., Li, X., Xie, C., Nong, S., Jia, Y., He, S.,
+  doi: 10.1145/3694715.3695960. URL https://doi.    Chen, H., Bai, Z., Hou, Q., Yan, S., Zhou, D., Sheng, Y.,
+  org/10.1145/3694715.3695960.                      Jiang, Z., Xu, H., Wei, H., Zhang, Z., Nie, P., Zou, L.,
+Gemini.      Gemini 2.5:    Our most intelligent    Zhao, S., Xiang, L., Liu, Z., Li, Z., Jia, X., Ye, J., Jin, X.,
+  AI    model.          https://blog.google/        and Liu, X. MegaScale: Scaling Large Language Model
+  technology/google-deepmind/                       Training  to More Than 10,000 GPUs. In 21st USENIX
+  gemini-model-thinking-updates-march-2025/,        Symposium    on Networked Systems Design and Implemen-
+  2025.                                             tation (NSDI   24), pp. 745–760, Santa Clara, CA, April
+                                                    2024. USENIX Association. ISBN 978-1-939133-39-7.
+Github. Github Copilot. https://github.com/         URL https://www.usenix.org/conference/
+  features/copilot/, 2024.                          nsdi24/presentation/jiang-ziheng.
+Google.      Tpu  architecture.   https:                      Kokolis, A., Kuchnik, M., Hoffman, J., Kumar, A., Malani,
+ //cloud.google.com/tpu/docs/                                   P., Ma, F., DeVito, Z., Sengupta, S., Saladi, K., and
+  system-architecture-tpu-vm#tpu-pod.                           Wu, C.-J. Revisiting Reliability in Large-Scale Machine
+Guha, E., Marten, R., Keh, S., Raoof, N., Smyrnis, G.,          Learning Research Clusters. In 2025 IEEE International
+  Bansal, H., Nezhurina, M., Mercat, J., Vu, T., Sprague,       Symposium on High Performance Computer Architecture
+  Z., Suvarna, A., Feuer, B., Chen, L., Khan, Z., Frankel,     (HPCA), pp. 1259–1274. IEEE, 2025.
+  E., Grover, S., Choi, C., Muennighoff, N., Su, S., Zhao,    Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+ W., Yang, J., Pimpalgaonkar, S., Sharma, K., Ji, C. C.-J.,    C. H., Gonzalez, J., Zhang, H., and Stoica, I. Effi-
+  Deng, Y., Pratt, S., Ramanujan, V., Saad-Falcon, J., Li,     cient memory management for large language model
+ J., Dave, A., Albalak, A., Arora, K., Wulfe, B., Hegde,       serving with pagedattention. In Proceedings of the
+  C., Durrett, G., Oh, S., Bansal, M., Gabriel, S., Grover,    29th Symposium on Operating Systems Principles, SOSP
+ A., Chang, K.-W., Shankar, V., Gokaslan, A., Merrill,         ’23, pp. 611–626, New York, NY, USA, 2023. Associa-
+  M. A., Hashimoto, T., Choi, Y., Jitsev, J., Heckel, R.,      tion for Computing Machinery. ISBN 9798400702297.
+  Sathiamoorthy, M., Dimakis, A. G., and Schmidt, L.           doi: 10.1145/3600006.3613165. URL https://doi.
+  Openthoughts: Data recipes for reasoning models, 2025.       org/10.1145/3600006.3613165.
+  URL https://arxiv.org/abs/2506.04178.
+                                                              Maeng, K., Bharuka, S., Gao, I., Jeffrey, M., Saraph, V., Su,
+He, T., Li, X., Wang, Z., Qian, K., Xu, J., Yu, W., and        B.-Y., Trippel, C., Yang, J., Rabbat, M., Lucia, B., and
+  Zhou, J. Unicron: Economizing self-healing llm training      Wu, C.-J. CPR: Understanding and Improving Failure
+  at scale, 2023. URL https://arxiv.org/abs/                   Tolerant Training for Deep Learning Recommendation
+  2401.00134.                                                  with Partial Recovery. Proceedings of Machine Learning
+Hu, Q., Ye, Z., Wang, Z., Wang, G., Zhang, M., Chen,           and Systems, 3:637–651, 2021.
+  Q., Sun, P., Lin, D., Wang, X., Luo, Y., Wen, Y., and       Meta-AI. Introducing meta llama 3: The most capable
+  Zhang, T. Characterization of Large Language Model           openly available llm to date. https://ai.meta.
+  Development in the Datacenter. In Proceedings of the         com/blog/meta-llama-3/, April 2024.
+ 21st USENIX Symposium on Networked Systems Design
+  and Implementation, NSDI’24, USA, 2024. USENIX              Miao, X., Shi, C., Duan, J., Xi, X., Lin, D., Cui, B., and
+ Association. ISBN 978-1-939133-39-7.                          Jia, Z. Spotserve: Serving generative large language
+                                             High-performance Resilient Serving
+
+  models on preemptible instances. In Proceedings of             SGLang-Team.     Deploying deepseek with pd dis-
+  the 29th ACM International Conference on Architec-               aggregation and large-scale expert parallelism on
+  tural Support for Programming Languages and Oper-                96 h100 gpus.      https://lmsys.org/blog/
+  ating Systems, Volume 2, ASPLOS ’24, pp. 1112–1127,              2025-05-05-large-scale-ep/, May 2025. LM-
+  New York, NY, USA, 2024. Association for Comput-                 SYS Blog.
+  ing Machinery. ISBN 9798400703850. doi: 10.1145/
+  3620665.3640411. URL https://doi.org/10.                       Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J.,
+  1145/3620665.3640411.                                            and Catanzaro, B. Megatron-LM: Training Multi-Billion
+                                                                   Parameter Language Models Using Model Parallelism.
+Mistral-AI. Cheaper, better, faster, stronger. https://            CoRR, abs/1909.08053, 2019. URL http://arxiv.
+ mistral.ai/news/mixtral-8x22b, April 2024.                        org/abs/1909.08053.
+Mohan, J., Phanishayee, A., and Chidambaram, V. Check-           Strati, F., McAllister, S., Phanishayee, A., Tarnawski, J.,
+ Freq: Frequent, Fine-Grained DNN Checkpointing. In                and Klimovic, A. Déjàvu: Kv-cache streaming for fast,
+ 19th USENIX Conference on File and Storage Tech-                  fault-tolerant generative llm serving. In Proceedings of
+ nologies (FAST 21), pp. 203–216. USENIX Asso-                     the 41st International Conference on Machine Learning,
+ ciation, February 2021. ISBN 978-1-939133-20-5.                   ICML’24. JMLR.org, 2024.
+ URL https://www.usenix.org/conference/
+ fast21/presentation/mohan.                                      Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y.,
+NVIDIA. Nvlink and nvlink switch. https://www.                     and Lin, W. Llumnix: dynamic scheduling for large
+ nvidia.com/en-in/data-center/nvlink/.                             language model serving. In Proceedings of the 18th
+                                                                   USENIX Conference on Operating Systems Design and
+NVIDIA. Nvidia gb200 nvl72. https://www.nvidia.                    Implementation, OSDI’24, USA, 2024. USENIX Associ-
+ com/en-us/data-center/gb200-nvl72/,                               ation. ISBN 978-1-939133-40-3.
+ 2025a.
+                                                       Thorpe, J., Zhao, P., Eyolfson, J., Qiao, Y., Jia, Z.,
+NVIDIA. Dynamo 0.4 delivers 4x faster performance,       Zhang, M., Netravali, R., and Xu, G. H. Bamboo:
+  slo-based autoscaling, and real-time observabil-       Making Preemptible Instances Resilient for Affordable
+  ity. https://developer.nvidia.com/blog/                Training of Large DNNs. In 20th USENIX Sympo-
+  dynamo-0-4-delivers-4x-faster-performance-slo-based-autoscaling-and-real-time-observability
+                                                         sium on Networked Systems Design and Implemen-
+ August 2025b.                                           tation (NSDI 23), pp. 497–513, Boston, MA, April
+                                                         2023. USENIX Association. ISBN 978-1-939133-33-5.
+OpenAI. ChatGPT: Language models for task-oriented di-   URL https://www.usenix.org/conference/
+  alogue. https://openai.com/blog/chatgpt/,              nsdi23/presentation/thorpe.
+  2022.
+
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright,          Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+  C. L., Mishkin, P., Zhang, C., Agarwal, S., Slama, K.,           L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Attention
+  Ray, A., Schulman, J., Hilton, J., Kelton, F., Miller, L.,       is all you need. In Proceedings of the 31st International
+  Simens, M., Askell, A., Welinder, P., Christiano, P., Leike,     Conference on Neural Information Processing Systems,
+ J., and Lowe, R. Training language models to follow               NIPS’17, pp. 6000–6010, Red Hook, NY, USA, 2017.
+  instructions with human feedback, 2022. URL https:               Curran Associates Inc. ISBN 9781510860964.
+ //arxiv.org/abs/2203.02155.
+                                                                 Wang, Z., Jia, Z., Zheng, S., Zhang, Z., Fu, X., Ng,
+Qin, R., Li, Z., He, W., Cui, J., Ren, F., Zhang, M., Wu, Y.,     T. S. E., and Wang, Y. GEMINI: Fast Failure Re-
+  Zheng, W., and Xu, X. Mooncake: Trading more storage            covery in Distributed Training with In-Memory Check-
+  for less computation—a {KVCache-centric} architecture           points. In Proceedings of the 29th Symposium on Op-
+  for serving {LLM} chatbot. In 23rd USENIX Conference            erating Systems Principles, SOSP ’23, pp. 364–381,
+  on File and Storage Technologies (FAST 25), pp. 155–170,        New York, NY, USA, 2023. Association for Comput-
+  2025.                                                           ing Machinery. ISBN 9798400702297. doi: 10.1145/
+                                                                  3600006.3613145. URL https://doi.org/10.
+SGLang-Team.     Sglang v0.4: Zero-overhead batch                 1145/3600006.3613145.
+  scheduler, cache-aware load balancer, faster struc-
+  tured outputs.     https://lmsys.org/blog/                     Wang, Z., Ying, Z., and Zhang, Y. Online makespan min-
+  2024-12-04-sglang-v0-4/, December 2024.                         imization: Beat lpt by dynamic locking, 2025. URL
+  LMSYS Blog.                                                     https://arxiv.org/abs/2311.11195.
+                                            High-performance Resilient Serving
+
+Xie, Z., Xu, Z., Zhao, M., An, Y., Mailthody, V. S., Mahlke,
+  S., Garland, M., and Kozyrakis, C. Strata: Hierarchical
+  context caching for long context language model serving.
+  arXiv preprint arXiv:2508.18572, 2025.
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  G. Orca: A distributed serving system for Transformer-
+  Based generative models. In 16th USENIX Sympo-
+  sium on Operating Systems Design and Implementa-
+  tion (OSDI 22), pp. 521–538, Carlsbad, CA, July
+  2022. USENIX Association. ISBN 978-1-939133-28-1.
+  URL https://www.usenix.org/conference/
+  osdi22/presentation/yu.
+
+Zeng, S., Xie, M., Gao, S., Chen, Y., and Lu, Y. Medusa:
+  Accelerating serverless llm inference with materializa-
+  tion. In Proceedings of the 30th ACM International
+  Conference on Architectural Support for Programming
+  Languages and Operating Systems, Volume 1, ASPLOS
+  ’25, pp. 653–668, New York, NY, USA, 2025. Associa-
+  tion for Computing Machinery. ISBN 9798400706981.
+  doi: 10.1145/3669940.3707285. URL https://doi.
+  org/10.1145/3669940.3707285.
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+  rett, C., and Sheng, Y. Sglang: efficient execution of
+  structured language model programs. In Proceedings of
+  the 38th International Conference on Neural Informa-
+  tion Processing Systems, NIPS ’24, Red Hook, NY, USA,
+  2025. Curran Associates Inc. ISBN 9798331314385.
+
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu,
+  X., Jin, X., and Zhang, H. DistServe: Disaggregat-
+  ing prefill and decoding for goodput-optimized large
+  language model serving. In 18th USENIX Sympo-
+  sium on Operating Systems Design and Implementa-
+  tion (OSDI 24), pp. 193–210, Santa Clara, CA, July
+  2024. USENIX Association. ISBN 978-1-939133-40-3.
+  URL https://www.usenix.org/conference/
+  osdi24/presentation/zhong-yinmin.
+Zu, Y., Ghaffarkhah, A., Dang, H.-V., Towles, B., Hand, S.,
+  Huda, S., Bello, A., Kolbasov, A., Rezaei, A., Du, D.,
+  Lacy, S., Wang, H., Wisner, A., Lewis, C., and Bahini,
+  H. Resiliency at Scale: Managing Google’s TPUv4 Ma-
+  chine Learning Supercomputer. In 21st USENIX Sym-
+  posium on Networked Systems Design and Implementa-
+  tion (NSDI 24), pp. 761–774, Santa Clara, CA, April
+  2024. USENIX Association. ISBN 978-1-939133-39-7.
+  URL https://www.usenix.org/conference/
+  nsdi24/presentation/zu.
+

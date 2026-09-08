@@ -1,0 +1,1138 @@
+                                        DATAFLOW I S A LL YOU N EED
+
+
+ Darshan Gandhi 1 Pushkar Nandkar 1 David Koeplinger 1 Nasim Farahini 1 Romy Tsoupidi 1 Samuel Rydh 1
+   Matheen Musaddiq 1 Tuowen Zhao 1 Reid Goodbar 1 Nathan Sheeley 1 Leon Zhang 1 Matthew Shaffer 1
+      John Long 1 Han Wang 1 Angela Wang 1 Arjun Sabnis 1 Joshua Brot 1 Yun Du 1 Hakan Zeffer 1
+                                Mingran Wang 1 Raghu Prabhakar 1
+
+
+
+                                                      A BSTRACT
+     The autoregressive decode phase of token generation is often a major performance bottleneck in modern AI
+     workflows due to its memory-bandwidth-bound characteristics, which are amplified by powerful open-source
+     models with large context windows and techniques such as chain-of-thought reasoning. Popular GPU architectures
+     extract as little as 21% of the available memory bandwidth from loading weights and KV caches, as the scope
+     of asynchronous execution is limited by CPU scheduling overheads, kernel synchronization overheads, and
+     inadequate compute-communication overlap. While prior work attempts to address these overheads with kernel
+     fusion and asynchronous execution on GPUs, they mostly focus on a single GPU and do not generalize across
+     different model architectures. We argue that to truly mitigate these overheads, Dataflow Is All You Need. In
+     this paper, we chronicle a co-design approach to achieve peak decoding performance on a dataflow architecture
+     – the SambaNova SN40 Reconfigurable Dataflow Unit (RDU), substantiated by three key dataflow enabled
+     optimizations – KernelLooping, BatchStreaming, and ScheduleOffloading – that generalize to models that
+     are small, large, dense, MoEs, or hybrids, and that use different attention mechanisms. Collectively, these
+     optimizations deliver more than 75% of the theoretical peak roofline performance for a wide range of popular
+     open-source models and demonstrate a speedup of more than 6× when using popular speculative decoding
+     techniques. Finally, we show that speculative decoding is 1.7× faster on 16 SN40 chips than on a DGX H100
+     despite both systems having comparable HBM bandwidth. The techniques described in this paper and the models
+     used in the evaluation are deployed in a production AI inference cloud at cloud.sambanova.ai.
+
+
+
+
+1    I NTRODUCTION                                                  advances in harnessing the value of test-time or inference-
+                                                                    time computation. The thesis behind this idea is simple:
+Powerful open-source foundational models have trans-                models can produce more accurate responses by increasing
+formed the landscape of AI research and adoption. Mod-              the amount of compute performed during inference on the
+els like Llama (Dubey et al., 2024), Mistral (Jiang et al.,         same model (OpenAI, 2024; Beeching et al.; Brown et al.,
+2024a), Qwen (Yang et al., 2024; Team, 2024), and                   2024), and this approach is more scalable than training-time
+DeepSeek (DeepSeek-AI, 2024) are trained on trillions of            scaling (Snell et al., 2024).
+tokens – almost all recorded textual data – on large GPU
+clusters, thus encapsulating a lot of knowledge within model        Token generation consists of two distinct phases: the prefill
+parameters. Furthermore, these model architectures sup-             phase – generating the first token – and the decode phase
+port large context windows of up to 128K tokens. Large              – producing the subsequent tokens. The prefill phase is
+context windows enable AI applications to embed a lot of            compute-bound because of high operational intensity. The
+information into a prompt – like documents, source code,            prefill phase computes the KV cache (Pope et al., 2022) that
+conversation history – to elicit a precise response from the        is later used during decode. The decode phase is memory-
+model. Consequently, the AI community has made rapid                bound because of low operational intensity. The Time-Per-
+   1
+                                                                    Output-Token (TPOT) during decode is hence bound by the
+     SambaNova.    Correspondence to: Raghu Prabhakar               speed of reading weights and KV-cache values from High
+<raghu.prabhakar@sambanovasystems.com>.
+                                                                    Bandwidth Memory (HBM) on GPUs. Reasoning models
+Proceedings of the 9 th MLSys Conference (Industry Track), Belle-   such as DeepSeek-R1 (DeepSeek-AI et al., 2025) vastly
+vue, WA, USA, 2026. Copyright 2026 by the author(s).                increase the ratio of output tokens generated per input token
+                                                                       Dataflow Is All You Need
+
+
+
+
+                                                                    1140
+                                                                                                                                 4462.4
+
+
+
+
+                                                                                            Time per Output Token (us)
+                                                                                                                                           3353.6
+
+
+
+
+                                                                                                 (Lower is better)
+                                                          584                                                                                        2863.5
+                                         265      293
+                                205
+
+                             2xH100 4xH100 DGX SN40-8 SN40-16
+                                           H100
+      (a) Draft-model (Llama 3.1 8B at BS=1) decoding
+                                                                                                                                2xH100     4xH100   DGX H100
+      speed in tokens/second.
+                             Target Model (70B)    Draft Model
+                                                                                                                         (a) DGX H100 raw TPOT breakdown.
+
+
+                                       12.6
+        Milliseconds/step
+         (lower is better)
+
+
+
+
+                                      (28%)
+                                                                                                                                20%         24%        28%
+
+                                        33                                                                                       8%
+                                                                                                                                 8%        13%
+                                      (72%)                                                                                                            19%
+                                                                                                                                 7%         10%
+                                                         6.7(43%)                                                               56%         10%        11%
+                                                         9 (57%)                                                                           43%         12%
+                                                                                                                                                       31%
+                               DGX H100                 SN40-16
+      (b) Time-per-step (milliseconds) breakdown with                                                                         2xH100      4xH100    DGX H100
+      speculative decoding
+                                                                                               (b) DGX H100 TPOT breakdown by percentage.
+Figure 1. Performance comparisons between H100 and SN40 for
+the Llama3.1 8B-Draft model alone (1a) and the 70B-Target model                      Figure 2. Time-per-Output-Token (TPOT) breakdown for
+with speculative decoding with the 8B draft producing 9 tokens                       Llama3.1-8B on 2, 4, and 8 H100s. GEMMs scale better than
+per step (1b). H100 executes small models inefficiently, lowering                    other operators. Allreduce scales poorly and is not overlapped
+the overall speedup from speculative decoding.                                       with compute.
+
+
+to almost 10:1 (Son) as they produce several intermediate                            munications like AllToAll and AllGather, while the GPU
+tokens. In addition, context caching techniques (Google;                             remains idle (Jiang et al., 2024b).
+OpenAI; Claude) lower the time to the first token and fur-
+                                                                                     To mitigate these overheads, the community has recently
+ther shift the focus from prefill to decode. Consequently,
+                                                                                     proposed megakernels (Spector et al., 2025a;b; Wu et al.,
+achieving peak decode throughput is crucial to enable the
+                                                                                     2025; Aimuyo et al., 2025). In short, megakernels fuse
+next wave of AI applications and increase PerfTCO for AI
+                                                                                     large portions of the model into a kernel to mitigate kernel
+cloud providers.
+                                                                                     overhead. However, megakernels do not fully eliminate
+Figure 1 compares token generation speeds for Llama3.1 8B                            HBM accesses in the middle of the kernel. Furthermore,
+and 70B. Data were obtained from public benchmarks (Ar-                              current megakernel approaches focus on single GPUs which
+tificial Analysis) and verified locally using TensorRT-                              do not emphasize overlapping collective communications
+LLM (NVIDIA, d). Figure 1a shows that the performance                                with compute (Spector et al., 2025a; Wu et al., 2025). Fi-
+of small models scales poorly on GPUs. A 4× increase                                 nally, prior works that try to overlap communication with
+in GPUs leads to a small (1.42×) improvement in speed.                               compute (DeepSeek; Zhao et al., 2025; Shulai Zhang &
+Specifically, a speed of 300 tokens/s on 8xH100 uses only                            Liu, 2025; Aimuyo et al., 2025) using tools like NVSH-
+21% of the total HBM bandwidth (24 TB/s) to load weights                             MEM (nvs) still incur extra HBM traffic, as GPU-to-GPU
+and KV caches.                                                                       communication occurs only via global (HBM) memory. For
+                                                                                     bandwidth-sensitive applications such as decode, this makes
+Figure 2 provides a time breakdown to explain GPU over-
+                                                                                     it harder to achieve peak performance.
+heads. Forced synchronization overheads at kernel bound-
+aries and inadequate compute-communication overlap are                               Furthermore, these overheads reduce the gains from Spec-
+the primary reasons for GPU inefficiencies. Prior work on                            ulative Decoding (SD), a common decode optimization to
+Mixture-of-Experts (MoEs) has similarly shown that about                             speed up a model with a smaller draft model (Leviathan
+68% of the time is spent on non-overlapped collective com-                           et al., 2023; Chen et al., 2023; Miao et al., 2024; Liu et al.,
+                                                  Dataflow Is All You Need
+
+2024; vLLM Team; NVIDIA, e). Figure 1b shows that                      communication overlap.
+GPUs spend 72% of the time per step in the draft model
+when an 8B draft model is used to accelerate a 70B target           2. We describe three key optimizations enabled by
+model. Note that Figure 1 does not account for the CPU                 dataflow: KernelLooping, BatchStreaming, and Sched-
+scheduling overhead between the draft and the target, which            uleOffloading to eliminate various system overheads in
+will further lower the performance on GPUs.                            Section 4.
+
+In this paper, we describe how dataflow naturally miti-             3. We perform a comprehensive evaluation of the pro-
+gates these overheads with aggressive kernel fusion and                posed techniques using SN40 in Section 5.2. We in-
+asynchronous execution across several chips, on the Sam-               dividually quantify the benefits of the proposed opti-
+baNova SN40 Reconfigurable Dataflow Unit (RDU). The                    mizations. We demonstrate overall speedups of more
+SN40 RDU executes large subgraphs of operations asyn-                  than 6× over the target model.
+chronously on one or more chips without accessing HBM
+                                                                    4. We study speculative decoding in detail: we quantify
+in between. This execution model enables one to aggres-
+                                                                       the acceptance rates with various models, datasets, and
+sively fuse large modules – such as the entire decoder layer
+                                                                       speculation window sizes in Section 2.
+– into a single kernel. Furthermore, operations are executed
+when their data is available. Consequently, computation,            5. We show that speculative decoding using SN40,
+memory access, and communication are all asynchronous                  achieves 75% of the maximum roofline performance
+and overlapped by construction. Communication between                  and outperforms speculative decoding on DGX-H100
+chips happens in a fine-grain way directly between on-chip             by 1.7×.
+memories, bypassing HBM and RDMA engines entirely.
+We introduce three optimizations that are enabled by            The techniques described in this paper have been deployed
+dataflow on the SN40 RDU: KernelLooping, BatchStream-           in a commercial AI inference cloud.
+ing, and ScheduleOffloading. KernelLooping is a compiler
+optimization that rewrites groups of repeated kernel calls      2     S PECULATIVE D ECODING
+into a single kernel call with a pipelined outer loop. Kernel
+looping has two key benefits: (i) it eliminates synchroniza-    This section reports the empirically measured acceptance
+tion between calls to the same kernel, and (ii) it overlaps     rates with speculative decoding on various combinations of
+the compute and communication across kernels. Even with         draft/target models and benchmarks. We then introduce a
+KernelLooping, batching introduces additional unwanted          performance model that will be used in subsequent sections.
+synchronization overheads at layer boundaries and at the
+host. We mitigate this with BatchStreaming and Sched-           2.1    Acceptance Rates
+uleOffloading. BatchStreaming is a compiler optimization
+in which samples in a batch overlap execution between de-       We first define a few terms that will be used in the rest of
+coder layers to avoid synchronization. ScheduleOffloading       the section.
+eliminates host overhead by offloading the kernel execution
+schedule for speculative decoding entirely to SN40. Sched-           • A ‘step’ in speculative decoding corresponds to a set
+uleOffloading works with MOEs, while techniques such as                of draft model runs, followed by one target model run.
+CUDA Graphs (NVIDIA, a) are incompatible with MoE’s                    One step can produce one (from the target) or more
+dynamic expert routing patterns (Aimuyo et al., 2025).                 tokens (if some draft tokens are accepted).
+
+We empirically show that the techniques presented in this pa-        • Speculation window, or ’k’: Number of draft tokens
+per generalize over a wide variety of models: size (small and          generated per step. The value ’k’ also corresponds to
+large), architecture (dense, MoE, alternating dense-sparse             the number of draft-model runs per step.
+layers), and attention mechanisms (GQA, MLA, alternating
+sparse and full attention). We evaluate this extensively over        • Acceptance rate, or ’AR’: The fraction of draft tokens
+several popular open source models over various batch sizes            accepted by the target model in each step. If the draft
+and context lengths. We further show that the proposed tech-           produces ’k’ tokens and the target model accepts ’a’
+niques can extract more value from speculative decoding                draft tokens, the acceptance rate is defined as (a +
+over state-of-the-art systems.                                         1)/(k + 1).
+
+The key contributions of this paper are listed below.           Table 1 shows the acceptance rates for three dimensions: the
+                                                                combination of the draft and the target model, the size of
+  1. We quantify and describe GPU inefficiencies due            the speculation window, and three popular benchmarks: Al-
+     to kernel synchronizations and lack of compute-            pacaEval, HumanEval, and GSM8K. AlpacaEval (Li et al.,
+                                                       Dataflow Is All You Need
+
+
+Table 1. Acceptance rates for various draft/target models, specula-
+                                                                                      TLN
+tion window sizes, and benchmarks AlpacaEval (Li et al., 2023),         DDR                         HBM
+HumanEval (Chen et al., 2021), and GSM8K (Cobbe et al., 2021).                        Core
+                                                                        DDR                        HBM
+    Target Model/      Window Alpaca Human
+                                                        GSM8K                         Core
+     Draft Model       Size (k) Eval            Eval                    DDR
+                           5        0.63        0.88       0.77                     Die-to-die
+  Llama 3.1 70B / 1B                                                                                DDR
+                           9        0.47        0.80       0.65                       Core
+                                                                        HBM
+                           5        0.72       0.95       0.83                                     DDR
+ Llama 3.1 70B / 8B                                                                   Core                          AGCU     Switch   PCU     PMU
+                           9        0.58       0.90       0.71          HBM
+                                                                                                   DDR
+                           5        0.50       0.87       0.82                        TLN
+ Qwen 2.5 72B / 1.5B                                                                                            DDR 100        HBM   1.6      SRAM
+                           9        0.33       0.78       0.71                                                 1.5 TB GBps    64 GB TBps
+                                                                                                                                             520 MB
+                                                                                                                                            >100 TBps
+                           5        0.65       0.87       0.82                P2P        PCIE Host Interface
+ Llama 3.1 405B / 3B
+                           9        0.48       0.78       0.70
+                           5        0.72       0.93       0.82         Figure 3. SN40 Architecture. Packaged as a two-die socket in 5FF
+ Llama 3.1 405B / 8B
+                           9        0.55       0.88       0.72         TSMC process. Each die features 2 dense compute Cores, 2 HBM
+                                                                       modules, and 3 DDR channels. Cores are interconnected via the
+                                                                       Top Level Network (TLN) and can communicate with other SN40s
+                                                                       using peer-to-peer (P2P) interfaces. Each Core is comprised of
+2023) is a general benchmark with a wide variety of prompts
+                                                                       PCUs and PMUs connected in a mesh network, RDN, enabling
+on various topics. HumanEval (Chen et al., 2021) is a bench-           seamless data exchange.
+mark that focuses on coding-related prompts and responses.
+GSM8K (Cobbe et al., 2021) is a math and reasoning bench-
+mark. The table shows that speculative decoding performs               3      SN40 S YSTEM OVERVIEW
+better on the coding tasks in HumanEval than on the broader
+AlpacaEval benchmark. Furthermore, we note that with                   This section describes SN40 (Prabhakar et al., 2024; Prab-
+larger k, the acceptance rate drops by different amounts,              hakar, 2024), a commercial dataflow AI accelerator built
+based on the benchmark and the draft model. Consequently,              to accelerate modern AI training and inference. Figure 3
+choosing a larger k can lead to higher performance, but also           shows a high-level diagram of SN40 with four SN40 cores
+to higher variability in the observed performance to the user.         connected to DDR, HBM, Peer-to-Peer (P2P) links, and
+                                                                       the host. One socket delivers 638 TFLOPs of peak BF16
+2.2   Roofline Model                                                   compute TFLOPs, and 520 MB of on-chip SRAM. Each
+                                                                       socket also interfaces with 64 GB of HBM memory pro-
+The number of draft tokens k and the acceptance rate AR                viding 1.6 TB/s of peak bandwidth, and 1.5 TB of DDR
+are key factors in the performance of speculative decoding,            memory providing over 100 GB/s of peak bandwidth. The
+as outlined in the previous section. We introduce the follow-          Top-Level Network (TLN) connects cores to IO blocks.
+ing simple equations for latency (1), throughput (2) and a
+simple roofline performance model during memory-bound                  Figure 3 further shows the key components of a single SN40
+execution(3). Equation 3 is later used in section 5.5.                 core. Each socket consists of 1040 Pattern Compute Units
+                                                                       (PCUs) and 1040 Pattern Memory Units (PMUs). PCUs
+                                                                       provide systolic and streaming compute capabilities. When
+                                                                       configured as a systolic array, it accelerates matrix multipli-
+               (draf t latency ∗ k + target latency)                   cations. Inputs to the systolic array are streamed left-to-right
+  latency =                                          (1)
+                           AR ∗ (k + 1)                                and top-to-bottom, and results are drained left-to-right into
+                                                                       output FIFOs. Matrix multiplications can be further paral-
+                                                                       lelized across multiple PCUs. Each PMU provides 512 KB
+                                        1
+                   throughput =                                  (2)   of program-managed on-chip memory along with dedicated
+                                     latency                           hardware for tensor transformations and address computa-
+                                                                       tions to aid efficient operator fusion. PMUs are used to
+                        samples ∗ HBM bw                               store on-chip tensors such as input, parameters, metadata,
+  P erfRL =                                                            and intermediate results. PCUs and PMUs exchange pack-
+                (weights size + KV cache ∗ samples)
+                                                                       ets of data through a programmable Reconfigurable Device
+  W here,
+                                                                       Network (RDN). Address Generation and Coalescing Units
+  RL = Roof line,                                                      (AGCUs) act as bridges for the SN40 core to access local
+  KV cache = KV cache per sample.                                      device memory (HBM, DDR), host memory, remote SN40
+                                                                 (3)   device memory, and remote SN40 cores. AGCUs implement
+                                                                            Dataflow Is All You Need
+
+             Embedding                                                K(Looped Kernel)                                                 Classifier               Sampling
+                                                                                                    …
+             Embedding             Decoder 0              Decoder 1               Decoder 2                     Decoder 31                 Classifier               Sampling
+
+                          Q GEMM      QK        Scale                      PV       O          All       RMS        Gate                         Down                 All
+                                    matmul     Maskfill
+                                                            Softmax
+                                                                         matmul    GEMM       Reduce     Norm       GEMM
+                                                                                                                               SilU        Mul
+                                                                                                                                                 GEMM
+                                                                                                                                                              Add
+                                                                                                                                                                     Reduce
+                                                                                                                                                                               xd
+                         Wq
+              RMS
+      xd-1    Norm
+                          K GEMM                                                                                       Wgate
+                                   transpose                                        Wo                               Up                          Wdown
+                         Wk
+                                                                                                                    GEMM
+                          V GEMM
+                         Wv                                                                                         Wup
+              K1          K2                         K3                             K4         K5         K6        K7                K8                 K9           K10
+                                                                                         K0
+      (a) Llama3.1-8B with 32 decoder layers, and the operators within one decoder layer. Labels K1 – K10 (green) are kernel
+      calls on the DGX H100, obtained by profiling TensorRT-LLM (NVIDIA, d) with the NVIDIA Nsight profiler (NVIDIA, c).
+      Label K0 (orange) corresponds to one kernel call on SN40 for the entire decoder layer. Collective communication operations
+      like allreduce do not execute asynchronously with other operators on the DGX H100. On SN40, allreduce is pipelined and
+      overlapped with other operators.
+      // DGX H100 Kernel Call Schedule                                   // SN40-16 Kernel Call                                 // SN40-16 + Kernel looping
+      x_in = embedding()                                                 Schedule                                               // Kernel Call Schedule
+      for decoder in range(0, 32):                                       x_in = embedding()                                     x_in    = embedding()
+        tmp_k1 = K1(x_in);    tmp_k2 = K2(tmp_k1);                       for decoder in range(0, 32):                           x_out   = all_decoders_nosync(x_in);
+        tmp_k3 = K3(tmp_k2.q, tmp_k2.k, tmp_k2.v);                         x_out = K0(x_in);                                    cls_out = classifier(x_in);
+        tmp_k4 = K4(tmp_k3); tmp_k5 = K5(tmp_k4);                          x_in = x_out;                                        out     = sampling(cls_out);
+        tmp_k6 = K6(tmp_k5); tmp_k7 = K7(tmp_k6);
+        tmp_k8 = K8(tmp_k7.gate, tmp_k7.up);                             cls_out = classifier(x_in)
+        tmp_k9 = K9(tmp_k5, tmp_k8);                                     out     = sampling(cls_out)
+        x_out = K10(tmp_k9); x_in = x_out;
+      cls_out = classifier(x_in);
+      out     = sampling(cls_out)
+
+      (b) Pseudocode showing kernel call schedule to generate one output token on (i) DGX H100 with TensorRT-LLM (NVIDIA,
+      d), (ii) SN40-16 with layer fusion, and (iii) KernelLooping. With KernelLooping, only 4 kernel calls are needed per output
+      token on SN40.
+
+                                     Figure 4. Kernel transformation opportunity enabled by SN40 over DGX H100.
+
+
+a lightweight peer-to-peer (P2P) communication protocol                                                blocks: one Embedding layer, 32 Decoder layers, one
+to directly stream data between SN40 cores on different                                                Classifier layer, and Sampling. On both platforms,
+sockets without involving DDR or HBM. The P2P protocol                                                 a ”kernel” of work is dispatched to the accelerator to execute
+provides primitives to build asynchronous collective com-                                              one or more (fused) PyTorch operators. Each kernel bound-
+munication primitives between multiple SN40 cores, such                                                ary acts as a forced synchronization barrier. In H100, a
+as AllReduce without involving HBM. A hardware graph                                                   decoder is broken up and executed as 10 kernel calls labeled
+orchestration mechanism in the AGCU enables executing                                                  K1 - K10 (in green) in Figure 4a. In contrast, SN40-16
+kernel launches without host involvement.                                                              executes all operators in the decoder layer as a single kernel,
+                                                                                                       labeled K0 (in orange) in Figure 4a. The kernel breakdown
+The compiler translates a model into a series of kernels (a
+                                                                                                       for H100 is obtained using TensorRT-LLM (NVIDIA, d) to
+fused subgraph of operations) and schedules (a specification
+                                                                                                       run Llama3.1-8B and by extracting kernel call information
+of kernel invocation order) and assembles them into a single
+                                                                                                       using the NVIDIA Nsight Systems profiler (NVIDIA, c).
+Processor Execution Format (PEF) file.
+                                                                                                       The decoder-level fusion on SN40-16 has been described in
+                                                                                                       prior literature (Prabhakar, 2024). Communication opera-
+4     O PTIMIZATIONS                                                                                   tors introduced by the TP mapping, such as allreduce, are
+                                                                                                       performed using the NVIDIA Collective Communications
+In this section, we describe the three optimizations used to
+                                                                                                       Library (NVIDIA, b) on H100, while SN40 implements the
+accelerate speculative decoding on SN40.
+                                                                                                       operators using the chip-to-chip peer-to-peer protocol.
+4.1   Kernel Looping                                                                                   KernelLooping exploits the general structure of modern
+                                                                                                       day LLMs which exhibit repetitive encoder/decoder blocks
+To illustrate inefficiencies resulting from synchronization                                            with same set of mathematics operations, but operating
+during the token generation phase on DGX H100 (dgx)                                                    on different data. After the proposed transformation, the
+and SN40-16, we use a tensor parallel (TP) implemen-                                                   model mapping absorbs the data dependencies between loop
+tation of Llama3.1-8B, a common choice for the draft                                                   iterations, resulting in a single kernel call for the decoder
+model, as a driving example. As depicted in Figure 4a,                                                 portion of the model. Figure 4b describes the impact of
+execution of the 8B model consists of four major types of                                              KernelLooping with pseudocode. With looping, Llama 8B
+                                                    Dataflow Is All You Need
+
+                          …
+                                             Down GEMM                              AllReduce             R
+                     H                                                                                    D
+                     B                                                                                    U
+                     M    …          Wdown
+                                                                   Add
+                                                                                    +                     0
+                          …                                                                               R
+                                             Down GEMM
+                     H                                                                                    D
+                     B                                                                                    U
+                     M    …                                        Add
+                                                                                    +                     1
+                                                         AGCU     PCU     PMU
+                                     Wdown
+
+Figure 5. A subset of operations from Figure 4a K8 - K10: Down GEMM, Add, and AllReduce. On the RDU, AllReduce executes
+asynchronously with GEMM and Add. Data is streamed between RDUs directly to on-chip PMUs, without involving HBM.
+
+
+SN40 needs just one kernel call for all 32 decoders, as shown     Figure 6 shows the result of the compiler pass on chained
+by Figure 4b(iii). In contrast, the H100 requires 320 calls.      matrix-multiplication operations (with tiling size of T)
+                                                                  where the output activation of the previous matrix-multiply
+Figure 5 shows a zoomed-in view of a subset of operations
+                                                                  operation serves as the input activation of the next matrix-
+in the decoder. On SN40, PCUs and PMUs asynchronously
+                                                                  multiply. Weight tensors are independent of each other. The
+execute GEMM, Add, and Allreduce. PMUs and AGCUs
+                                                                  transformation introduces on-chip memory buf 0 to host
+stream data between RDUs without involving HBM, which
+                                                                  the chained intermediate result. This buffer is reread while
+frees up HBM bandwidth to load weights and KV caches.
+                                                                  the next iteration is being produced, so it will be double
+                                                                  buffered. Additionally, since all intermediate results are
+4.1.1   Implementation Details
+                                                                  live, the write to output z occurs at the end of every out-
+KernelLooping is implemented with a combination of user           ermost iteration rather than at the end of the entire kernel.
+directives and a compiler optimization pass. User directives      As independent parameters, the weights are simply grouped
+in modeling code (easily implementable using decorators in        together and iterated using the iterator n.
+python) identify the scope of operations (for instance, one
+decoder) to be fused into one kernel. This creates a call         4.1.2   Dataflow Hardware Impact
+schedule where the same kernel is called repeatedly, albeit
+                                                                  Synchronous architectures (e.g. SIMT) approximate asyn-
+with different input/output tensors. The compiler recognizes
+                                                                  chrony in software, but use expensive synchronization mech-
+a sequence of such repeated calls (say, N) and rewrites the
+                                                                  anisms to coordinate execution. For example, megaker-
+kernel to have an outer loop of size N.
+                                                                  nels (Spector et al., 2025a;b) use counter-based dependency
+The KernelLooping pass is composed of two primary phases:         tracking via global memory. Synchronization through high-
+Pattern Matching and Transformation. Pattern Matching             latency memory accesses introduces substantial overheads;
+isolates a compatible contiguous list of kernel calls using a     reported costs exceed 200 µs, accounting for over 20%
+dataflow analysis pass, ensuring user directed kernel param-      of the latency budget in sub-millisecond inference. Fur-
+eters follow a strict pattern of usage across repeated calls.     thermore, this overhead grows with device count, and also
+For example, in the case of chained decoders, the chained         adds to memory traffic in addition to the movement of ac-
+output tensor of a previous kernel call must only be used         tivations. In comparison, native dataflow support in SN40
+by the next decoder’s kernel call, and the output parameter       supports asynchrony via lightweight control handshake sig-
+must be consistently used by the same input parameter for         nals, reducing the latency to nanoseconds and overheads to
+the pair to be eligible for on-chip buffering.                    zero, as the handshake is often pipelined with computation.
+                                                                  Consequently, maximum overlap of memory, compute, and
+Following matching, the Transformation phase constructs a
+                                                                  communication is achieved.
+unified kernel that replaces the identified sequence with a
+single looped invocation. This phase applies a series of trans-   In KernelLooping, the key insight is to keep the data flowing:
+formation rules, including: (i) concatenation and reshaping       between RDUs, between memory and RDU, and between
+of kernel inputs, (ii) introduction of an outer loop iterator     units within the RDU. Intermediate results between units
+and its propagation throughout the kernel body, and (iii)         in the RDU are streamed from producers to consumers.
+allocation of intermediate buffers with appropriate place-        Some tensors need to be partially materialized and double
+ment across the memory hierarchy (e.g., SRAM, HBM, or             buffered when tensors need to be transposed or reread after
+DRAM), based on performance and capacity considerations.          reductions. The on-chip interconnect and memory system
+                                                     Dataflow Is All You Need
+
+ Original Program                                         Transformed Program
+
+ kernel_d(w[MxM], x[MxN], z[MxN])                         kernel_d(w[3xMxM], x[MxN], z[3xMxN])
+   for (t = 0; t < M; t += T)                               @onchip buf0[MxN] = x
+     z[t::t+T] = w[t::t+T] * x                              @onchip buf1[MxN]
+ program example_d()                                        for(n = 0; n < 3; ++n)
+   w0[MxM], w1[MxM], w2[MxM]                                  for (t = 0; t < M; t += T)
+   x[MxN], y[MxN], z[MxN], r[MxN]                               buf1[t::t+T] = w[n][t::t+T] * buf0
+   call0 = kernel_d(w0, x, y)                                 buf0 = buf1
+   call1 = kernel_d(w1, y, z)                                 z[n] = buf1
+   call2 = kernel_d(w2, z, r)                             program example_d()
+                                                            w0[MxM], w1[MxM], w2[MxN]
+                                                            x[MxN], y[MxN], z[MxN], r[MxN]
+                                                            kernel_d({w0, w1, w2}, x, {y, z, r})
+
+
+Figure 6. Example of the kernel looping optimization using chained matrix multiplication operations with a tiling size of T. The left
+column shows a subset of the original program. The right column shows the corresponding transformed subset.
+
+
+facilitates this form of execution with much higher capacity         Sample 0                                           Time
+                                                                               Op0    Op1      …    OpN-2 OpN-1
+and bandwidth compared to GPUs.                                       Loop0
+                                                                            Sample 1
+                                                                              Loop0
+                                                                                      Op0     Op1     …   OpN-2 OpN-1
+                                                                                    Sample 2
+                                                                                              Op0    Op1    …   OpN-2 OpN-1
+                                                                                     Loop0
+Additionally, KernelLooping pipelines the execution of mul-                                Sample 3
+                                                                                             Loop0
+                                                                                                     Op0   Op1   …    OpN-2 OpN-1
+                                                                         Samples
+
+
+                                                                                                                            Sample 0 Op0
+tiple instances of the original kernel as distinct loop itera-                                                               Loop1
+                                                                                                                                            Op1
+                                                                                                                                   Sample 1 Op0
+                                                                                                                                                    …    OpN-2 OpN-1
+
+                                                                                                                                                   Op1     …   OpN-2
+tions. This eliminates any dead time between kernels and                                                                            Loop1
+                                                                                                                                          Sample 2 Op0    Op1    …
+                                                                                                                                           Loop1
+always keeps the memory system busy. The performance                                (a) Without Batch Streaming                                  Sample 3 Op0
+                                                                                                                                                  Loop1
+                                                                                                                                                                Op1
+
+
+of most models during decode is bandwidth bound, and is
+sensitive to the number of independent channels available            Sample 0
+                                                                      Loop0
+                                                                               Op0    Op1      …    OpN-2 OpN-1
+                                                                                                                       Time
+                                                                            Sample 1
+when accessing the intermediate activations, weights, and                     Loop0
+                                                                                       Op0
+                                                                                    Sample 2
+                                                                                              Op1     …   OpN-2 OpN-1
+
+                                                                                              Op0    Op1    …   OpN-2 OpN-1
+KV cache.                                                                            Loop0
+                                                                                           Sample 3
+                                                                                                     Op0   Op1   …    OpN-2 OpN-1
+                                                                                             Loop0
+                                                                          Samples
+
+
+
+
+                                                                                                        Sample 0
+The SN40’s hardware support for asynchronous dataflow                                                    Loop1
+                                                                                                                  Op0
+                                                                                                               Sample 1
+                                                                                                                         Op1      …    OpN-2 OpN-1
+
+                                                                                                                         Op0     Op1     …   OpN-2 OpN-1
+execution and peer-to-peer communication allows its com-                                                         Loop1
+                                                                                                                       Sample 2
+                                                                                                                                 Op0    Op1    …   OpN-2 OpN-1
+                                                                                                                        Loop1
+piler to include a generic KernelLooping pass. This pass                            (b) With Batch Streaming                  Sample 3
+                                                                                                                                Loop1
+                                                                                                                                        Op0   Op1   …    OpN-2 OpN-1
+
+
+is both applicable across workloads, from HPC kernels to
+repetitive structures of almost all modern AI models. The           Figure 7. The effect of BatchStreaming. We can see that without
+pass is also scalable from a single device to multi-device          BatchStreaming (a) all the samples of the batch need to finish
+configurations.                                                     processing before we start the next layer. On the other hand, with
+                                                                    BatchStreaming (b) we see that Sample 0 begins processing much
+4.2   Batch Streaming                                               earlier and all the stages of the pipeline are occupied.
+
+KernelLooping effectively removes kernel calls. However,
+batching introduces an artificial synchronization boundary           the dataflow paradigm that maps on to SN40’s on-chip re-
+at the end of the decoder, where all samples executing the           sources.
+previous decoder finish before any sample begins the next           The gain in performance from BatchStreaming optimization
+decoder. This artificial synchronization leads to the pipeline      is primarily due to initiation of the processing of the first
+warm-up cost being taken once for every decoder layer. The          batch element of the next loop as soon as the result of the
+performance impact is more pronounced on smaller draft              last stage of the pipeline for the corresponding sample is
+models with a big scale-up domain, where the time spent on          available. As a result, while the last stage of the pipeline is
+each decoder layer is only a few microseconds.                      still processing the second (and later) samples of the batch,
+BatchStreaming mitigates this overhead by introducing a             the first stage of the pipeline has started working on the
+non-blocking communication channel between decoder lay-             previous result of the first sample from the current batch.
+ers so that samples can flow through decoder layers asyn-           This eliminates any dead time and keeps every stage of the
+chronously. Such a non-blocking channel fits naturally into         pipeline busy during steady-state execution. This is illus-
+                                                                    trated in Figure 7. Section 5.3 quantifies the performance
+                                                                              Dataflow Is All You Need
+
+                                                                                                 PEF                                                           PEF
+ S                   S                      S                 S                    S             Schedule Decode                                              Schedule Decode
+                           SN-1
+                                                                                   Rest of
+      PMU    PCU            …        PCU                            Re PCU
+                                                                  PMU                                K0    K1      K2 * * * Kn-1                                 K0 K1      K2 * * * Kn-1
+                         W                                                         Decoder
+                            S3
+                         R
+ S                   S     Pred             S                 S                    S
+                         R                                                                        SN40                                         SN40
+      S2                    S2                                     S4
+             NORM        D
+              (S1)
+                            S1       PCU                                   PCU
+      S0                    S0                                     S3                                 K0      K1    K2 * * * Kn-1                K10 * * * K1n-1 K20 K21 * * * K2n-1 - - - KM0 * * * KMn-1
+
+ S                   S                      S                 S   AllReduce:1 Sample (S0,         Run Decode Schedule
+                                                                                                                                                 Run M Unrolled Decode Schedules
+                                                                  S1..) at a time
+        Reads from                              Writes into                                          Inputs                    Token                         Inputs              M Tokens
+        Loop Buffer Loop Buffer Capacity:       Loop Buffer             Buffer contents
+                    N samples                                     SX                           CPU                                                    CPU
+                                                                        are processed                                               Y
+                                                                                                        Generate                                               Generate M                   Y
+                                                                                                         1 token                                                 Tokens
+                                                                                               Application                N                           Application                 N
+
+Figure 8. BatchStreaming on SN40. LoopBuffer implements dis-                                               Start Decode                 End of Seq?           End Decode
+tributed write, read, and predication logic across PMUs, used to
+hold the output of a looped decoder block.
+                                                                                             Figure 9. Left : Decode Loop with host intervention : Iterative exe-
+                                                                                             cution of N kernels (K0 to Kn−1 ) on SN40, with control returning
+benefit of BatchStreaming on various draft models.
+                                                                                             to the host after each token generation. Right : With ScheduleOf-
+                                                                                             floading, SN40 generates M tokens without host intervention.
+4.2.1       Implementation Details
+Figure 8 illustrates the BatchStreaming execution flow in
+SN40. Cross-decoder operations are pipelined via a logical                                   the host after each token is generated. This is undesirable
+buffer, LoopBuffer, which has a holding capacity for all                                     because host intervention negates the advantage gained by
+samples in a batch. LoopBuffer is held on-chip by compos-                                    the dataflow architecture. The logical path forward is to
+ing multiple PMUs as a larger virtual scratchpad memory.                                     feed the output of one decode schedule to the next and form
+LoopBuffer receives writes at appropriate logical offsets                                    a chain of schedules that runs in a hardware orchestrated
+(data flow denoted by the red path) as soon as a decoder                                     mode. It is noteworthy that the how many such schedules
+completes processing a sample, and performs asynchronous                                     need to be chained is an execution time decision, controlled
+reads (data flow denoted by the blue path) when the sub-                                     by upstream application.
+sequent decoder can accept new inputs, while enforcing
+read-after-write dependencies. All data movement and ex-                                     4.3.1         Implementation Details
+ecution is driven solely by the availability of data at the                                  The SN40 runtime supports dynamic concatenation of ex-
+inputs in each unit. In other words, there is no global syn-                                 ecution schedules, referred to as ScheduleOffloading. As
+chronization across decoder layers. By decoupling decoder                                    described earlier, a schedule within a PEF consists of an
+boundaries, LoopBuffer enables the next decoder to begin                                     ordered sequence of kernel invocations, where each kernel
+execution without waiting for all samples to complete the                                    is associated with a bitfile and may be invoked multiple
+previous stage.                                                                              times with different inputs. The runtime parses the schedule
+                                                                                             and stitches the kernel bitfile loads to enable fully hardware-
+4.2.2       Dataflow Hardware Impact                                                         orchestrated execution. Leveraging this mechanism, the
+In a native dataflow execution model, independent sam-                                       runtime can concatenate multiple schedules as requested by
+ples within a batch are pipelined over distributed compute,                                  the application, which is aware of available schedules in the
+memory, and communication resources. The cost of an asyn-                                    PEF and may offload the same schedule repeatedly.
+chronous control handshake is negligible and overlapped                                      For correct composition, outputs of one schedule must
+with compute. This lightweight control handshake between                                     match the inputs of the next. The runtime ensures compat-
+producers and consumers is the key building block that                                       ibility by validating types and sizes and patching memory
+enables BatchStreaming. In contrast, GPU producers and                                       addresses, enabling seamless hardware orchestration. This
+consumers need to synchronize via the memory system,                                         reduces host intervention and improves token generation
+which incurs significantly higher overheads, and is harder                                   throughput.
+to overlap with useful work.
+                                                                                             ScheduleOffloading on SN40 allows the application to con-
+                                                                                             trol the number of tokens generated per schedule. As shown
+4.3     Schedule Offloading
+                                                                                             in Figure 9, host involvement decreases as the schedule is
+The decode schedule compiled into the PEF is capable of                                      unrolled multiple times. The unrolling factor (M ) is deter-
+generating one token at a time. At runtime, to generate                                      mined heuristically based on the speculation window (k)
+multiple tokens, the application needs to run the same de-                                   and I/O characteristics, and, in practice, remains bounded
+code schedule until the end of sequence token is generated,                                  by k. For speculative decoding, draft and target models can
+iteratively feeding the output of each schedule run on to                                    be configured independently, enabling applications to tune
+the next. This means that the control is transferred back to                                 token iteration (k) for improved acceptance rates.
+                                                         Dataflow Is All You Need
+
+
+Table 2. Model configurations evaluated in this paper. GPT-OSS          Table 3. TFLOPs and HBM bandwidths of the hardware configu-
+(OpenAI, 2025), DeepSeek R1(DeepSeek-AI, 2025), Llama (lla)             rations being evaluated.
+(Dubey et al., 2024), Mixtral (Jiang et al., 2024a), and Qwen (Team,                        Number of Total BF16     Total HBM
+                                                                         Platform
+2024). Each model is evaluated under several batch sizes.                                     Sockets  TFLOPS        Bandwidth
+ Model          Version /          Context             Configurations    DGX H100 (h10)          8       8,000        24.0 TB/s
+ Family         Precision          Lengths                               SN40-16                 16     10,208        25.6 TB/s
+ GPT OSS       120B, FP8          8K, 64K           decode, target
+ DeepSeek      R1 671B, FP8       8K                decode, target
+               4 17B128E,         8K, 32K           decode, target
+                                                                        mance numbers are obtained by executing the models using
+               FP8                                                      TensorRT-LLM (NVIDIA, d) and using the included bench-
+ Llama         3.2 1B, BF16   4K, 32K               decode, draft       marking scripts that measure steady-state token generation
+               3.2 3B, BF16   4K                    decode, draft       throughput. SN40 performance numbers are obtained by
+               3.1 8B, BF16   4K, 8K, 16K,          decode, draft       measuring and averaging the tokens/second on 10 prompts
+                              32K
+               3.3 70B, BF16 4K, 8K, 32K            decode, target
+                                                                        that generate a range of output tokens (< 100 to > 1000
+               3.1 405B, BF16 4K                    decode, target      output tokens).
+ Mixtral       8x7B, BF16         4K                decode, target
+                                                                        5.2   Kernel Looping
+               2.5 0.5B, BF16 4K                    decode, draft
+ Qwen
+               2.5 72B, BF16 4K                     decode, target      Figure 10 shows the speedups obtained on SN40-16 with
+                                                                        KernelLooping enabled, over a baseline without KernelLoop-
+                                                                        ing. The optimization speeds up on a wide variety of model
+                                                                        architectures, parameter sizes, batch sizes, and sequence
+4.3.2    Dataflow Hardware Impact                                       lengths, with a geomean speedup of 1.6×. We highlight
+                                                                        that kernel looping is not limited only to smaller models.
+CUDA Graphs (NVIDIA, a) similarly reduce CPU overhead
+                                                                        Figure 10 shows that larger models such as Qwen2.5-72B
+by capturing and replaying kernel execution sequences via
+                                                                        observe speedups close to 2× even at large batch sizes, high-
+a single CudaGraphLaunch. However, as noted in (Aimuyo
+                                                                        lighting the non-trivial impact of synchronization overheads
+et al., 2025), they are less effective for dynamic workloads
+                                                                        on decode performance without KernelLooping. Figure 11
+(e.g., expert routing in MoE models). Likewise, heuristic
+                                                                        illustrates the benefits of kernel looping with an HBM band-
+and runtime-dependent choices, such as schedule unrolling
+                                                                        width utilization trace obtained from a single socket of a
+in speculative decoding, are not fully compatible with static
+                                                                        SN40-16 system running Llama3.1-8B. KernelLooping (or-
+graph creation and execution model. Nonetheless, such
+                                                                        ange) sustains a much higher HBM bandwidth utilization
+graph-based approaches may be partially applicable under
+                                                                        compared to baseline (blue), which shows periodic drops in
+constrained dynamic conditions or extended with additional
+                                                                        HBM bandwidth due to synchronization overheads. Con-
+engineering support.
+                                                                        sequently, KernelLooping enables us to run many more
+                                                                        decoder layers during a fixed time window.
+5     E VALUATION
+In this section, we quantify the decode speed of several                5.3   Batch Streaming
+models on SN40. We first quantify each optimization in-                 Figure 12 shows the speedup achieved when running the
+dividually. We then quantify the impact of combining all                Llama 1B, 3B, and 8B models for batch sizes of 2, 4, 8, and
+optimizations against SN40’s roofline and GPU.                          16. For a batch size of 1, BatchStreaming has no effect and
+                                                                        is therefore omitted from the figure.
+5.1     Experimental Setup
+                                                                        The effectiveness of BatchStreaming optmization improves
+Table 2 summarizes the workload configurations used to                  for all evaluated models when the batch size is increased
+quantify the impact of our optimizations on the decode                  from 2 to 4 and from 4 to 8. The reason is that the extra
+performance on SN40. Table 3 describes the hardware                     samples hide more of the per-layer warm-up cost. When the
+platform under evaluation, including the number of sock-                batch size is increased to 16, we still see a healthy speedup
+ets, their compute TFLOPS, and the memory bandwidth.                    for all models. However, the speedup for the 1B and 3B
+As this paper focuses on the decode stage of inference,                 models with a batch size of 16 is a bit lower than when run
+all evaluations in this section measure and report decode               with a batch size of 8. This is because most of the benefits
+throughput as the primary metric. The throughput num-                   of the optimization are already harvested at a batch size of
+ber is obtained by measuring the time per output token                  8 and that the per-layer warm-up cost, relatively speaking,
+(TPOT) in steady state on all platforms. DGX H100 perfor-               is smaller with a higher batch size.
+                                                                                                                                    Dataflow Is All You Need
+
+
+                                                                          2.5
+                                           Speedup (Higher is better)
+                                                                          2.0
+                                                                          1.5
+                                                                          1.0
+                                                                          0.5
+                                                                          0.0
+                                                                          0.0 4K    4K 8K 8K 16K 16K 16K        4K 4K 4K                                      4K 4K 4K        8K 8K        8K 8K
+                                                                                                                             4K 4K 4K       4K 4K 8K 8K                                                8K 8K 8K 32K 32K 32K      8K  64K
+
+
+
+
+                                                                                                                                                                                                                                           GeoMean
+                                                                                BS1 BS8 BS1 BS8 BS1 BS8 BS16    BS1 BS8 BS16 BS1 BS8 BS16   BS1 BS8 BS1 BS8   BS1 BS8 BS16    BS1 BS4      BS1 BS4     BS1 BS2 BS4 BS1 BS2 BS4   BS8 BS2
+                                                                                           Llama 3.1            Llama 3.2      Mixtral        Llama 3.1       Qwen 2.5       Llama 3.1 DeepSeek             Llama 4              GPT OSS
+                                                                                              8B                   3B          8x7B4K            70B            72B            405B     R1-671B             17B128E               120B
+                                                                                                                                    BS1
+
+
+                                                                        Figure 10. Kernel looping speeds up on a broad variety of model architectures, batch sizes, and sequence lengths.
+
+
+                                    Base                                        Kernel looping                    Max. HBM Bandwidth
+HBM Bandwidth Utilization (GB/s)
+
+
+
+
+                                   2000
+
+                                   1500
+
+                                   1000
+
+                                    500
+                                                                                                                                                                Qwen2.5 0.5B            Llama 3.2 1B            Llama 3.2 3B           Llama 3.2 8B
+
+                                      0
+                                       0                                              50                 100                 150
+                                                                                 D0                             D1                    D2 …                Figure 13. Schedule offloading speedup (compared to no offload-
+                                                                          D0               D1      D2      D3         D4     D5      D6 D7 …              ing) for various batch sizes(BS) and k = 9.
+                                                                                                Time (microseconds)
+
+
+Figure 11. HBM bandwidth trace from one SN40 socket running                                                                                               Note that smaller models reach higher speedup numbers
+Llama3.1-8B. Kernel looping(orange) sustains higher HBM band-                                                                                             when compared with larger models. The reason is that the
+width utilization over the baseline (blue).                                                                                                               host overhead targeted by the schedule offload optimization
+                                                                                                                                                          is greater, relatively speaking, for the smaller models.
+The speedup is more pronounced for models with a higher                                                                                                   In addition, note that larger batch sizes typically yield less
+compute-to-memory ratio. This explains the lower gains we                                                                                                 speedup. This is explained by the somewhat longer latencies
+see on the 8B model compared to the 1B and 3B models.                                                                                                     of these configurations.
+
+5.4                                  Schedule Offloading                                                                                                  5.5       SN40 vs. GPU vs. Roofline
+Figure 13 presents the draft model only speedup achieved                                                                                                  We compare the speculative decoding performance on SN40-
+by ScheduleOffloading compared to the baseline – without                                                                                                  16 and DGX H100 against (a) roofline target model perfor-
+schedule offloading – when generating nine tokens. By                                                                                                     mance (Figure 14a) and (b) roofline speculative decoding
+allowing multiple draft model runs to proceed consecutively                                                                                               performance (Figure 14b). Speedup is calculated relative to
+without repeated host-side coordination, ScheduleOffloading                                                                                               the algorithmic roofline of a standalone target model on an
+technique significantly reduces overhead and improves total                                                                                               HBM-driven architecture (equation 3).
+throughput.
+                                                                                                                                                          Roofline speculative decode performance is computed using
+                                                                                                                                                          equation 3 for both draft and target models, combined in a
+                                                                                                                                                          k : 1 ratio.
+                                                                                                                                                          The estimated DGX H100 performance (equation 4) is based
+                                                                                                                                                          on standalone draft and target model benchmarks with se-
+                                                                                                                                                          quence length 1, using the TensorRT-LLM (NVIDIA, d)
+                                                                                                                                                          setup. These results are applied to a speculative decod-
+                                                                                                                                                          ing trace from an inference request on SN40. The trace
+                                                                                                                                                          includes iteration counts, token statistics, and acceptance
+                                                                                                                                                          data, helping to remove discrepancies due to compiler and
+Figure 12. Throughput improvement with batch streaming for a                                                                                              numerical format differences. However, speculative decod-
+set of Llama (Dubey et al., 2024) draft models. 1B, 3B, and 8B                                                                                            ing overhead and longer sequence effects on target model
+are sizes of models.
+                                                                                                                                                Dataflow Is All You Need
+
+                                                                      Baseline(B) B+Kernel B+KL+Batch   B+KL+BS+            Optimized
+                                                                                                                                                                                                     Host              SN40-Excess            SN40-Memory Roofline
+                                                                    4 SN40-16     Looping Streaming     Schedule offloading DGX H100
+                                                                                  (KL)     (BS)         SN40-16                                                                               100%
+                                                                                  SN40-16 SN40-16
+                                        Speedup (SD performance /
+
+
+
+
+                                                                                                                                                                   Percentage of total time
+                                          RL Target performance)
+
+                                                                    3
+                                                                                                                                                                                               75%
+
+
+
+
+                                                                                                                                                                       of one SD step
+                                                                    2
+                                                                                                                                                                                               50%
+                                                                    1
+
+
+
+
+                                                                                                                              OOM
+                                                                                                                 OOM
+
+
+
+
+                                                                                                                                          OOM
+                                                                                                                                                                                               25%
+                                                                    0
+
+                                                              Batch Size
+                                                                                 Llama 3.1 70B SL=4K (SD)
+                                                                                                                   Llama 3.1 405B                                                              0%
+                                                                                                                     SL= 4K (SD)                                                              Batch size    1        2      4      8     10      1       2      4
+                                                                                                                                                                                                                    Llama 3.1 70B (SD)         Llama 3.1 405B (SD)
+(a) Speedup with speculative decoding (SD) on SN40 and GPU
+vs. peak target model performance.
+                                                                         Baseline            Optimized                       Optimized                                                                                   (a) Batch sizes.
+                                                                         SN40-16             SN40-16                         DGX H100
+                                            80%
+  Percentage of RL Speculative Decode
+
+
+
+
+                                                                                                                                                                                              Host                   SN40-Excess              SN40-Memory Roofline
+                                                                                                                                                                                              100%
+                                            60%
+
+
+
+
+                                                                                                                                                                Percentage of total time
+                                                                                                                                                                                              75%
+             Performance
+
+
+
+
+                                                                                                                                                                    of one SD step
+                                            40%
+                                                                                                                                                                                              50%
+
+                                           20%
+                                                                                                                                                                                              25%
+                                                                                                                                                OOM
+                                                                                                                       OOM
+
+
+                                                                                                                                    OOM
+
+
+
+
+                           0%
+                                                                                                                                                                                              0%
+                       Batch Size                                                                                  Llama 3.1 405B                                                                     K         5              9            5             9
+                                                                            Llama 3.1 70B SL=4K (SD)
+                                                                                                                     SL=4K (SD)                                                                                 Llama 3.1 70B (SD)        Llama 3.1 405B (SD)
+
+
+
+(b) Comparison of achieved speculative decoding (SD) perfor-
+mance over roofline (RL) SD performance.                                                                                                                                                                                       (b) k.
+
+
+                                             Figure 14. SN40-16 vs. DGX H100 performance                                                                      Figure 15. Time distribution in speculative decoding on SN40 for
+                                                                                                                                                              various workload configurations.
+
+performance are not captured, making DGX H100 estimates                                                                                                       key components in Figure 15a. The SN40-Memory Roofline
+optimistic.                                                                                                                                                   represents time taken by the draft and target models, based
+                                                                                                                                                              on the HBM roofline equation (equation 3). The Host slice
+                                                                                                                                                              captures time spent in the speculative decoding (SD) algo-
+                                                                                 Samples ∗ K ∗ iterationsSN 40M                                               rithm, including token acceptance, logits processing, and
+          T imeDraf t
+               H100E =
+                                                                                     P erf ormanceDraf  t
+                                                                                                    H100M                                                     related transfers.
+                                                                                 Samples ∗ iterationsSN 40M                                                   Figure 15a shows that larger batch sizes increase the pro-
+          T imeTH100
+                 arget
+                       =
+                     E
+                           P erf ormanceTH100
+                                            arget
+                                               M
+                                                                                                                                                              portion of time spent beyond the roofline estimate (SN40-
+                                   T otal T okensSN 40M                                                                                                       Excess), likely due to: A) increased compute-bound be-
+                       SD
+          P erf ormanceH100E =                                                                                                                                havior not captured by the HBM-based roofline, and B)
+                                T imeDraf  t        T arget
+                                      H100E + T imeH100E                                                                                                      greater I/O overhead. As the target model size increases,
+          W here, E = Estimated, M = M easured                                                                                                                both SN40-Excess and Host time decrease—attributed to:
+                                                                                                                                                       (4)    A) better HBM utilization, bringing performance closer to
+                                                                                                                                                              the roofline, and B) SD workload remaining constant, as it
+Figure 14 shows that SN40-16 achieves a 60–80% higher                                                                                                         depends on vocabulary size, not model size.
+speedup than DGX H100 on the Llama 3.1 70B specula-
+                                                                                                                                                              Finally, Figure 15b illustrates the impact of the choice of
+tive decoding workload. The 405B model could not run on
+                                                                                                                                                              the k value for speculative decoding. As k increases, the
+DGX H100 due to memory limits. SN40-16 also achieves
+                                                                                                                                                              time spent on the draft model also increases. Draft mod-
+45–78% of its theoretical roofline across batch sizes. As
+                                                                                                                                                              els typically exhibit more wasted performance due to their
+model size increases—from 70B to 405B—efficiency im-
+                                                                                                                                                              smaller size, limited parallelization potential, and warm-up
+proves. Despite having similar HBM bandwidth, SN40-16’s
+                                                                                                                                                              latencies inherent in any given architecture. However, in-
+architecture and earlier-discussed optimizations yield supe-
+                                                                                                                                                              creasing the k value can improve the number of accepted
+rior speculative decoding performance.
+                                                                                                                                                              draft model tokens, thereby reducing the number of calls
+To better understand the time distribution on SN40-16 sys-                                                                                                    to slower target models. This is reflected in the reduced
+tems for the workloads in Figure 14, we break down the                                                                                                        fraction of SN40-Memory Roofline from k = 5 to k = 9.
+                                                       Dataflow Is All You Need
+
+                                                                     Router (OpenRouter).       We highlight key optimization
+Table 4. Normalized speculative decode performance of SN40 for
+                                                                     aspects below.
+the different workload configurations.
+                                BS=1        BS=4       BS=16         Graph Compilation: Compile-time optimizations, includ-
+ Model Config
+                               k=5 k=9 k=5 k=9 k=5 k=9               ing KernelLooping and BatchStreaming, add negligible over-
+                                                                     head. User annotations of looping regions constrain eligible
+ Llama 70B-1B (SS=4k)          3.5   4.7   3.3   4.6   3.2   3.8
+ Llama 70B-8B (SS=4k)          2.8   3.5   2.6   3.2   2.3   2.6
+                                                                     subgraphs, reducing transformation complexity. In practice,
+ Llama 70B-1B (SS=32k)         3.4   4.6   3.1   4.3   3.1   3.9     a single compute graph instance is compiled; under tensor
+ Llama 70B-8B (SS=32k)         2.5   3.1   2.1   2.5   1.8   2.1     parallel (TP), graphs are identical across devices. Looping
+ Qwen2.5 72B-0.5B (SS=4k)      3.5   4.6   2.8   4.2   2.5   3.8     further reduces this to one decoder graph, compiled once
+ Llama 405B-3B (SS=4k)         4.0   6.1   3.8   5.8   3.5   5.1     on a single device. Thus, compile time and memory do not
+ Llama 405B-8B (SS=4k)         3.9   6.0   3.7   5.3   3.4   4.7
+                                                                     scale with decoder count. Model parameters do not affect
+                                                                     compilation, as they do not change the graph structure to
+                                                                     the compiler. Specifically, the sizes of intermediate ten-
+5.6   Batched Speculative Decode                                     sor shapes are determined by the tile sizes chosen for the
+Table 4 shows the speedup of batched speculative decoding            weights and KV caches, where the tile size is a function of
+compared to the target model baseline, illustrating how vari-        the compute and memory latencies and not the size of the
+ous factors – including the ratio of target to draft model size,     weights and KV caches themselves.
+sequence length, batch size, and the speculative decoding            Runtime Memory ScheduleOffloading is controlled by ap-
+parameter k – affect the speedup achieved.                           plication heuristics. PEF schedule memory scales linearly
+In general, larger draft-to-target model ratios yield greater        with unrolling factor M , but remains small (a few MB). In
+gains. For example, using the same draft model yields                practice, we notice that the benefit of M plateaus around 20.
+higher speedups for the Llama 405B model compared to                 The added capacity overheads are negligible in relation to
+the Llama 70B model. Conversely, using smaller 1B draft              available HBM (100s of GB) and DRAM (TBs).
+model for 70B target model provides better speedups com-             Checkpoint Processing KernelLooping requires check-
+pared to using 8B draft model.                                       point weights to be formatted and arranged differently so
+However, speedup diminish as the batch size grows. Large             that they can be read efficiently from HBM. Specifically,
+models benefit more from batch scaling because their one-            weights across decoder layers need to be packed into higher-
+time weight-loading cost is amortized over more samples,             dimensional tensors. Automatic checkpoint preprocessing
+while the KV cache overhead for the smaller draft model              infrastructure reads in compiler-generated metadata to ap-
+becomes a bigger fraction of its total latency. Consequently,        propriately restructure the checkpoint inputs.
+the performance gap between the draft and the target model
+narrows at higher batch sizes, reducing speculative decoding         7    C ONCLUSIONS
+speedups. A similar effect occurs with longer sequence
+lengths. Increasing the sequence length from 4K to 32K               This work demonstrates that overcoming decode inefficiency
+disproportionately increases the latency of the draft model          requires rethinking execution from first principles. We show
+due to larger KV caches, so the relative advantage over the          that dataflow is all you need to deliver near-roofline perfor-
+target model shrinks.                                                mance for large-scale AI inference.
+
+Additionally, a higher k value (e.g., k = 9 vs. k = 5)               Dataflow execution inherently overlaps compute, mem-
+typically improves speedups by allocating more generation            ory, and communication across chips. Through hard-
+steps to the faster draft model. However, the benefit of a           ware–software co-design on the SambaNova SN40 Re-
+larger k decreases as the batch size increases, again because        configurable Dataflow Unit (RDU), we demonstrate how
+the throughput of the draft model does not scale as well as          compiler-driven optimizations – KernelLooping, Batch-
+the larger model under these conditions.                             Streaming, and ScheduleOffloading – achieve over 75% of
+                                                                     the theoretical roofline across diverse models, from small
+                                                                     dense LLMs to large MoEs. End-to-end results with spec-
+6     D EPLOYMENT E XPERIENCE                                        ulative decoding show 6× faster token generation perfor-
+All techniques in this paper are deployed across                     mance compared to single-model baselines and 1.7× higher
+all models on the SambaNova Cloud platform                           throughput than a DGX H100 system with comparable ag-
+(cloud.sambanova.ai).            Key metrics—Time to                 gregate HBM bandwidth. These techniques have proven
+First Token (TTFT), token throughput, and context                    robust in deployment, powering production inference at
+length—are available via third-party benchmarks such                 cloud.sambanova.ai.
+as Artificial Analysis (Artificial Analysis) and Open-
+                                                     Dataflow Is All You Need
+
+R EFERENCES                                                        Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+                                                                     Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+Nvidia dgx h100 datasheet. https://resources.nv
+                                                                     R., Hesse, C., and Schulman, J. Training verifiers to solve
+  idia.com/en-us-dgx-systems/ai-enterpr
+                                                                     math word problems. arXiv preprint arXiv:2110.14168,
+  ise-dgx.
+                                                                     2021.
+Nvidia h100 tensor core gpu architecture. https://re
+  sources.nvidia.com/en-us-tensor-core.                            DeepSeek. Deepgemm: clean and efficient fp8 gemm ker-
+                                                                     nels with fine-grained scaling. URL https://gith
+The llama 4 herd: The beginning of a new era of natively             ub.com/deepseek-ai/DeepGEMM.
+  multimodal ai innovation. https://ai.meta.co
+  m/blog/llama-4-multimodal-intelligenc                            DeepSeek-AI. Deepseek-v2: A strong, economical, and
+  e/.                                                                efficient mixture-of-experts language model, 2024.
+
+Nvidia nvshmem. https://docs.nvidia.com/nv                         DeepSeek-AI, Liu, A., Feng, B., Xue, B., Wang, B., Wu, B.,
+  shmem/.                                                            Lu, C., Zhao, C., Deng, C., Zhang, C., Ruan, C., Dai, D.,
+                                                                     Guo, D., Yang, D., Chen, D., Ji, D., Li, E., Lin, F., Dai,
+Aimuyo, O. J., Oh, B., and Singh, R. Flashdmoe: Fast                 F., Luo, F., Hao, G., Chen, G., Li, G., Zhang, H., Bao,
+  distributed moe in a single kernel, 2025. URL https:               H., Xu, H., Wang, H., Zhang, H., Ding, H., Xin, H., Gao,
+  //arxiv.org/abs/2506.04667.                                        H., Li, H., Qu, H., Cai, J. L., Liang, J., Guo, J., Ni, J., Li,
+Artificial Analysis. Artificial analysis: Independent analysis       J., Wang, J., Chen, J., Chen, J., Yuan, J., Qiu, J., Li, J.,
+  of ai models and api providers. URL https://arti                   Song, J., Dong, K., Hu, K., Gao, K., Guan, K., Huang,
+  ficialanalysis.ai/.                                                K., Yu, K., Wang, L., Zhang, L., Xu, L., Xia, L., Zhao,
+                                                                     L., Wang, L., Zhang, L., Li, M., Wang, M., Zhang, M.,
+Beeching, E., Tunstall, L., and Rush, S. Scaling test-time           Zhang, M., Tang, M., Li, M., Tian, N., Huang, P., Wang,
+  compute with open models. URL https://huggin                       P., Zhang, P., Wang, Q., Zhu, Q., Chen, Q., Du, Q., Chen,
+  gface.co/spaces/HuggingFaceH4/blogpo                               R. J., Jin, R. L., Ge, R., Zhang, R., Pan, R., Wang, R.,
+  st-scaling-test-time-compute.                                      Xu, R., Zhang, R., Chen, R., Li, S. S., Lu, S., Zhou, S.,
+                                                                     Chen, S., Wu, S., Ye, S., Ye, S., Ma, S., Wang, S., Zhou,
+Brown, B., Juravsky, J., Ehrlich, R., Clark, R., Le, Q. V., Ré,     S., Yu, S., Zhou, S., Pan, S., Wang, T., Yun, T., Pei, T.,
+  C., and Mirhoseini, A. Large language monkeys: Scaling             Sun, T., Xiao, W. L., Zeng, W., Zhao, W., An, W., Liu,
+  inference compute with repeated sampling, 2024. URL                W., Liang, W., Gao, W., Yu, W., Zhang, W., Li, X. Q.,
+  https://arxiv.org/abs/2407.21787.                                  Jin, X., Wang, X., Bi, X., Liu, X., Wang, X., Shen, X.,
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,           Chen, X., Zhang, X., Chen, X., Nie, X., Sun, X., Wang,
+  L., and Jumper, J. Accelerating large language model               X., Cheng, X., Liu, X., Xie, X., Liu, X., Yu, X., Song,
+  decoding with speculative sampling, 2023. URL https:               X., Shan, X., Zhou, X., Yang, X., Li, X., Su, X., Lin, X.,
+  //arxiv.org/abs/2302.01318.                                        Li, Y. K., Wang, Y. Q., Wei, Y. X., Zhu, Y. X., Zhang,
+                                                                     Y., Xu, Y., Xu, Y., Huang, Y., Li, Y., Zhao, Y., Sun, Y.,
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,          Li, Y., Wang, Y., Yu, Y., Zheng, Y., Zhang, Y., Shi, Y.,
+  H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,             Xiong, Y., He, Y., Tang, Y., Piao, Y., Wang, Y., Tan, Y.,
+  Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,              Ma, Y., Liu, Y., Guo, Y., Wu, Y., Ou, Y., Zhu, Y., Wang,
+  M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,           Y., Gong, Y., Zou, Y., He, Y., Zha, Y., Xiong, Y., Ma, Y.,
+  S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-           Yan, Y., Luo, Y., You, Y., Liu, Y., Zhou, Y., Wu, Z. F.,
+  ian, M., Winter, C., Tillet, P., Such, F. P., Cummings, D.,        Ren, Z. Z., Ren, Z., Sha, Z., Fu, Z., Xu, Z., Huang, Z.,
+  Plappert, M., Chantzis, F., Barnes, E., Herbert-Voss, A.,          Zhang, Z., Xie, Z., Zhang, Z., Hao, Z., Gou, Z., Ma, Z.,
+  Guss, W. H., Nichol, A., Paino, A., Tezak, N., Tang,               Yan, Z., Shao, Z., Xu, Z., Wu, Z., Zhang, Z., Li, Z., Gu,
+  J., Babuschkin, I., Balaji, S., Jain, S., Saunders, W.,            Z., Zhu, Z., Liu, Z., Li, Z., Xie, Z., Song, Z., Gao, Z.,
+  Hesse, C., Carr, A. N., Leike, J., Achiam, J., Misra,              and Pan, Z. Deepseek-v3 technical report, 2025. URL
+  V., Morikawa, E., Radford, A., Knight, M., Brundage,               https://arxiv.org/abs/2412.19437.
+  M., Murati, M., Mayer, K., Welinder, P., McGrew, B.,
+  Amodei, D., McCandlish, S., Sutskever, I., and Zaremba,          DeepSeek-AI, D. G. e. a. Deepseek-r1: Incentivizing reason-
+  W. Evaluating large language models trained on code.               ing capability in llms via reinforcement learning, 2025.
+  2021.                                                              URL https://arxiv.org/abs/2501.12948.
+
+Claude. Prompt caching with claude. URL https://ww                 Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+  w.anthropic.com/news/prompt-caching.                              A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+                                                  Dataflow Is All You Need
+
+  A., et al. The llama 3 herd of models. arXiv e-prints, pp.    NVIDIA. Nsight systems. https://developer.nv
+  arXiv–2407, 2024.                                              idia.com/nsight-systems, c.
+Google. Context caching - google gemini api documentation.      NVIDIA. Tensorrt-llm. https://docs.nvidia.co
+  URL https://ai.google.dev/gemini-api                           m/tensorrt-llm/index.html, d.
+ /docs/caching.
+                                                                NVIDIA. Tensorrt-llm speculative decoding boosts in-
+Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A., Savary,    ference throughput by up to 3.6x, e. URL https:
+   B., Bamford, C., Chaplot, D. S., de las Casas, D., Hanna,     //developer.nvidia.com/blog/tensorrt
+   E. B., Bressand, F., Lengyel, G., Bour, G., Lample, G.,       -llm-speculative-decoding-boosts-inf
+   Lavaud, L. R., Saulnier, L., Lachaux, M.-A., Stock, P.,       erence-throughput-by-up-to-3-6x/.
+   Subramanian, S., Yang, S., Antoniak, S., Scao, T. L.,
+   Gervet, T., Lavril, T., Wang, T., Lacroix, T., and Sayed,    OpenAI. Prompt caching - openai. URL https://plat
+   W. E. Mixtral of experts, 2024a. URL https://arxi              form.openai.com/docs/guides/prompt-c
+   v.org/abs/2401.04088.                                          aching.
+
+Jiang, C., Tian, Y., Jia, Z., Zheng, S., Wu, C., and Wang,      OpenAI. “learning to reason with llms,”, 2024. URL http
+   Y. Lancet: Accelerating mixture-of-experts training via        s://openai.com/index/learning-to-rea
+   whole graph computation-communication overlapping,             son-with-llms/.
+   2024b. URL https://arxiv.org/abs/2404.1
+                                                                OpenAI, S. A. e. a. gpt-oss-120b gpt-oss-20b model card,
+   9429.
+                                                                  2025. URL https://arxiv.org/abs/2508.1
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference          0925.
+  from transformers via speculative decoding. In Inter-
+  national Conference on Machine Learning, pp. 19274–           OpenRouter. Openrouter: The unified interface for llms.
+  19286. PMLR, 2023.                                              URL https://openrouter.ai/.
+
+Li, X., Zhang, T., Dubois, Y., Taori, R., Gulrajani, I.,        Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury,
+  Guestrin, C., Liang, P., and Hashimoto, T. B. Alpacaeval:       J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S., and
+  An automatic evaluator of instruction-following models.         Dean, J. Efficiently scaling transformer inference, 2022.
+  https://github.com/tatsu-lab/alpaca_                          Prabhakar, R. Sambanova sn40l rdu: Breaking the barrier
+  eval, 5 2023.                                                   of trillion+ parameter scale gen ai computing. In 2024
+Liu, X., Daniel, C., Hu, L., Kwon, W., Li, Z., Mo, X., Che-       IEEE Hot Chips 36 Symposium (HCS), pp. 1–24, Los
+  ung, A., Deng, Z., Stoica, I., and Zhang, H. Optimizing         Alamitos, CA, USA, aug 2024. IEEE Computer Society.
+  speculative decoding for serving large language models          doi: 10.1109/HCS61935.2024.10664717. URL https:
+  using goodput, 2024. URL https://arxiv.org/                     //doi.ieeecomputersociety.org/10.110
+  abs/2406.14066.                                                 9/HCS61935.2024.10664717.
+
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z.,           Prabhakar, R., Sivaramakrishnan, R., Gandhi, D., Du, Y.,
+ Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi,               Wang, M., Song, X., Zhang, K., Gao, T., Wang, A., Li,
+ X., Shi, C., Chen, Z., Arfeen, D., Abhyankar, R., and            K., Sheng, Y., Brot, J., Sokolov, D., Vivek, A., Leung,
+ Jia, Z. Specinfer: Accelerating large language model             C., Sabnis, A., Bai, J., Zhao, T., Gottscho, M., Jackson,
+ serving with tree-based speculative inference and verifi-        D., Luttrell, M., Shah, M. K., Chen, E., Liang, K., Jain,
+ cation. In Proceedings of the 29th ACM International             S., Thakker, U., Huang, D., Jairath, S., Brown, K. J., and
+ Conference on Architectural Support for Programming              Olukotun, K. Sambanova sn40l: Scaling the ai memory
+ Languages and Operating Systems, Volume 3, ASPLOS                wall with dataflow and composition of experts, 2024.
+ ’24, pp. 932–949, New York, NY, USA, 2024. Associa-              URL https://arxiv.org/abs/2405.07518.
+ tion for Computing Machinery. ISBN 9798400703867.
+                                                                Shulai Zhang, Ningxin Zheng, H. L. Z. J. W. B. C. J. Q. H. W.
+ doi: 10.1145/3620666.3651335. URL https:
+                                                                  C. S. Z. L.-W. C. Q. C. and Liu, X. Comet: Fine-grained
+ //doi.org/10.1145/3620666.3651335.
+                                                                  computation-communication overlapping for mixture-of-
+NVIDIA. Getting started with cuda graphs. https://de              experts, 2025.
+ veloper.nvidia.com/blog/cuda-graphs/,
+ a.                                                             Snell, C., Lee, J., Xu, K., and Kumar, A. Scaling llm
+                                                                  test-time compute optimally can be more effective than
+NVIDIA. Collective communications library (nccl). http            scaling model parameters, 2024. URL https://arxi
+ s://developer.nvidia.com/nccl, b.                                v.org/abs/2408.03314.
+                                                    Dataflow Is All You Need
+
+Son, G. Qwq-longcot dataset on huggingface. URL https:
+  //huggingface.co/datasets/amphora/Qw
+  Q-LongCoT-130K.
+Spector, B., Juravsky, J., Sul, S., Dugan, O., Lim, D., Fu, D.,
+  Arora, S., and Ré, C. Look ma, no bubbles! designing a
+  low-latency megakernel for llama-1b, May 2025a. URL
+  https://hazyresearch.stanford.edu/bl
+  og/2025-05-27-no-bubbles.
+Spector, B., Juravsky, J., Sul, S., Lim, D., Dugan, O., Arora,
+  S., and Ré, C. We bought the whole gpu, so we’re damn
+  well going to use the whole gpu, September 2025b. URL
+  https://hazyresearch.stanford.edu/bl
+  og/2025-09-28-tp-llama-main.
+Team, Q. Qwen2.5: A party of foundation models, Septem-
+  ber 2024. URL https://qwenlm.github.io/b
+  log/qwen2.5/.
+vLLM Team. How speculative decoding boosts vllm per-
+  formance by up to 2.8x. URL https://blog.vllm.
+  ai/2024/10/17/spec-decode.html.
+Wu, M., Cheng, X., Liu, S., Shi, C., Ji, J., Ao, K., Vel-
+ liengiri, P., Miao, X., Padon, O., and Jia, Z. Mirage:
+ A multi-level superoptimizer for tensor programs. In
+ 19th USENIX Symposium on Operating Systems Design
+ and Implementation (OSDI 25), Boston, MA, July 2025.
+ USENIX Association.
+Yang, A., Yang, B., Hui, B., Zheng, B., Yu, B., Zhou, C.,
+  Li, C., Li, C., Liu, D., Huang, F., Dong, G., Wei, H., Lin,
+  H., Tang, J., Wang, J., Yang, J., Tu, J., Zhang, J., Ma, J.,
+  Xu, J., Zhou, J., Bai, J., He, J., Lin, J., Dang, K., Lu, K.,
+  Chen, K., Yang, K., Li, M., Xue, M., Ni, N., Zhang, P.,
+  Wang, P., Peng, R., Men, R., Gao, R., Lin, R., Wang, S.,
+  Bai, S., Tan, S., Zhu, T., Li, T., Liu, T., Ge, W., Deng,
+  X., Zhou, X., Ren, X., Zhang, X., Wei, X., Ren, X., Fan,
+  Y., Yao, Y., Zhang, Y., Wan, Y., Chu, Y., Liu, Y., Cui, Z.,
+  Zhang, Z., and Fan, Z. Qwen2 technical report. arXiv
+  preprint arXiv:2407.10671, 2024.
+Zhao, C., Zhou, S., Zhang, L., Deng, C., Xu, Z., Liu, Y.,
+  Yu, K., Li, J., and Zhao, L. Deepep: an efficient expert-
+  parallel communication library. https://github.c
+  om/deepseek-ai/DeepEP, 2025.
+

@@ -1,0 +1,1443 @@
+         S UPER I NFER : SLO-AWARE ROTARY S CHEDULING AND M EMORY
+              M ANAGEMENT FOR LLM I NFERENCE ON S UPERCHIPS
+
+
+                                Jiahuan Yu 1 Mingtao Hu 1 Zichao Lin 1 Minjia Zhang 1
+
+
+                                                      A BSTRACT
+     Large Language Model (LLM) serving faces a fundamental tension between stringent latency Service Level
+     Objectives (SLOs) and limited GPU memory capacity. When high request rates exhaust the KV cache budget,
+     existing LLM inference systems often suffer severe head-of-line (HOL) blocking. While prior work explored
+     PCIe-based offloading, these approaches cannot sustain responsiveness under high request rates, often failing
+     to meet tight Time-To-First-Token (TTFT) and Time-Between-Tokens (TBT) SLOs. We present SuperInfer,
+     a high-performance LLM inference system designed for emerging Superchips (e.g., NVIDIA GH200) with
+     tightly coupled GPU-CPU architecture via NVLink-C2C. SuperInfer introduces RotaSched, the first proactive,
+     SLO-aware rotary scheduler that rotates requests to maintain responsiveness on Superchips, and DuplexKV,
+     an optimized rotation engine that enables full-duplex transfer over NVLink-C2C. Evaluations on GH200 using
+     various models and datasets show that SuperInfer improves TTFT SLO attainment rates by up to 74.7% while
+     maintaining comparable TBT and throughput compared to state-of-the-art systems, demonstrating that SLO-aware
+     scheduling and memory co-design unlocks the full potential of Superchips for responsive LLM serving. Code is
+     available in https://github.com/Supercomputing-System-AI-Lab/SuperInfer.
+
+1    I NTRODUCTION                                                 failing to serve requests whose KV cache no longer fits.
+Large Language Models (LLMs) (Achiam et al., 2023; Tou-            To overcome this bottleneck, a line of work explores offload-
+vron et al., 2023; Liu et al., 2024a; Bai et al., 2023) increas-   ing, which swaps KV cache or model parameters to CPU
+ingly power latency-critical applications. These services          memory (Sheng et al., 2023; Jiang et al., 2024c; Hu et al.,
+demand strict latency Service Level Objectives (SLOs), par-        2024). While expanding effective memory capacity, exist-
+ticularly Time-To-First-Token (TTFT) and Time-Between-             ing techniques suffer two critical limitations. First, most of
+Tokens (TBT), to ensure responsive user interactions. Con-         them are SLO-unaware, reacting to memory pressure rather
+sequently, building high-performance LLM serving systems           than latency urgency, often causing severe TBT SLO viola-
+capable of meeting SLOs while maintaining high throughput          tions for requests stuck in swapped queues (§ 3.1). Second,
+has become a critical research challenge.                          they are typically designed for PCIe architectures, whose
+                                                                   limited bandwidth (∼32-64GB/s) makes swapping too slow
+The key difficulty lies in memory-intensive inference. Each        to alleviate HOL blocking under high load (§ 3.2).
+request maintains an ever-growing key-value (KV) cache
+during autoregressive generation (Radford et al., 2019). Un-       The emergence of GPU-CPU tightly-coupled Superchips,
+der high request rates, this cumulative KV cache quickly ex-       such as the NVIDIA GH200 (NVIDIA, 2024), fundamen-
+hausts GPU memory, leading to severe head-of-line (HOL)            tally shifts this landscape. GH200 integrates a Hopper GPU
+blocking and SLO violations. While prior SLO-aware sched-          and a Grace CPU via NVLink-C2C, a cache-coherence
+ulers (Agrawal et al., 2024; Fu et al., 2024; Hong et al.,         interconnect with up to 900GB/s bandwidth, an order of
+2025) reduce queuing delays via priority reordering, they          magnitude higher than PCIe. While initial studies explore
+are ultimately constrained by limited on-device memory,            GH200 for LLM serving (Xu et al., 2024) and training (Lian
+    1
+                                                                   et al., 2025), its full potential remains untapped. Specifically,
+      Siebel School of Computing and Data Science, University of   directly porting existing PCIe-based offloading mechanisms
+Illinois Urbana-Champaign, Champaign, USA. Correspondence
+to: Jiahuan Yu <jiahuan2@illinois.edu>, Mingtao Hu <ming-
+                                                                   to GH200 yields unexpectedly poor results due to <5% uti-
+tao4@illinois.edu>, Zichao Lin <zichaol3@illinois.edu>, Minjia     lization of C2C bandwidth (§ 3.3). This counterintuitive
+Zhang <minjiaz@illinois.edu>.                                      result suggests the bottleneck lies in the software stack in-
+                                                                   stead of hardware. What prevents today’s serving stacks
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,       from exploiting the full potential of Superchips, and what
+2026. Copyright 2026 by the author(s).
+                                                                   design principles are needed to close this gap?
+           SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+Our in-depth study of GH200’s memory hierarchy and of-            Early systems like DeepSpeed-Inference (Aminabadi et al.,
+floading behavior reveals fundamental software-hardware           2022) and FlexGen (Sheng et al., 2023) treat host mem-
+mismatches preventing current serving stacks from leverag-        ory as an extension of GPU memory to fit models beyond
+ing its full potential (§ 4.3.1). Guided by our observations,     on-device capacity. While enabling single-GPU inference
+we introduce SuperInfer, a high-performance, SLO-aware            for large models, their static offloading leads to high data
+LLM serving system optimized for Superchips. SuperInfer           transfer latency during dynamic serving workloads. Later,
+employs two co-designed techniques for responsive, full-          PagedAttention (Kwon et al., 2023) proposes paging-based
+duplex offloading: (1) RotaSched (§ 4.2), an OS-inspired ro-      memory managers that organize KV cache into small, fixed-
+tary scheduler that, instead of using passive preemption for      size blocks, significantly reducing memory fragmentation
+out-of-memory error prevention, introduces a novel transient      and improving memory utilization. This design has be-
+rotary state and active rotation to proactively rotate requests   come the de facto technique in recent LLM serving frame-
+between HBM and DRAM based on their SLO progress. (2)             works (Kwon et al., 2023; Zheng et al., 2024). However,
+DuplexKV (§ 4.3), a high-performance KV cache rotation            paging scatters KV cache across non-contiguous small re-
+engine co-designed to support efficient request rotations         gions, making GPU-CPU transfer expensive. Subsequent
+over NVLink-C2C. It maximizes C2C bandwidth utilization           systems attempt to overlap the transfer overheads with com-
+by enabling full-duplex data-race-free transfers, merging         putation (Jiang et al., 2024b; Luo et al., 2025; Cao et al.,
+fragmented KV cache segments into large efficient batches,        2025; Yu et al., 2024; Kim et al., 2025; Hu et al., 2024; Qin
+and overlapping transfers with model execution.                   et al., 2025). FastDecode (He & Zhai, 2024), NEO (Jiang
+                                                                  et al., 2024c), HeteGen (Zhao et al., 2024), CachedAtten-
+We evaluate SuperInfer across various models and work-
+                                                                  tion (Gao et al., 2024), FlashGen (Jeong & Ahn, 2025), and
+loads on GH200. Under high request rates, SuperInfer sub-
+                                                                  NanoFlow (Zhu et al., 2025) propose offloading KV cache
+stantially improves end-to-end SLO attainment, achieving
+                                                                  or part of the computation from GPU to CPU or SSDs, ef-
+up to 74.7% higher TTFT success rates than state-of-the-
+                                                                  fectively increasing the batch size and therefore inference
+art systems, while maintaining comparable throughput and
+                                                                  throughput. Although effective, these designs remain PCIe-
+TBT. At low request rates, where memory is sufficient, Su-
+                                                                  bound, and do not exploit the high-bandwidth, full-duplex
+perInfer matches baseline performance, confirming its bene-
+                                                                  C2C links in emerging Superchips.
+fits stem from efficient, SLO-aware memory management
+on Superchips. These improvements demonstrate that Su-            To overcome the PCIe bottleneck, Aqua (Vijaya Kumar
+perchips, paired with co-designed software, can effectively       et al., 2025) offloads KV cache to other GPUs via inter-
+mitigate HOL blocking and enable responsive LLM serving.          GPU NVLink, but it relies on limited spare peer GPU
+                                                                  memory rather than large CPU memory on Superchips.
+In summary, this paper makes the following contributions:
+                                                                  Alternatively, some systems reduce KV cache volume it-
+(1) We identify the limitations of existing LLM serving
+                                                                  self instead of transfer pipeline optimizations (Chen et al.,
+systems with PCIe-based offloading on Superchips, and an-
+                                                                  2025b; Song et al., 2024). For example, InfiniGen (Lee
+alyze why they fail to utilize NVLink-C2C bandwidth and
+                                                                  et al., 2024) prunes KV entries via dynamic importance
+achieve SLO responsiveness. (2) We present SuperInfer,
+                                                                  estimation and transfers only a subset of KVs for each re-
+the first SLO-aware LLM serving system co-designed for
+                                                                  quest. CacheGen (Liu et al., 2024b) compresses KV cache
+Superchips, which consists of (i) RotaSched, an OS-inspired
+                                                                  via layer-wise quantization and arithmetic coding. These
+scheduler using active rotation guided by Virtual Lag Time
+                                                                  methods reduce offloading overhead but are lossy, making
+(VLT), and (ii) DuplexKV, a full-duplex KV cache rota-
+                                                                  them hard to generalize to unseen tasks and requests.
+tion engine that eliminates C2C under-utilization. (3) We
+demonstrate that SuperInfer achieves up to 74.7% higher
+TTFT SLO attainment rate under high request rates while           2.2   Offloading over Emerging Tightly Coupled
+maintaining comparable throughput and TBT latency.                      GPU–CPU Architectures
+                                                                  Recent Superchip architectures (e.g., NVIDIA GH200,
+2     BACKGROUND AND R ELATED W ORK                               AMD MI300A) tightly integrate GPU and CPU via high-
+                                                                  performance interconnects, offering an order of magni-
+2.1   LLM Inference and Offloading over PCIe GPUs                 tude higher bandwidth than traditional PCIe. For exam-
+During LLM autoregressive generation, each request’s KV           ple, GH200’s NVLink-C2C provides 900GB/s bidirectional
+cache grows linearly with sequence length (Radford et al.,        bandwidth (NVIDIA, 2024). Several recent studies have
+2019), making GPU memory the dominant bottleneck: even            benchmarked (Fusco et al., 2024; Schieffer et al., 2024)
+high-end GPUs can hold only a limited number of con-              or explored programming Superchips (Vellaisamy et al.,
+current requests. Researchers have explored sophisticated         2025). SuperOffload (Lian et al., 2025) further examines
+mechanisms to address this challenge.                             Hopper, Grace, C2C joint optimizations, demonstrating po-
+                                                                  tential for large-scale LLM training. However, few prior
+           SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+systems explicitly target LLM inference on Superchips. The                       waiting   WF       running                        swapped
+most relevant work is Pie (Xu et al., 2024), which enables                                                                  SF
+GPU-CPU KV cache spilling on GH200 and adapts mem-                           102                                       21
+
+
+
+
+                                                                  P99 TTFT (s)
+
+
+
+
+                                                                                                         P99 TBT (s)
+ory allocation on-the-fly. However, Pie is not optimized                                          FCFS
+for tight latency SLOs under high load, nor does it apply                    101                  WF
+                                                                                                  SF               21
+SLO-aware scheduling. In contrast, SuperInfer introduces                     100
+an active rotary scheduler and full-duplex transfer engine,                    10.0 12.5 15.0 17.5 20.0                 10.0 12.5 15.0 17.5 20.0
+                                                                                         RPS                                      RPS
+jointly addressing SLO-awareness and C2C link utilization.
+                                                                     Figure 1. Two static offloading policies: Waiting-First (WF) and
+2.3   Scheduling for Latency-Aware Inference                         Swapped-First (SF), and comparison of their P99 TTFT and TBT
+                                                                     to FCFS under varying request rates (Qwen2.5-32B, ShareGPT).
+While widely used techniques like continuous batching (Yu
+et al., 2022) improve throughput, they lack explicit latency
+control. Several works target fairness among requests or
+clients (Sheng et al., 2024; Wei et al., 2025), which comple-         then examine the limitations of PCIe for offloading (§ 3.2),
+ment but do not directly optimize for latency SLOs.                   finally analyze the unexpected NVLink-C2C bandwidth
+                                                                      under-utilization of existing offloading techniques (§ 3.3).
+There has been a growing number of works explicitly man-
+aging request latency. Sarathi-Serve (Agrawal et al., 2024)
+                                                                      3.1          SLO-Aware Offloading as a Challenge
+introduces chunked prefill and a dynamic batching policy
+to improve SLO attainment under dynamic workloads, but               While sophisticated scheduling techniques exist, they can-
+it assumes GPU-residency of all requests. Ao et al. (2025)           not fundamentally overcome the GPU memory pressure im-
+formulate LLM serving as an online scheduling problem                posed by hardware constraints (more details in Appendix A).
+and proposes WAIT/Nested-WAIT algorithms to balance                  A natural idea to mitigate memory pressure is offloading,
+throughput and latency under memory constraints. While               which swaps inactive requests’ KV cache to CPU memory.
+effective within single-GPU memory, these works do not               However, this introduces a challenge for SLO-aware serving
+address latency management of LLM serving for heteroge-              (Fig. 1): prioritize waiting requests (Waiting-First, WF) by
+neous GPU-CPU hierarchies or offloading. A larger set of             preempting running ones, or prioritize resuming swapped
+systems mitigates latency via queue reordering and request           requests (Swapped-First, SF)? These static, SLO-unaware
+prioritization. For example, SSJF (Qiu et al., 2024) and             policies, common in production frameworks (Zheng et al.,
+LTR (Fu et al., 2024) use length prediction to approximate           2024; Kwon et al., 2023), fail to strike a balance. As Fig. 1
+Shortest-Job-First (SJF) or Shortest-Remaining-Time-First            shows, compared to First-Come-First-Serve (FCFS), WF
+(SRTF) scheduling, reducing HOL blocking and improving               favors new arrivals, reducing TTFT but significantly increas-
+responsiveness of short requests. Others treat SLO attain-           ing TBT, as running requests are paused for a long time
+ment as a search or scheduling optimization problem, such            during generation. Conversely, SF protects TBT but de-
+as SOLA (Hong et al., 2025), FastServe (Wu et al., 2023),            grades to FCFS-like performance, failing to fully exploit the
+SHEPHERD (Zhang et al., 2023), or target multi-SLO serv-             potential of offloading, as swapped requests are prioritized
+ing for mixed request types (Zhang et al., 2025; Huang et al.,       to resume immediately, thus swap space is underutilized.
+2025; Borui et al., 2025; Li et al., 2025). Although effective,      Consequently, neither policy effectively balances TTFT and
+they are fundamentally limited by GPU memory capacity.               TBT.
+Alternatively, several works aim to reduce SLO violations by          Insight #1: Offloading shows promise for alleviating mem-
+saving GPU memory or increasing utilization (Chen et al.,             ory pressure, but making it SLO-aware requires determining
+2025c; Patke et al., 2024). LightLLM (Gong et al., 2025)              which requests to swap or run. Static policies inevitably bias
+estimates future KV cache usage to avoid harmful preemp-              toward one SLO at the expense of the other. An effective
+tion, which wastes GPU memory, but it is also limited by              design must mitigate this issue via proactive scheduling.
+GPU memory capacity. TokenFlow (Chen et al., 2025a) and
+Select-N (Ma et al., 2025) explore SLO-aware scheduling               3.2          Responsiveness Bottleneck Caused by Low Swap
+with offloading to balance host memory usage and latency,                          Bandwidth over PCIe
+which are PCIe-based and thus limited by its bandwidth.
+                                                                      Even with ideal scheduling, SLO-aware offloading succeeds
+                                                                      only if requests can be swapped fast enough between GPU
+3     O BSERVATIONS                                                   and CPU. In practice, offloading responsiveness is con-
+This section presents the motivational studies. We first              strained by the effective swap bandwidth, i.e., the amount of
+identify the SLO-aware offloading as a challenge (§ 3.1),             KV cache transferred per unit time, which, on PCIe-based
+                                                                      GPUs, is fundamentally limited by the bandwidth of PCIe.
+                                SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+           24                                                                                                                                                200
+
+
+
+
+                                                                                                                                              Bandwidth (GB/s)
+                                         TTFT                            Backlogging                 LLaMA-3-8B D2H        Qwen2.5-32B H2D                           C2C D2H
+P99 TTFT (s)
+
+
+
+
+                                             P99 TBT (s)
+                PCIe Gen5 x16            TBT 22              Slow     waiting                        LLaMA-3-8B H2D        Mixtral-8x7B D2H                          C2C H2D
+           23                                              clearing                                  Qwen2.5-32B D2H       Mixtral-8x7B H2D                          PCIe D2H
+                                                                                                                                                             100     PCIe H2D
+                                                                      running        Slow
+
+
+
+
+                                                                                               Bandwidth
+           22                                                Slow                                      10
+
+
+
+
+                                                                                                 (GB/s)
+                                             21            resuming   swapped     offloading
+                 50 100 150                                                                                                                                      0
+                Swap Bandwidth (GB/s)                                      HOL Blocki ng                   0   8K         64K 256K                                   23 28 213 218
+                                                                                                                    Transfer Tokens                                    Segment Size (KB)
+   Figure 2. P99 TTFT and TBT                              Figure 3. Limitations of low
+   latency vs. swap bandwidth                              swap bandwidth for offloading:      Figure 4. Measured      bidirec-                    Figure 5. NVLink-C2C
+   for vLLM with offloading.                               slow clearing of backlogged         tional CPU-GPU KV cache                             (GH200) vs. PCIe Gen5x16
+   (Qwen2.5-32B,     ShareGPT,                             waiting requests and new HOL        transfer bandwidth of vLLM                          (H200) full-duplex bandwidth
+   RPS=20).                                                blocking in the swapped queue.      for three different models.                         by segment size.
+
+
+
+    As Fig. 2 shows, increasing swap bandwidth beyond the                                      stems not from the C2C itself, but from the Grace DRAM
+    PCIe Gen5x16 uni-directional limit significantly reduces                                   subsystem. Each NUMA node in Grace provides 384GB/s
+    both TTFT and TBT. Tail TTFT is primarily caused by                                        of DRAM bandwidth (NVIDIA, 2024). Therefore, memory-
+    waiting queue delay, and tail TBT primarily results from                                   intensive transfers can saturate DRAM bandwidth before
+    the duration that requests are in the swapped state. Thus,                                 reaching the C2C link’s 450+450 GB/s theoretical peak.
+    PCIe’s low swap bandwidth creates two major obstacles to                                   Moreover, Grace DRAM is half-duplex, which explains
+    reducing tail latencies (Fig. 3). The first, it leads to request                           why concurrent device-to-host (D2H) and host-to-device
+    backlogging, i.e., the accumulation of new arriving requests                               (H2D) transfers are limited by ∼384GB/s in total, while
+    in the waiting queue due to GPU memory exhausting at                                       individual D2H/H2D can each achieve higher bandwidth.
+    high request rates. Low swap bandwidth makes clearing
+                                                                                               Despite these findings, the large disparity between achiev-
+    this backlog through offloading sluggish; paused requests
+                                                                                               able (∼200GB/s) and achieved (∼10GB/s) bandwidth raises
+    remain in GPU memory longer due to slow offloading, while
+                                                                                               a natural question: what prevents current LLM offloading
+    new arrivals continue to queue up, increasing TTFT SLO
+                                                                                               mechanisms from fully harnessing GH200’s NVLink-C2C?
+    violations. Second, when a large number of requests are
+    swapped, low swap bandwidth stalls request resumption due                                  Insight #3: Superchips unlock the bandwidth essential for
+    to slow KV cache transfer, leading to new HOL blocking                                     responsive offloading, but current LLM serving stacks ex-
+    in the swapped queue and limited responsiveness to TBT                                     ploit <5% of it. Fully exploiting its architecture requires
+    SLO violations. Consequently, PCIe fundamentally limits                                    co-designed scheduling and memory-management mecha-
+    ability of offloading-based LLM serving systems to respond                                 nism for high-performance, SLO-aware LLM inference.
+    to dynamic SLO violations when system load is high.
+    Insight #2: Offloading-based SLO-aware LLM inference                                       4       S YSTEM D ESIGN
+    is fundamentally limited by low bandwidth of PCIe. It
+                                                                                               Based on insights from § 3, we propose SuperInfer, a high-
+    constrains the swap bandwidth and responsiveness, leading
+                                                                                               performance LLM serving system optimized for memory-
+    to slow clearing of backlogged waiting requests and new
+                                                                                               intensive, latency-sensitive tasks on GH200. This section
+    HOL blocking in the swapped queue.
+                                                                                               details SuperInfer’s overview (§ 4.1) and its two key com-
+                                                                                               ponents: RotaSched (§ 4.2) and DuplexKV (§ 4.3).
+    3.3           Superchip Offers Opportunity but Not for Free
+    In principle, the GH200’s high NVLink-C2C bandwidth                                        4.1         Overall Architecture
+    could eliminate the swap bandwidth bottleneck described
+                                                                                               Fig. 6 illustrates the overall architecture of SuperInfer,
+    above, enabling near-instantaneous request preemption and
+                                                                                               which is composed of two co-designed components:
+    resumption. However, our profiling of widely-used LLM
+    serving systems shows severe bandwidth under-utilization.                                  RotaSched (§ 4.2): An OS-inspired, SLO-aware preemp-
+                                                                                               tive scheduler implementing active rotation to fully utilize
+    As Fig. 4 shows, vLLM’s offloading engine achieves only
+                                                                                               large swap space. Guided by a novel Virtual Lag Time (VLT)
+    ∼10GB/s of effective bandwidth on GH200 (<5% of the
+                                                                                               metric, it employs Largest-VLT-First (LVF) policy to prior-
+    theoretical peak) across three models, regardless of the total
+                                                                                               itize lagging requests vulnerable to SLO violations, while
+    transfer token number. To understand this gap, we perform a
+                                                                                               preempting long-running ones into the rotary state for later
+    fine-grained full-duplex transfer bandwidth characterization
+                                                                                               resumption. This ensures fast request execution rotation
+    across different segment sizes for GH200 (see Appendix
+                                                                                               with offloading and high responsiveness for SLO violations.
+    B for method). As Fig. 5 shows, C2C bandwidth saturates
+    at ∼200+200GB/s. Further investigation shows this limit                                    DuplexKV (§ 4.3): A high-performance KV cache rotation
+                   SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+ RotaSched (§ 4.2)                     Users                                        Block Tabl e                      Running Reqs                           Core 1 Core 2
+                                                                             Req Blk HBM Blk DRAM Blk                  Req 1     Req 2
+                                                                                                                      Tok ens   Tok ens       Running
+  waiti ng     1    2   3                  2       3                          1:0       H0           /
+                                GPU
+                                                                              1:1       H3           /                Req 1     Req 2         Pasued/        Thread   Thread
+  running 4         5   6                  6       1       7
+                                                                              4:0       H1         D1                 KV $      KV $
+                                exec                                          4:1       H2         D0
+                                                                                                                                                Idle         1 Data   3 Data
+   rotary      7    8   9                  8       9       4       5                                                   Hopper HBM                              On-Chip $
+                                                                              5:0       H6         D4
+     request stat es                  schedule result                         5:1       H5         D7        Req 1    Req 2     Req 3     Req 4     Thread   Thread   Thread   Thread
+   LVF             Virtual Lag Time (VLT)                                     6:0       H3         D2        KV $     KV $      KV $      KV $      1 Data   2 Data   3 Data   4 Data
+  sched                                                                       6:1       H4         D3                  Grace DRAM                            Main Memory
+           1 7 9 2 8 3 6 4 5                                                  7:0       H1         D8
+   to prioritize        Active R otate             to preempt                 7:1       H6         D9
+                                                                              8:0        /         D11    Figure 7. Analogy: LLM serving stack on GH200 (left) vs. OS on
+                                                                              8:1        /         D5
+          6    4    5                          6       4       5
+ Hopper
+
+
+
+
+                            eager rotate                                                                  CPU (right). Requests → threads, Hopper HBM → on-chip cache,
+
+
+                                                                   DRAM
+                                                                              9:0        /         D6
+
+
+                                                                   Grace
+  HBM
+
+
+
+
+          1    7             swap-in           7       8       9              9:1        /         D10    Grace DRAM → main memory, KV cache → thread data.
+                                                                              ...       ...         ...
+                            duplex xfer via NVLink-C2C
+ DuplexKV (§ 4.3)                                                          blk-first layout
+
+
+Figure 6. Overall architecture of SuperInfer. RotaSched maintains
+the requests states and perform Largest VLT First (LVF) schedul-
+ing based on Virtual Lag Time (VLT). DuplexKV manages the KV
+cache allocation across Hopper HBM and Grace DRAM with a
+block table, and transfers KV cache for swap-in and eager block                                           Based on this insight, SuperInfer adapts the rotation prin-
+rotation in a full-duplex manner. Numbers in squares denote differ-                                       ciple for LLM serving to mitigate SLO violations. Instead
+ent requests. “X:Y” denotes KV block Y of request X, “H:W” and                                            of treating preemption as a last resort to prevent OOM, Su-
+“D:Z” denotes KV cache block in HBM and DRAM, respectively.
+                                                                                                          perInfer actively rotates requests across two execution tiers
+                                                                                                          based on their SLO status. It introduces a rotary state: a
+                                                                                                          transient execution state where a request’s progress is tem-
+engine optimized for Superchips, enabling RotaSched’s fre-                                                porarily paused on GPU and its KV cache is swapped to
+quent, large-volume offloading. It achieves high bandwidth                                                the CPU, waiting for next rotation. This enables an LLM
+and low overhead via eager block rotation for data-race-free,                                             inference scheduling structure on Superchips analogous to
+full-duplex transfers, transformed KV cache layout with                                                   OS time-slicing, but driven by SLO rather than fixed quanta,
+batched transfer kernel launches to merge small segments                                                  as introduced next. Fig. 6 shows request state transition in
+into efficient large transfers, and a cross-iteration pipeline                                            SuperInfer.
+to overlap transfers with computation.
+                                                                                                          4.2.2      Virtual Lag Time (VLT)
+4.2       RotaSched: OS-Inspired Rotary Scheduler for
+          SLO-Aware Offloading                                                                            While the rotary state enables to alternate requests between
+                                                                                                          GPU and CPU, the key question is when rotation should
+4.2.1         From Passive Preemption to Proactive Rotation                                               occur. Simply relying on queue length or memory usage
+                                                                                                          would fall back to passive, SLO-unaware scheduling.
+Most existing LLM serving systems (Kwon et al., 2023;
+Zheng et al., 2024) employ passive preemption: later-arrived                                              A prominent lag-based thread scheduler in OS is Earliest
+requests are paused (by offloading/discarding their KV                                                    Eligible Virtual Deadline First (EEVDF) (Stoica & Abdel-
+cache) only when KV cache demand exceeds available GPU                                                    Wahab, 1995). It tracks a lag value that shows whether a
+memory. While preventing out-of-memory (OOM), it fails                                                    thread has received its fair share of CPU time, and prioritizes
+to actively manage SLOs. Crucially, no preemption occurs                                                  those with the earliest virtual deadlines. While offering valu-
+if GPU memory suffices for running requests, even if many                                                 able inspirations for managing a large number of concurrent
+waiting requests are close to violating their TTFT SLOs.                                                  requests, directly applying it to LLM serving is infeasible
+                                                                                                          for two reasons. First, unlike lightweight context switches in
+The GH200’s tightly-coupled design offers a unique oppor-
+                                                                                                          OS supported by hardware-managed cache fetching, LLM
+tunity to rethink LLM latency and memory management.
+                                                                                                          request rotation involves costly GPU-CPU KV cache trans-
+As Fig. 7 illustrates, an LLM serving stack on GH200 is
+                                                                                                          fer. Second, LLM serving must jointly manage two distinct,
+analogous to an OS on CPU: requests act as threads, Hopper
+                                                                                                          asymmetrically sensitive latency targets (TTFT and TBT).
+HBM as on-chip cache, Grace DRAM as main memory, and
+KV cache as thread data. This analogy inspires a shift in per-                                            Building on EEVDF’s spirit, SuperInfer introduces a metric
+spective: from static allocation of GPU memory to dynamic                                                 called Virtual Lag Time (VLT) to measure a request’s devia-
+scheduling of GPU execution. Operating systems employ                                                     tion from its SLO progress. VLT serves as the scheduling
+preemptive, time-slicing schedulers like CFS (Wong et al.,                                                currency of RotaSched: requests with higher positive VLT
+2008) and EEVDF (Stoica & Abdel-Wahab, 1995) to rotate                                                    are prioritized for execution, while those with smaller neg-
+execution among numerous threads without starvation.                                                      ative VLT become candidates for rotation. The following
+               SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+           Rotary    slope =                                    Time                                  Waiting       ① Contention   ② Sort                          VLT
+           Waiting                      Req 1   -4 0           20        -4 0        2 ....       1      2      3      check
+           Running                      Req 2   -3     -5 0          20         finished                                             1      7     9     2      8     3      6      4     5
+VLT
+
+                                                                                                      Running          HBM
+    0                                   Req 3
+                                        Req 4
+                                                2
+                                                3 0
+                                                          40
+                                                           -4 0
+                                                                    -4 0    10
+                                                                           20
+                                                                                           -4
+                                                                                       -4 ....                      can hold all   reqs to prioritize: BHBM + Bxfer blks   preempt: Bswap blks
+                                                                                                  4      5      6
+         BSB
+             FSF                                                                                                       KV$ ?
+                                                running        waiting      rotary
+                                                                                                       Rotary         yes            1      7     9     2      8     3      6      4     5
+               Time Offset
+                                                                                                  7      8      9      FCFS        ③ Prioritize requests                   ④ Preempt req
+                                        Figure 9. A conceptual example
+Figure 8. Visualization of VLT.         to show how LVF rotates execu-
+The time offset refers to: tnow −       tions. There are 4 requests in                           Figure 10. Demonstration of LVF scheduling algorithm. ①②③④
+tlast (rotary), tnow −tarr (waiting),   total, and HBM can only hold 2                           refer to steps described in § 4.2.3.
+or tnow − trun (running).               requests. Numbers refer to VLT.
+
+                                                                                                 rithm 1), which performs the following steps during each
+equation defines the VLT for each type of request:                                               engine iteration: ① Contention Check: If HBM can hold
+                                                                                                KV cache of all requests, LVF skips subsequent steps and
+        α · ReLU (tnow − tlast − βB SB ) , for rotary,
+                                                                                                falls back to FCFS. ② Sort: LVF calculates VLTs for all
+V LT = ReLU (tnow − tarr − βF SF ) ,          for waiting,                                       requests and sorts them in descending order as a list L. Wait-
+        
+        
+          − (tnow − trun ) ,                  for running,                                       ing and rotary requests vulnerable to SLO violations are at
+                                                                                                 the head. The tail holds running requests which are preemp-
+where SB and SF are the TTFT and TBT SLO, respectively.                                          tion candidates. ③ Prioritize requests: Given a transfer
+α ≥ 0 is sensitivity weight, βB , βF ∈ R are latency toler-                                      budget Bxfer and free HBM KV block number BHBM , LVF
+ance coefficients for TTFT and TBT, respectively. tnow is                                        picks rotary/waiting requests starting from the head of L,
+current system time, tlast is the time of last generated token,                                  until all Bxfer + BHBM blocks are used. Selected requests are
+tarr is request arrival time, trun is the time a request begins                                  prioritized for execution. ④ Preempt requests: Bswap extra
+in the running state. Fig. 8 visualizes VLT for three request                                    blocks besides the current free HBM blocks are required to
+types when α > 1, βB > 0, βF > 0. For running requests,                                          hold prioritized requests. LVF starts from the tail of L to
+VLT is negative and decreases as they run, with smaller                                          preempt running requests until getting enough extra blocks.
+values indicating higher degree of “advance”. Conversely,                                        This algorithm allows LVF to dynamically monitor potential
+VLTs of waiting and rotary requests are initially zero when                                      SLO violations using VLT, and perform preemptive schedul-
+their inactive time is within tolerance. They turn positive                                      ing. By preempting (and swapping out) running requests, it
+once tolerance is exceeded, increasing further with longer                                       makes HBM space for resuming SLO-vulnerable waiting
+waits, reflecting their degree of “lag”.                                                         or rotary requests. Thus, LVF enables the SLO-aware use
+VLT provides a mechanism to monitor request time usage                                           of large swap spaces, avoiding the TBT violations in naive
+and potential SLO violations, enabling the SLO-aware pri-                                        policies (§ 3.1). Fig. 9 shows a conceptual example of how
+orities. Intuitively, a larger VLT signifies more “lag,” thus                                    LVF rotates execution among 4 requests when HBM can
+requires higher execution priority to mitigate SLO viola-                                        only hold 2 requests. Furthermore, the transfer budget Bxfer
+tions. Additionally, the adjustable parameters α, βB , βF                                        controls the number of blocks to be swapped each itera-
+offer flexibility for scenario-specific trade-offs. First, α de-                                 tion, reflecting the swap bandwidth. NVLink-C2C enables
+fines the sensitivity ratio of TBT/TTFT to SLO violations;                                       a large Bxfer and a high swap bandwidth compared to PCIe-
+larger values indicate higher relative TBT sensitivity. Typi-                                    based systems, which is critical to system responsiveness
+cally, TBT is more delay-sensitive (100ms is significant for                                     for backlogged waiting requests, as discussed in § 3.2.
+TBT while manageable for TTFT), suggesting α ≥ 1. Sec-
+ond, βB and βF reflect SLO requirements and tolerances in                                        4.3     Efficient Offloading and Memory Management for
+scheduling, where larger values indicate higher tolerance for                                            Superchip NVLink-C2C
+SLO violations, enabling scenario-specific configuration.
+                                                                                                 4.3.1       Why NVLink-C2C Utilization Remains Low?
+4.2.3    Largest-VLT-First (LVF) Scheduling                                                      As discussed in § 3.3, existing offloading mechanisms suffer
+                                                                                                 from severe under-utilization on NVLink-C2C, achieving
+Building on VLT, we next introduce the Largest-VLT-First
+                                                                                                 only ∼10GB/s effective throughput, far below the theoret-
+(LVF) scheduling policy, which leverages VLT to orches-
+                                                                                                 ical peak. To understand why, we examine how modern
+trate proactive GPU-CPU request rotation. LVF prioritizes
+                                                                                                 LLM serving frameworks manage KV cache.
+requests by VLT: those with higher positive VLT (indicat-
+ing more vulnerable to SLO violations) are prioritized for                                       Most recent LLM serving systems employ PagedAtten-
+execution, while those with lower negative VLT (indicating                                       tion (Kwon et al., 2023) to manage KV cache. While elim-
+prolonged execution time) become preemption candidates                                           inating memory fragmentation by allocating KV cache in
+to free HBM. Fig. 10 illustrates the LVF algorithm (Algo-                                        fixed-sized blocks (e.g., 16 tokens per block), it also scatters
+          SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+                                                                 Segment Block         Block Index
+Algorithm 1 LVF Scheduling                                       Layer                                            25
+                                                                                                                                   Performance Comparison
+
+
+
+
+                                                                         00       01       02        03                 Kernel Launch
+
+
+
+
+                                                                                                          Time (us)
+Require: Request (running QR , waiting QW , rotary QS ),                 04       05       06        07                 Transfer
+                                                                                                                  23
+
+
+
+
+                                                                 Layer
+                                                                 Index
+                                                                         08       09       10        11
+    KV cache block number of request blk(·), transfer bud-               12       13       14        15
+                                                                                 Layer-First Layout
+    get Bxfer , current free HBM block number BHBM .                                                                   26      28 210 212
+                                                                                                                            Segment Size (KB)
+Ensure: Preempted requests P, prioritized requests R.            Figure 11. Layer, block, and
+ 1: P ← ∅, R ← ∅, Bleft ← BHBM + Bxfer                           segment structure of the Page-             Figure 12. Kernel     launch
+ 2: L ← QR ∪ QW ∪ QS                 ▷ All requests in a list    dAttention KV cache. Colors                and transfer times for seg-
+                 P
+ 3: if BHBM ≥ r∈QW ∪QS blk(r) then                ▷ Step ①       denote different requests, and             ments of different sizes via
+ 4:     return ∅, QW ∪ QS               ▷ Fallback to FCFS       numbers denote relative seg-               cudaMemcpyAsync (vLLM,
+ 5: end if                                                       ment addresses.                            Qwen2.5-32B, ShareGPT).
+ 6: Sort L in descending order of VLT.            ▷ Step ②
+ 7: for r ∈ L do ▷ Find prioritized requests ▷ Step ③
+ 8:     if VLT(r) ≥ 0 & blk(r) ≤ Bleft then                      lightweight GPU kernel. When thousands of them are issued
+ 9:         R ← R ∪ {r}, Bleft ← Bleft − blk(r)                  back-to-back, their accumulated launch overhead dominates
+10:     end if                                                   execution time, further limiting effective bandwidth. Our
+11: end for                                                      profile on GH200 using NVLink-C2C (Fig. 12) confirms
+12: Bswap ← Bxfer − Bleft ▷ Extra block number ▷ Step ④          that the current offloading path under-utilizes NVLink-C2C
+13: for r ∈ reversed(L) do        ▷ Find preempted request       also due to the software induced granularity and launch over-
+14:     if VLT(r) < 0 & Bswap > 0 then                           head. Specifically, launch time of cudaMemcpyAsync is
+15:         P ← P ∪ {r}, Bswap ← Bswap − blk(r)                  larger than transfer time when Sseg ≤ 4MB.
+16:     end if
+                                                                 4.3.2    DuplexKV: Efficient KV Cache Rotation Engine
+17: end for
+18: return (P, R) ▷ Preempted and prioritized requests           Our analysis shows that NVLink-C2C bandwidth under-
+                                                                 utilization stems not from hardware, but from thousands of
+                                                                 small, non-contiguous cudaMemcpyAsync launches by
+                                                                 current LLM serving stack. To fully exploit the C2C, Super-
+each request’s KV cache to non-contiguous GPU memory
+                                                                 Infer introduces DuplexKV, a high-performance KV cache
+regions. Supposing a Transformer-based model has NL lay-
+                                                                 rotation engine that (i) performs data-layout transformation
+ers, each maintaining their own KV cache. During inference,
+                                                                 to reorganize fragmented KV segments into large, contigu-
+each layer’s KV cache is divided into blocks (with KV of
+                                                                 ous regions optimized for transfer; (ii) pipelines compu-
+P tokens per block). KV entries within the same layer and
+                                                                 tation with simultaneous D2H/H2D transfers, maximizing
+block form the largest contiguous memory region, which
+                                                                 utilization of NVLink-C2C’s full-duplex bandwidth.
+we call a segment (Fig. 11). Segment size is Sseg = P × C,
+where C denotes per-token KV size. Across NL layers and          The challenge lies in swap-in/out dependencies. A
+NB blocks, a request’s full KV cache can be viewed as a          straightforward bandwidth improvement is launching in-
+layer-first 3D virtual tensor of shape (NL , NB , Sseg ).        dependent CUDA streams for concurrent H2D and D2H
+                                                                 transfers. However, naively overlapping them introduces
+However, while KVs of the same segment are contiguous,
+                                                                 data races on shared HBM blocks. As Fig. 13 (left) shows,
+segments from different layers or blocks are not, leading
+                                                                 the destination HBM blocks for swap-in might coincide with
+to non-contiguous memory layout. Since these segments
+                                                                 the source blocks being freed by swap-out. This dependency
+are typically fine-grained and much smaller than transfer-
+                                                                 forces the swap-in stream to wait for swap-out completion,
+efficient sizes, it results in poor C2C bandwidth utilization.
+                                                                 causing serialization of both directions and C2C link under-
+For example, in Qwen2.5-32B (NL = 64, C = 4, P = 16),
+                                                                 utilization. While many prior systems discuss overlapping
+each segment is Sseg = 64KB, while a full block’s KV
+                                                                 transfer with computation (Gao et al., 2024; Jiang et al.,
+cache (all 64 layers) is 4MB. Thus, each 64KB segment
+                                                                 2024c), few explicitly examine overlapping of bidirectional
+must be transferred independently via a separate cudaMem-
+                                                                 H2D/D2H transfers; for example, vLLM (Kwon et al., 2023)
+cpyAsync kernel launch. As Fig. 5 shows, NVLink-C2C
+                                                                 and SGLang (Zheng et al., 2024) perform swap-in and swap-
+achieves high throughput (∼200GB/s per direction) only
+                                                                 out serially. To our knowledge, no prior work has analyzed
+when the transfer size ≥8MB. Below that threshold, band-
+                                                                 or addressed the data-race dependencies from bidirectional
+width drops sharply, falling <10GB/s for ≤64KB segments.
+                                                                 transfer concurrency in tightly coupled GPU-CPU systems
+Therefore, while PagedAttention efficiently utilizes GPU
+                                                                 like GH200. This motivates our new eager block rotation
+memory, it paradoxically keeps the NVLink-C2C operating
+                                                                 mechanism in SuperInfer, which eliminates these dependen-
+in its low-efficiency regime. Furthermore, the vast num-
+                                                                 cies and enables full-duplex utilization of C2C.
+ber of transfer operations also contributes to poor utiliza-
+tion. Each cudaMemcpyAsync is launched internally as a           Eager block rotation for data race free overlapping. To
+           SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+                                                token gen                                     i     Block Index          j
+                         data discard on sync     sync
+  HBM                    race preemption ed        ed
+                                                            dirty
+                                                                    no data                 00 00     01 04       02 08           03 12
+
+
+
+
+                                                                              Layer Index
+            swap out                 eager rotation                  race                                                                     cudaMemcpy
+                        swap in                                                             04 01     05 05       06 09           07 13       BatchAsync:
+ DRAM
+                                         sync     sync                                      08 02     09 06       10 10           11 14          00-03
+                                          ed       ed
+                                                                                                                                                 08-11
+                                                                                            12 03     13 07       14 11           15 15
+Figure 13. Left figure shows how data races occur when the swap-                   Original +(j-i)             +(j-i)        Modified Block-First
+in destination block is the swap-out source block. Right figure                   Attention ×Sseg             ×NL×Sseg       Attention Layout
+shows our eager block rotation, which breaks the data dependency
+to enable concurrent swap-in and swap-out.                                     Figure 14. With block-first layout, small segments of the same
+                                                                               block are merged into a larger contiguous region. Transfers of these
+                                                                               regions can be done via a single cudaMemcpyBatchAsync
+decouple two streams, DuplexKV introduces an eager block                       kernel launch. Grey numbers are relative memory address for
+rotation mechanism (Fig. 13 right). The key insight is that                    layer-first layout, black numbers are those for block-first layout.
+KV cache generation is incremental: each request appends
+new tokens to its designated block sequentially, and previ-
+ously fully written blocks remain unchanged until request                      overlap schedule and KV cache rotation with model execu-
+completes. Therefore, blocks are categorized: (i) Dirty: par-                  tion (e.g., LLM decoding), as Fig. 15 shows. It employs a
+tially filled and updated during token generation, and (ii)                    cross-iteration pipeline: during iteration-t, GPU executes
+Synced: fully filled and will not receive further writes until                 the batch prepared in iteration-(t − 1), while the scheduler
+the request finishes. DuplexKV eagerly swap-out synced                         and DuplexKV concurrently prepare the batch for iteration-
+blocks from HBM and DRAM in the background, even                               (t + 1) on the host side. This pipeline hides data transfer and
+before preemption. These early transfers mark the corre-                       schedule latency behind compute, which minimizes GPU
+sponding HBM blocks as synced. When the request is                             stall time and maximizing GPU utilization.
+later preempted, only the last dirty block needs swap-out,
+while synced blocks in HBM can be discarded since valid                         5           E VALUATION
+copies already exist in DRAM. Crucially, this “discarded
+on preemption” mechanism relies on CPU-side duplication                         5.1         Evaluation Methodology
+to maintain data correctness, ensuring that it imposes no                       Models and Workloads. We evaluate SuperInfer over
+additional HBM pressure. A lightweight block table (as                          three models: LLaMA-3-8B (Dubey et al., 2024), Qwen2.5-
+shown in Fig. 6) tracks each block’s state and residency.                       32B (Yang et al., 2025) and Mixtral-8x7B (Jiang et al.,
+Block-first layout and batched KV transfers. To address                         2024a). We use ShareGPT (ShareGPT Team, 2023) and
+the inefficiency of small, scattered memory segments, we                        LMSYS-Chat-1M (Zheng et al., 2023) datasets with con-
+redesign the KV cache storage from layer-first to block-first                   trolled request arrival rates with sampled request arrival
+ordering. As Fig. 14 shows, this layout makes all layers                        intervals following the Poisson distribution.
+within the same block contiguous, merging NL small per-                         Metrics. We evaluate SuperInfer with the SLO attainment
+layer segments into one large contiguous region (e.g., 64KB                     rate, defined as the percentage of requests that satisfy the
+→ 4MB for Qwen-2.5-32B). This transformation converts                           SLO thresholds for TTFT and TBT.
+numerous fine-grained transfers into much reduced large
+DMA operations, which are in the high-bandwidth regime of                       Implementation. We implement SuperInfer in Python and
+NVLink-C2C. We also extend PagedAttention to adopt this                         C++ on top of vLLM (Kwon et al., 2023) (v0.6.6.post1), a
+block-first layout. As Fig. 14 shows, for original PagedAt-                     widely used production-level LLM inference framework.
+tention with layer-first KV cache layout, the stride between                    Hardware Testbeds. All experiments are performed on an
+block-i and block-j is (j − i) · Sseg , while for block-first lay-              NVIDIA GH200 NVL2 system. Each GH200 Superchip
+out, it becomes (j −i)·NL ·Sseg . We extend PagedAttention                      features 144GB of HBM and 480GB of DRAM. We utilize
+kernels to support this layout and stride, while preserving                     numactl to configure NUMA memory affinity, ensuring
+the paging abstraction. To further reduce kernel launch over-                   that all allocated memory resides on the same Superchip.
+head, we merge individual cudaMemcpyAsync kernels
+of one direction (e.g., HBM → DRAM) into a single cu-
+                                                                                5.2         Main Result
+daMemcpyBatchAsync kernel. This batched invocation
+issues all transfer descriptors in one kernel launch, effec-                   We evaluate SuperInfer across all three models and all two
+tively eliminating per-kernel launch overhead.                                 datasets, comparing it against several baseline systems:
+Cross-iteration pipeline to overlap execution with ro-                          vLLM (Kwon et al., 2023) (v0.6.6.post1), with V1 en-
+tation. To further reduce critical path latency, we also                        gine (vLLM Community, 2025) enabled. It is a widely-used
+              SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+      Sched       D2H Xfer   H2D Xfer   Model Exec          Update   new rotary (swapped) queue HOL blocking (§ 3.1). Among
+     batch from                                  batch to
+      iter t-1       Sched D2H Xfer     Update                       baselines, LTR achieves the best TTFT SLO attainment
+                                                 iter t+1
+                           H2D Xfer                                  but significantly sacrifices TBT, as its static deadline-based
+                         Model Exec
+                                                                     priority mechanism fails to achieve the balanced improve-
+                                                                     ments. Notably, LightLLM shows unusual trends where
+Figure 15. Comparing execution flow of vLLM (up) and SuperIn-        TBT SLO attainment improves or stabilizes as the request
+fer (down). Schedule and KV cache transfers (2 CUDA streams)
+                                                                     rate increases, as it is designed to avoid harmful preemp-
+are overlapped with model execution in SuperInfer.
+                                                                     tion caused by KV cache overflow and maintain stable TBT
+                                                                     under high load (check Appendix C for further analysis).
+production-level LLM inference system.                               Furthermore, while TensorRT-LLM incorporates a broad set
+                                                                     of advanced optimizations beyond KV-cache management
+TensorRT-LLM (NVIDIA, 2026) (v1.1.0). A highly opti-                 and scheduling to achieve competitive TBT SLO attainment,
+mized LLM inference framework by NVIDIA, incorporat-                 its TTFT SLO attainment still degrades significantly at high
+ing a broad set of low-level and kernel optimizations.               request rates, due to its reliance on lazy preemption in re-
+LightLLM (Gong et al., 2025), LTR (Fu et al., 2024): Two             quest scheduling and its offloading strategy under memory
+representative SLO-aware scheduler. LightLLM balances                pressure, which can delay prompt processing for newly ar-
+trade-off between request queuing and harmful evictions by           riving requests.
+estimating future memory occupancy. LTR approximates                 These results demonstrate SuperInfer’s high performance
+SJF using learning-based request length ranking.                     and effectiveness in mitigating SLO violations. This is
+NEO (Jiang et al., 2024c): A representative work to offload          achieved through the co-design of the SLO-aware, preemp-
+partial KV cache and Attention computation to the CPU.               tive RotaSched and bandwidth-efficient DuplexKV. Overall,
+Notably it does not support MoE models like Mixtral-8x7B.            SuperInfer exploits the full potential of the GH200 memory
+                                                                     hierarchy and NVLink-C2C for SLO-aware offloading.
+For all baselines, PagedAttention (Kwon et al., 2023) and
+chunked prefill (Agrawal et al., 2024) are enabled. We               5.3     Analysis Results
+exclude Pie (Xu et al., 2024), HeteGen (Zhao et al., 2024),
+and Select-N (Ma et al., 2025) due to the lack of publicly           5.3.1    How does each module of SuperInfer bring
+available code. FlexGen (Sheng et al., 2023) is excluded for                  benefits?
+lacking essential features (PagedAttention, chunked prefill),        To isolate the benefit of each module proposed in § 4, we
+which prevents fair comparison. Approximate methods like             follow settings in § 5.2 and evaluate the following configu-
+InfiniGen (Lee et al., 2024) are also excluded.                      rations using the Qwen2.5-32B and ShareGPT dataset: (1)
+For our evaluation, we configure the RotaSched’s parame-             vLLM: with default FCFS scheduler; (2) SuperInfer w/o
+ters as: α = 3, βB = 0, βF = 0.5, Bxfer = 2400. TTFT                 DuplexKV: SuperInfer with default KV cache offloading
+and TBT SLOs are set to 5s and 100ms, respectively. Out of           engine in vLLM, with two sub-variants for its transfer bud-
+the 480 GB of Grace DRAM, we allocate 400 GB for KV                  get: L (Bxfer = 300), which reflects the severe bandwidth
+cache offloading and conservatively reserve the remaining            under-utilization, and H (Bxfer = 2400), which matches
+80 GB for the OS and the SuperInfer runtime. This 80 GB              DuplexKV’s budget; (3) SuperInfer: The full version (Ro-
+serves as a conservative safety margin, as SuperInfer intro-         taSched +DuplexKV). Fig. 17 shows the results. Comparing
+duces no extra memory consumption beyond the offloading              vLLM and SuperInfer w/o DuplexKV (L) confirms that Ro-
+space comparing to vLLM in our setup (∼12 GB), leaving               taSched effectively mitigates TTFT SLO violations while
+sufficient headroom for stable execution. We report the              maintaining comparable TBT SLO attainment. However,
+TTFT and TBT SLO attainment rate under various request               forcing a large Bxfer with inefficient offloading engine as
+arrival rates.                                                       SuperInfer w/o DuplexKV (H) degrades performance, yield-
+                                                                     ing significantly lower TBT SLO attainment. This occurs
+Fig. 16 presents our results, revealing two key findings. First,     because slow transfers become the critical bottleneck, pre-
+SuperInfer significantly surpasses baselines in TTFT SLO             venting full overlap with model execution (Fig. 15). Finally,
+attainment, especially at high request rates. This demon-            the full SuperInfer successfully manages the large Bxfer us-
+strates its effectiveness of mitigating waiting queue HOL            ing DuplexKV, achieving even greater TTFT improvements
+blocking via highly responsive active rotation, which proac-         compared to SuperInfer w/o DuplexKV (L).
+tively preempts running requests to prioritize waiting ones
+based on VLT (§ 4.2). Second, SuperInfer maintains TBT
+SLO attainment superior or comparable to baselines, indi-
+cating it leverages swap space in an SLO-aware manner for
+balanced TTFT and TBT improvement without introducing
+                                                SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+                                                                  vLLM      TensorRT-LLM      LTR                                                      LightLLM      NEO       SuperInfer
+                                           ShareGPT@Qwen2.5-32B LMSYS@Qwen2.5-32B ShareGPT@Llama3-8B                                                  LMSYS@Llama3-8B ShareGPT@Mixtral-8x7B LMSYS@Mixtral-8x7B
+                                        100
+Attainment (%) Attainment (%)
+                  TTFT SLO
+
+
+
+
+                                         50
+                                          0
+                                        100
+   TBT SLO
+
+
+
+
+                                         50
+                                          0
+                                                  10              20                     20                     40      40      50       60                    60      80             100       10                           20          20                  40
+                                                       RPS                                           RPS                      RPS                                    RPS                             RPS                                      RPS
+
+     Figure 16. Comparison of SuperInfer against baselines across various models, datasets, and request rates (RPS). SuperInfer achieves
+     significant improvements in TTFT SLO attainment over baselines, while preserving TBT SLO attainment comparable to others.
+
+
+                                              vLLM                                                         SuperInfer w/o DuplexKV (L)                   100                                                   100
+                                              SuperInfer w/o DuplexKV (H)                                  SuperInfer
+
+
+
+
+                                                                                                                                                                                                     Attainment (%)
+                                                                                                                                              Attainment (%)
+                                                                                                                                                 TTFT SLO
+
+
+
+
+                                                                                                                                                                                                        TBT SLO
+                                                                                                                                                               50                                                     50
+              TTFT SLO Attainment (%)
+
+
+
+
+                                                                            TBT SLO Attainment (%)
+
+
+
+
+                                    100                                                          100                                                                                                                          =1         =4          = 50
+                                                                                                                                                                                                                              =2         =5          = 100
+                                                                                                                                                                                                                              =3         = 10
+                                        50                                                           50                                                         05              10         15   20                      05         10           15      20
+                                                                                                                                                                                     RPS                                                RPS
+                                         010.0 12.5 15.0 17.5 20.0                                    010.0 12.5 15.0 17.5 20.0
+                                                    RPS                                                          RPS                      Figure 18. TTFT and TBT SLO attainment rate of SuperInfer un-
+                                                                                                                                          der various α. Larger α leads to better TBT but worse TTFT.
+     Figure 17. Comparing TTFT and TBT SLO attainment rates for:
+     vLLM, SuperInfer w/o DuplexKV (L/H), SuperInfer.                                                                                                  20            F = 0.0
+                                                                                                                                                                                                                      2
+                                                                                                                                          P99 TTFT (s)
+
+
+
+
+                                                                                                                                                                                                          P99 TBT (s)
+                                                                                                                                                                     F = 0.2
+                                                                                                                                                                     F = 0.6
+                                                                                                                                                       10            F = 1.0
+                                                                                                                                                                                                                      1
+                                                                                                                                                                     F = 5.0
+      5.3.2                                   How does RotaSched tame tradeoff between TTFT                                                                          F = 10.0
+
+                                              and TBT through VLT?                                                                                         05              10          15       20                    05           10           15      20
+                                                                                                                                                                                 RPS                                                    RPS
+      As defined in § 4.2.2, VLT includes sensitivity parameter
+      α for TTFT/TBT trade-off, and tolerance parameters βB ,                                                                             Figure 19. P99 TTFT and TBT of SuperInfer (various βF values).
+      βF to reflect SLOs and their tolerances. We follow settings
+      in § 5.2 to evaluate their impacts using using Qwen2.5-
+      32B and ShareGPT. Fig. 18 shows results with varying                                                                                TTFT improvements, enabling scenario-specific deployment
+      α ≥ 1 and fixed βB = βF = 0. It shows that larger                                                                                   tuning.
+      α yields better TBT SLO attainment, as rotary requests
+                                                                                                                                          It is important to note that while we provide a qualitative
+      get larger VLTs for prioritization. However, this comes
+                                                                                                                                          characterization to guide the understanding of parameter
+      at the cost of lower TTFT attainment, as waiting requests
+                                                                                                                                          behavior under different settings, parameter selection can
+      are relatively delayed. Thus, for TTFT-sensitive tasks (like
+                                                                                                                                          be tailored to specific applications. SuperInfer does not
+      summarization), we recommend setting α ≤ 1 to get the
+                                                                                                                                          attempt to correlate or predict query distributions when
+      best TTFT improvement. α = 3 offers a balanced sweet
+                                                                                                                                          setting these parameters. Such correlations are difficult
+      spot; further increases bring diminishing TBT benefits while
+                                                                                                                                          to define in online LLM serving due to the dynamics and
+      significantly harming TTFT. Fig. 19 shows fixing α = 1,
+                                                                                                                                          unpredictability of the workloads. Instead, SuperInfer is
+      βB = 0 and increasing βF leads to worse P99 TTFT, as new
+                                                                                                                                          designed to proactively react to KV cache pressure and SLO
+      arrived requests have smaller VLTs and thus lower priority.
+                                                                                                                                          violation risks. The exposed parameters (α, βB and βF )
+      For βF ≥ 2, P99 TTFT sharply increases with minimal
+                                                                                                                                          simply control how aggressively the system responds once
+      TBT improvement, as new requests are significantly delayed.
+                                                                                                                                          such pressure is observed.
+      Conversely, as Fig. 20 shows, when fixing α = 1, βF = 0
+      and varying βB in a large range, larger βB worsen P99 TBT,
+                                                                                                                                          5.3.3                     How much bandwidth can DuplexKV achieve?
+      as rotary requests get smaller VLTs and lower priority for
+      resumption. Due to TBT’s higher sensitivity to short delays,                                                                        To evaluate DuplexKV’s optimizations for bandwidth uti-
+      βB < 0 is suggested for best TBT tails latency, albeit at                                                                           lization in § 4.3, we measure the bandwidth and end-to-end
+      the cost of relatively higher TTFT tail latencies. Overall, α,                                                                      (E2E) transfer time of bidirectionally transferring 16GB
+      βB and βF provide flexibility to trade off between TBT and                                                                          (8GB or 32768 tokens per direction) of Qwen2.5-32B KV
+                        SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+                     B = -300
+                                                                                                                             300
+
+
+
+
+                                                                                                     P99 TTFT (s)
+P99 TTFT (s)
+
+
+
+
+                                                                                                                                                              P99 TBT (s)
+                                                         P99 TBT (s)
+                     B = -200
+                                                                                                                20           600                                        5.0
+           20
+                     B = -100
+                     B = -10                                       2                                                         1200
+                     B = -1
+                     B=0                                                                                                     2400                                       2.5
+                     B=1                                                                                                     4800
+               05                                                  05                                               00       5         10         15         20 0.00                5         10         15     20
+                                10         15       20                       10         15      20
+                                     RPS                                          RPS                                                  RPS                                                    RPS
+
+Figure 20. P99 TTFT and TBT of SuperInfer (various βB values).                                       Figure 21. Comparing P99 TTFT and TBT of SuperInfer with
+                                                                                                     various Bxfer . Higher Bxfer significantly reduce tail latencies.
+
+Table 1. Measured bandwidth and E2E time of different transfer
+engines. U denotes uni-directional, B denotes bidirectional.                                                                               vLLM (TP=2)                        SuperInfer (TP=2)
+                                                                                                                                     TTFT SLO                                             TBT SLO
+                                                                                                                                  Attainment (%)                                      Attainment (%)
+                M ETHOD                D2H (GB/ S )         H2D (GB/ S )          E2E T IME ( MS )                  100                                                 100
+             NAIVE                          10.75( U )          9.86( U )            1556.15                         80                                                  80
+
+
+
+
+                                                                                                     Qwen2.5-32B
+                                                                                                      ShareGPT
+              MS                           80.05( U )          133.51( U )           159.87
+                                                                                                                     60                                                  60
+           MS+MK                           238.95( U )         269.69( U )            63.14
+          D UPLEX KV                       180.99( B )         179.37( B )            46.80                          40                                                  40
+       I DEAL ( DUPLEX )                   192.00( B )         192.00( B )            41.66
+                                                                                                                     20 20                                               20
+                                                                                                                                 30        40          50    60               20    30        40         50    60
+                                                                                                                    100                                                 100
+                                                                                                                     80                                                  80
+
+
+                                                                                                     Qwen2.5-32B
+                                                                                                       LMSYS
+cache. We compare the following configurations: (1) Naive:                                                           60                                                  60
+uses per-segment (64KB) copy as vLLM; (2) MS (merged                                                                 40                                                  40
+segments): uses our block-first layout to merge segments                                                             20 20                                               20
+                                                                                                                                      40          60         80               20         40         60         80
+to 4MB, but still uses per-segment transfer; (3) MS+MK                                                              100                                                 100
+(merged kernels): builds on MS, with merged transfer kernel                                                          80                                                  80
+                                                                                                     Mixtral-8X7B
+                                                                                                      ShareGPT
+
+
+
+per direction. Crucially, due to data races, transfers are still                                                     60                                                  60
+performed serially (one direction at a time); (4) DuplexKV:                                                          40                                                  40
+the full version in § 4.3.2, MS+MK+eager block rotation,                                                             20 20                                               20
+                                                                                                                                 30        40          50    60               20    30        40         50    60
+enabling concurrent full-duplex transfers; (5) Ideal: the the-                                                      100                                                 100
+oretical limit of DRAM bandwidth (half-duplex 384GB/s,                                                               80                                                  80
+                                                                                                     Mixtral-8X7B
+                                                                                                        LMSYS
+
+
+
+
+192GB/s per direction concurrently). Table 1 shows the                                                               60                                                  60
+results. The naive method achieves only 5.6% of ideal band-                                                          40                                                  40
+width and results in 37.4× the ideal E2E time, due to its high                                                                                                           20
+                                                                                                                     20 25        50         75        100    125              25       50     75        100   125
+inefficiency with small-segment transfers (§ 4.3.1). Instead,
+merging segments (MS) and kernels (MS+MK) incremen-
+                                                                                                     Figure 22. Comparison of SuperInfer and vLLM under TP=2 set-
+tally improves realized uni-directional bandwidth within the
+                                                                                                     tings. The performance benefits of SuperInfer successfully extend
+limitation of DRAM (384GB/s), showing the importance of
+                                                                                                     to distributed configurations.
+large transfer size and batch kernels. However, due to data
+races, they can only perform direction-serialized transfers,
+thus achieving only 3.6× and 1.4× the ideal time, respec-
+tively. In contrast, our proposed DuplexKV achieves near-                                            mainly comes from the time requests spend in waiting or
+ideal bidirectional bandwidth and E2E time consumption                                               rotary states. Also, larger budgets yield greater improve-
+(1.1× the ideal), due to its eager block rotation to eliminate                                       ments, confirming the necessity of high swap bandwidth for
+data race and enable concurrent bidirectional transfers.                                             effective SLO-aware LLM serving with offloading.
+                                                                                                     A potential concern with SuperInfer is whether KV cache
+5.3.4               How important is the high swap bandwidth?
+                                                                                                     transfers might introduce pipeline stalls if they do not com-
+In LVF scheduling (§ 4.2.3), the transfer budget (Bxfer ) deter-                                     plete before model inference finishes. Upon reviewing the
+mines block number rotated per iteration, reflecting the swap                                        data collected across all experiments in § 5.2, we find that
+bandwidth. As discussed in § 3.2, a high swap bandwidth is                                           incomplete overlaps which lead to execution stalls occurred
+crucial to clear accumulated waiting requests timely and pre-                                        in only 0.021% of all engine iterations. A detailed break-
+vent new HOL blocking for the rotary (swapped) requests.                                             down reveals average latencies of 7.63 ms for scheduling,
+We validate this by testing SuperInfer with Qwen2.5-32B                                              15.8 ms for KV transfers, and 69.82 ms for model execution.
+and ShareGPT, varying Bxfer while keeping other settings                                             Because the scheduling and transfer latencies are substan-
+same as § 5.2. The results in Fig. 21 show that a larger                                             tially shorter than the model execution time, their overheads
+Bxfer significantly reduces the P99 TTFT and TBT, which                                              are effectively hidden.
+                     SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+         vLLM@ShareGPT          vLLM@LMSYS       SuperInfer@ShareGPT        SuperInfer@LMSYS
+                 Mixtral-8x7B              Qwen2.5-32B                                         ACKNOWLEDGMENTS
+          6
+              1e3
+                                     6
+                                         1e3                  2.0 1e4 Llama3-8B
+                                                                                               We sincerely appreciate the anonymous reviewers and our
+Throughput
+(# token/s)
+
+
+
+          4                          4                        1.5                              shepherd. Their insightful feedback helps significantly im-
+                                                                                               prove the quality of the paper. This research was supported
+          2         20          40   2        20         40 1.0        50     75    100        by the National Science Foundation (NSF) under Grant No.
+                    RPS                       RPS                           RPS
+                                                                                               2441601. The work utilized the Delta and DeltaAI system
+Figure 23. Throughput of vLLM and SuperInfer on three models.                                  at the National Center for Supercomputing Applications
+                                                                                               (NCSA) and Jetstream2 at Indiana University through allo-
+                                                                                               cation CIS240055 from the Advanced Cyberinfrastructure
+                                                                                               Coordination Ecosystem: Services & Support (ACCESS)
+                                                                                               program, which is supported by National Science Founda-
+                                                                                               tion grants #2138259, #2138286, #2138307, #2137603, and
+                                                                                               #2138296. The Delta advanced computing resource is a col-
+                                                                                               laborative effort between the University of Illinois Urbana-
+5.3.5            Does SuperInfer extend to multi-GPU settings?                                 Champaign and NCSA, supported by the NSF (award OAC
+To confirm that SuperInfer’s benefits persist in distributed                                   2005572) and the State of Illinois. UIUC SSAIL Lab is
+environments, we evaluated it using Tensor Parallelism                                         supported by research funding and gift from Google, IBM,
+(TP=2) with Qwen2.5-32B and Mixtral-8x7B. GPUs are                                             Amazon, and AMD, including the Google ML and Systems
+connected with NVLink (900GB/s). As Fig. 22 shows,                                             Junior Faculty Award.
+across both models and datasets, SuperInfer consistently
+achieves higher TTFT and TBT SLO attainment rates com-
+pared to vLLM. This is because our RotaSched and Du-
+plexKV are fundamentally orthogonal to standard paral-
+lelism strategies; they introduce no extra inter-GPU traffic,
+allowing SuperInfer to scale effectively in multi-GPU and
+distributed setups.
+
+5.3.6            How does SuperInfer affect the throughput?
+Fig. 23 shows measured throughput of vLLM and SuperIn-
+fer from § 5.2. SuperInfer achieves comparable or slightly
+better throughput than vLLM, with up to 29.2% improve-
+ment at high request rates. This is because in conventional
+offloading, memory-heavy long requests can monopolize
+GPU memory for a long time, preventing new requests
+from leveraging the concurrency benefit of chunked pre-
+fill (Agrawal et al., 2024), as prefill requests have few batch-
+ing opportunities. In contrast, SuperInfer’s fast rotation
+offers prefill requests more batching opportunities.
+
+6             C ONCLUSION
+This paper presents SuperInfer, a high-performance, SLO-
+aware LLM serving system optimized for Superchips. Su-
+perInfer transforms passive preemption into proactive, fine-
+grained request scheduling, via an OS-inspired active rotary
+scheduler and a co-designed DuplexKV rotation engine,
+achieving high NVLink-C2C utilization. Evaluations across
+diverse models and workloads show that SuperInfer sub-
+stantially improves SLO attainment under high request rates
+while maintaining throughput. Our study demonstrates that
+Superchips unblock new opportunities for LLM serving, but
+realizing their full potential requires careful co-design of
+scheduling and memory movement in the software system.
+          SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+R EFERENCES                                                        gpu clusters. In Proceedings of the Twentieth European
+                                                                   Conference on Computer Systems, pp. 589–604, 2025c.
+Achiam, J., Adler, S., Agarwal, S., Ahmad, L., Akkaya, I.,
+  Aleman, F. L., Almeida, D., Altenschmidt, J., Altman, S.,      Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+  Anadkat, S., et al. Gpt-4 technical report. arXiv preprint      A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+  arXiv:2303.08774, 2023.                                         A., et al. The llama 3 herd of models. arXiv e-prints, pp.
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,             arXiv–2407, 2024.
+  N., Gulavani, B., Tumanov, A., and Ramjee, R. Taming           Fu, Y., Zhu, S., Su, R., Qiao, A., Stoica, I., and Zhang, H.
+  {Throughput-Latency} tradeoff in {LLM} inference with            Efficient llm scheduling by learning to rank. Advances
+  {Sarathi-Serve}. In 18th USENIX Symposium on Operat-             in Neural Information Processing Systems, 37:59006–
+  ing Systems Design and Implementation (OSDI 24), pp.             59029, 2024.
+ 117–134, 2024.
+                                                                 Fusco, L., Khalilov, M., Chrapek, M., Chukkapalli, G.,
+Aminabadi, R. Y., Rajbhandari, S., Awan, A. A., Li, C.,            Schulthess, T., and Hoefler, T. Understanding data move-
+ Li, D., Zheng, E., Ruwase, O., Smith, S., Zhang, M.,              ment in tightly coupled heterogeneous systems: A case
+ Rasley, J., et al. Deepspeed-inference: enabling efficient        study with the grace hopper superchip. arXiv preprint
+ inference of transformer models at unprecedented scale.           arXiv:2408.11556, 2024.
+ In SC22: International Conference for High Performance
+ Computing, Networking, Storage and Analysis, pp. 1–15.          Gao, B., He, Z., Sharma, P., Kang, Q., Jevdjic, D., Deng,
+ IEEE, 2022.                                                       J., Yang, X., Yu, Z., and Zuo, P. {Cost-Efficient} large
+                                                                   language model serving for multi-turn conversations with
+Ao, R., Luo, G., Simchi-Levi, D., and Wang, X. Optimiz-
+                                                                   {CachedAttention}. In 2024 USENIX Annual Technical
+  ing llm inference: Fluid-guided online scheduling with
+                                                                   Conference (USENIX ATC 24), pp. 111–126, 2024.
+  memory constraints. arXiv preprint arXiv:2504.11320,
+  2025.                                                          Gong, R., Bai, S., Wu, S., Fan, Y., Wang, Z., Li, X., Yang,
+                                                                   H., and Liu, X. Past-future scheduler for llm serving
+Bai, J., Bai, S., Chu, Y., Cui, Z., Dang, K., Deng, X., Fan,
+                                                                   under sla guarantees. In Proceedings of the 30th ACM
+  Y., Ge, W., Han, Y., Huang, F., et al. Qwen technical
+                                                                  International Conference on Architectural Support for
+  report. arXiv preprint arXiv:2309.16609, 2023.
+                                                                  Programming Languages and Operating Systems, Volume
+Borui, W., Juntao, Z., Chenyu, J., Chuanxiong, G., and            2, pp. 798–813, 2025.
+  Chuan, W. Efficient llm serving on hybrid real-time and
+  best-effort requests. arXiv preprint arXiv:2504.09590,         He, J. and Zhai, J. Fastdecode: High-throughput gpu-
+  2025.                                                            efficient llm serving using heterogeneous pipelines. arXiv
+                                                                   preprint arXiv:2403.11421, 2024.
+Cao, S., Liu, S., Griggs, T., Schafhalter, P., Liu, X., Sheng,
+  Y., Gonzalez, J. E., Zaharia, M., and Stoica, I. Moe-          Hong, K., Li, X., Chen, L., Mao, Q., Dai, G., Ning, X.,
+  lightning: High-throughput moe inference on memory-             Yan, S., Liang, Y., and Wang, Y. Sola: Optimizing slo
+  constrained gpus. In Proceedings of the 30th ACM In-             attainment for large language model serving with state-
+  ternational Conference on Architectural Support for Pro-         aware scheduling. In Eighth Conference on Machine
+  gramming Languages and Operating Systems, Volume 1,             Learning and Systems, 2025.
+  pp. 715–730, 2025.
+                                                                 Hu, C., Huang, H., Hu, J., Xu, J., Chen, X., Xie, T., Wang,
+Chen, J., Du, C., Liu, R., Yao, S., Yan, D., Liao, J., Liu,        C., Wang, S., Bao, Y., Sun, N., et al. Memserve: Con-
+  S., Wu, F., and Chen, G. Tokenflow: Responsive llm               text caching for disaggregated llm serving with elastic
+  text streaming serving under request burst via preemptive        memory pool. arXiv preprint arXiv:2406.17565, 2024.
+  scheduling. arXiv preprint arXiv:2510.02758, 2025a.
+                                                                 Huang, J., Xiong, Y., Yu, X., Huang, W., Li, E., Zeng, L.,
+Chen, W., He, S., Qu, H., Zhang, R., Yang, S., Chen, P.,           and Chen, X. Slo-aware scheduling for large language
+  Zheng, Y., Huai, B., and Chen, G. {IMPRESS}: An                  model inferences. arXiv preprint arXiv:2504.14966,
+  {Importance-Informed}{Multi-Tier} prefix {KV} stor-              2025.
+  age system for large language model inference. In 23rd
+  USENIX Conference on File and Storage Technologies             Jeong, J. and Ahn, J. Accelerating llm serving for multi-
+ (FAST 25), pp. 187–201, 2025b.                                    turn dialogues with efficient resource management. In
+                                                                   Proceedings of the 30th ACM International Conference
+Chen, W., Lu, C., Xu, H., Ye, K., and Xu, C. Multiplexing          on Architectural Support for Programming Languages
+  dynamic deep learning workloads with slo-awareness in            and Operating Systems, Volume 2, pp. 1–15, 2025.
+          SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A., Savary,    Ma, C., Ye, Z., Zhao, H., Yang, Z., Fu, T., Han, J., Zhang,
+   B., Bamford, C., Chaplot, D. S., Casas, D. d. l., Hanna,       J., Luo, Y., Wang, X., Wang, Z., et al. Memory offload-
+   E. B., Bressand, F., et al. Mixtral of experts. arXiv          ing for large language model inference with latency slo
+   preprint arXiv:2401.04088, 2024a.                              guarantees. arXiv preprint arXiv:2502.08182, 2025.
+Jiang, C., Gao, L., Zarch, H. E., and Annavaram, M. Kvpr:        NVIDIA.       Nvidia grace hopper superchip archi-
+   Efficient llm inference with i/o-aware kv cache partial        tecture whitepaper, 2024.       URL https://
+   recomputation. arXiv preprint arXiv:2411.17089, 2024b.         resources.nvidia.com/en-us-grace-cpu/
+                                                                  nvidia-grace-hopper?ncid=no-ncid. [On-
+Jiang, X., Zhou, Y., Cao, S., Stoica, I., and Yu, M. Neo:         line; accessed 2025-10-26].
+   Saving gpu memory crisis with cpu offloading for online
+   llm inference. arXiv preprint arXiv:2411.01142, 2024c.        NVIDIA. Nvidia/tensorrt-llm: Tensorrt llm provides users
+                                                                  with an easy-to-use python api to define large language
+Kim, H., Wang, N., Xia, Q., Huang, J., Yazdanbakhsh, A.,          models (llms) and supports state-of-the-art optimizations
+  and Kim, N. S. Lia: A single-gpu llm inference accelera-        to perform inference efficiently on nvidia gpus. tensorrt
+  tion with cooperative amx-enabled cpu-gpu computation           llm also contains components to create python and c++
+  and cxl offloading. In Proceedings of the 52nd Annual           runtimes that orchestrate the inference execution in a per-
+  International Symposium on Computer Architecture, pp.           formant way., 2026. URL https://github.com/
+  544–558, 2025.                                                  NVIDIA/TensorRT-LLM. [Online; accessed 2026-03-
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,           27].
+ C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient        Patke, A., Reddy, D., Jha, S., Qiu, H., Pinto, C.,
+ memory management for large language model serving                Narayanaswami, C., Kalbarczyk, Z., and Iyer, R. Queue
+ with pagedattention. In Proceedings of the 29th Sym-              management for slo-oriented large language model serv-
+ posium on Operating Systems Principles, pp. 611–626,              ing. In Proceedings of the 2024 ACM Symposium on
+ 2023.                                                             Cloud Computing, pp. 18–35, 2024.
+Lee, W., Lee, J., Seo, J., and Sim, J. {InfiniGen}: Effi-        Qin, R., Li, Z., He, W., Cui, J., Ren, F., Zhang, M., Wu, Y.,
+  cient generative inference of large language models with         Zheng, W., and Xu, X. Mooncake: Trading more storage
+  dynamic {KV} cache management. In 18th USENIX                    for less computation—a {KVCache-centric} architecture
+  Symposium on Operating Systems Design and Implemen-              for serving {LLM} chatbot. In 23rd USENIX Conference
+  tation (OSDI 24), pp. 155–172, 2024.                             on File and Storage Technologies (FAST 25), pp. 155–170,
+                                                                   2025.
+Li, Z., Chen, Z., Delacourt, R., Oliaro, G., Wang, Z., Chen,
+  Q., Lin, S., Yang, A., Zhang, Z., Chen, Z., et al. Adaserve:   Qiu, H., Mao, W., Patke, A., Cui, S., Jha, S., Wang,
+  Accelerating multi-slo llm serving with slo-customized           C., Franke, H., Kalbarczyk, Z. T., Başar, T., and Iyer,
+  speculative decoding. arXiv preprint arXiv:2501.12162,           R. K. Efficient interactive llm serving with proxy
+  2025.                                                            model-based sequence length prediction. arXiv preprint
+                                                                   arXiv:2404.08509, 2024.
+Lian, X., Tanaka, M., Ruwase, O., and Zhang, M. Superof-
+  fload: Unleashing the power of large-scale llm training        Radford, A., Wu, J., Child, R., Luan, D., Amodei, D.,
+  on superchips. arXiv preprint arXiv:2509.21271, 2025.            Sutskever, I., et al. Language models are unsupervised
+                                                                   multitask learners. OpenAI blog, 1(8):9, 2019.
+Liu, A., Feng, B., Xue, B., Wang, B., Wu, B., Lu, C., Zhao,
+  C., Deng, C., Zhang, C., Ruan, C., et al. Deepseek-            Schieffer, G., Wahlgren, J., Ren, J., Faj, J., and Peng, I.
+  v3 technical report. arXiv preprint arXiv:2412.19437,            Harnessing integrated cpu-gpu system memory for hpc:
+  2024a.                                                           a first look into grace hopper. In Proceedings of the
+                                                                   53rd International Conference on Parallel Processing, pp.
+Liu, Y., Li, H., Cheng, Y., Ray, S., Huang, Y., Zhang, Q.,
+                                                                   199–209, 2024.
+  Du, K., Yao, J., Lu, S., Ananthanarayanan, G., et al.
+  Cachegen: Kv cache compression and streaming for fast          ShareGPT Team. Sharegpt, 2023.            URL https://
+  large language model serving. In Proceedings of the ACM          sharegpt.com/.
+  SIGCOMM 2024 Conference, pp. 38–56, 2024b.
+                                                                 Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,
+Luo, C., Cai, Z., Sun, H., Xiao, J., Yuan, B., Xiao, W., Hu,       B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen:
+  J., Zhao, J., Chen, B., and Anandkumar, A. Headinfer:            High-throughput generative inference of large language
+  Memory-efficient llm inference by head-wise offloading.          models with a single gpu. In International Conference
+  arXiv preprint arXiv:2502.12574, 2025.                           on Machine Learning, pp. 31094–31116. PMLR, 2023.
+           SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+Sheng, Y., Cao, S., Li, D., Zhu, B., Li, Z., Zhuo, D., Gonza-     Yu, C., Wang, T., Shao, Z., Zhu, L., Zhou, X., and Jiang,
+  lez, J. E., and Stoica, I. Fairness in serving large language     S. Twinpilots: A new computing paradigm for gpu-cpu
+  models. In 18th USENIX Symposium on Operating Sys-                parallel llm inference. In Proceedings of the 17th ACM
+  tems Design and Implementation (OSDI 24), pp. 965–988,            International Systems and Storage Conference, pp. 91–
+  2024.                                                             103, 2024.
+
+Song, Y., Mi, Z., Xie, H., and Chen, H. Powerinfer: Fast          Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  large language model serving with a consumer-grade gpu.           G. Orca: A distributed serving system for {Transformer-
+  In Proceedings of the ACM SIGOPS 30th Symposium on                Based} generative models. In 16th USENIX Symposium
+  Operating Systems Principles, pp. 590–606, 2024.                  on Operating Systems Design and Implementation (OSDI
+                                                                    22), pp. 521–538, 2022.
+Stoica, I. and Abdel-Wahab, H. Earliest eligible virtual
+  deadline first: A flexible and accurate mechanism for           Zhang, H., Tang, Y., Khandelwal, A., and Stoica, I.
+  proportional share resource allocation. Old Dominion              {SHEPHERD}: Serving {DNNs} in the wild. In 20th
+  Univ., Norfolk, VA, Tech. Rep. TR-95-22, 1995.                    USENIX Symposium on Networked Systems Design and
+                                                                    Implementation (NSDI 23), pp. 787–808, 2023.
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+  M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,        Zhang, W., Wu, Z., Mu, Y., Liu, B., Lee, M., and Lai, F.
+  Azhar, F., et al. Llama: Open and efficient foundation lan-       Tempo: Application-aware llm serving with mixed slo
+  guage models. arXiv preprint arXiv:2302.13971, 2023.              requirements. arXiv preprint arXiv:2504.20068, 2025.
+
+Vellaisamy, P., Labonte, T., Chakraborty, S., Turner, M.,         Zhao, X., Jia, B., Zhou, H., Liu, Z., Cheng, S., and You,
+  Sury, S., and Shen, J. P. Characterizing and optimizing           Y. Hetegen: Heterogeneous parallel inference for large
+  llm inference workloads on cpu-gpu coupled architec-              language models on resource-constrained devices. arXiv
+  tures. arXiv preprint arXiv:2504.11750, 2025.                     preprint arXiv:2403.01164, 2024.
+
+Vijaya Kumar, A., Antichi, G., and Singh, R. Aqua:                Zheng, L., Chiang, W.-L., Sheng, Y., Li, T., Zhuang, S.,
+  Network-accelerated memory offloading for llms in scale-          Wu, Z., Zhuang, Y., Li, Z., Lin, Z., Xing, E. P., et al.
+  up gpu domains. In Proceedings of the 30th ACM Inter-             Lmsys-chat-1m: A large-scale real-world llm conversa-
+  national Conference on Architectural Support for Pro-             tion dataset. arXiv preprint arXiv:2309.11998, 2023.
+  gramming Languages and Operating Systems, Volume 2,
+  pp. 48–62, 2025.                                                Zheng, L., Yin, L., Xie, Z., Sun, C. L., Huang, J., Yu, C. H.,
+                                                                    Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+vLLM Community. vllm v1 - vllm, 2025. URL                           Sglang: Efficient execution of structured language model
+  https://docs.vllm.ai/en/latest/usage/                             programs. Advances in Neural Information Processing
+  v1_guide.html. [Online; accessed 2025-10-27].                     Systems, 37:62557–62583, 2024.
+
+Wei, Z., Yen, J., Chen, J., Zhang, Z., Huang, Z., Chen, C.,       Zhu, K., Gao, Y., Zhao, Y., Zhao, L., Zuo, G., Gu, Y., Xie,
+ Yu, X., Gu, Y., Wu, C., Wang, Y., et al. Equinox: Holistic         D., Ye, Z., Kamahori, K., Lin, C.-Y., et al. {NanoFlow}:
+ fair scheduling in serving large language models. arXiv            Towards optimal large language model serving through-
+ preprint arXiv:2508.16646, 2025.                                   put. In 19th USENIX Symposium on Operating Systems
+                                                                    Design and Implementation (OSDI 25), pp. 749–765,
+Wong, C. S., Tan, I., Kumari, R. D., and Wey, F. Towards            2025.
+ achieving fairness in the linux scheduler. ACM SIGOPS
+ Operating Systems Review, 42(5):34–43, 2008.
+
+Wu, B., Zhong, Y., Zhang, Z., Liu, S., Liu, F., Sun, Y.,
+ Huang, G., Liu, X., and Jin, X. Fast distributed infer-
+ ence serving for large language models. arXiv preprint
+ arXiv:2305.05920, 2023.
+
+Xu, Y., Mao, Z., Mo, X., Liu, S., and Stoica, I. Pie:
+  Pooling cpu memory for llm inference. arXiv preprint
+  arXiv:2411.09317, 2024.
+
+Yang, A., Yu, B., Li, C., Liu, D., Huang, F., Huang, H.,
+  Jiang, J., Tu, J., Zhang, J., Zhou, J., et al. Qwen2. 5-1m
+  technical report. arXiv preprint arXiv:2501.15383, 2025.
+                      SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+A    C OMPARING FCFS AND SJF-O RACLE                                                increase, the TBT SLO attainment rate improves or sta-
+                                                                                    bilizes. To further explore the underlying root cause, we
+As discussed in § 3.1, recent LLM serving systems increas-                          analyze the cumulative distribution function (CDF) of TBT
+ingly employ sophisticated scheduling techniques to man-                            for LightLLM.
+age latency. However, they cannot overcome the memory
+constraints posed by hardware. Once KV cache storage is                             As shown in Fig. 25, when request rate increase, the CDF
+exhausted, newly arrived requests have to backlog in the                            of TBT of LightLLM shows almost no changes. There-
+waiting queue, waiting for running ones to finish.                                  fore, the TBT SLO attainment rate also stabilizes. That is
+                                                                                    because LightLLM’s “Past-Future” scheduler is designed
+To illustrate, we measure vLLM on GH200 using                                       to avoid harmful request evictions by precisely estimating
+Qwen2.5-32B (Yang et al., 2025) model and ShareGPT                                  the peak future KV cache required by the running batch.
+dataset (ShareGPT Team, 2023). We compare the First-                                Unlike aggressive schedulers that underestimate memory
+Come-First-Serve (FCFS) and Shortest-Job-First with ora-                            consumption and suffer from frequent, harmful evictions un-
+cle generation length information (SJF-Oracle) policy. As                           der high load, LightLLM’s approach ensures that scheduled
+shown in Fig. 24, both FCFS and SJF-Oracle fail to pre-                             requests can complete successfully without the response
+vent TTFT SLO violations under memory pressure. Once                                interruptions that typically cause TBT SLO violations. This
+KV cache storage is exhausted, the length of waiting queue                          stable TBT performance, free from eviction-induced stalls,
+spikes dramatically, which causes severe TTFT SLO viola-                            directly translates to a stabilized SLO attainment rate even
+tions.                                                                              as request rates increase.
+                        100
+                                                                                                            100
+       KV Cache Usage (%)
+
+
+
+
+                                                               1000
+                                                                   # Waiting Reqs
+
+
+
+
+                                                                                                                       RPS=5
+
+
+
+
+                                                                                                                                  TBT SLO
+                                                                                                                       RPS=10
+
+                                                                                           CDF Percentage (%)
+                            50                                                                                  80     RPS=15
+                                                               500                                                     RPS=20
+                                                  FCFS                                                          60
+                                                  SJF-oracle
+                             0                                 0
+                              0   25   50 75        100                                                         40
+                                       Time (s)
+                                                                                                                20
+Figure 24. KV cache usage and waiting request number for vLLM
+with FCFS and SJF-oracle scheduler. Model: Qwen2.5-32B,                                                          0
+                                                                                                                0.00   0.05      0.10 0.15   0.20
+dataset: ShareGPT, RPS=20.                                                                                                      TBT (s)
+                                                                                    Figure 25. Cumulative distribution function (CDF) of TBT for
+B    BANDWIDTH M EASUREMENT                                                         LightLLM in § 5.2. When request rate increase, LightLLM
+
+We measure the CPU-GPU bandwidth for GH200 and H200
+using NVIDIA’s open-source nvbandwidth tool (v0.8).                                 D    V LLM ON U NIFIED M EMORY OF GH200
+We focus on two specific bidirectional copy engine (CE)
+test cases:                                                                         Some readers may consider the hardware-managed Uni-
+                                                                                    fied Memory (UM) of GH200 (NVIDIA, 2024) as a poten-
+                                                                                    tial good solution for offloading. UM merges HBM and
+    • host to device bidirectional memcpy -
+                                                                                    DRAM into a unified address space and automatically mi-
+      ce (Test ID 2)
+                                                                                    grates blocks based on access, allowing for a unified large
+    • device to host bidirectional memcpy -                                         KV cache storage without explicit offloading management.
+      ce (Test ID 3)                                                                However, our test result in Fig. 26 show that enabling UM
+                                                                                    for vLLM severely degrades performance, leading to signif-
+                                                                                    icantly higher average TBT.
+The following command is used to run all tests:
+                                                                                    This performance collapse stems not from traditional UM
+CUDA_VISIBLE_DEVICES=0 numactl
+    --cpunodebind=0 --membind=0                                                     overheads caused by page-fault-driven migration, but from
+    ./nvbandwidth -t 2 3 -b <size_in_MB>                                            a fundamental architecture and workload mismatch.
+    -i 3
+                                                                                    On conventional PCIe-based GPUs, UM is page-fault driven.
+                                                                                    An access to a non-resident page (e.g., in CPU memory)
+C    F URTHER A NALYSIS OF L IGHT LLM                                               triggers a costly page fault and GPU stall, after which the
+                                                                                    driver migrates the page over PCIe. In contrast, the GH200’s
+As discussed in § 5.2, LightLLM (Gong et al., 2025) shows                           architecture features a cache-coherent NVLink-C2C inter-
+an unusual TBT SLO attainment rate trend: as request rates                          connect and Address Translation Services (ATS) (NVIDIA,
+           SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+
+                         4
+           Average TBT (s)
+                         2                vLLM w/ UM
+                                          vLLM
+                         0
+                             16      18           20
+                                  RPS
+Figure 26. Comparing the vLLM and that with KV cache storage in
+GH200’s Unified Memory (UM). vLLM on UM shows significant
+TBT degradation.
+
+
+2024). This allows the Hopper GPU to directly access the
+Grace CPU’s DRAM without incurring any page faults.
+GH200 does support page migration, but instead of being
+page-fault driven, it uses hardware access counters to track
+the access frequency of pages from both the CPU and GPU.
+When a CPU-resident page is accessed from the GPU side,
+it initially keeps its residency in CPU memory. Only after
+enough frequent accesses will the GH200 trigger a back-
+ground migration from CPU to GPU.
+Although this migration is transparent to applications like
+vLLM and involves no page faults, it exposes a new bot-
+tleneck: the bandwidth cliff. The GPU’s local HBM mem-
+ory provides bandwidth up to 4 TB/s, whereas the CPU’s
+DRAM subsystem, even when accessed directly over the
+900 GB/s C2C link, is limited to its own lower bandwidth of
+384 GB/s. This makes GPU access to CPU memory nearly
+an order of magnitude slower than access to HBM.
+This bandwidth cliff is the root cause of vLLM’s poor per-
+formance on UM. When a new request’s KV cache blocks
+are resident in DRAM, the GPU’s initial accesses are all
+serviced over the low-bandwidth C2C link through ATS,
+leading to poor performance in the Attention kernel. The
+request may finish processing long before the hardware
+counters accumulate enough frequency to ever trigger a mi-
+gration. The system is thus perpetually “warming up” data
+that is already “cold” or no longer in active use.
+Therefore, this hardware-managed UM is not suitable for
+LLM serving with offloading.
+            SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+E       A RTIFACT A PPENDIX                                             • Data licenses: LMSYS-Chat-1M Dataset License Agree-
+                                                                          ment6 (LMSYS-Chat-1M) and Apache 2.05 (ShareGPT).
+E.1     Artifact check-list (meta-information)
+    • Algorithm: RotaSched: Largest-VLT-First (LVF) Schedul-            • Archived DOI: Artifact: https://doi.org/10.
+      ing; DuplexKV: Eager Block Rotation.                                5281/zenodo.18971768. Code: https://doi.
+                                                                          org/10.5281/zenodo.19394229.
+    • Program: SuperInfer (implemented in Python and C++,
+      atop vLLM v0.6.6.post11 ).
+                                                                     E.2     Description
+    • Compilation: CUDA 12.8 and GCC 13.3.0 for DuplexKV
+      and CUDA kernels of SuperInfer.
+                                                                     E.2.1    Hardware dependencies
+                                                                        • Platform: NVIDIA GH200 NVL2. This system features two
+    • Dataset: ShareGPT2 ; LMSYS-Chat-1M3 .                               Grace CPU and Hopper GPU pairs. Each Hopper GPU is
+                                                                          equipped with 144GB HBM, and each Grace CPU contains
+    • Run-time environment: Ubuntu 24.04.3 LTS with kernel                480GB DRAM (with a maximum bandwidth of 384GB/s).
+      6.8.0-100-generic-64k, CUDA 12.8.                                   Within each pair, the Grace CPU and Hopper GPU are
+                                                                          tightly coupled via an NVLink-C2C interconnect, providing
+    • Hardware: NVIDIA GH200 NVL24 , with 2 Grace-Hopper                  900GB/s of bidirectional bandwidth. Additionally, the two
+      pairs, each including 144GB HBM and 480GB DRAM con-                 Hopper GPUs are interconnected via a 900GB/s NVLink.
+      nected via NVLink-C2C.
+                                                                        • Storage: About 500GB of free disk space is required to
+    • Execution: A pre-configured Docker environment with                 accommodate the Docker image, model weights, and dataset
+      automated bash scripts for orchestrating server and client          cache.
+      processes, benchmarking baselines, parsing execution logs,
+      and generating performance plots..
+                                                                     E.2.2    Software dependencies
+    • Metrics: Time-To-First-Token (TTFT) SLO attainment rate;
+      Time-Between-Tokens (TBT) SLO attainment rate; Through-           • OS & Environment: Ubuntu 24.04.3 LTS with kernel 6.8.0-
+      put (tokens/s); Achieved NVLink-C2C transfer bandwidth              100-generic-64k, CUDA 12.8 and GCC 13.3.0. Our provided
+      (GB/s) and transfer time (ms).                                      Docker image is pre-packaged with this environment. The
+                                                                          virtual environments for SuperInfer and all evaluated base-
+    • Output: Parsed logs and Python-generated plots.                     lines are managed and isolated using Anaconda.
+
+    • Experiments: End-to-end SLO attainment comparison                 • SuperInfer: Implemented atop vLLM v0.6.6.post17 , with
+      against baselines (vLLM, LightLLM, LTR, NEO).                       PyTorch 2.5.1.
+
+    • Disk Requirement: ∼500 GB (to accommodate model                   • Baselines: The evaluated baselines have the following spe-
+      weights for Qwen2.5-32B, Mixtral-8x7B, LLaMA-3-8B,                  cific software dependencies:
+      dataset caches, and the Docker image).
+                                                                              – vLLM: Version v0.6.6.post17 with PyTorch 2.5.1.
+    • Time Requirement: Time for pulling docker image varies                  – LTR8 : Git commit 13bbf6ff3dab661791d4136
+      based on the network connection speed. The whole exper-                   2551b089e5f77c91c with PyTorch v2.4.1.
+      iments takes about 30 hours. Because the full evaluation
+      across all models and datasets is time-consuming, we also               – LightLLM9 : Version v1.1.0 with PyTorch 2.9.0.
+      provide a “lite” experiment for convenience. This lite ver-             – NEO10 : Git commit 33e4a0f7632688e4122de
+      sion evaluates a single model on a single dataset to quickly              4c3c140196cebea6a5a with PyTorch 2.7.0 and
+      reproduce the core main results, which can be completed in                Triton 3.3.011 .
+      approximately 5 hour.
+
+    • Code licenses: Apache 2.05 .                                   E.2.3    Datasets
+    1
+    https://github.com/vllm-project/vllm/                            We use two open-source datasets to evaluate SuperInfer and the
+releases/tag/v0.6.6.post1                                            baselines:
+  2
+    https://huggingface.co/datasets/                                    6
+anon8231489123/ShareGPT_Vicuna_unfiltered/                                https://huggingface.co/
+blob/main/ShareGPT_V3_unfiltered_cleaned_                            datasets/lmsys/lmsys-chat-1m#
+split.json                                                           lmsys-chat-1m-dataset-license-agreement
+  3                                                                     7
+    https://huggingface.co/datasets/lmsys/                                https://github.com/vllm-project/vllm/
+lmsys-chat-1m                                                        releases/tag/v0.6.6.post1
+  4                                                                     8
+    https://www.nvidia.com/en-us/                                         https://github.com/hao-ai-lab/vllm-ltr
+                                                                        9
+data-center/grace-hopper-superchip/                                       https://github.com/ModelTC/LightLLM
+  5                                                                    10
+    https://choosealicense.com/licenses/                                  https://github.com/NEO-MLSys25/NEO
+                                                                       11
+apache-2.0/                                                               https://github.com/triton-lang/triton
+            SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips
+
+  1. ShareGPT12 : This dataset contains highly diverse, real-         various request rates. For a quicker reproduction, you can run the
+     world conversational turns between users and LLMs. In our        provided “lite” experiment (∼5 hour), which evaluate all methods
+     evaluation, following prior works such as LTR, we extract        on just 1 model (Qwen2.5-32B) and 1 dataset (ShareGPT).
+     only the first conversational turn (the initial human prompt
+     and the LLM response) to serve as a single request.              E.4.1   Lite Version
+                         13
+  2. LMSYS-Chat-1M : A large-scale, real-world dataset com-           To execute the “lite” version of the experiment, please run the
+     prising one million conversations collected in the wild from     following commands:
+     the LMSYS Chatbot Arena.
+                                                                                                                                    
+                                                                          ulimit -n 100000
+During testing, for each dataset, we randomly sample a total of           conda activate vllm-v1
+120 × RPS requests (representing 120 seconds of traffic at a target       python /home/mingtao4/AE_scripts/
+request rate). These requests are then dispatched to the server               AELite_AIO_0309_v1.py
+with inter-request delays sampled from a Poisson distribution to                                                                    
+simulate realistic arrival patterns.
+                                                                      This automated script evaluates SuperInfer alongside the base-
+E.2.4    Models                                                       lines (vLLM, LTR, LightLLM, and NEO) using the Qwen2.5-32B
+                                                                      model and the ShareGPT dataset. It sequentially launches the LLM
+We use three open-source LLMs for our evaluations to cover di-        server and the benchmark client for all data points. The generated
+verse model scales and architectural designs:                         logs are saved in AE_results.
+                                                                      To reproduce the figure in the paper, run Jupyter Notebook
+   • LLaMA-3-8B14 : Represents widely adopted, small-scale
+                                                                      /home/mingtao4/AE_scripts/AELite_mainresult.
+     dense models.
+                                                                      ipynb to automatically parse these logs and reproduce the figure.
+   • Mixtral-8x7B15 : Represents Mixture-of-Experts (MoE) ar-         Expected Results: It should reproduce the first column (ShareGPT
+     chitectures.                                                     @ Qwen2.5-32B) of Fig. 16 in the paper.
+   • Qwen2.5-32B16 : Represents larger-scale dense models.
+                                                                      E.4.2   Full Version
+                                                                      To execute the full version of the experiment, please run the fol-
+E.3     Installation                                                  lowing commands:
+To simplify the environment setup and installation process, we                                                                      
+provide a self-contained Docker image. This image comes pre-              ulimit -n 100000
+packaged with all necessary runtime dependencies, the SuperInfer          conda activate vllm-v1
+itself, the evaluated baselines. Model weights will be download           python /home/mingtao4/AE_scripts/
+automatically when running the scripts (Hugging Face token re-                AE_AIO_0309_v1.py
+quired).                                                                                                                            
+                                                              
+      docker pull monsoon235/                                         This automated script evaluates SuperInfer alongside the baselines
+          superinfer_ae_public                                        (vLLM, LTR, LightLLM, and NEO) using all models and datasets.
+      docker run --gpus all -it -u 1003 -w /                          It sequentially launches the LLM server and the benchmark client
+          home/mingtao4 monsoon235/                                   for all data points. The generated logs are saved in AE_results.
+          superinfer_ae_public zsh # enter
+          the environment                                             To reproduce the figure in the paper, run Jupyter Note-
+                                                                    book /home/mingtao4/AE_scripts/AE_mainresult.
+                                                                      ipynb to automatically parse these logs and reproduce the figure.
+                                                                      Expected Results: It should reproduce the full Fig. 16 in the
+E.4     Experiment workflow and expected result                       paper.
+A full evaluation of the main results takes roughly 30 hours due to
+the extensive combination of 3 models, 2 datasets, 5 methods, and
+  12
+     https://huggingface.co/datasets/
+anon8231489123/ShareGPT_Vicuna_unfiltered/
+blob/main/ShareGPT_V3_unfiltered_cleaned_
+split.json
+  13
+     https://huggingface.co/datasets/lmsys/
+lmsys-chat-1m
+  14
+     https://huggingface.co/meta-llama/
+Meta-Llama-3-8B
+  15
+     https://huggingface.co/mistralai/
+Mixtral-8x7B-v0.1
+  16
+     https://huggingface.co/Qwen/Qwen2.5-32B
+

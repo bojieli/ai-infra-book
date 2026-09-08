@@ -1,0 +1,1024 @@
+           E FFICIENT L ONG - CONTEXT L ANGUAGE M ODEL T RAINING BY
+                           Core Attention Disaggregation
+
+
+                Yonghao Zhuang * 1 Junda Chen * 2 Bo Pang † 2 Yi Gu 2 3 Yibo Zhu 4 Yimin Jiang 4
+                                     Ion Stoica 5 Eric Xing 1 3 Hao Zhang 2
+
+
+                                                         A BSTRACT
+     We present core attention disaggregation (CAD), a technique that improves long-context LLM training by
+     disaggregating the core attention (CA) – the parameter-free softmax(QK⊤ )V computation – and schedules it
+     on an independent pool of resources. Existing systems co-locate core attention with other components. At long
+     context, the quadratic growth of CA computation and near-linear growth of the rest create load imbalance – hence
+     stragglers across data and pipeline groups. CAD is enabled by two key observations: (i) statelessness: CA has
+     no trainable parameters and minimal transient state, so balancing reduces to scheduling compute-bound tasks;
+     and (ii) composability: modern attention kernels sustain high utilization on fused batches of arbitrary-length
+     token-level shards. CAD dynamically partitions the core attention computation into token-level tasks (CA-tasks),
+     and dispatches them to a pool of devices specialized for CA computation (attention servers). It then rebatches
+     CA-tasks to equalize CA compute across attention servers without loss of kernel efficiency. We have implemented
+     CAD in a system called DistCA with a ping-pong scheme to completely overlap communication with compute,
+     and in-place attention servers to improve memory utilization. Scaling to 512 H200 GPUs and 512K context
+     length, DistCA eliminates DP/PP stragglers, achieves near-perfect compute and memory balance, and improves
+     end-to-end training throughput by up to 1.9× over Megatron-LM and 1.35× over existing load-balancing methods
+
+1    I NTRODUCTION                                                self-attention compute in transformers grows quadratically
+                                                                  with sequence length, whereas the rest scales approximately
+Recent large language model (LLM) applications show a             linearly. Consequently, two chunks with the same total
+steadily increasing demand for processing longer contexts.        tokens can incur very different attention FLOPs depending
+For instance, reasoning workloads must generate long chain-       on how documents are distributed. For example, in Figure 1,
+of-thoughts to yield accurate answers (Guo et al., 2025);         a chunk with a single 4K-token document requires roughly
+coding agents operate over multi-file repositories (Liu et al.,   4x the attention FLOPs of a chunk packed with four 1K-
+2024b). To reliably support these use cases, LLMs must            token documents, even though both contain 4K tokens.
+operate with contexts of 100K - 1M tokens at inference.
+                                                                  This imbalance manifests as stragglers (Figure 1) in large-
+Equipping an LLM with long-context capability typically           scale distributed training in two ways (Wang et al., 2025c;
+requires training on datasets with both long documents and        Lin et al., 2025). First, in data parallelism (DP), replicas
+ordinary (short) documents (Gao et al., 2025). A standard         process different chunks and synchronize at the gradient
+approach to batch documents of variable length is document        barrier; the replica with the largest attention workload stalls
+packing (Rae et al., 2021; Wang et al., 2024): concatenate        the others. Second, in pipeline parallelism (PP) (Huang
+multiple documents into a fixed-size chunk and apply an           et al., 2019; Shoeybi et al., 2019), pipeline stages operate
+attention mask to block cross-document attention. While           on different microbatches concurrently; a microbatch with a
+document packing improves throughput, it leads to variance        larger attention workload makes its current stage a straggler,
+in the attention compute – therefore load imbalance – across      creating pipeline bubbles which stall the entire pipeline. In
+different chunks (Lin et al., 2025). The root cause is that       hybrid DP and PP, these effects compound, and slowdowns
+  *
+    Equal contribution † Work done at UCSD. 1 Carnegie Mellon     of 1.34-1.44x (Wang et al., 2025c; Lin et al., 2025) have
+University 2 UC SanDiego 3 MBZUAI 4 StepFun 5 UC Berkeley.        been reported even under modest context lengths.
+Correspondence to: Eric Xing <epxing@andrew.cmu.edu>, Hao
+Zhang <haz094@ucsd.edu>.                                          One remedy is to equalize compute by assigning more to-
+                                                                  kens to devices processing shorter documents (Wang et al.,
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,      2025c). This balances compute but unbalances memory, as
+2026. Copyright 2026 by the author(s).                            activation footprints grow with total tokens. In the “4×1K
+                                    Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+   context-independent          context-dependent   Masked out Attention                                        Table 1. Compute and Memory
+         Pre Core Attention
+                                                                                                                for components in LLMs. l is the
+       (LayeNorm, QKV-Proj)                                                                                     document’s number of tokens.
+   Value
+                     GeMM                1x4K doc        4x1K doc
+                                                                                                                           Memory      Compute
+                            Output
+   Key
+            GeMM    Attn                                                                                           CA        0          O(l2 )
+                   Score                                                                                          Linear    O(l)        O(l)
+  Query
+                                       GPU 0
+
+
+
+
+                                                                   Comm
+         Core Attention                                                                                           MISC      O(l)         ≈0
+                                                          Idle
+                                       GPU 1
+        Post Core Attention
+     (O-Proj, LayerNorm, FFN)                                    Time                                           CA: core attention layer;
+                                                                                                                Linear: FFN, qkvo-proj
+                                                                                                                MISC: layer norm, dropout, ...
+Figure 1. Transformer and its workload imbalance
+caused by core attention.                                                  Figure 2. DistCA architecture.
+
+vs. 1×4K” example: matching the 1×4K attention FLOPs                               document of origin. This allows partitioning and recombin-
+requires 12 more 1K documents on the 4×1K device, raising                          ing shards to equalize CA compute, instead of committing
+its activation memory by 3×. Another remedy, context par-                          to the uniform splits typically assumed by CP.
+allelism (CP) (Liu et al., 2024a; Jacobs et al., 2023), shards
+                                                                                   These observations lead to core attention disaggregation
+each document along the sequence dimension and equally
+                                                                                   (CAD), which disaggregates CA and schedules it indepen-
+distributes shards across DP replicas, which balances com-
+                                                                                   dently on a specialized pool of resources, named attention
+pute and memory, but at the cost of extra communication
+                                                                                   servers. Attention servers are stateless, and accept core
+of KV states. Unfortunately, it cannot mitigate PP strag-
+                                                                                   attention tasks – the CA computation of arbitrarily parti-
+glers: pipeline stages hold disjoint model layers and cannot
+                                                                                   tioned document shards – as compute requests. The runtime
+jointly compute shards of the same document; straggler
+                                                                                   dynamically batches CA tasks into large fused kernel calls
+microbatches still generate bubbles that stall other stages.
+                                                                                   and schedule them to any attention server. Hence, CAD
+Fundamentally, the imbalance stems from mismatched com-                            allows to achieve near-perfect load balancing across all at-
+plexity between attention and the rest of the model, as il-                        tention servers, while avoiding memory imbalance. Unlike
+lustrated in Table 1. When attention and other layers are                          CP, CAD decouples core attention from the parallelisms for
+collocated, the mismatch grows with model scale and con-                           the rest of the model, eliminating stragglers in DP and PP.
+text length, leading to a severe load imbalance.
+                                                                                   Implementing CAD raises two practical challenges. First,
+This naturally leads us to disaggregate attention from the                         CA is compute-intensive but memory-light; dedicating de-
+rest of the model, so the attention and non-attention com-                         vices as attention servers might underutilize memory. We
+ponents can be scaled independently to balance workload                            therefore time-share GPUs between attention servers (Li
+across devices. A challenge, however, is that disaggregation                       et al., 2014) and the rest of model computation to keep
+introduces per-layer transfers of inputs and outputs across                        both compute and memory utilization high (§4.1). Second,
+the attention boundary. At first glance, this communication                        dispatching token-level core attention tasks adds communi-
+is prohibitive and could negate its benefits. Surprisingly, we                     cation overhead; we design a ping-pong execution scheme
+find the opposite: precisely isolating the core attention (CA)                     (§4.1) to overlap communication with computation between
+– the weightless softmax(QK⊤ )V computation (Figure 1)                             two alternating batches. We also develop a scheduler (§4.2)
+– and applying targeted overlap and placement optimiza-                            that optimizes document sharding to strike a balance be-
+tions allows the communication to be effectively hidden in                         tween balancing workloads while minimize communication.
+today’s long-context training workloads.
+                                                                                   We implement CAD in a system called DistCA, and evaluate
+Specifically, we identify two key characteristics of core                          it at up to 512 H200 GPUs for workloads with up to 512k
+attention that makes disaggregation effective. First, state-                       context length. DistCA improves end-to-end throughput by
+lessness: CA contains no trainable parameters and stores                           up to 1.9x against Megatron-LM, and 1.35x against existing
+only small per-row softmax statistics; balancing CA hence                          load balance methods. Our studies show that the communi-
+reduces to scheduling compute-bound tasks. Second, com-                            cation caused by CAD can be fully hidden while attention
+posability: CA can be partitioned at token granularity into                        is near-perfectly balanced.
+arbitrary-length shards. Each shard, given its target tokens’
+                                                                                   In summary, this paper makes three key contributions:
+Q and context tokens’ K, V, independently computes the
+output. Shards from different documents can be re-batched                          • Propose core attention disaggregation to address the load
+into a single high-occupancy kernel. In modern attention ker-                        imbalance in long-context training of LLMs.
+nels (e.g., Flash Attention), throughput primarily depends                         • Implement DistCA with three key optimizations: in-place
+on the aggregated tokens in the fused call rather than their                         GPU time sharing, ping-pong overlap, and a workload-
+                     Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+  balanced and communication-aware scheduler.                   an all-gather (AG) to collect token states of its context to
+• Conduct comprehensive evaluation of CAD on large-scale        compute the attention of the local shard. Under a causal
+  realistic training workloads.                                 mask, earlier tokens in the sequence performs less atten-
+                                                                tion computation than later tokens, so naively slicing the
+2     BACKGROUND                                                sequence creates load imbalance. Recent work (Dubey et al.,
+                                                                2024) mitigates this with a head-tail shard assignment: par-
+2.1   LLM Architecture                                          titions the sequence into 2 × CP shards and assign rank i
+                                                                both the i-th and the (2 × CP − 1 − i)-th shard. Further,
+LLMs adopt the Transformer architecture, which consists
+                                                                when document packing is used, per-document CP shards
+of a stack of identical Transformer layers. As shown in
+                                                                each document rather than the entire concatenated chunk to
+Figure 1, we distinguish two types of layers.
+                                                                balance workloads, which is discussed in detail in §3.2.
+Context-independent layers include QKV-projection,
+                                                                Pipeline parallelism (PP) partitions the model’s layers into
+output-projection, feed-forward network (FFN), layernorm,
+                                                                stages, and splits the input data into microbatches, which
+and position embedding. These layers operate token-wise:
+                                                                flow through each stage concurrently; synchronization oc-
+the output for each token depends only on its own hidden
+                                                                curs when activations are passed between two pipeline
+state, so both compute and activation memory scale approx-
+                                                                stages. To minimize pipeline bubbles, each stage shall
+imately linearly with the number of tokens. The dominant
+                                                                ideally have a similar compute workload (Zheng et al.,
+cost arises from the linear (GEMM) operators.
+                                                                2022). However, because different microbatches may con-
+Context-dependent layers include only core attention (CA).      tain chunks packed with varying lengths of documents, the
+In this paper, we deliberately distinguish core attention       processing time of each stage become imbalanced, leading
+from attention; the latter refers to the composite of QKV-      to bubbles that propagate downstream that idle all subse-
+projection, output-projection, layernorm, and core attention    quent stages. This imbalance cannot be mitigated by glob-
+in most literature. Given queries (Q), keys (K), and values     ally resharding the data, as each pipeline stage processes a
+(V), CA computes attention scores P = softmax(QK⊤ )             disjoint set of model layers.
+(with masking as needed) and outputs O = P × V. We em-
+phasize that CA has no trainable parameters (nor gradients)     3     C HALLENGE AND M OTIVATION
+and its per-token computation does not require intermediate
+outputs from other tokens’ CA, but only their K, V vectors.     This section formalizes the problem of compute and memory
+The CA compute process is plotted in Figure 1.                  imbalance under document packing, explains why existing
+                                                                remedies cannot adequately balance both, and motivates
+At training, storing P is memory-prohibitive due to its
+                                                                core attention disaggregation.
+quadratic complexity. Modern IO-aware attention ker-
+nels (Dao et al., 2022) avoid materializing P and recompute
+                                                                3.1   Load Imbalance in Compute and Memory
+it during backward. Hence, CA also generates an negligible
+amount of intermediate states, rendering it stateless.          Let the compute of an l-token document be FLOPs(l) =
+                                                                αl2 + βl, where α, β are constants related to LLM architec-
+2.2   LLM Training Parallelization                              tures (e.g., hidden size). αl2 represents the core attention
+                                                                FLOPs; βl aggregates FLOPs of context-independent lay-
+Modern LLM training combines four parallelisms – data,
+                                                                ers. Let activation memory be M(l) = γl, since modern
+tensor, context, and pipeline parallelisms – to scale.
+                                                                IO-aware attention kernels avoid storing P in forward and re-
+In data parallelism (DP), replicas process different batches    compute it during backward; activations saved for backward
+and meet at a gradient synchronization barrier. Any replica     are therefore dominated by context-independent layers.
+that receives a batch with a larger attention workload (e.g.,                                                      n
+                                                                For a microbatch of documents withPnlengths   {lP
+                                                                                                                i }i=1 packed
+from packed data) becomes a straggler and stalls the others.                                             2          n
+                                                                together, the total compute is α P  i=1 li + β      i li , while
+                                                                                                      n
+Tensor parallelism (TP) shards model layers at the cost of      the total activation memory is γ i=1 li . To make two
+per-layer communication, which is not affordable when scal-     microbatches – of lengths {li }ni=1 and {lj′ }m
+                                                                                                              j=1 – balanced
+ing beyond one node (TP size > 8). TP balances memory           in
+                                                                Pn both  compute
+                                                                           Pm ′   and memory,
+                                                                                       Pn 2      both conditions
+                                                                                                  Pm ′2            must hold:
+and compute across TP shards, as attention is sharded along          l
+                                                                   i i  =    j jl and      l
+                                                                                         i i  =       l
+                                                                                                    j j  , which    is difficult
+the head dimension and all devices process exactly the same     to satisfy in practice. Existing methods typically target
+data batch (Shoeybi et al., 2019).                              one condition at a time.
+                                                                                     Pn For P example, fixed-size packing
+                                                                                                 m
+                                                                equalizes memory ( i li = j lj′ ) by packing the same
+Context parallelism (CP) shards data along the sequence di-
+                                                                number of total tokens in both chunks, but leaves attention
+mension across multiple GPUs. Context-independent layers
+                                                                compute unequal due to the quadratic term.
+run independently on each shard, yet core attention requires
+                       Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+
+
+
+   (a) all-gather latency(%)      (b) Memory breakdown (%)               Figure 5. CA Throughput.     Figure 6. Throughput with
+                                                                                                      variable-length data chunk
+Figure 3. Latency and memory breakdown for all-gather in Context                                      and per-doc CP.
+Parallel, Llama-8B. Document lengths are all 32k.
+                                                                   constrained by memory pressure and becomes ineffective.
+                                                                   Per-document context parallelism. For a chunk packed
+                                                                   with documents l1 , l2 . . . ln , evenly slicing the concatenated
+                                                                   chunk yields imbalance because early tokens perform less
+                                                                   work under causal masking (even with “head-tail” paring in
+                                                                   §2.2). Per-document CP instead partitions each document
+                                                                   into 2c shards (c is the CP degree) and assigns to rank i the
+                                                                   i-th and (2c − 1 − i)-th shard of each document. Each CP
+                                   (b) Divergence of Attention     rank hence processes an equal share of every document –
+  (a) Memory divergence.           Computation.                    balancing both compute and memory. Despite this, we find
+                                                                   that per-document CP encounters three bottlenecks at scale.
+Figure 4. Throughput and memory divergence for variable-length
+data chunks, measured on 512K-token data chunks, 8B model.         First, for ordinarily short documents, per-document CP still
+                                                                   partitions them and results in tiny shards. These tiny shards
+Two remedies, variable-length data chunk and per-document          may underfill attention tiles and lower arithmetic inten-
+context parallelism, adjust the document packing scheme or         sity (Wang et al., 2025c). Figure 5 shows that the kernel’s
+sequence sharding to approximate these conditions (Wang            throughput drops significantly for document shorter than
+et al., 2025c), respectively. Next, we quantitatively analyze      128 tokens. Second, in per-document CP, the each rank runs
+them and show their inadequacies.                                  1/c of the overall computation, but requires all-gathering
+                                                                   the whole KV states, whose cost is linear to the global num-
+3.2   Problems of Existing Methods                                 ber of tokens. As shown in Figure 3a, when scaling up CP
+                                                                   degree, the all-gather latency share rises from merely 3%
+Variable-length data chunk. This approach redistributes
+                                                  Pn 2             on 2 nodes to nearly 40% on 32 nodes. Finally, the last
+documents
+Pm ′2       across microbatches to equalize         i li =         CP rank must store the entire document’s aggregated KV
+     l
+   j j  (FLOPs),  i.e., it tries to move several documents         states as input states, and release the memory until back-
+from a microbatch with more attention compute toP  compen-         ward. The memory overhead scales with CP degree. As
+sate other microbatches. However, token counts l then              shown in Figure 3b, the KV memory fraction grows from
+diverge across microbatches, inflating activation memory           3% at 2 nodes to almost 30% at 16 nodes. These bottlenecks
+on some ranks. Figure 4a shows per-microbatch memory               fundamentally limit the scalability of per-document CP.
+divergence growing with DP size (fixing TP=8), when we
+scale global batch size proportionally with the number of          Combination of both. Systems combining these techniques
+nodes to keep memory fully utilized; with a 512K max-              inherit the drawbacks of each as scale grows. Figure 6
+imum length, achieving compute balance requires 1.08 -             shows an experiment on a 64-GPU 512K-token workload.
+1.17x more activation memory on some ranks.                        Scaling the CP degree reduces imbalance, but also decreases
+                                                                   throughput and risks OOM as batch size or number of nodes
+Worse still, as sequence length grows, the method hits the         increases. On the other hand, increasing DP causes severe
+memory cap, where simply moving sequences fails to fully           load imbalance and suboptimal throughput. This trade-off
+equalize attention compute due to memory constraints. The          becomes more acute with larger scale and longer context.
+resulting straggler effect is visible in Figure 4b, where we
+quantify how much GPU compute is underutilized due to
+                                                                   3.3     Motivation for Core Attention Disaggregation
+attention imbalance by measuring the percentage of average
+idle time to average iteration time; the idle fraction rises to    The balancing conditions in §3.1P
+                                                                                                   suggest a natural boundary:
+19% at DP=4 and 55% at DP=8 for a 512K-length workload.            separate
+                                                                     P      CA’sPquadratic term  α   li2 from the linear terms
+In such regimes, variable-length chunking is fundamentally         β li and γ li associated with context-independent lay-
+                      Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+ers. This boundary is motivated by two key asymme-
+tries. First, divergent scaling: CA computation grows
+quadratically with document length and is stateless (no train-
+able parameters, no stored activations), whereas context-
+independent layers grow linearly and are stateful (they
+store parameters and activations for backward). Second, in-
+compatible balancing requirements: applying fine-grained
+                                                                 Figure 7. Ping-Pong execution on a single GPU acting as an in-
+sharding uniformly to all layers – as in per-document CP
+                                                                 place attention server. Pre-CA denotes computation before core
+– assigns each device a different number of tokens. This         attention (qkv-proj, layer norm, positional embedding); Post-CA
+inherently sacrifices memory balance to achieve compute          denotes computation after core attention (o-proj, FFN, auxiliary
+balance.                                                         operations); EP/TP denotes expert/tensor parallelism communi-
+                                                                 cation. Each microbatch is split into two nano-batches (Ping and
+These asymmetries motivate disaggregating CA so that it
+                                                                 Pong); (i, 0) is the Ping half of layer i, (i, 1) is the Pong half.
+can be parallelized with a different strategy than the rest of
+                                                                 Computation of one nano-batch overlaps with communication of
+the model - something existing fine-grained CP approaches        the other.
+fundamentally cannot achieve. Once CA is decoupled, we
+can: (1) independently schedule and equalize CA com-
+pute across a shared pool of devices, i.e. attention servers,
+without concerning memory, as CA is stateless; (2) inde-
+pendently balance the compute and memory of context-             requires communicating K, V of context tokens. We show
+independent layers, which are both linear with tokens. Mak-      that this communication has a low overhead for four reasons.
+ing this practical hinges on two questions: (Q1) how to          First, due to casual mask, the K, V of later shards are not
+balance CA compute? (Q2) can we hide the communication           needed by earlier shards. We use an all-to-all operation
+caused by disaggregation? We next explain two observa-           to send only the required shards; Second, when schedul-
+tions that make both possible.                                   ing shards onto devices, the more communication intense
+Divisibility and kernel composability. We observe that           shards – the later shards of a document that have more con-
+core attention computation is divisible at the token granu-      text tokens – can be dispatched on different devices to avoid
+larity. Given Q for target tokens and K, V for their context,    a straggler in the all-to-all; Third, thanks to the flexibility
+each shard computes independently. In modern attention           of arbitrary sharding, we can further optimize the shard-
+kernels, each GPU thread block is assigned a tile of the         ing schemes to minimize communication, without being
+core attention computation. The kernel can sustain high          restricted by uniform sequence splits or a fixed CP degree.
+MFU on variable-length fused sequence, provided its size         We develop this algorithm in detail in §4.2; Finally, com-
+is larger than this tile. In other words, kernel throughput      munication sending the input of a batch’s core attention can
+depends primarily on the aggregate tokens in a fused call,       be overlapped with the computation of another batch; we
+not on their document of origin. This implies, in practice,      realized this as a ping-pong execution scheme in §4.1.
+documents can be arbitrarily sharded then recombined into        We formally estimate the communication overhead in Ap-
+a single high-occupancy CA kernel (with proper masking)          pendix A, and show that with a Llama-3-34B’s configuration
+without hurting kernel efficiency.                               and InfiniBand bandwidth, documents can be partitioned
+We corroborate this by profiling FA2 on a 32K-token chunk        into up to 31 shards and distributed across different devices
+packed of document shards of varying lengths and context         without incurring communication overhead, and for larger
+sizes. Within each chunk, we fix the shard length while ran-     models, this upper bound even increases.
+domly sampling the context size for each shard; we sample
+multiple chunks to measure the average throughput. Re-           4    M ETHOD
+sults in Figure 5 show a high throughput as long as each
+document shard has more than 128 tokens, which is the            We implement core attention disaggregation in a system
+kernel tile size set by FA2. Shards shorter than 128 to-         named DistCA. DistCA has two main components: a run-
+kens are padded, which waste compute of their assigned           time system and a workload scheduler as shown in Fig-
+thread blocks. This characteristic enables us to solve Q1        ure 2. The runtime (§4.1) alternate between executing the
+by arbitrarily partitioning any document into shards with        context-independent layers and the core attention of each
+a multiple of 128 tokens and recombine them and issue as         transformer layer, inserting the necessary communication
+a single attention kernel, which balances compute without        between the GPUs responsible for these two parts. The
+compromising kernel efficiency.                                  workload scheduler (§4.2) takes a batch of documents as in-
+                                                                 put, and determines how to shard each document and where
+Communication cost. Like CP, disaggregating CA also              to place each shard across devices.
+                        Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+4.1       Runtime
+In CAD, core attention is computed by a pool of attention
+servers. More formally, we use core attention task to de-
+scribe attention server’s workload. A core attention task
+(CA-task), denoted by t, is defined as the core attention
+computation of a query shard q(t) and its context’s Key-
+Value shard kv(t) = context(q(t)). Assume a document
+is split into multiple non-overlapping shards q1 , q2 , . . . , qn ,
+the whole document’s core attention result is the collection
+of the corresponding t1 , t2 , . . . , tn .
+As illustrated in Figure 2, in a group of GPUs process-
+ing multiple documents, each GPU can function as an                      Figure 8. Pipeline Parallel schedule: standard 1F1B (top) vs. dis-
+independent attention server. For a batch of documents                   aggregated attention (bottom). Each row is a pipeline stage. Gray
+B = {d0 , d1 . . . dn }, after being processed by context-               slots arise from data dependencies inherent to pipeline parallelism.
+independent layers, they are split into CA-tasks: T =                    DistCA fills these idle slots with dummy microbatches that compute
+                                                                         core attention tasks from other pipeline stages’ real microbatches.
+{td00 , td10 . . . td01 , td11 . . . }. Each CA-task is assigned to an
+                                                                         Since CA is stateless (no model weights or stored activations are
+attention server. Assume a server s is assigned a set of tasks,
+                                                                         needed), these dummy microbatches incur no additional memory
+Ts ⊆ T . It first receives all inputs of the CA-tasks it is              overhead.
+assigned: Receive Tensor = {q(t), kv(t)|t ∈ Ts }. Upon re-
+ceiving all input tensors, due to the divisibility discussed in          arate group of GPUs to core attention would leave their
+§3.3, the server can batch all CA-tasks and executes within              memory largely unused, while the GPUs processing context-
+a single kernel (e.g. via a FlashAttention call). After that,            independent layers would remain memory-constrained. In-
+the output of each CA-task is sent back to the originating               place attention server solves this problem by allowing each
+GPU that handles next context-independent layers.1                       GPU to periodically switch its role between computing
+A central scheduler, running on the CPU, determines the                  context-independent layer and acting as an attention server.
+sharding strategy: how to shard and generate all CA-tasks,               This switching behavior is identical with or without pipeline
+then assigns each CA-task to an attention server, so the                 parallelism: each GPU simply alternates between its CA-
+scheduler outputs:                                                       server role and its context-independent-layer role within
+                                                                         each transformer layer. By doing so, it achieves both high
+  T, {Ts |s ∈ CA Servers} = Scheduler(B, CA Servers).                    memory utilization and balanced compute across GPUs.
+                                                                         Ping-Pong execution. To hide communication overhead,
+We detail the scheduling algorithm in §4.2. While GPUs
+                                                                         we employ a ping-pong execution schedule. Figure 7 il-
+processing the current batch, the scheduler prefetches doc-
+                                                                         lustrates the execution flow on a single GPU. We fuse the
+uments for the upcoming batch. Using pre-computed pro-
+                                                                         post-CA computation of the previous transformer layer with
+filing data, the scheduler estimates the computational cost
+                                                                         the pre-CA computation of the current layer. This fusion
+for each document and potential CA-tasks, and generates a
+                                                                         is possible because both sets of operations are context-
+sharding and assignment plan for the batch.
+                                                                         independent. Each input microbatch is divided into two
+Incorporating CAD into an end-to-end training system in-                 smaller nano-batches, “Ping” and “Pong”, of the same num-
+volves several key design choices, which we describe next.               ber of tokens. The execution of these two nano-batches is
+                                                                         interleaved, allowing the communication of one to overlap
+In-place attention server. One straightforward design of
+                                                                         with the computation of the other. Furthermore, we overlap
+attention server is to allocate a dedicated pool of GPUs
+                                                                         the intra-node communication for Tensor Parallel (typically
+solely for the CA computation. Although the design is fea-
+                                                                         over NVLink) with the inter-node communication caused
+sible, we find that this design leads to significant memory
+                                                                         by core attention disaggregation (typically over InfiniBand).
+underutilization for long-context training. As shown in Fig-
+ure 3b, the FFN layers account for the majority of memory                Pipeline parallelism support. CAD naturally integrates
+consumption due to their large hidden states; conversely,                with DP and TP, and replaces CP. We discuss how to in-
+the core attention is stateless. Therefore, dedicating a sep-            tegrate CAD with pipeline parallelism. In PP (Figure 8),
+      1
+                                                                         a training iteration is divided into multiple logical ticks.
+    CAD does not introduce additional nondeterminism beyond              During each tick, different pipeline stages process different
+standard GPU training: it does not alter the dataloader output
+order or the mathematical result of core attention, since each docu-     microbatches concurrently. For CA, as it has no weights, CA
+ment’s shards are reassembled identically regardless of execution        tasks from different PP stages are indistinguishable from
+schedule.                                                                CA tasks across microbatches in DP, both of which will
+                      Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+be scheduled and balanced across attention servers. For            Items divided n. With F̄ , attention servers are partitioned
+context-independent layers (excluding CA), since micro-            into surplus (load > F̄ ) and deficit (load < F̄ ), and sorted
+batches across all PP stages contain the same number of            by descending deficit.
+tokens, their corresponding computations will have identical
+                                                                   2. Iterating through deficit servers for migration. For
+– hence balanced workload.
+                                                                   each deficit destination d in order, we attempt to migrate
+To prevent device from idling when switching roles between         from surplus sources to close d’s gap. To find the most effi-
+attention server and computing context-independent layers,         cient Item to migrate for d, the scheduler evaluates each Item
+we adjust the schedule so that all stages perform the same         candidate using a cost-benefit heuristic. First, for each Item,
+phase within a tick – either all forward or all backward. We       its maximum number of FLOPs to be migrated, denoted as
+realize this by logically deferring selected backward micro-       ∆Fmax , is determined by the Item’s own FLOPs (FItem ),
+batches to the pipeline bubbles at the end of the schedule,        the sender’s surplus (Ssource ), and the recipient’s deficit
+as illustrated in Figure 8, without increasing the number of       (Ddestination ): ∆Fmax = min(FItem , Ssource , Ddestination ). To
+ticks per iteration. Additionally, during the pipeline warm-       transfer each shard, there is a communication cost. We
+up and drain-down phases, some stages are inevitably idle;         choose the shard whose FLOPs equal ∆Fmax but with the
+we repurpose these idle GPUs time for attention servers to         minimal communication. We also estimate the communi-
+running CA tasks. This integration is compatible with 1F1B,        cation cost Vcomm associated with this migration (see Ap-
+the interleaved 1F1B, and other widely-adopted schedules.          pendix B). With ∆Fmax and Vcomm , the scheduler calcu-
+                                                                   lates a priority score for each candidate Item, defined as
+4.2   Communication-Aware Greedy Scheduling                        the communication cost per unit of computation transferred:
+                                                                   E = ∆F  Vcomm . A higher E signifies a more efficient migra-
+                                                                              max
+
+The scheduler must balance two competing goals: load               tion. The scheduler selects the Item with the highest score.
+balance and communication efficiency. Partitioning and
+rebatching CA tasks improves balance but might incurs              Based on the calculated ∆Fmax , the selected Item is either
+transfers of Q, K, V. We therefore solve a constrained op-         entirely migrated if ∆Fmax = FItem , or spitted into two
+timization problem: (1) minimize load imbalance across             sub-Items, if ∆Fmax < FItem . The newly created sub-Item
+attention servers (measured in FLOPs), while (2) minimiz-          with ∆Fmax flops is dispatched to the destination attention
+ing communication volume (measured in bytes).                      server, while the remainder is retained by the source server.
+Profiler. To estimate the cost of a shard’s CA-task, we            3. Termination Condition The scheduler dynamically bal-
+build a profiler that benchmarks CA over a grid of query           ances the workload until when the load on each server is
+and key-value lengths kv. For each grid point we record            within ϵF̄ (tolerance epsilon), or when remaing moves fail
+ground-truth latency and throughput. Given a CA-task t,            to improve E beyond a threshold. In this way, the scheduler
+we predict its execution time by bilinear interpolation over       ensures the system-wise load balance while avoids unneces-
+the four nearest grid points. If t lies in the saturation region   sary communication caused by insignificant migration.
+(i.e., the kernel is at peak throughput), we derive execution
+time from the max measured throughput instead.                     5    I MPLEMENTATIONS
+Scheduling units. To formally describe our scheduling al-          We implemented DistCA with 2K lines of Python code.
+gorithm, we introduce Item as either a complete document or        For efficient dispatching of attention server’s input and out-
+a shard of a document. The shard can be of any size, as long       put, we implemented an All-to-All communication kernel
+as it is a multiple of the attention kernel implementation’s       following the idea of (Lei et al., 2025), with another 1K
+block size (128 in our case). Each Item already resides on         CUDA and C++ code. The communication utilizes NVSH-
+the device that computes its context-independent layers. An        MEM (NVIDIA Corporation, 2025).
+Item’s CA computation exactly maps to a CA-task.
+                                                                   Since DistCA only changes the logic of attention com-
+The scheduler input is a batch of Items B and the number           putation, we integrate DistCA to Megatron-LM (Shoeybi
+of attention servers n (we assume each attention server is         et al., 2019) to reuse its efficient implementation for token-
+identical). The scheduler decides if an Item should be split       independent layers, model architecture, 4D parallelization,
+into smaller Items, and which attention server each Item is        and end-to-end training pipeline. The integration takes 1k
+assigned to. For PP, the scheduler is called for each logical      lines of Python code for custom attention layer, ping-pong
+tick; otherwise, the scheduler is called once per microbatch.      computation, and pipeline parallelism.
+The scheduling algorithm unfolds in the following steps:
+1. Determine target load. First, the scheduler computes the
+ideal per-server load (F̄ ) by summing the total FLOPs of all
+                       Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+
+Table 2. Experiment model configurations. “Hidden” is the hidden
+dimension size, “#Head” is the number of attention heads, and
+“Head Size” is the per-head dimension.
+     Name         #Layer Hidden #Head Hdim GQA
+  Llama-3-8B        32       4096       32      128         8
+  Llama-34B         48       8192       64      128        16
+
+
+6     E XPERIMENTS
+6.1   Setup
+Model and Hardware. We test DistCA on LLaMA 8B and
+LLaMA 34B. The model configurations are in Table 2. All
+experiments are running with NVIDIA DGX H200 nodes.
+Each node has 8× 140GB H200 GPUs.                                  Figure 9. 3D Parallel (no PP) experiment. Relative speedup is
+                                                                   defined as the average duration over baseline
+Parallelization. As discussed in §2.1, TP offers load bal-
+ance among ranks, and has negligible communication over-
+head when the communication is within a device. So we              cal FLOP disparity across ranks. FlexSP uses ILP to decide
+fix TP=8 in our experiments. For PP, we grid search best           the CP degree of each CP group, and which document is
+configurations that avoid out-of-memory(OOM).                      assigned to each group. To mitigate the system overhead
+After determining TP and PP degrees, we grid search DP             and enable tensor parallel, we reimplement FlexSP within
+and CP degree for the baseline methods. For DistCA, doc-           Megatron using the FlexSP parallelism planner described
+uments are placed sequentially: each device computes a             in Wang et al. (2025b). We run the solver offline with a
+fixed number of tokens for context-independent layers. If          300-second timeout to compute the optimal document place-
+a device reaches its token threshold before a document is          ment. For WLB-LLM, since the official implementation is
+fully placed, the remaining portion of that document is put        unavailable, we reproduce its adaptive CP sharding policy
+to the next device.                                                within our system by sweeping over DP–CP degrees and
+                                                                   reporting the best-performing configuration. We omit the
+Input data. For each experiment, given a number of tokens          deferred execution mechanism (Algorithm 1 in(Wang et al.,
+per batch, we sample 30 batches from an input distribution         2025c)) as it modifies the training dynamics; integrating it
+and report the average throughput. Our experiments use two         is left to future work.
+(synthetic) distributions: (1) Pretrain with upsampled long
+context documents (“Pretrain”). Following the common               We show the relative throughput across DistCA and other
+practice (Fu et al., 2024), we upsample long documents in          baselines in this section. To see the comparison with abso-
+a pretrain data distribution by randomly filtering out doc-        lute throughput, see § D.
+uments shorter than a threshold. (2) ProLong (Gao et al.,
+2025): a public dataset specific for long context training.        6.2   End-to-End Experiment
+This work shows that a mixture of long and short docu-
+                                                                   3D parallelism (w/o PP). We first show the performance
+ments brings the best performance. Compared to “Pretrain”,
+                                                                   without PP. Table 4 (in §C) shows the “MaxDocLen”, the
+“ProLong” has a higher percentage of long documents.
+                                                                   batch size, and number of GPUs for each experiment.
+We vary the maximum number of tokens of a document
+                                                                   The result is shown in Figure 9. DistCA consistently outper-
+(“MaxDocLen”) to evaluate the system’s performance with
+                                                                   forms all three baselines, with up to 1.92x speedup against
+different context window size. The total number of tokens
+                                                                   Megatron, 1.35x against “FlexSP+”, and 1.20x against
+is determined by the memory capacity. In all test cases, the
+                                                                   “WLB-ideal”. For Megatron, the main performance bot-
+baselines go out of memory before DistCA, and the total
+                                                                   tleneck mainly comes from attention imbalance, which re-
+number of tokens for all systems are set to that value.
+                                                                   sults from imbalance from data parallel group and from per-
+Baselines. We compare DistCA against Megatron (Shoeybi             sequence CP. The phenomenon gets exaggerated as the num-
+et al., 2019), FlexSP (Wang et al., 2025b) (“FlexSP+”), and        ber of nodes and “MaxDocLen” increases. For “FlexSP+”
+WLB-LLM (Wang et al., 2025c) (“WLB-ideal”), making a               and “WLB-ideal”, the performance gap stems from the in-
+few modifications to each baseline to ensure the comparison        herent CP–DP trade-off: larger CP increases the CP-related
+is fair to them. For Megatron, we employ per-sequence              communication and memory overhead, whereas larger DP
+sharding for context parallelism and balance different DP          requires more complex scheduling and balancing across DP
+ranks by reordering microbatches to minimize the theoreti-         ranks, as discussed in §3.2. In contrast, DistCA dispatches
+                      Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+only a subset of tokens and effectively overlaps communi-
+cation with computation via a ping-pong execution scheme.
+The fine-grained token-level scheduling space further im-
+proves load balance. Moreover, as noted in §3.2, “FlexSP+”
+and “WLB-ideal” are also constrained by two conflicting
+factors on the memory side: (1) variable-size data chunks
+across DP ranks exacerbate memory imbalance, while (2)
+context parallelism introduces significant all-gather commu-
+nication overhead. These conflicting factors jointly limit
+the attainable efficiency of the optimal solution, leading to
+suboptimal performance in practice.
+“FlexSP+” also exhibits additional issues that further degrade
+performance. First, under the 300-second solver timeout,
+the ILP solver often fails to find the true optimal sequence     Figure 10. 4D Parallel (with PP) experiment. Relative speedup is
+placement as the problem size grows. As a result, we ob-         defined as the average duration over baseline.
+serve suboptimal placements in “FlexSP+” that can degrade
+performance by 1.4x - 3x depending on the solver time
+budget. Second, “FlexSP+” may still group smaller docu-
+ments together with larger ones within a single CP group to
+improve efficiency, which inadvertently increases both mem-
+ory consumption and communication overhead, resulting in
+out-of-memory (OOM) failures in certain cases.                   The results are shown in Figure 10. DistCA generally outper-
+                                                                 forms Megatron and “WLB-ideal” and demonstrates more
+With 34B model, DistCA achieves greater speedups at              favorable scaling characteristics over the set of different
+higher “MaxDocLen”. This is because a larger “MaxDo-             configurations. For the 8B model (left 2 figures in Fig-
+cLen” leads to a more diverse document length distribution,      ure 10), DistCA achieves up to 1.35x speedup compared to
+making it increasingly difficult for “FlexSP+” and “WLB-         “WLB-ideal” and up to 1.83x speedup compared to Mega-
+ideal” to balance the workload effectively.                      tron across different configurations. In addition to the advan-
+Interestingly, with 8B model, DistCA achieves greater            tages described with the 3D parallel (non PP) experiments,
+speedups at lower “MaxDocLen”. This is because we use            DistCA further balances computation across pipeline stages,
+the same number of nodes to train the 8B model as the 34B        and repurpose idle stages during warmup and drain-out
+model. As a result, the total number of tokens per batch         phases as core attention servers. In contrast, Megatron and
+is larger, increasing the likelihood of having multiple doc-     WLB-LLM struggles to find effective configurations, often
+uments with similar lengths. In this setting, the all-gather     running out of memory at high CP or DP degrees, and expe-
+overhead becomes more significant: a smaller “MaxDocLen”         riencing amplified load imbalance caused by pipeline par-
+leads to lower FLOPs per token in the core attention compu-      allelism, which further skews attention computation across
+tation, while the all-gather cost remains the same because       stages.
+the total number of tokens is the same. We also observe that     For the 34B model, DistCA also shows positive speedup
+DistCA has a higher speedup on “Pretrain” than “ProLong”,        across most configurations (16, 32, and 64 GPUs), achieving
+mainly because “Pretrain” contains more short documents          up to 1.25x speedup compared to “WLB-ideal” and 1.72x
+and is more challenging for “FlexSP+” and “WLB-ideal” to         speedup compared to Megatron. The performance gap gen-
+balance the workload.                                            erally widens as the maximum document length increases,
+4D parallelism. We now present the performance results           since larger input diversity exacerbates load imbalance.
+under full 4D parallelism. Table 5 (in §C) shows the “Max-       Despite these gains, we observe that memory fragmenta-
+DocLen”, the batch size and number of GPUs for each              tion creates some runtime overhead that limits DistCA ’s
+experiment. In each setting, we sweep all DistCA, Mega-          performance in the 34B 4D-parallel experiments. Because
+tron and WLB across all possible configurations, using a         Core Attention handles requests with varying tensor shapes
+sufficiently large batch size for the given model and work-      at each micro-batch, the allocator repeatedly creates and re-
+load. To ensure a fair comparison for Megatron and WLB           leases differently sized memory blocks, causing fragmenta-
+in 34B model, we increase the number of GPUs only for the        tion and frequent PyTorch garbage collection. The resulting
+34B model to 16, 32, and 64, thereby enlarging the pipeline      CPU overhead delays GPU kernel launches and degrades
+parallelism search space.                                        overall performance. We plan to address this issue in future
+                                                                 work with static memory allocation and CUDA Graphs.
+                       Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+                                                                 nodes under the Pretrain distribution, using 1M and 512K to-
+                                                                 tal tokens respectively with a maximum document length of
+                                                                 128K. For the 8B model, latency remains largely unchanged
+                                                                 when the tolerance factor is between 0 and 0.20 as the com-
+                                                                 munication can still be fully overlapped with computation.
+                                                                 For the 34B model, however, setting the tolerance factor
+                                                                 below 0.10 is too restrictive – communication volume in-
+Figure 11. Throughput for different communication patterns.      creases and can no longer be hidden, causing higher latency.
+                                                                 Conversely, when the tolerance factor is too large, latency
+                                                                 roughly linearly rises again due to load imbalance.
+                                                                 Figure 12 also plots the relation between communication
+                                                                 size and imbalance tolerance factor. In most cases, tun-
+                                                                 ing tolerance factor from 0 to 0.15 decreases the memory
+                                                                 requirement by 20-25% while leaving average duration stay-
+                                                                 ing almost the same or – in some cases as shown in 34B,
+                                                                 8 nodes – better. A tolerance factor beyond this point will
+                                                                 significantly increase the iteration latency, while leaving the
+                                                                 communication size relatively stable.
+                                                                 Further detailed analysis quantifying the system overheads
+                                                                 of disaggregation – including QKV splitting/merging cost,
+                                                                 theoretical communication bandwidth requirements, and
+                                                                 millisecond-level scheduler complexity – are provided in
+Figure 12. Impact of the compute imbalance tolerance factor.
+                                                                 Appendix E.
+
+6.3   Ablation study                                             7    R ELATED W ORKS
+To study the effects of different components in DistCA, we       Load imbalance in long-context training. Lin et al. (2025)
+designed several ablation studies:                               identifies the document length skew across microbatches as
+System overhead. The primary system overhead in DistCA           a primary cause of slowdowns in today’s LLM training sys-
+lies in the communication volume between a token’s atten-        tems. Several strategies have been proposed to mitigate this
+tion server and the device for its context-independent layers.   issue. FlexSP (Wang et al., 2025b) introduces dynamic con-
+We designed two baselines to illustrate the overhead:            text parallelism. It uses an integer linear programming (ILP)
+                                                                 solver to dynamically choose CP degree for device sub-
+1) Signal communication (“Signal”). This reduces each com-       groups and to assign documents to these subgroups. How-
+munication volume to 1 byte, meaning the synchronization         ever, the ILP is NP-hard, which limits scalability; besides,
+overhead now only reflects computation imbalance.                it only targets a narrower setting (FSDP). Several other ap-
+2) Remove Ping-Pong execution (“Single Stream”). This            proaches also attempt to mitigate the CP overhead either
+makes the communication on the same GPU stream as com-           by dynamic CP degree for each document (Ge et al., 2025)
+putation, removing the optimization to overlap the two parts.    or by overlapping communication with attention computa-
+                                                                 tion (Liu et al., 2024a; Chen et al., 2025). Compared to these
+Figure 11 reports results on 8B and 34B models across            variants of CP, CAD achieves a more precise load balance
+8 and 16 nodes using the Pretrain distribution, with the         by a token granularity variable length sharding. CAD also
+total number of tokens fixed to saturate compute. DistCA         reduces the communication at scale by not only prevent-
+achieves nearly the same latency as “Signal”, indicating that    ing sharding short document, but sharding long documents
+communication is almost fully overlapped with computation,       aware of communication efficiency.
+and therefore eliminating the 10-17% higher latency that
+would otherwise be incurred by “Single Stream”.The only          In addition to per-document CP, WLB-LLM (Wang et al.,
+exception is the 8B model on 8 nodes, where the compute          2025c) introduces variable-size data chunk, which uses an
+workload is too small to fully hide communication.               imbalanced MLP to compensate the workload imbalance
+                                                                 from attention. Because activation memory is tied to MLP
+Hyper-parameter in scheduler. The scheduler introduces a         computation, equalizing total FLOPs with this method leads
+tolerance factor that trades off CA load balance against com-    to memory imbalance. As the context length increases, the
+munication volume to minimize latency. Figure 12 shows           fraction of MLP computation shrinks, making it harder to
+this trade-off by evaluating 8B and 34B models on 8 and 16
+                     Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+offset attention imbalance.                                    ferred and ignores K, V already resident on the destination;
+                                                               this can overestimate bytes and yield non-minimal transfers.
+ByteScale (Ge et al., 2025) performs data-aware CP/DP
+sharding (named HDP) to reduce redundant communication         Regarding our evaluation, since public datasets rarely re-
+for short documents. However, it keeps attention and non-      flect real-world long-context training practices, it currently
+attention layers co-located and preserves the conventional     relies on representative public and synthetic distributions
+execution unit (evenly sharded documents). In this sense,      (e.g., upsampled pretrain data (Fu et al., 2024; Wang et al.,
+HDP can be viewed as a workload-heterogeneity-aware            2025c) and ProLong (Gao et al., 2025)); testing DistCA on
+variant of CP that dynamically adjusts CP degrees. A key       proprietary, industry-scale data remains an open direction.
+constraint is that “different HDP ranks handle an equal        Additionally, as observed in §6, our evaluation at larger
+number of tokens” (Ge et al., 2025); in practice, device       model scales is bottlenecked by occasional memory frag-
+groups with a higher CP degree handle longer documents         mentation overhead, which could be mitigated via static
+whose per-token FLOPs are higher due to the quadratic          memory allocation in the future.
+core attention cost, making global workload balance hard
+to achieve. In contrast, CAD explicitly disaggregates core     9    C ONCLUSION
+attention from the rest of the model and assigns different
+parallelization strategies to the two components, allowing     This paper presents core attention disaggregation, a new
+attention workload to be balanced independently at token       architecture for large language model training that separates
+granularity. To benchmark against this family of adaptive      the core attention from the rest of the model to enable in-
+CP methods in §6, we compare against FlexSP (Wang et al.,      dependent scaling and scheduling. We observe that core
+2025b), which formulates workload-heterogeneity-aware          attention is stateless and composable at token granularity,
+parallelism as a per-batch ILP optimization and serves as a    enabling efficient disaggregation with minimal communica-
+strong baseline.                                               tion overhead. We implement core attention disaggregation
+                                                               in DistCA. DistCA features a workload-aware scheduler
+Model disaggregation. Disaggregation, most commonly
+                                                               to balance computation while minimizing communication,
+prefill-decode disaggregation, has been widely adopted in
+                                                               and a ping-pong execution scheme to hide communication
+LLM inference (Zhong et al., 2024; Patel et al., 2024; Hu
+                                                               latency. End-to-end evaluation shows that DistCA improves
+et al., 2025; Qin et al., 2025). The most closely related
+                                                               throughput by up to 1.92x speedup over Megatron, and
+efforts MegaScale-Infer (Zhu et al., 2025) and concurrent
+                                                               1.35x speedup over existing state-of-the-art training systems
+work (Wang et al., 2025a) further disaggregate attention and
+                                                               with load balancing, with increasing advantages at larger
+FFN onto separate physical devices in inference. These
+                                                               scales.
+work primarily targets mixture-of-expert (MoE) models
+as the per-layer transfer caused by disaggregation can be
+merged with the token routing communication inherent to        R EFERENCES
+MoE, thereby avoiding additional latency; for dense models,    Chen, C., Chen, T., Duan, J., Zhu, Q., Wang, Z., Hu, Q., Sun,
+they would incurs extra overhead. In contrast, our work          P., Li, X., Yang, C., and Hoefler, T. Zeppelin: Balancing
+focuses on language model training, which is throughput-         variable-length workloads in data parallel large model
+oriented, and demonstrates benefits independent of model         training. arXiv preprint arXiv:2509.21841, 2025.
+architectures.
+                                                               Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Ré, C. Flashat-
+8   L IMITATIONS                                                 tention: Fast and memory-efficient exact attention with
+                                                                 io-awareness. In Koyejo, S., Mohamed, S., Agarwal, A.,
+DistCA implements in-place attention servers to maintain         Belgrave, D., Cho, K., and Oh, A. (eds.), Advances in
+memory utilization (§4.1). If memory demand is satisfied,        Neural Information Processing Systems 35: Annual Con-
+dedicating more GPUs to attention (without scaling those for     ference on Neural Information Processing Systems 2022,
+others) could further reduce compute time while preserving       NeurIPS 2022, New Orleans, LA, USA, November 28 -
+load balance and low communication overhead. We also             December 9, 2022, 2022.
+believe that DistCA could enable better fault tolerance and
+performance isolation, which we leave to future work.          Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A.,
+Our scheduler restricts each CA-task to a Q shard with the       Letman, A., Mathur, A., Schelten, A., Yang, A., Fan, A.,
+full K, V context. Allowing a CA-task to use a Q shard           Goyal, A., Hartshorn, A., Yang, A., Mitra, A., Sravanku-
+with only a sub-range of its K, V context would add flex-        mar, A., Korenev, A., Hinsvark, A., Rao, A., Zhang, A.,
+ibility. In addition, when estimating communication, the         Rodriguez, A., Gregerson, A., Spataru, A., Rozière, B.,
+current model pessimistically assumes all tokens are trans-      Biron, B., Tang, B., Chern, B., Caucheteux, C., Nayak, C.,
+                                                                 Bi, C., Marra, C., McConnell, C., Keller, C., Touret, C.,
+                      Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+  Wu, C., Wong, C., Ferrer, C. C., Nikolaidis, C., Allonsius,      Jacobs, S. A., Tanaka, M., Zhang, C., Zhang, M., Song,
+  D., Song, D., Pintz, D., Livshits, D., Esiobu, D., Choud-          S. L., Rajbhandari, S., and He, Y. Deepspeed ulysses: Sys-
+  hary, D., Mahajan, D., Garcia-Olano, D., Perino, D., Hup-          tem optimizations for enabling training of extreme long
+  kes, D., Lakomkin, E., AlBadawy, E., Lobanova, E., Di-             sequence transformer models. CoRR, abs/2309.14509,
+  nan, E., Smith, E. M., Radenovic, F., Zhang, F., Synnaeve,         2023. doi: 10.48550/ARXIV.2309.14509. URL https:
+  G., Lee, G., Anderson, G. L., Nail, G., Mialon, G., Pang,          //doi.org/10.48550/arXiv.2309.14509.
+  G., Cucurell, G., Nguyen, H., Korevaar, H., Xu, H., Tou-
+  vron, H., Zarov, I., Ibarra, I. A., Kloumann, I. M., Misra,      Lei, Y., Lee, D., Zhao, L., Kurniawan, D., Kim, C., Jeong,
+  I., Evtimov, I., Copet, J., Lee, J., Geffert, J., Vranes, J.,      H., Kim, C., Choi, H., Yu, L., Krishnamurthy, A., Sherry,
+  Park, J., Mahadeokar, J., Shah, J., van der Linde, J., Bil-        J., and Nurvitadhi, E. FLASH: fast all-to-all com-
+  lock, J., Hong, J., Lee, J., Fu, J., Chi, J., Huang, J., Liu,      munication in GPU clusters. CoRR, abs/2505.09764,
+  J., Wang, J., Yu, J., Bitton, J., Spisak, J., Park, J., Rocca,     2025. doi: 10.48550/ARXIV.2505.09764. URL https:
+  J., Johnstun, J., Saxe, J., Jia, J., Alwala, K. V., Upasani,       //doi.org/10.48550/arXiv.2505.09764.
+  K., Plawiak, K., Li, K., Heafield, K., Stone, K., and et al.     Li, M., Andersen, D. G., Smola, A., and Yu, K. Com-
+  The llama 3 herd of models. CoRR, abs/2407.21783,                  munication efficient distributed machine learning with
+  2024. doi: 10.48550/ARXIV.2407.21783. URL https:                   the parameter server. Advances in neural information
+  //doi.org/10.48550/arXiv.2407.21783.                               processing systems, 27, 2014.
+Fu, Y., Panda, R., Niu, X., Yue, X., Hajishirzi, H., Kim,
+                                                                   Lin, J., Jiang, Z., Song, Z., Zhao, S., Yu, M., Wang, Z.,
+  Y., and Peng, H. Data engineering for scaling language
+                                                                     Wang, C., Shi, Z., Shi, X., Jia, W., Liu, Z., Wang,
+  models to 128k context. In Proceedings of the 41st In-
+                                                                     S., Lin, H., Liu, X., Panda, A., and Li, J. Under-
+  ternational Conference on Machine Learning, pp. 14125–
+                                                                     standing stragglers in large model training using what-
+  14134, 2024.
+                                                                     if analysis. In Zhou, L. and Zhou, Y. (eds.), 19th
+Gao, T., Wettig, A., Yen, H., and Chen, D. How to train              USENIX Symposium on Operating Systems Design and
+  long-context language models (effectively). In Che, W.,            Implementation, OSDI 2025, Boston, MA, USA, July
+  Nabende, J., Shutova, E., and Pilehvar, M. T. (eds.), Pro-         7-9, 2025, pp. 483–498. USENIX Association, 2025.
+  ceedings of the 63rd Annual Meeting of the Association             URL https://www.usenix.org/conference/
+  for Computational Linguistics (Volume 1: Long Papers),             osdi25/presentation/lin-jinkun.
+ ACL 2025, Vienna, Austria, July 27 - August 1, 2025, pp.
+                                                                   Liu, H., Zaharia, M., and Abbeel, P. Ringattention
+  7376–7399. Association for Computational Linguistics,
+                                                                     with blockwise transformers for near-infinite context.
+  2025. URL https://aclanthology.org/2025.
+                                                                     In The Twelfth International Conference on Learning
+  acl-long.366/.
+                                                                     Representations, ICLR 2024, Vienna, Austria, May 7-
+Ge, H., Feng, J., Huang, Q., Fu, F., Nie, X., Zuo, L., Lin, H.,      11, 2024. OpenReview.net, 2024a. URL https://
+  Cui, B., and Liu, X. Bytescale: Communication-efficient            openreview.net/forum?id=WsRHpHH4s0.
+  scaling of llm training with a 2048k context length on
+ 16384 gpus. In Proceedings of the ACM SIGCOMM 2025                Liu, T., Xu, C., and McAuley, J. Repobench: Benchmarking
+  Conference, pp. 963–978, 2025.                                     repository-level code auto-completion systems. In The
+                                                                     Twelfth International Conference on Learning Represen-
+Guo, D., Yang, D., Zhang, H., Song, J., Zhang, R., Xu, R.,           tations, 2024b.
+  Zhu, Q., Ma, S., Wang, P., Bi, X., et al. Deepseek-r1: In-
+  centivizing reasoning capability in llms via reinforcement       NVIDIA Corporation. NVSHMEM: GPU-Centric Open-
+  learning. arXiv preprint arXiv:2501.12948, 2025.                  SHMEM. https://developer.nvidia.com/
+                                                                    nvshmem, 2025. Accessed: 2025-09-30.
+Hu, C., Huang, H., Xu, L., Chen, X., Wang, C., Xu, J., Chen,
+  S., Feng, H., Wang, S., Bao, Y., Sun, N., and Shan, Y.           Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, I.,
+  Shuffleinfer: Disaggregate llm inference for mixed down-           Maleki, S., and Bianchini, R. Splitwise: Efficient gen-
+  stream workloads. ACM Trans. Archit. Code Optim., 22               erative llm inference using phase splitting. In 2024
+  (2), July 2025. ISSN 1544-3566. doi: 10.1145/3732941.              ACM/IEEE 51st Annual International Symposium on
+  URL https://doi.org/10.1145/3732941.                               Computer Architecture (ISCA), pp. 118–132, 2024. doi:
+                                                                     10.1109/ISCA59077.2024.00019.
+Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, D., Chen,
+  M., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., et al. Gpipe:         Qin, R., Li, Z., He, W., Cui, J., Ren, F., Zhang, M., Wu, Y.,
+  Efficient training of giant neural networks using pipeline         Zheng, W., and Xu, X. Mooncake: Trading more storage
+  parallelism. Advances in neural information processing             for less computation—a {KVCache-centric} architecture
+  systems, 32, 2019.                                                 for serving {LLM} chatbot. In 23rd USENIX Conference
+                     Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+  on File and Storage Technologies (FAST 25), pp. 155–170,       WLB-LLM: workload-balanced 4d parallelism for large
+  2025.                                                          language model training. In Zhou, L. and Zhou, Y. (eds.),
+                                                                 19th USENIX Symposium on Operating Systems Design
+Rae, J. W., Borgeaud, S., Cai, T., Millican, K., Hoffmann,       and Implementation, OSDI 2025, Boston, MA, USA, July
+  J., Song, F., Aslanides, J., Henderson, S., Ring, R.,          7-9, 2025, pp. 785–801. USENIX Association, 2025c.
+  Young, S., et al. Scaling language models: Methods,            URL https://www.usenix.org/conference/
+  analysis & insights from training gopher. arXiv preprint       osdi25/presentation/wang-zheng.
+  arXiv:2112.11446, 2021.
+                                                               Zheng, L., Li, Z., Zhang, H., Zhuang, Y., Chen, Z., Huang,
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,       Y., Wang, Y., Xu, Y., Zhuo, D., Xing, E. P., et al. Alpa:
+  J., and Catanzaro, B. Megatron-lm: Training multi-             Automating inter-and {Intra-Operator} parallelism for
+  billion parameter language models using model paral-           distributed deep learning. In 16th USENIX Symposium
+  lelism. CoRR, abs/1909.08053, 2019. URL http:                  on Operating Systems Design and Implementation (OSDI
+  //arxiv.org/abs/1909.08053.                                    22), pp. 559–578, 2022.
+Wang, B., Wang, B., Wan, C., Huang, G., Hu, H., Jia, H.,       Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu,
+ Hao, N., Li, M., Chen, N., Chen, S., Yuan, S., Xie, W.,         X., Jin, X., and Zhang, H. DistServe: Disaggregat-
+ Song, X., Chen, X., Yang, X., Zhang, X., Yu, Y., Wang,          ing prefill and decoding for goodput-optimized large
+ Y., Zhu, Y., Jiang, Y., Zhou, Y., Lu, Y., Li, H., Hu, J.,       language model serving. In 18th USENIX Sympo-
+ Lo, K. M., Huang, A., Jiao, B., Li, B., Chen, B., Miao,         sium on Operating Systems Design and Implementa-
+ C., Lou, C., Hu, C., Xu, C., Yu, C., Yao, C., Lv, D.,           tion (OSDI 24), pp. 193–210, Santa Clara, CA, July
+ Shi, D., Sun, D., Huang, D., Hu, D., Pang, D., Liu, E.,         2024. USENIX Association. ISBN 978-1-939133-40-3.
+ Zhang, F., Wan, F., Yan, G., Zhang, H., Zhou, H., Wu,           URL https://www.usenix.org/conference/
+ H., Guo, H., Chen, H., Zhang, H., Wu, H., Zhang, H.,            osdi24/presentation/zhong-yinmin.
+ Yan, H., Lv, H., Wei, H., Zhou, H., Wang, H., Wang, H.,
+ Li, H., Zhou, H., Wang, H., Guo, H., Wang, J., Gong,          Zhu, R., Jiang, Z., Jin, C., Wu, P., Stuardo, C. A., Wang, D.,
+ J., Xie, J., Zhou, J., Sun, J., Wu, J., Zhang, J., Liu, J.,     Zhang, X., Zhou, H., Wei, H., Cheng, Y., Xiao, J., Zhang,
+ Cheng, J., Luo, J., Yan, J., Yang, J., Hou, J., Zhang,          X., Liu, L., Lin, H., Chang, L., Ye, J., Yu, X., Liu, X.,
+ J., Cao, J., Yin, J., Liu, J., Huang, J., Lin, J., Tan, K.,     Jin, X., and Liu, X. Megascale-infer: Serving mixture-
+ Li, K., An, K., Lin, K., Liu, K., Yang, L., Zhao, L.,           of-experts at scale with disaggregated expert parallelism.
+ Chen, L., Shi, L., Tan, L., Lin, L., Zhang, L., Chen,           CoRR, abs/2504.02263, 2025. doi: 10.48550/ARXIV.
+ L., Huang, L., Shi, L., Gu, L., and Chen, M. Step-3 is          2504.02263. URL https://doi.org/10.48550/
+ large yet affordable: Model-system co-design for cost-          arXiv.2504.02263.
+ effective decoding. CoRR, abs/2507.19427, 2025a. doi:
+ 10.48550/ARXIV.2507.19427. URL https://doi.
+ org/10.48550/arXiv.2507.19427.
+
+Wang, S., Wang, G., Wang, Y., Li, J., Hovy, E., and Guo,
+ C. Packing analysis: Packing is more appropriate for
+ large models or datasets in supervised fine-tuning. arXiv
+ preprint arXiv:2410.08081, 2024.
+
+Wang, Y., Wang, S., Zhu, S., Fu, F., Liu, X., Xiao, X., Li,
+ H., Li, J., Wu, F., and Cui, B. Flexsp: Accelerating large
+ language model training via flexible sequence parallelism.
+ In Eeckhout, L., Smaragdakis, G., Liang, K., Sampson,
+ A., Kim, M. A., and Rossbach, C. J. (eds.), Proceedings
+ of the 30th ACM International Conference on Architec-
+ tural Support for Programming Languages and Operating
+ Systems, Volume 2, ASPLOS 2025, Rotterdam, Nether-
+ lands, 30 March 2025 - 3 April 2025, pp. 421–436. ACM,
+ 2025b. doi: 10.1145/3676641.3715998. URL https:
+ //doi.org/10.1145/3676641.3715998.
+
+Wang, Z., Cai, A., Xie, X., Pan, Z., Guan, Y., Chu, W.,
+ Wang, J., Li, S., Huang, J., Cai, C., Hao, Y., and Ding, Y.
+                      Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+A     U PPER B OUND FOR C ORE ATTENTION                            we have:
+      S ERVER MAX PARTITION SIZE                                       s ≤ 2(tB − hq )/hkv − 1
+                                                                         = 2(2.796 · 10−6 s · 50GB/s − 16KB)/4KB − 1
+               Table 3. Llama-34B configuration                          ≈ 31
+  hidden (h)    key-value hidden (hkv )      intermeidate (i)
+     8192               2048                      22016            The computation time for context-independent layers, t,
+                                                                   scales quadratically with the hidden size hq . Therefore, for
+                                                                   larger models, this upper bound on s even increases.
+Let a document of length l be divided into s shards. We
+denote the hidden size of query and key-value tensor as hq
+and hkv . The query states for the entire document must be         B    C OMMUNICATION OVERHEAD FUNCTION
+distributed, resulting in a total communication volume of          This section discusses the formulation of communication
+l · hq . Besides, the first key-value shard serves as context of   cost function v(·).
+all query shards (0 to s − 1), the second serves the context
+of query shards 1 to s − 1... Assuming the document is             For a shard of nq query tokens and nkv key-value tokens,
+evenly sharded, the total communication volume for key-            there is:
+value states is: hkv · (l/s · s + l/s · (s − 1) + . . . ) =        v(∆Fmax , Lq , Lkv , sizeq , sizekv ) = min Comm(nq , nkv )
+(s + 1)lhkv /2.                                                                                             nq ,nkv
+
+Let the network bandwidth be B, and the time to com-                                           0 < nq ≤ Lq
+pute a token’s Context-Independent layer be t, When com-                      nq + Lkv − Lq ≤ nkv ≤ Lkv
+munication is fully overlapped with computation, there                               nq (2nkv − nq )   ∆Fmax
+should be t · l ≥ l · (hq + hkv (s + 1)/2)/B. Rearrang-                                              =
+                                                                                     Lq (2Lkv − Lq )    FItem
+ing the terms gives an upper bound on the number of shards:
+                                                                                     Comm(nq , nkv ) = nq · sizeq + nkv · sizekv
+s ≤ 2(tB − hq )/hkv − 1.
+We use Llama-34B as the example to analyze the theoreti-           Let α = ∆F           sizekv
+                                                                            FItem , β = sizeq , there is:
+                                                                              max
+
+
+cal max number of partition. Its configuration is listed in
+                                                                                                  1    αβLq (2Lkv − Lq )
+Table 3. We assume the InfiniBand bandwidth is 50GB/s,             Comm(nq , nkv ) = sizeq (nq (1+ β)+                   )
+and the MFU for Context Independent layer is 50% of the                                           2           2nq
+H200 node (990TFLOPs for FP16).                                                                                      opt
+                                                                   p a result, selecting a shard of nq
+                                                                   As                                                     =
+The total flops to compute a token’s Context Independent               αβLq (2Lkv − Lq )/(β + 2) results in the minimal com-
+                                                                                                p
+layer is:                                                          munication: v(·) = sizeq · αβ(β + 2)Lq (2Lkv − Lq ).
+                                                                   However, if there is noptq    > Lq or the correspond-
+ 2 · (h · h · 2 + h · hkv + h · i · 3) = 2h(2h + hkv + 3i)         ing nopt
+                                                                         kv   <   n q +  Lkv   −  Lq , there is the optimal
+                                                                   configuration  corresponds    to   the upper bound of
+                                      = 1320 · 220 flops                       p
+                                                                   nmax
+                                                                     q    =      (L q − Lkv )2 + αL (2L
+                                                                                                     q    kv − Lq ), and the
+                                                                   minimal communication is the corresponding value.
+Here the first factor 2 is because each pair of elements in        In practice, we notice that different shards have a diverged
+matrix multiplication has an add operation and a multipli-         MFU. As a result, estimating the Item (or the sub-Item)’s
+cation operation. The Query and Output tensors each has            time directly by flops is not precise. However, our profiling
+a mapping from a vector of hidden size to another also of          result also shows that, if we still follow the practice of the
+hidden size; the Key and Value tensors each has a mapping          head-tail context parallel, i.e. an Item has both the first i to
+from hidden size to key-value hidden size; the Feed-Forward        j tokens and the last i to j tokens, the estimation by flops
+Layer applies a Gated 2-layer MLP, so it has 3 mapping from        is still accurate. As a result, we keep using the head-tail
+hidden size to FFN intermediate size, or reversely from FFN        context parallel and leave a more precise modeling as a
+intermediate size to hidden size.                                  future work. In this way, we redefine nkv as the key-value
+As a result, the time to compute these layers are:                 tokens for the “head” half shard, and the communication
+                                                                   cost is modified as:
+
+t = 1320 · 220 flops/(50% · 990 TFLOPs) ≈ 2.796 · 10−6 s           Comm(nq , nkv ) = nq · sizeq + (Ldoc − (nkv − nq )) · sizekv
+                                                     (1)
+                                                                   This is because that the first i to j tokens need the first j
+Taking this into the formulation s ≤ 2(tB − hq )/hkv − 1,          token’s KV states, while the last i to j tokens need the Ldoc −i
+                      Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+token’s KV states. By definition, there is i + nq = j = nkv .
+Hence, the communication equals:
+                                                        
+              1                       αβLq (2Lkv − Lq )
+ Ldoc sizekv + sizeq nq (2 + β) −
+              2                                 nq
+
+As a result, the optimal nq corresponds to the minimal
+possible value. Based on other constraints, there is
+                 q
+  nmin
+   q    =L  kv −   L2kv − α(2Lkv − Lq )Lq
+    v(·) =Ldoc sizekv +
+                                                   
+          1                       αβLq (2Lkv − Lq )
+            sizeq nmin
+                     q  (2 + β) −
+          2                             nmin
+                                         q
+
+
+C    E XPERIMENT S ETUP
+
+             Table 4. 3D Training Configurations.
+    Model        MaxDocLen Batch Size #GPU
+    Llama-8B         128K       8, 16, 32     64, 128, 256
+    Llama-8B         256K       4, 8, 16      64, 128, 256
+    Llama-8B         512K       2, 4, 8       64, 128, 256
+    Llama-34B        128K       4, 8, 16      64, 128, 256
+    Llama-34B        256K       2, 4, 8       64, 128, 256
+    Llama-34B        512K       2, 4, 8       64, 128, 256
+
+
+
+
+         Table 5. 4D Parallel Training Configurations.
+    Model       MaxDocLen Batch Size #GPU
+    Llama-8B        128K        32, 64, 128   64, 128, 256
+    Llama-8B        256K        16, 32, 32    64, 128, 256
+    Llama-8B        512K        8, 8, 16      64, 128, 256
+    Llama-34B       128K        32, 64, 128   128, 256, 512
+    Llama-34B       256K        16, 32, 32    128, 256, 512
+    Llama-34B       384K        8, 8, 16      128, 256, 512
+
+
+
+D    E XPERIMENT R ESULT WITH A BSOLUTE
+     T HROUGHPUT
+In § 6, Figure 9 and Figure 10 shows the relative perfor-
+mance of DistCA compared to baselines.
+This section presents the absolute aggregate throughput (Fig-
+ure 13) and per-GPU throughput (Figure 14) in k-tokens per
+second under the same setup described in § C.
+
+E    S YSTEM OVERHEADS OF C ORE
+     ATTENTION D ISAGGREGATION
+QKV splitting and merging overhead. Disaggregating
+core attention requires splitting QKV tensors before dis-
+patching CA tasks and merging output tensors afterward.
+
+                                                                Figure 13. Aggregate absolute throughput (k-tokens/s) across dif-
+                                                                ferent datasets, model sizes and 3D/4D paralleism.
+                       Efficient Long-context Language Model Training by Core Attention Disaggregation
+
+
+                                                                     Table 6. Overhead of QKV tensor splitting and output merging,
+                                                                     measured as percentage of iteration time.
+                                                                      Model #Nodes SeqLen QKV(%) O(%) Total(%)
+                                                                        8B          8      128K          1.61    0.54      2.15
+                                                                        8B         16      128K          0.57    0.30      0.87
+                                                                        8B         32      128K          0.43    0.28      0.71
+                                                                       34B         16      128K          0.69    0.32      1.00
+                                                                       34B         32      128K          0.37    0.18      0.55
+                                                                       34B         64      128K          0.28    0.14      0.42
+
+
+                                                                     Table 6 quantifies this overhead. The cost ranges from 0.42%
+                                                                     to 2.15% of iteration time, and decreases as the cluster scales
+                                                                     up (more computation to amortize the fixed overhead). This
+                                                                     confirms that the tensor manipulation cost of disaggregation
+                                                                     is negligible.
+
+
+                                                                     Table 7. Theoretical network bandwidth required to fully overlap
+                                                                     CAD communication with computation (512K context). All values
+                                                                     are well below the InfiniBand bandwidth available per GPU (50
+                                                                     GB/s).
+                                                                          Model BS #Nodes Tol. Factor BW (GB/s)
+                                                                             8B      2         8       0.15            41.3
+                                                                             8B      4        16       0.05            40.3
+                                                                             8B      8        32       0.05            39.7
+                                                                            34B      2         8       0.10            33.8
+                                                                            34B      4        16       0.05            33.3
+                                                                            34B      8        32       0.05            32.7
+
+                                                                     Communication bandwidth analysis. Table 7 reports the
+                                                                     theoretical minimum bandwidth to fully hide CAD com-
+                                                                     munication via ping-pong overlap, computed as the ratio
+                                                                     of maximum data transfer size to the minimum available
+                                                                     computation time. Two observations stand out. First, as
+                                                                     model size scales up, the non-CA computation time grows
+                                                                     quadratically with hidden size while the QKV transfer size
+                                                                     grows only linearly, relaxing the bandwidth requirement
+                                                                     (41.3 GB/s for 8B vs. 33.8 GB/s for 34B). Second, under
+                                                                     weak scaling, the required bandwidth slightly decreases due
+                                                                     to improved kernel efficiency and lower imbalance. All
+                                                                     values are well below the per-GPU InfiniBand bandwidth
+                                                                     (50 GB/s) available in our cluster, consistent with the near-
+                                                                     perfect overlap observed in Figure 11.
+                                                                     Scheduler overhead. The scheduler’s complexity is
+                                                                     O(N K), where N is the number of documents and K is
+                                                                     the number of devices. In our experiments (TP=8), scaling
+                                                                     from 64 to 256 GPUs incurs 50–300 ms of scheduling time
+                                                                     depending on batch composition. Importantly, the sched-
+                                                                     uler runs entirely off the critical path: it requires only the
+                                                                     document lengths of the next batch, which the dataloader
+                                                                     prefetches while GPUs execute the current training step.
+                                                                     Since training iteration times are on the order of seconds or
+                                                                     longer, the millisecond-level scheduling overhead is fully
+                                                                     overlapped.
+
+
+Figure 14. Per-GPU absolute throughput (k-tokens/s) across differ-
+ent datasets, model sizes and 3D/4D paralleism.
+

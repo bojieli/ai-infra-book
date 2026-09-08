@@ -1,0 +1,908 @@
+     FP8-F LOW-M O E: A C ASTING -F REE FP8 R ECIPE WITHOUT D OUBLE
+                          Q UANTIZATION E RROR
+
+
+                        Fengjuan Wang 1 Zhiyi Su 1 Xingzhu Hu 1 Cheng Wang 1 Mou Sun 1
+
+
+                                                    A BSTRACT
+     Training large Mixture-of-Experts (MoE) models remains computationally prohibitive due to their extreme
+     compute and memory demands. Although low-precision training promises to accelerate computation and reduce
+     memory footprint, existing implementations still rely on BF16-dominated dataflows with frequent quantize-
+     dequantize (Q/DQ) conversions. These redundant casts erode much of FP8’s theoretical efficiency. However,
+     naively removing these casts by keeping dataflows entirely in FP8 introduces double quantization error: tensors
+     quantized along different dimensions accumulate inconsistent scaling factors, degrading numerical stability.
+     We propose FP8-Flow-MoE, an FP8 training recipe featuring a quantization-consistent FP8-centric dataflow
+     with a scaling-aware transpose and fused FP8 operators that streamline computation and eliminate explicit cast
+     operations from 12 to 2. Evaluations on a 671B-parameter MoE model demonstrate up to 21% higher throughput
+     and 16.5 GB lower memory usage per GPU compared to BF16 and naı̈ve FP8 baselines, while maintaining stable
+     convergence. We provide a plug-and-play FP8 recipe compatible with TransformerEngine and Megatron-LM,
+     with the reference implementation available at our GitHub repository.
+
+1    I NTRODUCTION                                               Low-precision computation has emerged as a promis-
+                                                                 ing direction to address this challenge. Compared to
+The development of large language models (LLMs) has              the mainstream BF16-based Automatic Mixed Precision
+witnessed remarkable progress in recent years, with model        (AMP) scheme, adopting the FP8 format can theoret-
+scales growing to hundreds of billions and even trillions of     ically double computation throughput and halve com-
+parameters (Brown et al., 2020; Zhang et al., 2022; Meta         munication latency (Micikevicius et al., 2022). Since
+AI Team, 2023). These massive models have demonstrated           the introduction of NVIDIA’s Hopper architecture with
+unprecedented capabilities across natural language under-        native FP8 Tensor Core support (NVIDIA Corpora-
+standing, reasoning, and knowledge-intensive tasks (Ope-         tion, 2022), FP8 training has drawn increasing attention.
+nAI, 2023; Bubeck et al., 2023). However, training such          DeepSeek first demonstrated the feasibility of FP8 preci-
+large-scale models poses significant computational chal-         sion at massive scale in its V3 Mixture-of-Experts (MoE)
+lenges, and the enormous cost has become a de facto barrier      model (DeepSeek-AI Team, 2024), and subsequently open-
+for many research institutions and even large industrial labs.   sourced DeepGEMM (DeepSeek-AI Team, 2025b) and
+To mitigate this, the Mixture-of-Experts (MoE) architec-         DeepEP (DeepSeek-AI Team, 2025a)—two critical kernels
+ture (Lepikhin et al., 2021; Fedus et al., 2022; Rajbhan-        for FP8 MoE efficiency—enabling high-throughput grouped
+dari et al., 2022) has been introduced to increase model         GEMM computation and low-latency cross-node all-to-all
+capacity without proportionally increasing computation, ac-      communication.
+tivating only a subset of experts per token. While MoE           Despite these advances, a complete training recipe designed
+significantly reduces the overall training cost compared to      around an FP8 dataflow has been missing. Naively replac-
+dense transformers, its large communication footprint and        ing BF16 kernels with their FP8 counterparts introduces
+memory demand still make training at scale highly expen-         excessive casting overheads—each GEMM boundary typ-
+sive—motivating the exploration of low-precision formats         ically involves multiple quantize–dequantize (Q/DQ) con-
+such as FP8 to further improve efficiency.                       versions (DeepSeek-AI Team, 2024; NVIDIA Corporation,
+   1
+     Zhejiang Lab, Hangzhou, China. Correspondence to: Mou       2023; Zhao et al., 2025). As a result, the realized throughput
+Sun <123sssmmm@gmail.com>.                                       of current FP8 systems often falls short of their theoretical
+                                                                 potential, sometimes even lagging behind optimized BF16
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,     baselines. Moreover, without a properly designed recipe
+2026. Copyright 2026 by the author(s).
+                                                                 and careful memory management, FP8 kernels may incur
+                        FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+extra activation copies, undermining the expected memory            of-Experts models. Section 3 details how the scaling-aware
+savings.                                                            transpose operator eliminates double-quantization error and
+                                                                    enables a casting-free FP8 dataflow, supported by a suite
+However, simply removing these casts is not a viable solu-
+                                                                    of high-performance FP8 kernels integrated into FP8-Flow-
+tion. A straightforward strategy is to keep operator inputs
+                                                                    MoE. Section 4 compares FP8-Flow-MoE, BF16, and naı̈ve
+and outputs directly in FP8—bypassing BF16 storage and
+                                                                    FP8 on a 671B DeepSeek-V3 model for compute, memory,
+boundary casting—to avoid Q/DQ overhead. While this
+                                                                    and communication efficiency, and validates convergence
+approach reduces conversions, it introduces double quanti-
+                                                                    on a 16B DeepSeek-V2-lite model trained with 200B to-
+zation error: tensors quantized along different dimensions
+                                                                    kens. Finally, Section 5 concludes the paper and discusses
+(e.g., row-wise before GEMM and column-wise afterward)
+                                                                    potential directions for extending FP8-Flow-MoE to other
+accumulate inconsistent scaling factors, leading to direc-
+                                                                    low-precision formats and representations.
+tional precision loss and potential instability (Dettmers et al.,
+2022).
+                                                                    2    R ELATED W ORK
+To address these challenges, we propose FP8-Flow-MoE,
+a systematic and practical FP8 training recipe centered on          Low-precision computation has become a key enabler for
+an end-to-end FP8 dataflow. Our key contributions are               efficient large-scale model training. Early FP16 and BF16
+summarized as follows:                                              mixed-precision schemes significantly reduced training cost
+                                                                    while maintaining convergence (Micikevicius et al., 2018;
+  1. Avoidance of double quantization error in FP8                  Wang et al., 2018). Recently, the FP8 format has gained
+     dataflows. We eliminate quantization inconsistency             attention for its ability to double arithmetic throughput on
+     by introducing a scaling-aware transpose operator              modern accelerators (NVIDIA Corporation, 2022; Micikevi-
+     that directly converts FP8 tensors between row- and            cius et al., 2022; DeepSeek-AI Team, 2024). FP8 generally
+     column-wise layouts while preserving scaling con-              follows IEEE 754 conventions but defines multiple variants,
+     sistency. This design removes the need for dequan-             most notably E4M3 and E5M2, which balance precision
+     tize–requantize cycles across operators, effectively           and dynamic range differently (Wang et al., 2018). E4M3
+     avoiding double quantization error in FP8 dataflows.           offers finer precision, while E5M2 provides a wider numeric
+                                                                    range. Another variant, UE8M0, encodes powers of two and
+  2. Casting-free FP8 recipe with a native FP8 kernel               is typically used for scaling factors rather than activations.
+     suite. We present the FP8-Flow-MoE recipe, where
+     the entire MoE stage operates in FP8 with no ex-               Converting higher-precision tensors (e.g., FP32 or BF16)
+     plicit casting except at the entry point. Compared to          into FP8 requires quantization. The scaling strategy defines
+     a drop-in kernel replacement approach, the number              the quantization recipe and directly impacts stability and
+     of cast operations is reduced from 12 to 2, marking            accuracy. Early works relied on per-tensor scaling (Micike-
+     a paradigm shift from BF16-centric to FP8-centric              vicius et al., 2018), which often underutilizes FP8’s range
+     computation. We further provide a suite of native              when tensor values span several magnitudes. Later studies
+     FP8 operators that make the recipe feasible and ef-            proposed finer-grained scaling, such as per-block or per-
+     ficient in practice. Several of these kernels have al-         channel quantization (Peng et al., 2023), which preserve
+     ready been merged into upstream repositories (e.g.,            accuracy for small-magnitude values while maintaining ef-
+     NVIDIA/TransformerEngine (NVIDIA Corporation,                  ficiency. These techniques have become standard in recent
+     2023)), while others will be released as part of our           FP8 training systems.
+     open-source implementation.                                    The adoption of FP8 was accelerated by both hardware and
+  3. Comprehensive analysis of FP8 training at system               software advances. NVIDIA’s Hopper architecture intro-
+     scale. We conduct an in-depth study comparing FP8              duced native FP8 Tensor Core support (NVIDIA Corpora-
+     and BF16 across MoE components, analyzing both                 tion, 2022), while TransformerEngine provided open-source
+     kernel-level and quantization-related effects. FP8-            operator-level support for FP8 quantization (NVIDIA Cor-
+     Flow-MoE achieves up to 21% throughput improve-                poration, 2023). Early large-scale studies, including sim-
+     ment and 8 GB memory reduction per GPU compared                ulated FP8 GPT-3 training (Micikevicius et al., 2022) and
+     to the BF16 baseline, while naive FP8 kernel replace-          Inflection-2 (Inflection AI, 2023), demonstrated that FP8
+     ment yields only a 3% gain with negligible or even             can maintain convergence comparable to BF16. DeepSeek-
+     negative memory savings.                                       V3 (DeepSeek-AI Team, 2024) further validated FP8 train-
+                                                                    ing at trillion-parameter scale and released two key li-
+The remainder of this paper is organized as follows. Sec-           braries—DeepGEMM (DeepSeek-AI Team, 2025b) for
+tion 2 reviews related work on low-precision training tech-         grouped-GEMM and DeepEP (DeepSeek-AI Team, 2025a)
+niques for LLMs and the architectural design of Mixture-            for cross-node communication—establishing a strong FP8
+                       FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+baseline for Mixture-of-Experts (MoE) models.                    achieving higher arithmetic throughput compared to BF16,
+                                                                 but leaves all EP communication and data movement stages
+However, these implementations still follow BF16 dom-
+                                                                 in higher precision formats. As a result, while the GEMM
+inated dataflows, requiring frequent Q/DQ conversions
+                                                                 kernels benefit from FP8 tensor cores, the overall MoE layer
+across GEMM boundaries (Zhao et al., 2025). Such redun-
+                                                                 performance improvement is largely limited to GEMM and
+dant casting limits realized FP8 performance and increases
+                                                                 remains bounded by high-precision communication, data
+memory traffic. Conversely, removing these casts introduces
+                                                                 movement, and the conversion overhead around grouped
+double quantization error, as tensors quantized along dif-
+                                                                 linear modules.
+ferent dimensions (row-wise vs. column-wise) accumulate
+inconsistent scaling factors (Dettmers et al., 2022). This       Another representative implementation is the DeepSeek-
+trade-off between computational efficiency and numerical         V3 training system (Figure 1(c)), which demonstrated suc-
+stability remains a major challenge in current FP8 systems.      cessful large-scale FP8 MoE training with state-of-the-
+                                                                 art performance. Although the complete training frame-
+The rapid scaling of large language models (LLMs) (Brown
+                                                                 work was not fully open-sourced, the available descriptions
+et al., 2020; Meta AI Team, 2023) has pushed training in-
+                                                                 and accompanying releases—specifically DeepGEMM and
+frastructure to its limits. Parallelization strategies such as
+                                                                 DeepEP—suggest that both expert computation and inter-
+tensor, pipeline, and data parallelism (Rajbhandari et al.,
+                                                                 expert communication are accelerated via customized, high-
+2022), together with the Mixture-of-Experts (MoE) archi-
+                                                                 performance FP8 kernels. However, the overall dataflow
+tecture (Lepikhin et al., 2021; Fedus et al., 2022), have
+                                                                 still incurs substantial (de)quantization overhead. In partic-
+become essential for trillion-parameter training. MoE re-
+                                                                 ular, DeepEP extends FP8 beyond expert GEMMs to token
+duces active computation by routing each token to a small
+                                                                 dispatch, but introduces 2 additional (de)quantization con-
+subset of experts, achieving high model capacity without
+                                                                 versions around dispatch and another 2 on the backward
+proportional cost. However, the sparse and irregular compu-
+                                                                 combine path, resulting in a total of 12 (de)quantization con-
+tation pattern introduces new bottlenecks: all-to-all expert
+                                                                 versions per MoE layer. Moreover, in the Wgrad stage, FP8
+communication, activation padding, and dynamic routing
+                                                                 activations are typically quantized row-wise, dequantized,
+overheads (Rajbhandari et al., 2022; DeepSeek-AI Team,
+                                                                 and then re-quantized in a column-wise manner. Since these
+2024). Integrating FP8 precision into such workflows is
+                                                                 per-token quantization schemes apply scaling along a par-
+particularly challenging, as each communication or expert
+                                                                 ticular direction, the repeated (de)quantization can amplify
+boundary typically requires additional quantization and data
+                                                                 rounding and scaling errors (“double quantization error”),
+reformatting. These factors fragment computation into many
+                                                                 negatively affecting numerical stability and convergence.
+small kernels and diminish arithmetic intensity, preventing
+FP8’s theoretical benefits from being fully realized in end-     These challenges motivate FP8-Flow-MoE: a quantization-
+to-end MoE training.                                             consistent, casting-free FP8 dataflow that eliminates redun-
+                                                                 dant (de)quantization operations and maintains numerical
+                                                                 stability throughout the MoE pipeline.
+Motivation Within each MoE layer, a router assigns to-
+kens to a subset of experts. From a dataflow perspective,
+one MoE layer consists of routing, (EP) dispatch, token
+                                                                 3     M ETHOD
+reordering (permute/unpermute), expert computation (two          There have been extensive studies on applying FP8 quan-
+grouped linear projections with an activation in between),       tization in transformer-based model training, particularly,
+and final combination. Figure 1(a) illustrates this BF16         dense models such as BERT, GPT, etc., achieving signifi-
+baseline, where communication and data reordering sit on         cant performance gain with negligible accuracy loss. This
+the critical path around the expert GEMMs.                       contribution focuses on another archetype of models, MoE
+When extending this flow to FP8 computation, existing            models, which have emerged as one of the most performant
+frameworks primarily adopt conservative integration strate-      LLM architectures due to their high capability and reduced
+gies. For instance, NVIDIA’s Transformer Engine imple-           resource requirements for inference, i.e. only small parts of
+ments a blockwise FP8 recipe (Figure 1(b)), where FP8 is         all experts are activated.
+applied only to GEMM kernels and quantization conversions
+confined strictly within the grouped linear modules. As a        3.1   Scaling-aware transpose
+consequence, each MoE block still incurs frequent quantiza-      One of the key challenges in fully adopting FP8 precision
+tion conversions around the two grouped linear layers: per       in the MoE module is the two different quantization lay-
+layer, Fprop and Dgrad each introduce 1 row-wise quanti-         outs required by the grouped linear operations. Specifically,
+zation, and Wgrad introduces 2 column-wise quantizations,        the activations (and their gradients) are consumed in a row-
+resulting in 4 conversions per grouped linear and 8 in to-       wise quantized format (referred to as Fprop and Dgrad in
+tal.This design allows FP8 acceleration in grouped GEMMs,
+FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+
+
+
+                            (a) BF16 baseline.
+
+
+
+
+                (b) TransformerEngine blockwise recipe.
+
+
+
+
+              (c) according to DeepSeek V3 technical report.
+
+
+
+
+                           (d) FP8-Flow-MoE.
+
+
+
+          Figure 1: The computational graph of an MoE module
+                       FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+Figure 1), while the weight-gradient computation requires         where we assumed a deterministic rounding algorithm, e.g.
+column-wise quantized inputs (Wgrad). However, the pre-           round to nearest (RtN), is used and rounding the same num-
+ceding all-to-all communication (dispatch) typically trans-       ber twice does not change its value.
+mits only one format, usually the row-wise quantized data,
+                                                                  However, in case that the second quantization is performed
+to leverage the reduced-communication advance brought by
+                                                                  column-wise, its scaling factor will be calculated from the
+using a low-precision format.
+                                                                  128-element tile after transpose, marked as s′ , which is
+As a consequence, when the grouped linear layer subse-            generally not the same as s. We have
+quently needs column-wise quantized data, a naive imple-
+mentation must first dequantize → transpose → requantize,                                                 round(xi /s) · s
+                                                                      Qcol (D(Qrow (xi ))) = round(                        )    (9)
+introducing two rounds of (de)quantization. This process                                                        s′
+leads to what we call the double quantization error, whose
+                                                                  where the two rounding operators cannot be combined be-
+root cause is that 1D per-token quantization uses scaling
+                                                                  cause they are applying to two different values. However,
+factors computed over contiguous segments (e.g., 128 ele-
+                                                                  this error amplification can be mitigated if the scaling factor
+ments per scale), and the scales differ across the two layouts.
+                                                                  is constrained to powers of two, in which case, rescaling
+Since FP8 quantization maps scaled values onto a discrete
+                                                                  between two quantization domains (row-wise and column-
+representable grid determined by the exponent and man-
+                                                                  wise) involves only adjusting exponent bits, provided that
+tissa bits, performing two independent quantizations with
+                                                                  no overflow or underflow occurs. Formally, let us assume
+different scaling factors effectively remaps values twice to                         ′
+                                                                  s = 2T , s′ = 2T , where T ∈ N, T ′ ∈ N. At row-wise
+non-overlapping discrete sets. Formally, the double quanti-
+                                                                  quantization, the value of an element is discretized to
+zation error is defined by
+              E = Qcol (D(Qrow (X))) − X                   (1)        Qrow (x) = (−1)SN · 2E−7 · (1 + M/8) · 2T                (10)
+where Qrow (·), Qcol (·) are the row-wise and column-wise         where SN , E and M are the sign bit, exponent bits and
+quantization operator and D(·) is the de-quantization op-         matissa bits of the its FP8 coding respectively, 7 and 8 are
+erator. Both row-wise and column-wise quantization are            constants derived from FP8 E4M3 definition. While apply-
+performed in a per-tile fashion, with 128 continuous ele-         ing column-wise quantization, the same value is discretized
+ments in each tile. In other words, the scaling factor is         to a different representation,
+calculated as
+                        max0≤i<128 ∥xi ∥                                                   ′     ′                       ′
+                   s=                                     (2)        Qcol (x) = (−1)SN · 2E −7 · (1 + M ′ /8) · 2T             (11)
+                                448
+where 448 is the maximum representable number of                  Since both T and T ′ are natural numbers, there exist another
+FP8 E4M3 format. After scaling, a quantization operator           natural number D, where D = T ′ − T . Notice that if we set
+essentially maps xi into the nearest discrete value
+                                        xi                                SN ′ = SN,       E ′ = E − D,        M ′ = M.
+                  Qrow (xi ) = round( )                   (3)
+                                        s
+A de-quantization operator scales the FP8 data back to its        , we have
+original range by multiplying the scaling factor, but the
+rounding error remains,                                             Qcol (x) = (−1)SN · 2E−D−7 · (1 + M/8) · 2D+T (12)
+                                        xi                                    = (−1)SN · 2E−D−7+D+T · (1 + M/8)                (13)
+               D(Qrow (xi )) = round( ) · s               (4)                        SN        E−7+T
+                                         s                                    = (−1)      ·2           · (1 + M/8)             (14)
+Following this representation, it is trivial that performing                  = (−1) SN
+                                                                                          ·2   E−7
+                                                                                                     · (1 + M/8) · 2 T
+                                                                                                                               (15)
+a second row-wise quantization do not introduce any extra
+error since the same 1x128 elements are again tiled for quan-                 = Qrow (x)                                       (16)
+tization, which gives same maximum value and eventually
+                                                                  Building on this insight, we further align all scaling fac-
+leaving s unchanged. A number is strictly mapped to the
+                                                                  tors within a transposed block to the largest one (to avoid
+identical discrete value, or formally,
+                                                                  overflow) and directly convert between layouts by expo-
+                                      round( xsi ) · s            nent manipulation alone. In other words, we can transform
+      Qrow (D(Qrow (xi ))) = round(                    )   (5)
+                                           s                      row-wise quantized FP8 tensors into column-wise quan-
+                                            xi                    tized ones without any dequantization or re-quantization, by
+                             = round(round( ))             (6)
+                                             s                    simply modifying the exponent bits of the FP8 encodings.
+                                      xi
+                             = round( )                    (7)    This principle underlies our Scaling-aware FP8 Transpose
+                                       s                          operator, as outlined in Algorithm 1. In our implementation,
+                             = Qrow (xi )                  (8)    we follow the Transformer Engine’s blockwise FP8 recipe
+                        FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+Algorithm 1 Scaling-aware FP8 Transpose (per block BxB)         Fusion of operators to reduce kernel fragmentation. We
+ 1:                         row
+      Input: row-wise data Xi,j , scaling factor Sirow for      apply quantization-aware and data-movement-aware fusion
+      i ∈ [i0 , i0 +B−1], j ∈ [j0 , j0 +B−1]                    along the MoE path to reduce kernel launches and interme-
+                              col
+ 2: Output: column-wise data Xj,i and scaling factor Sjcol      diate memory traffic. This includes fusing token reordering
+                                                                (permute/unpermute and padding/unpadding) into symmet-
+ 3: Smax = maxi∈[i0 ,i0 +B−1] Sirow                             ric kernels across forward/backward passes, and fusing ac-
+ 4: ∀j ∈ [j0 , j0 +B−1], Sjcol = Smax                           tivation with FP8 quantization to produce FP8 outputs on
+ 5: for each element (i, j) in the block do                     the-fly without introducing standalone quantization opera-
+ 6:   k = log2 (Smax /Sirow )                      {k ∈ N}      tors on the critical path. Details are provided in Section 3.3.1
+ 7:   if k = 0 then                                             and Section 3.3.2.
+           col       row
+ 8:      Xj,i   = Xi,j                                          Scaling-aware FP8 transpose. To meet the column-wise
+ 9:   else                                                      FP8 requirement of Wgrad FP8 GEMM while avoiding
+                    row
+10:      SN = Xi,j       & 0x80                  {sign bit}     the costly dequantize → transpose → requantize sequence,
+                  row
+11:      E = Xi,j & 0x78                   {exponent bits}      we use our previously introduced Algorithm 1 to directly
+                   row
+12:      M = Xi,j       & 0x07              {mantissa bits}     convert row-wise FP8 activations and output gradients into
+13:      Enew = E − (k ≪ 3)                                     column-wise FP8.
+14:      Enew = 0 if Enew < 0x08            {flush-to-zero}
+15:        col
+         Xj,i   = SN | Enew | M                                 Fine-grained recomputation. Because dispatch → per-
+16:   end if                                                    mute/padding → expert computation stays in FP8, we en-
+17: end for                                                     able fine-grained recomputation before the first grouped
+                                                                linear layer. This can reduce peak activation memory by up
+                                                                to ∼50% and avoids recomputing the router, compared to
+                                                                recomputation at the full moe module level.
+
+and set the quantization block size to B=128; however, the      While maintaining numerical stability, we retain BF16 at
+algorithm applies to an arbitrary block size B.                 two specific boundaries: (i) between the first grouped lin-
+                                                                ear and the activation function, and (ii) between the second
+During the scaling-aware transpose, we select the maxi-         grouped linear and the combine operation (i.e., reduction
+mum scaling factor within each block. Since scaling factors     across experts). These two exceptions correspond to funda-
+are defined as quantization divisors, this guarantees the ex-   mental numerical challenges for FP8 arithmetic. The first
+ponent adjustment only shifts FP8 exponents downward,           involves nonlinear transformations (e.g., GELU or ReLU),
+eliminating overflow risk. Underflow is possible and is a       which can amplify quantization errors due to their sensitiv-
+general property of FP8 quantization. In our case, its im-      ity to input perturbations. The second involves reduction
+pact is limited for two reasons. First, the transpose affects   operations (e.g., summations), where accumulated values
+only weight gradient computation and does not propagate to      significantly increase the required dynamic range and are
+dgrad. Second, even with E4M3, the exponent range spans         therefore more susceptible to overflow under limited expo-
+multiple orders of magnitude, so the resulting underflow is     nent precision. The same considerations apply symmetri-
+typically not large enough to dominate gradient updates.        cally to the corresponding backward computations. Since
+                                                                these two computations are adjacent in the graph, we retain
+3.2    Casting-free FP8 dataflows                               BF16 precision locally to ensure stability, while keeping all
+To fully exploit the computational advantages of FP8 while      other tensors strictly in FP8 format.
+maintaining numerical stability, we design an FP8-centric
+dataflow, referred to as FP8-Flow-MoE (Figure 1(d)), that       3.3   High-Performance FP8 Kernels
+minimizes format conversions and preserves FP8 represen-        To make the proposed FP8-centric computation flow practi-
+tations along the MoE expert path whenever possible. Con-       cal and efficient, we further develop a comprehensive set of
+cretely, FP8-Flow-MoE introduces the following design           supporting operators specifically tailored to the data depen-
+choices:                                                        dencies and numerical patterns within the MoE layer. These
+FP8 communication. We perform quantization before dis-          operators address key challenges that arise when apply-
+patch and feed row-wise FP8 tensors into grouped linear.        ing FP8 to large-scale MoE training, including cumulative
+This keeps the dispatch → permute/padding → expert com-         rounding and scaling errors, redundant data conversions,
+putation path entirely in FP8. In the TransformerEngine         and schedule inefficiencies caused by fractured kernels. To-
+implementation, we store the scale factors in a compact lay-    gether, they enable a seamless and high-throughput execu-
+out to avoid layout-induced transposes overhead. Detailed       tion of the FP8-Flow-MoE, ensuring that the benefits of
+benchmarks are provided in Section 4.4.2.                       FP8 tensor cores extend beyond isolated kernels to the full
+                       FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+end-to-end training pipeline.                                    kernels.
+                                                                 To mitigate this issue, we apply quantization-aware fusion
+3.3.1   Fused Permute and Padding
+                                                                 to surrounding compute kernels whenever possible. In par-
+In FP8 data pipeline, a padding step is introduced to satisfy    ticular, we fuse the SwiGLU activation and quantization
+the shape constraint of FP8 GEMM kernels—each expert’s           steps into a single kernel, producing FP8-quantized outputs
+input must contain a multiple of 16 entries to fully utilize     for subsequent computation without introducing standalone
+tensor cores. Before this, a permute operation reorganizes       quantization operators on the critical path. This design pre-
+dispatched tokens so that samples belonging to the same          serves the numerical efficiency of mixed precision while
+expert are contiguous in memory. Executing these two light-      removing the quantization bottleneck that previously limited
+weight data movement kernels separately incurs redundant         end-to-end performance. Operator-level micro-benchmark
+HBM accesses and kernel launches. Since both operations          results are reported in Section 4.4.3.
+are element-wise and independent, they can be naturally
+fused into a single kernel.                                      4     E XPERIMENTS
+Based on these observations, we design a Fused Per-
+                                                                 We evaluate FP8-Flow-MoE from two perspectives: numer-
+mute+Padding operator that directly performs expert-wise
+                                                                 ical convergence and training efficiency. And training effi-
+reordering and shape alignment in one pass. The fusion is
+                                                                 ciency includes end-to-end efficiency results (Section 4.2),
+implemented through a thread-block mapping scheme that
+                                                                 component-level ablations (Section 4.3), and operator-level
+dynamically computes the target offset in the padded lay-
+                                                                 micro-benchmarks (Section 4.4).
+out while streaming reordered input elements from global
+memory. Similarly, in the backward propagation phase, we         All end-to-end experiments (convergence, efficiency, and
+apply the same fusion strategy to combine unpermute and          ablations) are conducted on a 32-node NVIDIA Hopper
+unpadding operations into a single kernel. This symmetric        cluster, where each node is equipped with eight GPUs (80
+fusion ensures consistent data handling between forward          GB memory per GPU). Expert parallelism (EP) is scaled
+and backward flows. A detailed benchmark and analysis are        across nodes to assess training efficiency and scalability
+provided in Section 4.4.1.                                       under realistic large-model workloads.
+
+3.3.2   Fused SwiGLU and Quantization                            4.1   Convergence Validation
+The motivation for designing an FP8-centric training flow        To verify that FP8-Flow-MoE maintains numerical stability
+originates from a key performance observation: naively in-       and convergence behavior, we train a DeepSeek-V2-Lite
+serting FP8 kernels (e.g., GEMM and communication) into          model (16 B parameters) from scratch under two precision
+a BF16 computation graph introduces frequent quantiza-           settings: BF16 and FP8-Flow-MoE. Both models are trained
+tion and dequantization operations, which can substantially      for 200 B tokens, using identical optimization hyperparame-
+offset the benefits of FP8 acceleration.                         ters, learning rate schedule, data ordering, and parallelism
+To illustrate this issue, we analyze FP8 communication us-       configurations. All runs use a realistic web-scale pretraining
+ing the DeepEP library released by DeepSeek. In its default      mixture consistent with the DeepSeek-V3 accuracy valida-
+usage, quantization and dequantization are performed im-         tion setting (DeepSeek-AI Team, 2024), including FineWeb,
+mediately before and after the communication, introducing        Nemotron-CC-v2, and DCLM-baseline.
+extra data conversion and synchronization on the critical        As shown in Figure 2, the two loss curves are nearly indistin-
+path. A detailed latency breakdown and quantitative analy-       guishable across the entire training trajectory, from the early
+sis are provided in Section 4.4.2.                               warm-up phase through the stabilized loss regime. The FP8-
+It is worth noting that although FP8 communication theoret-      Flow-MoE model shows no sign of divergence, gradient
+ically halves the data transfer size, in practice, the need to   underflow, or numerical drift, the relative loss error remains
+transmit both the FP8 tensor and its corresponding scaling       consistently below 0.19%, which is within the typical vari-
+factors increases the number of data buffers and synchroniza-    ance introduced by stochastic training dynamics. These
+tions, thereby constraining the achievable communication         results demonstrate that our FP8-centric dataflow does not
+speedup. Nevertheless, even a single pair of quantization        compromise convergence fidelity even under extended-scale
+and dequantization operators can noticeably reduce the per-      workloads.
+formance gain of FP8 communication. Considering that a           This observation confirms that the scaling-aware transpose
+typical MoE forward or backward pass involves multiple           and fused operators in FP8-Flow-MoE preserve the numeri-
+such pairs (see Figure 1(c)), the cumulative overhead can        cal dynamics of BF16 training.
+almost completely neutralize the benefits of isolated FP8
+                                  FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+            12                                                                tron, as checkpointing the entire MoE layer would other-
+                                                        BF16
+                                                        FP8-Flow-MoE (ours)   wise cause OOM across all recipes. To isolate the effect
+            10
+                                                                              of computation efficiency from communication overlap, all
+             8                                                                end-to-end experiments are performed without computa-
+  LM Loss
+
+
+
+
+                                                                              tion–communication overlap.
+             6
+                                                                              Throughput Analysis. Table 1 and 2 summarizes the mea-
+             4
+                                                                              sured throughput (TGS, tokens/GPU/s) and peak memory
+             2                                                                (Mem, GB) under three EP settings. Across all activation
+                 0B   25B   50B     75B   100B   125B   150B   175B    200B   checkpointing modes, FP8-Flow-MoE consistently outper-
+                                    Consumed tokens
+                                                                              forms the BF16 baseline, achieving +6 % (EP8), +8 %
+             Figure 2: Training loss on DeepSeek-V2-Lite                      (EP16), and +16 % (EP32) throughput improvements. Com-
+                                                                              pared with the Blockwise recipe, FP8-Flow-MoE further
+                                                                              improves throughput by 3 % (EP8), 8 % (EP16), and up to
+                                                                              21 % (EP32). It also surpasses the Tensorwise recipe, sug-
+4.2         Efficiency Evaluation                                             gesting that the benefits of FP8-Flow-MoE extend beyond
+We evaluate FP8-Flow-MoE on multiple large-scale MoE                          BF16 and Blockwise FP8 to a more quantization-efficient
+models, with DeepSeek-V3 (671B) as the primary bench-                         baseline, with the advantage reaching up to 18% at EP32.
+mark and additional evaluations on Qwen3-235B and                             The performance gap widens at higher EP levels, where the
+DeepSeek-V2 (236B) to assess generality across model                          cumulative impact of reduced quantization overhead and
+scales and architectures.                                                     kernel fusion becomes more significant.
+
+We next benchmark end-to-end training efficiency across                       Memory Efficiency. Table 2 shows that, under AC =
+these models under multiple precision and dataflow configu-                   sel (+MoE expert) at EP8, FP8-Flow-MoE reduces peak
+rations. Specifically, we compare the following four repre-                   memory by approximately 8 GB vs. BF16 and 16.5 GB
+sentative configurations: (1) BF16: baseline configuration                    vs. TE FP8 baselines(Blockwise and Tensorwise), directly
+using standard FP32-BF16 mixed precision. (2) Blockwise:                      benefiting from the FP8 checkpoint compression mecha-
+TE-style blockwise recipe with FP8 grouped GEMM ker-                          nism, which stores intermediate activations in FP8 instead
+nels. (3) Tensorwise: TE-style tensorwise recipe with FP8                     of BF16. At the largest scale of EP = 32, both the BF16 and
+grouped GEMM kernels. (4) FP8-Flow-MoE (ours): FP8-                           FP8 baselines (Blockwise and Tensorwise) encounter out-
+centric dataflow with fused operators and minimal quantiza-                   of-memory (OOM) errors, while FP8-Flow-MoE remains
+tion overhead.                                                                stable, clearly demonstrating its superior scalability and
+                                                                              memory efficiency.
+Training Hyperparameters. All end-to-end efficiency ex-
+periments use AdamW (β1 =0.9, β2 =0.95) with sequence                                              EP8           EP16          EP32
+                                                                               Method
+length 4096, tensor parallelism TP=1, and context paral-                                        TGS    Mem    TGS     Mem TGS Mem
+lelism CP=1. All runs are continued from the same pub-
+                                                                               BF16            1,109     39    939    36    671      43
+licly released checkpoint to ensure comparable initialization                  Blockwise       1,146     37    938    41    644      51
+across methods. For DeepSeek-V3 (671B) and Qwen3-                              Tensorwise      1,130     38    989    42    660      53
+235B, we use a global batch size of 15,360 tokens with                         FP8-Flow-MoE    1,176     37   1,012   39    779      49
+learning rate 7.3 × 10−6 (min LR = 0). For DeepSeek-V2
+(236B), we use a global batch size of 8,192 tokens with                       Table 1: Throughput analysis on DeepSeek-V3 under
+learning rate 3 × 10−6 (min LR = 3 × 10−7 ).                                  AC=full
+DeepSeek-V3 (671B) serves as the primary benchmark for
+end-to-end efficiency experiments, enabling us to evaluate                                         EP8           EP16             EP32
+                                                                               Method
+the scalability and robustness of FP8-Flow-MoE under real-                                      TGS    Mem    TGS     Mem   TGS     Mem
+istic large-scale training conditions. Models are trained us-
+                                                                               BF16            1,178     64   1,055 71 OOM OOM
+ing standard expert and pipeline parallelism configurations                    Blockwise       1,178     73   1,031 77 OOM OOM
+(EP/PP = 8/32, 16/16, 32/8) and evaluated under two activa-                    Tensorwise      1,231     73   OOM OOM OOM OOM
+tion checkpointing (AC) strategies: AC = full, which applies                   FP8-Flow-MoE    1,193     56   1,111 66  912 75
+full checkpointing to all modules; and AC = sel (+MoE
+expert), which selectively checkpoints the MoE layer while                    Table 2: Throughput analysis on DeepSeek-V3 under
+excluding experts to evaluate FP8 activation compression.                     AC=sel (+MoE expert)
+The latter represents the most memory-efficient configura-
+tion compatible with the 1F1B-overlap schedule in Mega-                       Beyond the primary benchmark on DeepSeek-V3 (671B),
+                      FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+we further evaluate FP8-Flow-MoE on two additional large-                            EP8                EP16                EP32
+                                                                Method
+scale MoE models, Qwen3-235B and DeepSeek-V2 (236B),                             TGS     Mem         TGS     Mem         TGS      Mem
+to assess robustness across model scales and architectures.
+                                                                BF16             1,474     55        1,499     63        1,315     66
+Detailed results are reported in Table 3, Table 4, Table 5,     Blockwise        1,600     60        1,547     70        1,293     70
+and Table 6.                                                    Tensorwise       1,548     60        1,599     70        1,391     70
+                                                                FP8-Flow-MoE     1,572     52        1,601     57        1,408     55
+In particular, FP8-Flow-MoE delivers up to +16% through-
+put improvement on Qwen3-235B and up to +10% on
+                                                                 Table 6: Throughput on DeepSeek-V2 under AC=sel.
+DeepSeek-V2 under AC=full. Moreover, under AC=sel
+(+MoE expert) with EP32 on Qwen3-235B, FP8-Flow-MoE
+is the only configuration that remains runnable, whereas       ablating one component often requires adjusting the train-
+BF16 and TE FP8 baselines encounter OOM. On DeepSeek-          ing pipeline and scheduling, which may slightly deviate
+V2 with EP32, FP8-Flow-MoE further reduces peak mem-           from the fully optimized behavior. Nevertheless, end-to-
+ory by up to 15 GB per GPU compared to TE FP8 baselines        end ablations remain useful to quantify the contribution of
+and by up to 11 GB compared to BF16.                           key optimizations on the critical path. We conduct com-
+These results are consistent with our findings on DeepSeek-    ponent ablations on DeepSeek-V3 (671B) under the same
+V3, indicating that the benefits of FP8-Flow-MoE generalize    setup as our main efficiency evaluation with full activation
+across different model scales and configurations.              checkpointing. We focus on two components: (i) fused
+                                                               permute+padding and (ii) scaling-aware FP8 transpose.
+                      EP8           EP16         EP32          For the fused permute+padding operator, we compare
+ Method
+                  TGS     Mem TGS Mem TGS Mem                  against a naive implementation that executes permute and
+ BF16             1,150     40   884     36    559     38      padding as separate operators. As shown in Table 7, fused
+ Blockwise        1,215     48   830     42    520     43      permute+padding consistently improves end-to-end through-
+ Tensorwise       1,268     46   883     40    543     37      put up to +4%, while also reducing peak GPU memory by
+ FP8-Flow-MoE     1,300     46   961     39    558     34      approximately 1 GB. These results indicate that kernel fu-
+                                                               sion on the MoE routing path provides a stable and non-
+  Table 3: Throughput on Qwen3-235B under AC=full.             trivial contribution to the overall throughput gains.
+                                                               For the scaling-aware FP8 transpose, we compare against
+                      EP8            EP16            EP32      the dequantize–transpose–requantize path(DoubleQuant).
+ Method                                                        Replacing DoubleQuant with scaling-aware transpose yields
+                  TGS     Mem    TGS     Mem    TGS     Mem
+                                                               substantially larger end-to-end improvements, improving
+ BF16             1,264 74  996  79 OOM OOM                    throughput by up to +18%. In addition to throughput gains,
+ Blockwise        OOM OOM OOM OOM OOM OOM
+ Tensorwise       OOM OOM OOM OOM OOM OOM
+                                                               this replacement reduces peak memory by approximately
+ FP8-Flow-MoE     1,413 64 1,091 60  651 68                    1 GB depending on the EP configuration.
+
+  Table 4: Throughput on Qwen3-235B under AC=sel.                                        EP8                 EP16                EP32
+                                                                Method
+                                                                                    TGS     Mem        TGS      Mem TGS Mem
+                                                                FP8-Flow-MoE    1,176           37     1,012        40      779     49
+                      EP8           EP16          EP32          Permute+Padding 1,130           37      967         41      768     50
+ Method
+                  TGS     Mem    TGS     Mem   TGS     Mem      DoubleQuant     1,028           38      859         41      655     51
+ BF16             1,286     27   1,319   36    1,147    35
+ Blockwise        1,450     33   1,330   43    1,113    40           Table 7: Component ablations on DeepSeek-V3
+ Tensorwise       1,365     34   1,277   44    1,094    42
+ FP8-Flow-MoE     1,393     32   1,344   41    1,209    38
+                                                               4.4   Operator-level micro-benchmarks
+  Table 5: Throughput on DeepSeek-V2 under AC=full.            We conduct a series of unit-level benchmarks that isolate
+                                                               each kernel’s performance. The test inputs are generated
+                                                               through simulation, and their tensor shapes are chosen to
+4.3   End-to-End Component Ablations
+                                                               reflect the real-world configurations of representative MoE
+FP8-Flow-MoE’s end-to-end gains come from several co-          models—DeepSeek-V2-Lite, DeepSeek-V2, and DeepSeek-
+designed optimizations, including FP8 communication,           V3 under different expert parallelism (EP) settings. Specifi-
+scaling-aware FP8 transpose, and operator fusion. Because      cally, these micro-benchmarks allow us to directly measure
+these components are tightly coupled in the execution graph,   raw kernel performance, demonstrating how each operator
+                                                                                  FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+contributes to the overall efficiency of the FP8-Flow-MoE                                                                                                                                         communication cost grows roughly linearly with workloads,
+system.                                                                                                                                                                                           the (de)quantization cost remains constant; consequently,
+                                                                                                                                                                                                  such data conversion reduces the end-to-end FP8 speedup
+Operator fusion benchmarks are run on a single GPU to iso-
+                                                                                                                                                                                                  from 1.6× to 1.4×. It is worth noting that although FP8
+late kernel-level speedups. For communication benchmarks,
+                                                                                                                                                                                                  communication theoretically halves the data transfer size,
+we follow the same EP-to-node mapping as in end-to-end
+                                                                                                                                                                                                  in practice, the need to transmit both the FP8 tensor and its
+training: EP8 is evaluated on 1 node, EP16 on 2 nodes, and
+                                                                                                                                                                                                  corresponding scaling factors doubles the number of data
+EP32 on 4 nodes.
+                                                                                                                                                                                                  buffers and synchronizations, limiting achievable speedup
+                                                                                                                                                                                                  to around 1.6×. Nevertheless, a single pair of quantization
+4.4.1                       Fused Permute and Padding
+                                                                                                                                                                                                  and dequantization operations reduces the performance gain
+We compare the fused and naive implementations under                                                                                                                                              of FP8 communication by roughly one third (from 0.6× to
+both BF16 and FP8 precision settings. Across different ten-                                                                                                                                       0.4× improvement).
+sor sizes corresponding to typical MoE workloads, the fused
+version demonstrates a consistent acceleration. For the for-                                                                                                                                                             (M,N,EP)                       BF16                       FP8 T IME ( MS )                                S PEEDUP
+ward permute+padding case, we observe up to 1.7× speedup                                                                                                                                                                                                ( MS )               Q/D                C OMM               A LL     C OMM               A LL
+(Figure 3), while for the backward unpermute+unpadding                                                                                                                                                  (24576,2048,8)                                  0.537       0.127/0.084                  0.325              0.535     1.65×              1.00×
+kernel, the improvement reaches as high as 6.6× on large-                                                                                                                                               (24576,5120,8)                                  0.785       0.087/0.089                  0.526              0.703     1.49×              1.12×
+                                                                                                                                                                                                        (32768,7168,8)                                  1.276       0.086/0.089                  0.905              1.080     1.41×              1.18×
+scale configurations (Figure 4).                                                                                                                                                                       (24576, 2048,16)                                 1.224       0.091/0.083                  1.176              1.350     1.04×              0.91×
+                                                                                                                                                                                                       (24576,5120,16)                                  2.213       0.082/0.082                  1.400              1.564     1.58×              1.42×
+                                                                                                                                                                                                       (32768,7168,16)                                  2.934       0.084/0.092                  1.847              2.023     1.59×              1.45×
+                  2.00        bf16 naive                                            fp8 naive                                                                                                          (24576,2048,32)                                  3.005       0.094/0.083                  2.740              2.918     1.10×              1.03×
+                              bf16 fused_permute_pad                                fp8 fused_permute_pad                                                                                              (24576,5120,32)                                  5.003       0.082/0.081                  2.868              3.031     1.74×              1.65×
+                  1.75                                                                                                                       1.70
+                                                                                                                                                                                                       (32768,7168,32)                                  7.327       0.082/0.082                  4.319              4.483     1.70×              1.63×
+Speedup (vs. naive)
+
+
+
+
+                                                                                                                         1.55
+                  1.50                                                                               1.39
+                                                                                                               1.34
+                                                                                                                                   1.39
+                                                                               1.30
+                  1.25                                                                     1.26                                                                                                                     Table 8: Communication Performance with Speedup
+                                                           1.05      1.08
+                                  1.00 1.03
+                  1.00  1.00                1.00      1.00      1.00      1.00        1.00      1.00      1.00      1.00      1.00      1.00
+
+                                                 0.79
+                  0.75       0.76
+
+
+                  0.50                                                                                                                                                                            4.4.3                     Fused SwiGLU and Quantization
+                  0.25
+                                                                                                                                                                                                  Figure 5 presents unit-level benchmarks for the fused
+                  0.00 (28672,1280) (24576,2048) (24576,5120) (32768,7168) (32768,8192) (32768,9216)
+                                                                  Input Shape in (M, N)                                                                                                           SwiGLU+Quant kernel. Compared with the naive imple-
+                                                                                                                                                                                                  mentation (standalone SwiGLU followed by a separate quan-
+Figure 3: Speedup of fused permute+pad over the naive                                                                                                                                             tization kernel), fusion consistently improves performance
+(separate) implementation.                                                                                                                                                                        in both passes. In the forward pass, the fused kernel achieves
+                                                                                                                                                                                                  1.69×–2.18× speedup across the tested shapes. The gain
+                                                                                                                                                                                                  is even more pronounced in the backward pass, reaching
+                                 bf16 naive                                                                   fp8 naive
+                  8              bf16 fuse_unpermute_unpad                                                    fp8 fuse_unpermute_unpad                                                            2.56×–4.01×, indicating that removing the extra kernel
+                                                                                                                                                 7.33                        7.31
+                                                                                                                     6.90                                                                         launch and intermediate activation round-trips is particu-
+Speedup (vs. naive)
+
+
+
+
+                                                                                         6.60                                                                                              6.57
+                                                                                                                                                               6.12
+                  6                                                                                    5.79
+                                                                                                                                   5.52                                                           larly beneficial when backward-side memory traffic is heav-
+                                 4.24          4.25          4.41
+                                                                           4.65
+                                                                                                                                                                                                  ier. The accompanying latency breakdown further confirms
+                  4
+                                                                                                                                                                                                  that fusion substantially reduces the end-to-end operator
+                  2                                                                                                                                                                               time while preserving the original SwiGLU computation,
+                          1.00          1.00          1.00          1.00          1.00          1.00          1.00          1.00          1.00          1.00          1.00          1.00
+                                                                                                                                                                                                  and meanwhile directly produces FP8-quantized outputs for
+                  0      (28672,1280) (24576,2048) (24576,5120) (32768,7168) (32768,8192) (32768,9216)                                                                                            subsequent computation.
+                                                                                    Input Shape in (M, N)
+                                                                                                                                                                                                                     5
+Figure 4: Speedup of fused unpermute+unpad over the naive                                                                                                                                                                         fwd naive                                               bwd naive
+                                                                                                                                                                                                                                  fwd fused_swiglu_quant                                  bwd fused_swiglu_quant
+(separate) implementation.                                                                                                                                                                                           4                                                             3.91                             3.91                         4.01
+                                                                                                                                                                                                   Speedup (vs. naive)
+
+
+
+
+                                                                                                                                                                                                                     3
+                                                                                                                                                                                                                                                 2.56
+
+4.4.2                       FP8 Communication                                                                                                                                                                        2
+                                                                                                                                                                                                                                                                    2.09                              2.07
+                                                                                                                                                                                                                                                                                                                                   2.18
+
+                                                                                                                                                                                                                                   1.69
+
+
+Table 8 reports a latency breakdown of FP8 communication                                                                                                                                                             1     1.00           1.00               1.00           1.00               1.00          1.00           1.00          1.00
+
+in DeepEP, where quantization and dequantization are exe-
+cuted immediately before and after the communication ker-                                                                                                                                                            0      (28672,2048)                         (24576,2816)                   (24576,3072)                 (32768,4096)
+                                                                                                                                                                                                                                                                           Input Shape in (M, N)
+nel. The results reveal two key findings. First, for smaller-
+scale workloads, quantization and dequantization each con-                                                                                                                                        Figure 5: Speedup of fused SwiGLU+quantization over the
+sume a similar amount of time as the communication kernel,                                                                                                                                        naive (separate) implementation.
+nearly eliminating any performance gain. Second, while the
+                                                       FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+4.4.4                    Scaling-aware FP8 Transpose                                                                 exponent shift (Algorithm 1) without extra rounding from
+                                                                                                                     dequantization or requantization. Under this assumption,
+Figure 6 presents unit-level benchmarks for scaling-aware
+                                                                                                                     the transpose is FP8-format agnostic and applies to both
+FP8 transpose operator, Compared with the naive implemen-
+                                                                                                                     E4M3 and E5M2; otherwise, one must fall back to explicit
+tation (standalone dequantize → transpose → quantize), it
+                                                                                                                     dequantize→transpose→requantize.
+is clear that scaling-aware FP8 transpose operator delivers 2
+to 3 times speedup across all tensor shapes, confirming its                                                          Beyond the transpose, fused operators are driven by MoE
+effectiveness in computational efficiency.                                                                           dataflow and tensor-shape constraints (token reordering,
+                                                                                                                     padding/alignment, and conversion boundaries) rather than
+                  3.5           naive(DoubleQuant)                 scaling-aware-transpose                           Hopper-specific features. They are implemented using gen-
+                                                                3.06
+                  3.0                           2.76                                                                 eral kernel programming frameworks and primarily require
+                                                                                                2.60          2.62
+Speedup (vs. naive)
+
+
+
+
+                                                                                  2.58
+                  2.5           2.32                                                                                 a comparable programmable kernel stack and support for the
+                  2.0                                                                                                target low-precision datatypes and scaling representation.
+                  1.5
+                                                                                                                     These assumptions also align with the broader trend of
+                  1.0    1.00            1.00            1.00              1.00          1.00          1.00
+                                                                                                                     microscaling-style low-precision formats, where block
+                  0.5                                                                                                scales are represented as exponent-only encodings (e.g.,
+                  0.0 (28672,1280) (24576,2048) (24576,5120) (32768,7168) (32768,8192) (32768,9216)                  UE8M0/E8M0), and are standardized across FP8/FP6/FP4
+                                                   Input Shape in (M, N)
+                                                                                                                     variants (e.g., MXFP8/6/4). As such, FP8-Flow-MoE natu-
+Figure 6: Speedup of scaling-aware transpose over the naive                                                          rally extends to future hardware that adopts blockwise quan-
+(dequantize + transpose + quantize) implementation.                                                                  tization with exponent-only scaling, while preserving the
+                                                                                                                     design principles of eliminating redundant (de)quantization
+                                                                                                                     and reducing kernel fragmentation along the MoE path.
+4.5                     Discussion
+Persistent FP8 dataflow matters Simply replacing                                                                     5   C ONCLUSIONS
+GEMM or communication kernels with FP8 counterparts
+yields limited benefit, since quantization/dequantization                                                            This study identifies two additional factors that play criti-
+costs dominate at small batch sizes or high communication                                                            cal roles in achieving high end-to-end efficiency for FP8
+frequency. The proposed scaling-aware transpose and fused                                                            precision in large-scale Mixture-of-Experts (MoE) training.
+operator design eliminates redundant precision transitions,                                                          First, maintaining data in low precision throughout the com-
+directly improving kernel launch efficiency and memory                                                               putation flow minimizes redundant conversions and allevi-
+bandwidth utilization.                                                                                               ates memory bandwidth pressure. A representative example
+                                                                                                                     is our FP8 transpose operator, which directly transforms
+Scaling amplifies FP8-Flow-MoE’s gains As EP in-                                                                     row-wise to column-wise quantized tensors without revert-
+creases, communication and quantization overheads com-                                                               ing to higher precision—achieving high data throughput
+pound in baseline methods, whereas FP8-Flow-MoE’s low-                                                               while avoiding double quantization error.
+precision persistence minimizes these costs, resulting in up
+to 1.2× end-to-end acceleration at large expert parallelism.                                                         Second, FP8 precision inevitably fragments the computation
+                                                                                                                     graph by introducing small operators such as quantization
+Practical training stability Despite adopting lower preci-                                                           and padding, leading to excessive kernel launches and mem-
+sion for a larger portion of the training pipeline than base-                                                        ory traffic. By fusing lightweight operations and developing
+line implementations, FP8-Flow-MoE preserves identical                                                               custom high-performance implementations, FP8-Flow-MoE
+convergence behavior and robustness across hundreds of                                                               effectively eliminates this structural inefficiency.
+billions of tokens. This stability stems from our insight of                                                         In summary, FP8-Flow-MoE presents an FP8-centric train-
+potential double quantization errors at transpose boundaries.                                                        ing approach for MoE models that preserves convergence
+By introducing a scaling-aware transpose, FP8-Flow-MoE                                                               while improving end-to-end efficiency. Our results highlight
+effectively eliminates this redundant quantization while                                                             that the effectiveness of FP8 depends on dataflow design
+streamlining data movement, yielding both improved nu-                                                               rather than a drop-in replacement, and demonstrates the
+merical fidelity and higher efficiency.                                                                              practical viability of low-precision MoE training.
+
+Portability and Generality FP8-Flow-MoE is evaluated
+on NVIDIA Hopper, but its key ingredients are not tied
+                                                                                                                     ACKNOWLEDGMENTS
+to any specific GPU generation. The scaling-aware trans-                                                             This work is supported by National Key Research and De-
+pose assumes blockwise quantization with power-of-two                                                                velopment Program of China (No. 2023YFE0108600)
+scaling, so rescaling between layouts reduces to an exact
+                       FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+R EFERENCES                                                      Micikevicius, P., Stosic, D., Burgess, N., Cornea, M., Dubey,
+                                                                  P., Grisenthwaite, R., Ha, S., Heinecke, A., Judd, P.,
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+                                                                  Kamalu, J., Mellempudi, N., Oberman, S., Shoeybi, M.,
+  Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+                                                                  Siu, M., and Wu, H. FP8 Formats for Deep Learning.
+  Askell, A., et al. Language models are few-shot learners.
+                                                                  arXiv e-prints, art. arXiv:2209.05433, September 2022.
+  Advances in neural information processing systems, 33:
+                                                                  doi: 10.48550/arXiv.2209.05433.
+  1877–1901, 2020.
+                                                                 NVIDIA Corporation. Nvidia hopper architecture whitepa-
+Bubeck, S., Chandrasekaran, V., Eldan, R., Gehrke, J.,
+                                                                  per. Technical Whitepaper, 2022.
+  Horvitz, E., Kamar, E., Lee, P., Lee, Y. T., Li, Y., Lund-
+  berg, S., Nori, H., Palangi, H., Tulio Ribeiro, M., and
+                                                                 NVIDIA Corporation.   Nvidia transformer engine
+  Zhang, Y. Sparks of Artificial General Intelligence:
+                                                                  documentation. https://github.com/NVIDIA/
+  Early experiments with GPT-4. arXiv e-prints, art.
+                                                                  TransformerEngine, 2023.
+  arXiv:2303.12712, March 2023. doi: 10.48550/arXiv.
+  2303.12712.                                                    OpenAI. Gpt-4 technical report. arXiv e-prints, art.
+                                                                   arXiv:2303.08774, March 2023. doi: 10.48550/arXiv.
+DeepSeek-AI Team. Deepseek-v3 technical report. arXiv
+                                                                   2303.08774.
+  preprint arXiv:2412.19437, 2024.
+                                                                 Peng, H., Wu, K., Wei, Y., Zhao, G., Yang, Y., Liu, Z.,
+DeepSeek-AI Team. Deepep: an efficient expert-parallel
+                                                                   Xiong, Y., Yang, Z., Ni, B., Hu, J., et al. Fp8-lm:
+  communication library. https://github.com/
+                                                                   Training fp8 large language models. arXiv preprint
+  deepseek-ai/DeepEP, 2025a.
+                                                                   arXiv:2310.18313, 2023.
+DeepSeek-AI Team. Deepgemm: clean and efficient fp8
+  gemm kernels with fine-grained scaling. https://               Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi,
+  github.com/deepseek-ai/DeepGEMM, 2025b.                          R. Y., Awan, A. A., Rasley, J., and He, Y. DeepSpeed-
+                                                                   MoE: Advancing mixture-of-experts inference and train-
+Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.          ing to power next-generation AI scale. In Proceedings
+  Gpt3.int8(): 8-bit matrix multiplication for transformers        of the 39th International Conference on Machine Learn-
+  at scale. In Advances in Neural Information Processing           ing, volume 162 of Proceedings of Machine Learning
+  Systems, volume 35, pp. 30318–30332, 2022.                       Research, pp. 18332–18346. PMLR, 17–23 Jul 2022.
+
+Fedus, W., Zoph, B., and Shazeer, N. Switch transformers:        Wang, N., Choi, J., Brand, D., Chen, C.-Y., and Gopalakr-
+  Scaling to trillion parameter models with simple and ef-        ishnan, K. Training deep neural networks with 8-bit
+  ficient sparsity. Journal of Machine Learning Research,         floating point numbers. Advances in neural information
+  23(120):1–39, 2022.                                             processing systems, 31, 2018.
+
+Inflection AI. Inflection-2: The next step up. https:            Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M.,
+  //inflection.ai/inflection-2, 2023.                              Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., Mi-
+                                                                   haylov, T., Ott, M., Shleifer, S., Shuster, K., Simig, D.,
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y.,     Singh Koura, P., Sridhar, A., Wang, T., and Zettlemoyer,
+  Krikun, M., Shazeer, N., and Chen, Z. {GS}hard: Scal-            L. OPT: Open Pre-trained Transformer Language Models.
+  ing giant models with conditional computation and auto-          arXiv e-prints, art. arXiv:2205.01068, May 2022. doi:
+  matic sharding. In International Conference on Learning          10.48550/arXiv.2205.01068.
+  Representations, 2021. URL https://openreview.
+  net/forum?id=qrwe7XHTmYb.                                      Zhao, C., Deng, C., Ruan, C., Dai, D., Gao, H., Li, J.,
+                                                                   Zhang, L., Huang, P., Zhou, S., Ma, S., Liang, W., He,
+Meta AI Team. Llama 2: Open Foundation and Fine-Tuned              Y., Wang, Y., Liu, Y., and Wei, Y. Insights into deepseek-
+ Chat Models. arXiv e-prints, art. arXiv:2307.09288, July          v3: Scaling challenges and reflections on hardware for
+ 2023. doi: 10.48550/arXiv.2307.09288.                             ai architectures. In Proceedings of the 52nd Annual In-
+                                                                   ternational Symposium on Computer Architecture, ISCA
+Micikevicius, P., Narang, S., Alben, J., Diamos, G., Elsen,        ’25, pp. 1731–1745, New York, NY, USA, 2025. Associa-
+ E., Garcia, D., Ginsburg, B., Houston, M., Kuchaiev, O.,          tion for Computing Machinery. ISBN 9798400712616.
+ Venkatesh, G., and Wu, H. Mixed precision training.               doi: 10.1145/3695053.3731412. URL https://doi.
+ International Conference on Learning Representations              org/10.1145/3695053.3731412.
+ (ICLR), 2018.
+                         FP8-Flow-MoE: A Casting-Free FP8 Recipe without Double Quantization Error
+
+A PPENDIX                                                                          12                                                     BF16
+                                                                                                                                          FP8-Flow-MoE (ours)
+
+Analysis of double quantization error                                              10
+
+
+To analyze the error introduced by naive double quanti-                             8
+
+
+
+
+                                                                       LM Loss
+zation, we consider the following procedure for obtain-                             6
+ing a columnwise-quantized FP8 tensor from a rowwise-
+quantized one:                                                                      4
+
+            quant                 dequant
+         x −−−→ Qrow (x) −−−−→ D(Qrow (x))                                          2
+                                                              (17)                      0B      25B   50B   75B    100B     125B   150B      175B      200B
+                          quant                                                                               Consumed tokens
+                          −−−→ Qcol (D(Qrow (x)))
+Formally, let x ∈ Rn denote the high-precision tensor, let                                   Figure 7: Training loss on Qwen3-30B.
+Qrow and Qcol denote the rowwise and columnwise quantiza-
+                                                                                                                                          BF16
+tion operators, and let D denote the dequantization operator.                      25                                                     FP8-Flow-MoE (ours)
+
+For brevity, define x
+                    e = D(Qrow (x)). The overall double-                           20
+quantization error measures how far the final output Qcol (e
+                                                           x)
+
+
+
+
+                                                                       Grad norm
+                                                                                   15
+deviates from the original x:
+                                                                                   10
+       x) − x 2 = Qcol (e
+ Qcol (e                x) − Qrow (x) + Qrow (x) − x 2
+                                                                                    5
+                    ≤ Qcol (e
+                            x) − Qrow (x) 2 + Qrow (x) − x 2
+                                 e 2 + Qrow (x) − x 2
+                            x) − x
+                    = Qcol (e                                                       0
+                                                                                        0B      25B   50B   75B    100B     125B   150B      175B      200B
+                     |      {z     }  |      {z     }                                                         Consumed tokens
+                        2nd quant error     1st quant error
+                                                              (18)             Figure 8: Training gradient norm on Qwen3-30B.
+where the second line inserts and cancels Qrow (x), the
+third line applies the triangle inequality, and the fourth
+                                                                     accumulated numerical instability is observed under FP8-
+line uses the fact that dequantization is lossless, i.e., x
+                                                          e=
+                                                                     Flow-MoE. Together with the aligned loss curves in the
+D(Qrow (x)) = Qrow (x) since BF16 subsumes the full rep-
+                                                                     main text, this confirms that FP8-Flow-MoE preserves train-
+resentable range of FP8. This decomposition makes explicit
+                                                                     ing stability comparable to BF16.
+the extra discrepancy introduced by the naive dequantize-
+transpose-requantize path.                                                                                                                BF16
+                                                                                   50                                                     FP8-Flow-MoE (ours)
+
+Additional Convergence Validation Results                                          40
+
+To further strengthen the stability analysis in Section 4.1,
+                                                                       Grad norm
+
+
+
+
+                                                                                   30
+we provide additional convergence results on Qwen3-30B
+                                                                                   20
+and DeepSeek-V2-Lite.
+                                                                                   10
+Figure 7 shows that the training-loss trajectories of BF16
+and FP8-Flow-MoE on Qwen3-30B model remain closely                                  0
+matched throughout the entire run. FP8-Flow-MoE tracks                                  0B      25B   50B   75B    100B     125B   150B      175B      200B
+                                                                                                              Consumed tokens
+the BF16 baseline without visible divergence or instability.
+The mean relative loss difference stays below 0.1%. Fig-              Figure 9: Training gradient norm on DeepSeek-V2-Lite.
+ure 8 further supports this observation from the perspective
+of optimization stability. Both gradient-norm trajectories
+remain closely aligned throughout training. FP8-Flow-MoE
+does not exhibit larger or more frequent spikes than BF16,
+and both methods converge to a similar low-gradient regime
+in the late stage. No sign of gradient explosion, gradient
+collapse, or sustained numerical drift is observed.
+As a complement to the loss curves in Section 4.1, Figure 9
+shows the gradient-norm trajectories for DeepSeek-V2-Lite.
+BF16 and FP8-Flow-MoE remain closely aligned through-
+out training. No sign of gradient explosion, collapse, or
+

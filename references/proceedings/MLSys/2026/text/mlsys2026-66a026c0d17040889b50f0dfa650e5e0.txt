@@ -1,0 +1,1056 @@
+           ACCELERATING L ARGE -S CALE R EASONING M ODEL I NFERENCE :
+             S ELF -S PECULATIVE D ECODING WITH S PARSE ATTENTION
+
+
+    Yilong Zhao 1 * Jiaming Tang 2 * Kan Zhu 3 Zihao Ye 4 Chi-Chih Chang 5 Chaofan Lin 6 Jongseok Park 1
+     Guangxuan Xiao 2 Mohamed S. Abdelfattah 5 Mingyu Gao 6 Baris Kasikci 3 Song Han 2 4 Ion Stoica 1
+
+
+                                                        A BSTRACT
+        Reasoning language models have demonstrated remarkable capabilities on challenging tasks by generating
+        elaborate chain-of-thought solutions. However, such lengthy generation shifts the inference bottleneck from
+        compute-bound to memory-bound. To generate each token, the model applies full attention to all previously
+        generated tokens, requiring memory access to an increasingly large KV-Cache. Consequently, longer generations
+        demand more memory access for every step, leading to substantial pressure on memory bandwidth.
+        To address this, we introduce SparseSpec, a speculative decoding framework that reuses the same model as both
+        the draft and target models (i.e., self-speculation). SparseSpec features a novel sparse attention mechanism,
+        PillarAttn, as the draft model, which accurately selects critical tokens via elegantly reusing information from the
+        verification stage. Furthermore, SparseSpec co-designs self-speculation with three system optimizations: (1) a
+        unified scheduler to batch both draft and verification phases to maximize parallelism, (2) delayed verification for
+        CPU/GPU overlap, and (3) dynamic KV-Cache management to enable host memory offload to maximize GPU
+        memory utilization. Across various models and datasets, SparseSpec outperforms state-of-the-art solutions, with
+        an up to 2.13× throughput gain. Code is open-sourced at github.com/sspec-project/SparseSpec.
+
+1       I NTRODUCTION                                              have proposed a lossless technique, speculative decod-
+                                                                   ing (Chen et al., 2023). In a nutshell, speculative decoding
+Recent advances in reasoning language models (RLMs),               employs a smaller and faster draft model to generate mul-
+such as OpenAI-o1 (OpenAI, 2024), have demonstrated re-            tiple candidate tokens sequentially. These candidates are
+markable capabilities in solving complex reasoning tasks.          then verified in parallel by the original target model. This
+These models typically generate tens of thousands of to-           requires reading the large KV-Cache only once. In contrast,
+kens from problems described in only hundreds of tokens            without speculation, the entire KV-Cache needs to be loaded
+through extensive chain-of-thought (CoT) (Snell et al., 2024;      for every token. As a result, speculative decoding substan-
+DeepSeek-AI, 2025a). This lengthy, deliberate reasoning            tially reduces memory access and improves throughput.
+paradigm shifts the performance bottleneck of inference
+from compute-bound to memory-bound (Zhao et al., 2024b).           However, existing speculative decoding methods require
+Due to the auto-regressive nature of RLMs, generating each         additional training or modification for each target model,
+token requires loading all previously generated key-value          limiting their applicability. Specifically, some solutions re-
+vectors (KV-Cache), making long-output tasks memory-               quire training a separate standalone draft model (Chen et al.,
+bound. In fact, the total amount of KV-Cache that needs to         2023); others modify the model architecture by adding de-
+be loaded increases quadratically with output length (Tang         coder layers (Li et al., 2025a). These additional steps in-
+et al., 2024). For example, when serving Qwen3-8B (Yang            crease the complexity of real-world deployment. For ex-
+et al., 2025) on an H100 with a batch size of 128 and an out-      ample, training a small draft model requires careful data
+put of 8192, loading the KV-Cache takes on average 21 ms           curation for a specific workload and may not generalize (Liu
+per step, accounting for over 70% of the end-to-end latency.       et al., 2024b). Moreover, deployment also needs to redesign
+                                                                   the inference framework to orchestrate both models effi-
+To mitigate the memory bandwidth bottleneck, researchers           ciently (Miao et al., 2024). Ultimately, this creates signifi-
+    *
+   Equal contribution by coin flip. 1 University of California,    cant barriers to adoption (Zhang et al., 2024).
+Berkeley 2 Massachusetts Institute of Technology 3 University of
+Washington 4 NVIDIA 5 Cornell University 6 Tsinghua University.
+                                                                   Other work explores training-free methods, which either em-
+                                                                   ploy rule-based heuristics (e.g., N-Gram (Fu et al., 2024))
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,       or leverages the model itself via self-speculation (Liu et al.,
+2026. Copyright 2026 by the author(s).                             2024a; Sun et al., 2024). For example, MagicDec (Chen
+                  Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+
+
+
+Figure 1. Comparison between autoregressive generation (a), draft model-based speculative decoding (b), and SparseSpec (c). SparseSpec
+identifies the KV-Cache loading as the key bottleneck during token generation, and uses the same model weights with dynamic sparse
+attention as the draft model to achieve high efficiency and a high acceptance rate without additional training.
+
+
+et al., 2024) adopts the full model with a sliding window at-        identifies critical tokens by leveraging the exact attention
+tention to draft tokens, followed by a full attention to verify.     scores obtained by full attention in each verification phase.
+As the sparse attention greatly reduces the memory access            These critical tokens are then used in the following draft
+by up to 95% of the full attention, the overall throughput           steps, enabling high speculation accuracy through sparsity
+is improved correspondingly. However, existing methods               that adapts to various contexts (Zhang et al., 2025; Yang
+fail to provide ideal speedups for RLMs, due to its unique           et al., 2024). With such co-design with speculative decod-
+algorithmic and systematic challenges (§ 3.3).                       ing, PillarAttn achieves zero memory overhead critical token
+                                                                     identification compared to existing dynamic sparse methods.
+Algorithmically, existing methods provide inaccurate
+drafted tokens, due to the lack of adaptivity to the high            In addition to PillarAttn, SparseSpec introduces innovations
+context dynamics in RLMs. These reasoning models are in-             that address the three systematic challenges above men-
+herently trained to generate diverse contexts (DeepSeek-AI,          tioned: (1) a unified batch scheduler (§ 4.2) that batches
+2025a; Kimi Team, 2025). For example, when solving a                 the sparse draft and dense verification into a single batch
+math problem, the model explores alternate solutions, result-        to amortize weight loading, and evenly distributes requests
+ing in dynamic contexts (Guan et al., 2025). Systematically,         across draft and verify so per-iteration resource usage stays
+speculative decoding and RLMs jointly introduce the follow-          balanced, thus mitigating workload fluctuation; (2) delayed
+ing unique challenges: (1) workload fluctuation: as the draft        verification (§ 4.3) that delays verification by one iteration
+and verify phases have heterogeneous resource usages, the            to remove CPU verification from the critical path. After
+workload is imbalanced across iterations, leading to hard-           launching a unified batch at the (i-1)-th iteration, the CPU
+ware underutilization; (2) explicit synchronization: the draft       asynchronously prepares all metadata for the i-th iteration
+and verify phases require synchronization to ensure the vali-        excluding verification requests, while verification requests
+dation of the drafted tokens, which prevents the expensive           are postponed to the (i+1)-th iteration to overlap CPU work
+CPU operations from being overlapped with the GPU oper-              from (i-1)-th verification with GPU operations at i; (3) a dy-
+ations; (3) KV-Cache underutilization: the unpredictability          namic KV-Cache manager (§ 4.4) that offloads/loads to and
+of the output lengths from RLMs makes it difficult to fully          from CPU memory via an asynchronous and chunk-wise
+saturate the KV-Cache, leading to GPU memory waste.                  manner, thereby maximizing KV-Cache utilization.
+To alleviate these challenges, we present SparseSpec, a loss-        We prototype and evaluate SparseSpec across various
+less and training-free acceleration framework specialized            reasoning models, including Qwen3-1.7B/8B/14B (Yang
+for RLMs inference. In a nutshell, SparseSpec reuses the             et al., 2025), DeepSeek-R1-Distill-Llama3-8B (DeepSeek-
+same (target) model as the draft model, with a novel dynamic         AI, 2025a), and QwQ-32B (Qwen Team, 2025), using
+sparse attention as the drafting mechanism. Co-designed              NVIDIA DGX-H100 servers with various tensor parallelism
+with several system innovations, SparseSpec fully unleashes          configurations. On real-world workloads such as AIME (Nu-
+the potential of self-speculation for RLMs.                          mina, 2025), OlympiadBench (He et al., 2024), and Live-
+                                                                     CodeBench (Jain et al., 2024b), SparseSpec achieves up
+At the core of SparseSpec lies PillarAttn, a dynamic sparse
+                                                                     to 2.13× throughput improvement compared to the state-
+attention tailored for speculative decoding on RLMs (§ 4.1).
+                                                                     of-the-art serving framework vLLM (Kwon et al., 2023).
+PillarAttn selectively loads and computes only the critical
+                                                                     Furthermore, when compared to existing training-free meth-
+tokens—those with the highest attention scores during in-
+                                                                     ods vLLM-NGram, MagicDec (Chen et al., 2024), and Tri-
+ference—thereby significantly reducing memory bandwidth
+                                                                     Force (Sun et al., 2024), SparseSpec achieves up to 1.56×,
+usage. To handle context dynamics in reasoning, PillarAttn
+                                                                     1.36× and 1.76× throughput gain, respectively.
+                    Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                                       Avg. Output (mean ± std)
+    Dataset         Avg. Input
+                                 Qwen3-14B      Qwen2.5-32B-Instruct
+    AIME               138       13185 ± 7626        1732 ± 997
+    OlympiadBench      124       10233 ± 7889         957 ± 728                                Attention                  MLP
+    LiveCodeBench      148       10254 ± 7458         618 ± 157
+
+
+Table 1. Average (mean ± std) token lengths on three reasoning
+evaluation datasets. Input length is identical for both models;
+output lengths include their standard deviations.
+
+
+                                                                       Figure 2. Compute and memory bandwidth utilization of Qwen3-
+Our paper provides the following contributions:                        8B on an H100, with an average output of 12K on AIME.
+
+     • We analyze the performance bottleneck of batch RLMs
+       inference, and pinpoint the potential benefit of sparse
+                                                                       traditional LLMs, they are explicitly incentivized to follow
+       self-speculation with a theoretical formulation.
+                                                                       deliberate CoT via reinforcement learning (RL) (Kimi Team,
+     • We prototype a lossless and training-free acceleration
+                                                                       2025). Therefore, RLMs typically generate significantly
+       framework, SparseSpec, with a novel sparse attention
+                                                                       more tokens during inference than non-reasoning models.
+       PillarAttn, a unified batch scheduler, delayed verifica-
+                                                                       To demonstrate this, we collect the average input and output
+       tion, and a dynamic KV-Cache manager.
+                                                                       lengths of several reasoning tasks. As shown in Table 1, the
+     • We comprehensively evaluate our framework with real-
+                                                                       RLM Qwen3-14B generates on average 13542 tokens on
+       world workloads, demonstrating 2.13× speedup com-
+                                                                       the AIME dataset, approaching 7× more tokens than only
+       pared to state-of-the-art inference frameworks.
+                                                                       2593 tokens from a non-reasoning Qwen-2.5-32B.
+
+2      BACKGROUND                                                      Such lengthy outputs pose significant challenges for both
+                                                                       the training and deployment phases of RLMs. During RL
+2.1     Transformer-based Large Language Models                        post-training, RLMs are deployed to generate multiple roll-
+                                                                       outs, which are then scored by the reward model to evolve
+Transformer-based LLMs mainly consist of two compo-
+                                                                       the model. Such rollouts generation is throughput-oriented
+nents: a multi-layer perceptron (MLP) and a self-attention
+                                                                       offline inference, which could take more than 90% of the
+module. However, MLP and attention exhibit different
+                                                                       end-to-end RL training time (Luo et al., 2025). Besides,
+performance characteristics during batch inference: MLP
+                                                                       the deployment of RLMs including chatbots and agentic
+is typically compute-bound, while attention is memory-
+                                                                       workflows is latency-oriented online inference, which is
+bound (Tang et al., 2024). For general matrix-matrix mul-
+                                                                       also bottlenecked by the memory-bound attention. In this
+tiplication (GEMM) operations in MLP, batched requests
+                                                                       paper, we focus on lossless acceleration that can be applied
+share the same model weight, which can amortize memory
+                                                                       to both training and deployment phases.
+loading cost, resulting in high arithmetic intensity. There-
+fore, considering a latency function TGEMM (B) that maps
+the batch size B to the latency, it remains nearly constant be-        2.3   Speculative Decoding
+fore a certain threshold B̂, and then increases linearly with          To mitigate the memory-inefficiency, speculative decoding
+B after GPU is fully saturated (Zhao et al., 2024a). In con-           is proposed as a lossless acceleration by trading off compu-
+trast, different requests have independent context (i.e., KV-          tation for memory (Chen et al., 2023; Fu et al., 2024). The
+Cache), which cannot be amortized across a batch. Thus,                core idea is to leverage a lightweight draft model to propose
+memory traffic scales linearly with sequence length and                k candidate tokens sequentially, which are then verified in
+batch sizes, yielding consistently low arithmetic intensity            parallel by the original target model. Candidate tokens that
+and a linear latency function TAttn (M ), where M is the to-           align with the target model are accepted, while the rest are
+tal memory size of KV-Cache. In this paper, we focus on                discarded and regenerated via the same workflow, ensuring
+optimizing memory-bound attention, which is the primary                lossless generation quality of the original model.
+bottleneck for long-output RLMs inference (§ 3.1).
+                                                                       Assuming the latency of draft and target models are Tdraft
+                                                                       and Ttarget , respectively, the acceleration comes from the
+2.2     Evolving Workloads of RLMs
+                                                                       fact that Tdraft ≪ Ttarget . Therefore, despite only α · k + 1
+Reasoning language models (RLMs) are a class of LLMs                   candidate tokens are accepted (with an acceptance rate α
+designed to solve complex tasks through enhanced reason-               and a bonus token), the end-to-end latency when enabling
+ing capabilities, as demonstrated by OpenAI-o1 (OpenAI,                speculative decoding is (k · Tdraft + Tverify ) is smaller than
+2024) and DeepSeek-R1 (DeepSeek-AI, 2025a). Unlike                     the latency (αk + 1) · Ttarget without speculative decoding.
+                    Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+
+
+         Theoretical Optimal
+                         1.87x
+         Expected
+                           1.47x
+                                            Oracle Top-K
+                                                Attn
+         Achieved
+
+                     MagicDec
+
+
+
+
+                                                                   Figure 4. Visualization of attention scores of Qwen3-8B on the
+Figure 3. Theoretical and achieved speedup over vLLM of Mag-
+                                                                   AIME dataset. While the attention pattern has spatial locality, it
+icDec and self-speculation with oracle Top-K attention. Assume a
+                                                                   undergoes substantial changes during generation.
+sparsity ratio s = 0.05 and speculative step k = 8.
+
+                                                                   Theoretical analysis of speedup. We now formulate the
+3     M OTIVATION                                                  theoretical speedup of sparse self-speculative decoding, to
+                                                                   estimate the potential improvement. We define the speedup
+3.1   Batch RLMs Inference is Attention-bound                      η as the ratio of the average generation latency per token
+                                                                   with and without speculative decoding (i.e., Tbase /Tspec ).
+The long-generation of RLMs introduces a significant mem-
+                                                                   Specifically, let M be the total memory size of KV-Cache
+ory bottleneck in batched inference. Unlike short-generation
+                                                                   and B be the number of concurrent requests. With the same
+tasks, each reasoning request accumulates a large KV-Cache
+                                                                   notations in § 2.1, Tbase = TGEMM (B) + TAttn (M ), ignoring
+until completion, rapidly exhausting GPU memory and
+                                                                   other small operations for simplicity.
+severely constraining the number of concurrent requests
+(i.e., batch size). For example, serving Llama-3-8B on an          Assuming k the drafting length, α the acceptance rate, and
+H100 can accommodate only 64 requests with an 8K gener-            s the sparsity ratio of the draft attention, we calculate Tspec
+ation length. Inference at such small batch sizes is memory-       by considering an entire round of speculation with k draft
+bound for both MLP and attention, and with the KV-Cache            and 1 verification phases. Thus, we have (kα + 1) · Tspec =
+often larger than model weights, attention emerges as the          k · Tdraft + Tverify , where Tdraft = TGEMM (B) + TAttn (M · s)
+dominant runtime component.                                        and Tverify = TGEMM ((k + 1) · B) + TAttn (M ). As the
+                                                                   B concurrent requests are randomly distributed across the
+To demonstrate this, we profile bandwidth and compute uti-
+                                                                   k draft and 1 verification stages, the average input size
+lization over end-to-end execution for RLMs running on
+                                                                   for GEMMs is 2k+1     k+1 B, while the average input size for
+vLLM. We visualize the utilization within a single iteration
+in Figure 2. Compute is consistently underutilized below           attention is ks+1
+                                                                                 k+1     M . Thus, we can simpify the previously
+50% even when executing MLP; In contrast, memory band-             derived equation of (kα + 1) · Tspec as:
+width is heavily used across the entire iteration, indicating a                             2k + 1              ks + 1
+memory-bound workload. Although both MLP and atten-                      (k + 1)(TGEMM (           B) + TAttn (        M ))
+                                                                                             k+1                k+1
+tion are memory-bound, attention is dominant and accounts
+for more than 77% of end-to-end execution time.                    As discussed in § 2.1, TGEMM is non-linear function when
+                                                                   GPU is not fully saturated, while TAttn is approximately
+3.2   Sparse Self-Speculative Decoding Helps                       linear. Thus, the Tspec can be approximated as:
+Self-speculative decoding with sparse attention. As dis-                   k+1           2k + 1      ks + 1
+cussed in § 3.1, the RLMs inference is attention-bound due                       TGEMM (        B) +        TAttn (M )
+                                                                          kα + 1          k+1        kα + 1
+to the execessive memory access of KV-Cache under batch
+scenarios. Fortunately, prior studies on sparse attention          Given the formulation of latency per accepted token Tspec ,
+show that a small subset of tokens in KV-Cache (e.g., 5%)          and the latency per token Tbase on vanilla generation, the
+dominates the attention output, providing nearly lossless          speedup η is derived as η = Tbase /Tspec .
+speedup (Tang et al., 2024; Lin et al., 2025). Therefore, by
+                                                                   Practical performance implications. As GEMM and
+selectively loading and computing the most critical tokens,
+                                                                   attention have dramatically different characteristics, we ana-
+memory access can be substantially reduced, trading off ac-
+                                                                   lyze the implications of η over GEMM and attention sepa-
+curacy for efficiency. To ensure lossless acceleration, such
+                                                                   rately.
+methods can be applied as the draft model in speculative
+decoding, working with the full target model (i.e. sparse          For attention, since TAttn (M ) dominates Tbase in RLMs infer-
+self-speculative decoding (Sun et al., 2024)).                     ence as discussed in § 3.1, the reduction ratio of KV-Cache
+                     Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                                                                                                                              Dynamic
+                                                                                  GPU                                     KV Cache Manger
+                                           Elastic: Consistently High             CPU
+                                                                                                         Batch
+                                                                                                          Draft
+                                                                                                                          ×
+           Conservative: under-utilized      Mispredict:fluctuation
+
+                                                                                                          Draft
+                                                                        Request         Unified Batch                   Model Inference
+                                                      Zero Recomp.                       Scheduler       Verify
+                                                                                                                         w/ PillarAttn
+
+                                                                                                                                  0.7   0.1   0.2
+                                                                                                                          TopK(                     )
+                                                                         Output                   Delayed                     Identify
+                                                                                                 Verification              Critical Tokens
+
+Figure 5. GPU memory utilization and recomputation ratio dur-
+ing the first 100K steps when serving Qwen3-8B with AIME on                                Figure 6. Overview of SparseSpec.
+H100. We compare three policies: (1) Oracle, which knows output
+lengths in advance and schedules conservatively to avoid retraction,    dow attention), a dynamic sparse attention mechanism that
+achieving zero recomputation but low utilization; (2) Retraction,       adapts to the context dynamics is necessary to achieve a
+which predicts output length and schedules accordingly, achieving       high acceptance rate α during drafting.
+higher utilization but incurring frequent recomputation from re-
+traction; and (3) our dynamic KV-Cache manager with offloading,         Moreover, such sparse attention design should incur mini-
+which achieves near-full utilization without recomputation.             mal computation or storage overhead, to avoid adding com-
+                                                                        plexity to the system.
+
+access is (ks + 1)/(kα + 1), contributing the most to the               Workload fluctuation. As draft and verify phases have
+speedup. Since α ≫ s in practice, the attention latency can             heterogeneous resource usages, naive scheduling these two
+be greatly reduced. For example, with k = 16, α = 0.75,                 phases separately leads to workload fluctuation across itera-
+s = 0.05, the attention latency is reduced by 6.78×.                    tions, incurring substantial hardware underutilization. This
+                                                                        heterogeneity mainly comes from GEMM operations. For
+However, such memory reduction comes with the cost of                   instance, given a batch size B and speculative steps k, a
+extra GEMM computations, trading off computation for                    sequential execution pattern (all draft phases followed by
+memory. In practice, to avoid untolerable latency increase,             one verification phase) requires: (1) k GEMM operations
+the batch size should typically be limited to a certain thresh-         with input size B, and (2) one verification GEMM with
+old B̂, so that TGEMM is not oversaturated. For example,                input size (k + 1)B. This leads to under-utilization during
+on Hopper GPUs, B̂ = 256 only incurs minimal latency                    drafting and oversaturation during verification, with a total
+increase. Besides, α is also crucial to limit the latency               time of kTGEMM (B)+TGEMM ((k+1)B). Instead, a uniform
+increase, as the speedup η is inversely proportional to α.              scheduling incurs a total time of (k + 1)TGEMM ( 2k+1k+1 B).
+                                                                        Considering the non-linearity of TGEMM before saturation,
+3.3   Existing Methods Fall Short on RLMs                               TGEMM ( 2k+1
+                                                                                  k+1 B) < TGEMM (2B) ≈ TGEMM (B) when B is
+                                                                        far below the saturation point. Therefore, the naive schedul-
+However, we find that existing methods fail to provide ex-
+                                                                        ing incurs up to 2× longer execution time.
+pected speedup under RLMs inference, as modeled in § 3.2.
+As shown in Figure 3, when serving Qwen3-8B on an H100                  Explicit synchronization. The paradigm of speculative
+with AIME, MagicDec fails to approach the acceptance rate               decoding, i.e., drafting candidate tokens followed by verifi-
+of the oracle top-k attention (Lin et al., 2025), thus falling          cation, introduces an explicit synchronization between CPU
+far behind the theoretical optimal speedup. This is because             and GPU, preventing the expensive CPU operations from
+the draft model in existing methods is not adaptive to the              being overlapped with the GPU operations. Specifically,
+context dynamics in RLMs, leading to inaccurately drafted               the GPU must wait for the CPU to complete the verifica-
+tokens. Furthermore, even with the same acceptance rate,                tion process, which cleans metadata of rejected tokens from
+existing methods still have a non-negligible gap between                requests and resets draft status for the next generation step.
+the expected speedup, due to several system challenges.
+                                                                        As a result, state-of-the-art inference frameworks (Zheng
+Context dynamics. For long output of RLMs, sparsity                     et al., 2024; Kwon et al., 2023) must run CPU operations
+patterns shift significantly based on semantic context during           on the critical path when enabling speculative decoding,
+generation. As shown in Figure 4, the critical tokens of                incurring significant overhead. Such inefficiency is further
+the KV-Cache differs dramatically over time. Therefore,                 exacerbated in sparse self-speculative decoding, where each
+instead of using a static sparsity pattern (e.g., sliding win-          iteration has verification requests under unified scheduling.
+                   Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                      PillarAttention                                         New Req9
+                                                                                              Get Lowest      Num Tokens to Draft
+                                                                                                                                     Add to Batch
+                                                                                                Load               3-2=1
+
+                                                                              Bucket 1 Req0 Req4 Req8      Draft 0    Bucket 1 Req0 Req4 Req8       Draft 1
+                                                  Low       Selected          Bucket 2 Req1                Draft 1    Bucket 2 Req1 Req9            Draft 2
+                                                  High      Skipped
+                                                                              Bucket 3 Req2 Req6           Draft 2    Bucket 3 Req2 Req6            Verify
+One Iteration
+                                                                              Bucket 4 Req3 Req7           Verify     Bucket 4 Req3 Req7            Draft 0
+
+                                                                                    Iteration i                                 Iteration i + 1
+       Drafting                                (1) Select critical tokens
+    Verification                                 in verification stage.
+                                                                            Figure 8. Illustration of scheduling new requests. Unified and
+                                                (2) Sparse attention in     Resource-aware Batch Scheduler identifies the least-loaded bucket
+                                               the next drafting stage.
+                                                                            and schedules new requests to it by adjusting the drafting length.
+
+Figure 7. Illustration of PillarAttn. PillarAttn performs full atten-       4.1   PillarAttn: Dynamic Sparse Attention Tailored for
+tion and uses attention scores in the verification phase to identify              Self-Speculative Decoding
+sparsity patterns for the next k draft phases.
+                                                                            As discussed in § 3.2, both a high sparsity ratio s and a
+                                                                            high acceptance rate α are critical to the performance of
+                                                                            sparse self-speculation. Therefore, a sparse attention that
+                                                                            accurately and efficiently identifies sparsity patterns is nec-
+                                                                            essary. To this end, SparseSpec proposes PillarAttn, a sparse
+                                                                            attention mechanism tailored for self-speculation decoding.
+KV-Cache underutilization. The huge variance of output
+lengths from RLMs (§ 2.2) makes it hard to perfectly man-                   Dynamic sparsity pattern. To adapt to the context dynam-
+age KV-Cache, as the output lengths are unknown before                      ics as discussed in § 3.3, instead of using a fixed sparsity pat-
+generation. We collect the memory utilization and recom-                    tern (e.g., sliding window or static patterns from prompts),
+putation (i.e., the ratio of recomputed tokens to generated                 PillarAttn periodically re-identifies and updates the sparsity
+unique tokens) from a real-world trial. As shown in Figure                  pattern used in the drafting phase. Built on the assumption
+5, existing methods either underutilize KV-Cache capacity                   that the contextual semantics have spatial locality, PillarAttn
+or lead to excessive recomputation due to misprediction.                    updates the sparsity pattern at a small stride, within which
+Such underutilization of KV-Cache severely limits the self-                 the sparsity patterns are fixed. Therefore, the overhead of
+speculation speedup, as the efficiency metric η decreases                   identification can be amortized over a stride of iterations.
+with smaller KV-Cache size (§ 3.2).
+                                                                            Overhead-free identification. Such a stride is co-designed
+                                                                            with the paradigm of self-speculative decoding, with the
+3.4      SparseSpec: Unleashing Sparse Self-Speculation                     same value as the speculative steps k. After every k draft
+         with Efficient Algorithm-System Co-design                          steps with sparse attention, a verification step with full at-
+Opportunities. In this paper, we aim to leverage the sparse                 tention is performed, which computes the attention scores
+self-speculative decoding to mitigate the memory bandwidth                  for all tokens in the KV-Cache as intermediate results. To
+bottleneck of long-generation from batch RLMs inference,                    avoid extra computation and storage overhead, PillarAttn
+providing lossless and training-free acceleration.                          on-the-fly dumps the attention scores during verification via
+                                                                            customized attention kernels. Therefore, the sparsity pattern
+Challenges. However, realizing the theoretical speedup                      can be directly identified by reusing and applying Top-K
+of self-speculation presents several challenges, requiring                  on the dumped attention scores, which are first averaged
+algorithm-system co-design: (1) how to design a sparse                      over k draft tokens and query heads (within same group) if
+attention that adapts to the context dynamics with minimal                  group query attention is applied. Specifically, the attention
+overhead; (2) how to schedule draft and verify phases to                    logits and logarithm summation of exponential are cached
+avoid workload fluctuation; (3) how to handle the explicit                  during verification, which are used to rematerialized atten-
+synchronization to enable CPU/GPU overlap; and (4) how to                   tion scores for identification. We visualize the workflow of
+fully utilize the KV-Cache capacity without recomputation.                  PillarAttn in Figure 7, where the sparsity pattern is updated
+                                                                            during verification after every 3 draft phases.
+4       D ESIGN
+                                                                            4.2   Unified Batch Scheduler
+In this section, we describe the design of SparseSpec’s com-
+ponents, including a dynamic sparse attention algorithm                     As discussed in § 3.3, the draft and verification phases have
+(§ 4.1), a unified batch scheduler (§ 4.2), delayed verifica-               heterogeneous resource usages, which leads to underutiliza-
+tion (§ 4.3), and a dynamic KV-Cache manager (§ 4.4). We                    tion thus suboptimal performance. To address this, Spars-
+visualize the design overview of SparseSpec in Figure 6.                    eSpec introduces a unified batch scheduler, that provides a
+                          Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                       GPU Operations                CPU Operations               GPU Idle
+                                                                                                  demonstrate this, we profile state-of-the-art FlashInfer (Ye
+  Req 1                       Draft             Draft
+           Verify   CPU                                          Draft           Verify           et al., 2025) for both sparse and full attention. Results show
+  Req 2    Draft             Verify      CPU    Draft            Draft            Draft           that the kernel optimized for verification (full) attention
+  Req 3    Draft              Draft            Verify     CPU    Draft            Draft           achieves near 85% bandwidth but less than 50% for draft
+  Req 4    Draft              Draft             Draft           Verify     CPU    Draft
+                                                                                                  (sparse) attention; kernels optimized for sparse attention
+  Iter …   Iter i            Iter i+1          Iter i+2         Iter i+3         Iter i+4
+  (a) Synchronous CPU-GPU Executions                                                 Time Steps
+                                                                                                  deliver over 80% bandwidth, but degrade to 50% on full
+  Req 1
+                                                                                                  attention. To address this, SparseSpec introduces a fused
+           Verify   CPU          Draft     Draft        Draft
+                                                                                                  attention kernel in persistent-kernel style, which on-chip
+  Req 2    Draft    Verify CPU             Draft        Draft
+                                                                                                  dispatches verification and draft attention into their best
+  Req 3    Draft     Draft      Verify    CPU           Draft
+  Req 4
+                                                                                                  template instead of launching two kernels, achieving the
+           CPU       Draft       Draft     Verify    CPU
+  Iter …   Iter i   Iter i+1 Iter i+2 Iter i+3 Iter i+4
+                                                                                                  best of both. We evaluate the fused kernel in § 5.6.
+  (b) Asynchronous CPU-GPU Executions with Delayed Verification Time Steps
+                                                                                                  4.3   Delayed Verification
+Figure 9. Illustration of delayed drafting to achieve asynchronous
+CPU-GPU execution. Requests in the verification phase stall for
+                                                                                                  As detailed in § 3.3, the verification phase introduces an
+one cycle for the CPU to determine the number of accepted tokens                                  explicit synchronization between CPU and GPU, preventing
+and the critical tokens, while other requests can still move forward.                             the expensive CPU operations from being overlapped with
+                                                                                                  the GPU operations. For example, the execution of i-th
+uniform abstraction and workload-aware scheduling for both                                        iteration depends on the verification results of (i − 1)-th,
+phases. Furthermore, to enhance hardware efficiency, Spars-                                       specifically on rejected tokens and the updated sparsity pat-
+eSpec introduces a fused attention kernel that efficiently                                        tern. Such sequential execution can account for over 20%
+batches sparse and full attention into a single kernel.                                           of end-to-end latency (Srivatsa et al., 2024).
+
+Uniform abstraction for draft and verification. Since                                             Our key observation is that such synchronization only ap-
+draft and target models share the same model weights in                                           plies to requests in the verification phase. Under balanced
+self-speculation, both phases go through the exactly same                                         scheduling in § 4.2, such requests occupy only a small frac-
+                                                                                                          1
+on-GPU data and control flow, except for sparse attention                                         tion ( k+1 ) of the batch B. Therefore, instead of stalling the
+and full attention. Fortunately, modern inference frame-                                          entire batch, SparseSpec allows the metadata preparation
+works already integrate PagedAttention (Kwon et al., 2023),                                       for non-verification requests on CPU to proceed directly
+which is essentially a sparse attention implementation at                                         without waiting for the verification results from GPU. For
+the granularity of the page. Therefore, by using a page size                                      example, only verification requests from (i − 1)-th itera-
+of 1, both sparse and full attention can be unified with the                                      tion are stalled and taken out from the i-th iteration. After
+same pipeline, which greatly simplifies the system design                                         getting the verification results from GPU, the requests are
+and unleashes the flexibility of scheduling in both phases.                                       issued to the GPU for execution at (i + 1)-th iteration. We
+                                                                                                  illustrate the delayed verification in Figure 9.
+Workload-aware scheduling. As shown in § 3.3, sequen-
+tial execution of all draft phases followed by one verifi-                                        4.4   Dynamic KV-Cache Management
+cation phase results in poor hardware utilization, due to
+the extremely unbalanced workload. Therefore, given the                                           Aggressive CPU Offloading. Given the high output length
+scheduling flexibility enabled by the unified abstraction,                                        variance in RLMs (Table 1), achieving high KV cache uti-
+SparseSpec evenly mixes requests from both phases in each                                         lization without recomputation is challenging (Figure 5).
+batch (at each generation step). To achieve perfect balance,                                      Therefore, instead of optimizing output-length prediction,
+SparseSpec introduces a greedy bin-packing strategy that                                          SparseSpec prefers to aggressively increase request concur-
+assigns incoming new requests into different draft phases in                                      rency to fully utilize KV-Cache, while offloading KV-Cache
+a workload-aware way. Specifically, SparseSpec maintains                                          to host once approaching out-of-memory to avoid recom-
+k buckets to track request counts for each draft phase and                                        putation. Note that both offloading and loading follow the
+assigns each incoming request to the least-loaded bucket.                                         FIFO order, assuring fairness and avoiding starvation.
+This scheduling strategy is illustrated in Figure 8.
+                                                                                                  Overhead analysis. First, SparseSpec achieves offloading
+Fused sparse and full attention. Even under ideal schedul-                                        with negligible overhead by breaking the large KV-Cache
+ing, the attention operation still suffers from low hardware                                      into chunks and offloading chunk-by-chunk asynchronously.
+utilization due to its heterogeneity in the draft and verifi-                                     For instance, when running Qwen3-8B on a single H100
+cation phases. This is because the attention in draft and                                         GPU with a batch size of 128, each decoding step generates
+verification has different arithmetic intensities due to dif-                                     just 128 new tokens, requiring only 18MB of KV-Cache
+ferent input token counts, leading to different best kernel
+implementations (e.g., tile sizes and MMA instruction). To
+                                                    Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                                                                                              vLLM           vLLM-ngram                             MagicDec                                TriForce           Ours
+
+                                                       Qwen3-1.7B-TP1                                                                            Qwen3-8B-TP2                                                                         Qwen3-14B-TP4
+                         8000
+                                                                                                                                                                                                                         1.51× 6802            1.31× 6968         1.34× 6906
+ Throughput (tokens/s)
+
+
+
+
+                         6000                                                                                                                                                                                                                 5760               5658
+                                                                                      2.04× 5163                                                                                                                                           5300               5166
+                                                                                                                                                     1.58× 4897                                 1.62× 4937            5100
+                                                                                                                  1.79× 4685                                                                                                                                        4849
+                                                                 1.91× 4495                                                                                                                                       4498   4497
+                                          2.13× 4239                                                                                                                                                                                            4310
+                         4000                                                          3815                                                         3750                                      3746
+                                                                                                                                                                                           3741                              3610
+                                                                                    3512                         3451
+                                                                                                              3404                                     3564                                                                                          3400             3524
+                                           3220                    3352
+                                                                3228
+                                                                                           2913                                                  3094                                    3041
+                                        2716                          2650                                 2619        2765                               2707                                     2753
+                                              2411           2358              2534
+                                     1986
+                         2000
+
+
+                              0
+                                          AIME               LiveCodeBench OlympiadBench                          AIME                           LiveCodeBench OlympiadBench                                             AIME          LiveCodeBench OlympiadBench
+
+
+
+
+                                       Figure 10. End-to-end throughput comparison of SparseSpec and existing training-free acceleration frameworks.
+
+                                                                                              Stride
+                                                                               4       8        12      16        20
+                         8                                                                                               0.9                                                             8000
+
+
+
+
+                                                                                                                                                                 Throughput (tokens/s)
+                                                                                                                                                                                                             Eagle3                                            6892
+                                                                                                                                                                                                                                                            6469
+                                                             1.27× 6.1
+                                                                                                                                                                                                             Ours
+                         6                                                                                               0.8
+                                                                                                                                                                                         6000
+    Accepted tokens
+
+
+
+
+                                                                                                                               Acceptance rate
+                                                                                                                                                                                                        4632                    46394840
+                                                 3.02× 4.8                                                                                                                                           4043
+
+                         4
+                                                                                                                                                                                         4000
+                                                                                                                         0.7
+
+
+                                                                                                                                                                                         2000
+                         2           1.50× 1.6                                                                           0.6
+                               1.1                                                                   Budget ratio
+                                                                                                     Stride                                                                                     0
+                         0                                                                                               0.5                                                                    Qwen3-1.7B-TP1           Qwen3-8B-TP2                 Qwen3-14B-TP4
+                             Eagle-3    N-gram Streaming          Ours       0.05     0.10   0.15     0.20        0.25
+                                                                                          Budget ratio
+
+
+
+
+Figure 11. Left: Number of accepted tokens for EAGLE-3, N-                                                                                             Figure 12. End-to-end throughput comparison of SparseSpec and
+gram, Streaming, and SparseSpec when drafting k=8 tokens. Bars                                                                                         draft model based methods, averaged over three datasets. Error
+show the average across all models and datasets; error bars de-                                                                                        bars denote the standard deviation across datasets.
+note the standard deviation across model × dataset combinations.
+Right: Acceptance-rate sensitivity, with budget ratio on the bottom
+axis (k=8) and stride on the top axis (sparsity 0.05). Both curves
+are averaged over all evaluated models and datasets.                                                                                                   Team, 2025). We use tensor parallelism (TP) to partition
+                                                                                                                                                       models across multiple GPUs, selecting the paralleliza-
+                                                                                                                                                       tion that achieves the highest throughput per GPU, with
+memory 1 . Since the GPU latency per iteration is on the                                                                                               TP1/2/4 for 1.7B/8B/14B, respectively. We use NVIDIA
+magnitude of 10 ms, the necessary bandwidth is only 18                                                                                                 DGX-H100-SXM5 GPUs as our testbed.
+GB/s to overlap offloading with GPU computation, which is
+                                                                                                                                                       Datasets. We use the following datasets as target reasoning
+well below the PCIe bandwidth limit. Besides, SparseSpec
+                                                                                                                                                       workloads spanning math, general knowledge, and program-
+prioritizes scheduling the offloaded requests whenever GPU
+                                                                                                                                                       ming: (1) AIME (Veeraboina, 2023): Math problems from
+has available memory. This strategy bounds worst-case CPU
+                                                                                                                                                       the American Invitational Mathematics Examination; (2)
+usage to GPU capacity, e.g., 640GB for an 8×H100 server,
+                                                                                                                                                       OlympiadBench (He et al., 2024): Olympiad-level bilingual
+well within typical CPU DRAM limits in data centers.
+                                                                                                                                                       scientific problems across STEM requiring advanced multi-
+                                                                                                                                                       step reasoning, and we use its text QA subset for evaluation;
+5                            E VALUATION                                                                                                               and (3) LiveCodeBench (Jain et al., 2024a): Coding ques-
+                                                                                                                                                       tions collected from LeetCode, AtCoder, and Codeforces.
+5.1                           Evaluation Setup
+                                                                                                                                                       For each workload, we randomly sample 2048 requests
+Models and Hardwares. We primarily evaluate Spars-                                                                                                     to saturate the pipeline for the following evaluations. We
+eSpec using three state-of-the-art open-sourced RLMs: (1)                                                                                              set the temperature as 0.65 following common practice.
+Qwen3-1.7B, (2) Qwen3-8B, and (3) Qwen3-14B (Yang                                                                                                      Baselines. We compare SparseSpec against the following
+et al., 2025). To demonstrate generality across model archi-                                                                                           serving frameworks combined with different speculative
+tectures, we additionally evaluate on DeepSeek-R1-Distill-                                                                                             decoding algorithms: (1) vLLM 2 : we enable vLLM-V1 by
+Llama3-8B (DeepSeek-AI, 2025a) and QwQ-32B (Qwen                                                                                                       default for best performance; (2) vLLM-NGram (Leviathan
+                         1                                                                                                                                  2
+                             128 ∗ 128 ∗ 8 ∗ 2 ∗ 2 ∗ 36/1e6 = 18MB.                                                                                             Release v0.11.0 with commit hash: b8b302c
+                 Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+
+Table 2. Throughput speedup of SparseSpec over vLLM on non-      Table 3. Breakdown of execution time (ms) on Qwen3-8B.
+Qwen3 models. SparseSpec achieves consistent gains across dif-               CPU Attention GEMM             Others   Total
+ferent model families and TP configurations.
+                                                                   vLLM      3.2       17.1       7.2        1.2       28.7
+ Model                           TP   AIME    LiveCodeBench                            5.2        8.9        1.4        16
+                                                                   Ours      0.5
+ DeepSeek-R1-Distill-Llama3-8B   1    2.43×       1.38×                              (70%↓)     (24%↑)     (17%↑)    (44%↓)
+ QwQ-32B                         4    2.38×       1.65×
+
+
+                                                                 Qwen3-8B and -14B share the same head dimension and
+et al., 2023): a training-free speculative decoding integrated   number of key/value heads. Therefore, the maximal B of re-
+into vLLM; (3) MagicDec (Chen et al., 2024): as the origi-       quests increases a lot, which approaches the saturation point
+nal open-sourced one is hard-coded for short output lengths      B̂, incurring more computation overhead in speculation.
+and cannot be easily adapted, we reproduced MagicDec             Ours vs. draft model based speculative decoding. We
+within our framework strictly following their paper; and (4)     also compare SparseSpec with a state-of-the-art draft model
+TriForce (Sun et al., 2024): similar to MagicDec, we repro-      based speculative decoding method, EAGLE3, which re-
+duced TriForce based on vLLM; and (5) vLLM-EAGLE3 (Li            quire additional training. Under this setting, SparseSpec
+et al., 2025a): a state-of-the-art draft-model based specula-    still achieves better performance over all datasets and mod-
+tive decoding algorithm integrated by vLLM. We adopt all         els, despite requiring no additional training. SparseSpec
+EAGLE3 draft models open-sourced by Tencent (Contrib-            further delivers similar or higher throughput while com-
+utors, 2025). For all baselines, we enable chunked prefill,      pletely avoiding the additional cost and engineering effort
+CUDA graph, and continuous batching. We set up the best          associated with draft-model fine-tuning and deployment.
+configuration for both NGram (k = 4) and EAGLE3 (k = 3)
+according to our tests, with the tree-speculation disabled       Ours vs. self-speculative decoding. Layer-skipping self-
+in batch inference following (Li et al., 2025a). We set the      speculation methods such as LayerSkip (Elhoushi et al.,
+maximal batch size for all frameworks to 256, which is large     2024), Self-SD (Zhang et al., 2024), and SkipDecode (Corro
+enough to saturate GPU memory in our setup.                      et al., 2023) require model fine-tuning or layer-wise opti-
+                                                                 mization, and are therefore not directly applicable to RLMs.
+                                                                 Swift (Xia et al., 2025) removes the fine-tuning requirement
+5.2   End-to-End Performance
+                                                                 but is inherently limited to single-request inference, as dif-
+Ours vs. training-free speculative decoding. SparseSpec          ferent requests require skipping different layers, making
+is a training-free speculative decoding system by design.        batch serving infeasible. Even in the single-request setting
+Thus, we compare SparseSpec with training-free specula-          where Swift is most favorable, we reproduce it with its of-
+tive decoding methods including vLLM-NGram (Leviathan            ficial implementation on Llama-2-13B and observe only a
+et al., 2023), MagicDec (Chen et al., 2024), and Tri-            1.47× speedup on AIME, well below the > 2× speedup
+Force (Sun et al., 2024). Specifically, TriForce, as a hi-       SparseSpec achieves.
+erarchical framework, comprises three speculation layers,
+                                                                 Generality across model architectures. To validate that
+one of which relies on a standalone draft model; because
+                                                                 SparseSpec’s generality across model architectures, we eval-
+no usable small draft model is available for recent RLMs,
+                                                                 uate on DeepSeek-R1-Distill-Llama3-8B (TP1) and QwQ-
+we replace that layer with a training-free NGram. For the
+                                                                 32B (TP4), as shown in Table 2. SparseSpec achieves
+middle layer, we use sliding window attention as the draft
+                                                                 consistent speedups of 2.43× and 2.38× on AIME, con-
+model, the same as MagicDec. We set k equal to 1 and 6 for
+                                                                 firming that the analytical framework in § 3.2 generalizes
+the first and middle layer, which performs best in our setup.
+                                                                 across transformer-based autoregressive models.
+As shown in Figure 10, SparseSpec consistently outper-
+                                                                 Performance on shorter workloads. As analyzed in § 3.2,
+forms all baselines, achieving up to 2.13× speedup com-
+                                                                 self-speculation benefits diminish as shorter outputs allow
+pared to state-of-the-art framework, vLLM. When compared
+                                                                 larger batch sizes, shifting the workload from memory-
+to existing speculative decoding frameworks, SparseSpec
+                                                                 bound to compute-bound. On GPQA-Diamond (Rein et al.,
+achieves up to 1.36× throughput improvement. Interest-
+                                                                 2024) (∼8000 average output tokens), SparseSpec achieves
+ingly, TriForce consistently falls behind MagicDec, mainly
+                                                                 1.66× and 1.44× speedup on Qwen3-1.7B and Qwen3-8B,
+because the additional layer of NGram has a low acceptance
+                                                                 respectively, confirming effectiveness on moderately long
+rate (Figure 11 (left)) that leads to excessive computa-
+                                                                 workloads.
+tion. Besides, all speculative decoding methods achieve
+lower speedup with larger models and TP degrees. This            Execution time breakdown. To breakdown the improve-
+is because, though available GPU memory increases, the           ment, we profile the execution latency for CPU operations,
+per-token memory usage increases much less. For example,         attention, and GEMM in SparseSpec on Qwen3-8B model
+                  Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+
+Table 4. Average time per output token (TPOT) on AIME under       Table 5. Comparison of PillarAttn against Quest (Tang et al., 2024)
+fixed batch sizes. SparseSpec reduces per-token latency as its    on AIME with Qwen3-1.7B (k=8, sparsity 0.05). Top-10 Recall
+throughput gains come from higher token parallelism within the    measures the fraction of selected tokens overlapping with the
+same set of requests.                                             oracle top-10 tokens. Attn Coverage measures the total attention
+                                                                  score covered by the sparse attention selection.
+                           TPOT (ms)
+      Model                                     Speedup                                  End-to-End                Spatial Locality (%)
+                                                                   Method
+                      vLLM      SparseSpec                                        Accept. Rate   Throughput   Top-10 Recall   Attn Coverage
+                                                                   Quest            57.80%       3780 tok/s      76.17            69.88
+      Qwen3-1.7B      23.74        12.05         1.97×             PillarAttn       74.20%       4239 tok/s      80.04            74.70
+      Qwen3-8B        29.55        17.18         1.72×             Oracle Top-K        –             –           100.00           88.96
+
+
+
+
+                                                                  We set the sparsity ratio to 0.05, as performance saturates
+with AIME dataset, and compare it with vLLM in Table 3.
+                                                                  with further increases in selected tokens.
+Results show that SparseSpec successfully reduces the exe-
+cution time of Attention by 3.29×, with only a slight time
+increase in GEMM (1.7ms), consistent with our estimation          5.5   PillarAttn Analysis
+in § 3.2. Moreover, SparseSpec maintains exceptionally low        Comparison with state-of-the-art sparse attention. We
+CPU overhead (< 1 ms), resulting in high GPU utilization.         compare PillarAttn against Quest (Tang et al., 2024), a state-
+Latency analysis. Because SparseSpec increases token              of-the-art query-aware sparse attention method, on AIME
+parallelism without adding concurrent requests, throughput        with Qwen3-1.7B while keeping all other system optimiza-
+gains translate directly into lower per-output-token latency      tions identical. As shown in Table 5, PillarAttn achieves
+(TPOT). We measure the average TPOT on AIME under                 a 74.20% acceptance rate compared to Quest’s 57.80%,
+fixed batch sizes to isolate queuing effects, as shown in Table   and delivers 12% higher end-to-end throughput. This im-
+4. Compared to vLLM, SparseSpec reduces TPOT by 1.97×             provement is attributed to PillarAttn’s use of exact attention
+and 1.72× on Qwen3-1.7B and Qwen3-8B, respectively.               scores from the verification phase, as opposed to Quest’s
+                                                                  approximate importance estimation via key pooling.
+5.3   Speculation Acceptance Rate                                 Spatial locality analysis. PillarAttn relies on the observa-
+                                                                  tion that sparsity patterns exhibit spatial locality across the
+We evaluate the acceptance rate of PillarAttn by measuring
+                                                                  speculation stride, despite the dynamic contexts in RLMs.
+the average acceptance length when drafting 8 tokens (i.e.,
+                                                                  We measure how well each method’s selected tokens over-
+k = 8) across different models and datasets. We do not
+                                                                  lap with the oracle top-K tokens on AIME at 5% sparsity, as
+count the bonus token for all methods. As shown in Figure
+                                                                  shown in Table 5. PillarAttn consistently achieves higher
+11 (left), PillarAttn achieves an average acceptance token
+                                                                  recall and attention coverage than Quest. This is because the
+length of 6.16 out of 8 tokens, surpassing all other drafting
+                                                                  speculation stride is small (k=8–12 tokens), so the sparsity
+methods. In comparison, both NGram and EAGLE3 can
+                                                                  pattern refreshes frequently enough to track semantic shifts
+only draft fewer than 2 accepted tokens. We hypothesize
+                                                                  during reasoning.
+this is because those reasoning tasks are out-of-distribution
+from EAGLE3’s training datasets, indicating less generality.
+                                                                  5.6   Ablation Study
+5.4   Sensitivity Tests                                           To isolate the contribution of each design component, we
+                                                                  start from a naive implementation for sparse self-speculative
+We conduct sensitivity tests over three datasets to quantify
+                                                                  decoding, and incrementally enable the unified batch sched-
+how the speculation steps k and the sparsity ratio s affect
+                                                                  uler, dynamic KV-Cache manager, and delayed verification.
+the performance of PillarAttn, as shown in Figure 11 (right).
+                                                                  The throughput for AIME with Qwen3-1.7B is shown in Fig-
+Despite fixing s = 0.05 and k = 8 in our evaluation, Spars-
+                                                                  ure 13. Our experiments reveal that three designs boost
+eSpec has no rigid constraints on these hyperparameters
+                                                                  the performance by 1.23×, 1.61×, and 1.12×, respectively,
+during runtime, which in fact allows arbitrary combinations
+                                                                  culminating in an aggregate throughput gain of 2.22×. We
+and heterogeneous request configurations.
+                                                                  also provide detailed profiling for each component:
+Speculation steps k. Fixing the sparsity ratio s = 0.05, we
+                                                                  Batch size and compute utilization. Figure 14 presents
+vary the drafting length from 4 to 20. We set the draft length
+                                                                  a comparative analysis of GEMM input batch sizes and
+k = 8 to balance acceptance and verification overhead.
+                                                                  hardware utilization (in TFlops) between systems with and
+Sparsity ratio s. We vary the sparsity ratio in PillarAttn        without unified batching. With unified batching enabled,
+and measure the acceptance rate when generating 8 tokens.         the input batch size remains stable across iterations, while
+                 Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                             1.23x                                                       GEMM batch               Num. of draft requests          Num. of verify requests
+
+
+                                     1.61x                                                             Naive                           Unified Batching
+
+                                              1.12x                                     1000                                                                       120
+
+
+
+
+                                                                      GEMM batch size
+                                                                                                                                                                   100
+                                                                                         800
+
+
+
+
+                                                                                                                                                                         Requests
+                                                                                                                                                                   80
+                                                                                         600
+                                                                                                                                  Saturation Point                 60
+
+                                                                                         400                                                                       40
+
+                                                                                                                                                                   20
+Figure 13. Ablation study of SparseSpec on Qwen3-1.7B with                               200
+                                                                                                                                                                   0
+AIME. Each component contributes to significant improvement.                                   0      10           20       30    0        10          20     30
+                                                                                                           Step                                 Step
+
+
+
+traditional scheduling causes significant variance and leads
+to hardware underutilization during the drafting phase.           Figure 14. GEMM input batch size and request counts when run-
+                                                                  ning Qwen3-8B on H100 with different scheduling policies. Naive
+Fused attention. We evaluate the performance of the               alternates between all-draft and all-verify phases, yielding fluctu-
+fused sparse and full attention kernel against two baselines:     ation; Unified mixes draft/verify evenly with a stable batch size,
+sequentially launching two kernels (Sequential) and a naive       preventing both GPU underutilization and oversaturation.
+kernel that computes both attention types jointly (Naive
+Batch). The result is shown in Figure 15. Our fused kernel
+achieves a 1.3× speedup over sequentially running and a           used for verification. Such a hierarchical approach can re-
+1.8× speedup compared to naive batching, which comes              duce the amount of FFN computation besides KV-Cache
+from the following two factors: (1) best kernel configuration     loading, leading to a great opportunity for further speedup.
+dispatched to both draft and verification attention; (2) higher
+                                                                  Delayed verification overhead. Delayed verification in-
+bandwidth utilization when having more transaction bytes                                          1
+                                                                  troduces a one-cycle stall for k+1 of requests per iteration,
+within a single kernel to overlap pipeline latency.
+                                                                  but this cost is offset by removing CPU operations from
+Memory capacity utilization. We compare the memory                the critical path. For example, when running Qwen3-14B
+utilization and recomputation of SparseSpec with baselines        with 4×H100 on AIME, GPU execution requires 18.37 ms
+including oracle and preemption as described in § 4.4. As         per step while CPU operations require 8.55 ms per step on
+shown in Figure 5, SparseSpec utilizes nearly all available       average. The resulting CPU savings (8.55/18.37 ≈ 46.5%)
+GPU memory without incurring recomputation. We further            exceed the delayed verification overhead (1/(k+1) ≈ 11%
+quantify the overhead of offloading by comparing the execu-       for k=8), yielding a net 1.12× throughput improvement as
+tion time with offload operations enabled against a baseline      shown in the ablation study (§ 5.6).
+where these operations are replaced with an empty kernel.
+                                                                  Limitation. The proposed method focuses on improving
+The results indicate that offloading prolongs cycle time by
+                                                                  the memory efficiency of long-generation workloads. For
+only 0.5% on average, which is practically negligible.
+                                                                  tasks with short output lengths, the achievable batch size
+                                                                  is large enough to saturate GPU computation, making the
+6    D ISCUSSION                                                  workload compute-bound (Zhu et al., 2024). As analyzed
+                                                                  in § 3.2, once the average output length drops below a
+SparseSpec on mixture-of-expert (MoE) models. Spars-
+                                                                  model-specific threshold, the additional computation from
+eSpec can be seamlessly applied to MoE models, as only
+                                                                  speculation outweighs the memory savings. Similarly, when
+the attention module is involved without modifying FFN.
+                                                                  FFN rather than attention dominates latency, the speedup
+Furthermore, as only a subset of the experts is activated
+                                                                  from sparse attention is reduced. Nevertheless, as RLMs
+during inference, the input token size per expert decreases
+                                                                  continue to scale output lengths, attention-bound scenarios
+significantly, which increases the saturation point B̂ for the
+                                                                  are expected to become increasingly prevalent (Snell et al.,
+sparsified FFN computation. Therefore, self-speculation has
+                                                                  2024), broadening SparseSpec’s applicability.
+a higher potential due to the reduced computation overhead.
+SparseSpec with multi-token prediction (MTP). Spars-              7                      R ELATED W ORK
+eSpec can be combined with other lightweight drafting meth-
+ods, including EAGLE3 and MTP, into a hierarchical specu-         Long-context sparse attention. Prior works have widely
+lation approach as proposed in TriForce (Sun et al., 2024).       explored speeding up attention by exploiting its inherent
+For example, MTP is used to draft k1 tokens at once, which        sparsity. Static approaches (Xiao et al., 2024b; Zhang et al.,
+are verified by PillarAttn into a buffer; when k2 tokens are      2023; Li et al., 2024a) employ a fixed KV-cache pruning
+accepted and accumulated, the underlying full attention is        strategy, thus cannot adapt to evolving reasoning contexts.
+                                             Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+                              Sequential           Naive Batch             Fused Attention (Ours)   In contrast, SparseSpec identifies attention as the bottleneck
+                                       Qwen-2.5-7B w/ TP1                 Llama-3-8b w/ TP1         in reasoning inference and seamlessly integrates the original
+                             2000                              2000                                 model with an accurate dynamic sparse attention module
+                                                                                                    PillarAttn as the draft model, achieving substantial end-to-
+ Achieved Bandwidth (GB/s)
+
+
+
+
+                             1500                              1500                                 end speedups without requiring extra training or storage.
+                             1000
+                                    0.05 0.10 0.15 0.20 0.25          0.05 0.10 0.15 0.20 0.25
+                                       Qwen-2.5-14B w/ TP2                 QwQ-32B w/ TP4           8    C ONCLUSION
+                             2000                              2000
+                                                                                                    Due to long output sequences, reasoning model inference
+                                                               1500                                 is heavily memory-bound. We propose SparseSpec, a loss-
+                             1500
+                                                               1000                                 less and training-free framework for reasoning models that
+                             1000                                                                   adopts sparse self-speculation. SparseSpec identifies critical
+                                    0.05 0.10 0.15 0.20 0.25          0.05 0.10 0.15 0.20 0.25
+                                               Sparsity of Sparse Attention                         tokens during full attention in the verification phase and uses
+                                                                                                    them to guide sparsity during drafting. With system-level
+                                                                                                    optimizations-including a unified and resource-aware batch
+Figure 15. Performance comparison between sequentially launch-                                      scheduler, delayed verification, and dynamic KV-Cache
+ing FlashInfer kernels for full and sparse attention (Sequential),                                  manager-SparseSpec achieves up to 2.13× throughput im-
+naively batching full and sparse attention using one FlashInfer                                     provement over state-of-the-art serving frameworks.
+(Naive Batch), and our fused sparse and full attention kernels.
+                                                                                                    ACKNOWLEDGEMENTS
+                                                                                                    We thank MIT-IBM Watson AI Lab, Amazon and National
+While query-aware methods (Tang et al., 2024; Zhu et al.,                                           Science Foundation for supporting this research. We thank
+2025; Xiao et al., 2024a; Wu et al., 2025; Lin et al., 2025)                                        NVIDIA for donating the DGX server.
+dynamically identify important tokens during generation,
+they incur non-negligible overhead in estimating token im-
+portance. In contrast, PillarAttn naturally reuses attention
+                                                                                                    R EFERENCES
+scores from the verification phase of speculative decoding,                                         Ankner, Z., Parthasarathy, R., Nrusimha, A., Rinard, C.,
+to dynamically select critical tokens for the next drafting                                           Ragan-Kelley, J., and Brandon, W. Hydra: Sequentially-
+phase, with minimal overhead.                                                                         dependent draft heads for medusa decoding, 2024. URL
+                                                                                                      https://arxiv.org/abs/2402.05109.
+Speculative decoding. Speculative decoding provides
+lossless acceleration for long-output tasks. Training-based                                         Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,
+approaches-including the EAGLE series (Li et al., 2025b;                                              L., and Jumper, J. Accelerating large language model
+2024b; 2025a), Hydra (Ankner et al., 2024), Multi-token                                               decoding with speculative sampling, 2023. URL https:
+Prediction (DeepSeek-AI, 2025b) and EESD (Liu et al.,                                                 //arxiv.org/abs/2302.01318.
+2024a)-improve acceptance rates effectively via different
+draft model designs or learning approaches, but at the cost of                                      Chen, J., Tiwari, V., Sadhukhan, R., Chen, Z., Shi, J., Yen,
+higher deployment complexity. Training-free methods like                                              I. E.-H., and Chen, B. Magicdec: Breaking the latency-
+N-gram (Leviathan et al., 2023), Lookahead Decoding (Fu                                               throughput tradeoff for long context generation with spec-
+et al., 2024), and SAM Decoding (Hu et al., 2024) pre-                                                ulative decoding. arXiv preprint arXiv:2408.11049, 2024.
+dict future tokens from the current context, suffering from                                         Contributors, T. A. P. AngelSlim, 7 2025. URL https:
+degraded accuracy on reasoning tasks. MagicDec (Chen                                                  //github.com/Tencent/AngelSlim.
+et al., 2024) and TriForce (Sun et al., 2024) adopt static
+sparse attention as draft for long-input scenarios but strug-                                       Corro, L. D., Giorno, A. D., Agarwal, S., Yu, B., Awadal-
+gle with long, dynamic reasoning outputs. The suffix tree                                             lah, A., and Mukherjee, S. Skipdecode: Autoregressive
+approach in RhymeRL (He et al., 2025) and SuffixDecod-                                                skip decoding with batching and caching for efficient llm
+ing (Oliaro et al., 2024) is effective in RL rollouts but does                                        inference, 2023. URL https://arxiv.org/abs/
+not adapt to serving, where each document only occurs                                                 2307.02628.
+once. Self-speculative methods such as LayerSkip (Elhoushi
+                                                                                                    DeepSeek-AI. Deepseek-r1: Incentivizing reasoning capa-
+et al., 2024), Self-SD (Zhang et al., 2024), and SkipDe-
+                                                                                                      bility in llms via reinforcement learning, 2025a. URL
+code (Corro et al., 2023) skip layers during drafting but
+                                                                                                      https://arxiv.org/abs/2501.12948.
+require model fine-tuning or optimization. Swift (Xia et al.,
+2025) is training-free but less effective under batch serving,                                      DeepSeek-AI. Deepseek-v3 technical report, 2025b. URL
+as different requests may require skipping different layers.                                          https://arxiv.org/abs/2412.19437.
+                  Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+Elhoushi, M., Shrivastava, A., Liskovich, D., Hosmer,                memory management for large language model serving
+  B., Wasti, B., Lai, L., Mahmoud, A., Acun, B., Agar-               with pagedattention, 2023. URL https://arxiv.or
+  wal, S., Roman, A., Aly, A., Chen, B., and Wu, C.-                 g/abs/2309.06180.
+  J. Layerskip: Enabling early exit inference and self-
+  speculative decoding. In Proceedings of the 62nd An-             Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+  nual Meeting of the Association for Computational Lin-             from transformers via speculative decoding, 2023. URL
+  guistics (Volume 1: Long Papers), pp. 12622–12642.                 https://arxiv.org/abs/2211.17192.
+  Association for Computational Linguistics, 2024. doi:            Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A., Ye,
+  10.18653/v1/2024.acl-long.681. URL http://dx.d                      H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm knows
+  oi.org/10.18653/v1/2024.acl-long.681.                              what you are looking for before generation, 2024a. URL
+                                                                      https://arxiv.org/abs/2404.14469.
+Fu, Y., Bailis, P., Stoica, I., and Zhang, H. Break the se-
+  quential dependency of llm inference using lookahead             Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle-2: Faster
+  decoding, 2024. URL https://arxiv.org/abs/                         inference of language models with dynamic draft trees,
+  2402.02057.                                                        2024b. URL https://arxiv.org/abs/2406.1
+                                                                     6858.
+Guan, X., Zhang, L. L., Liu, Y., Shang, N., Sun, Y., Zhu, Y.,
+ Yang, F., and Yang, M. rstar-math: Small llms can master          Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle-3: Scaling
+  math reasoning with self-evolved deep thinking, 2025.              up inference acceleration of large language models via
+  URL https://arxiv.org/abs/2501.04519.                              training-time test, 2025a. URL https://arxiv.or
+                                                                     g/abs/2503.01840.
+He, C., Luo, R., Bai, Y., Hu, S., Thai, Z. L., Shen, J., Hu, J.,
+  Han, X., Huang, Y., Zhang, Y., Liu, J., Qi, L., Liu, Z., and     Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: Speculative
+  Sun, M. Olympiadbench: A challenging benchmark for                  sampling requires rethinking feature uncertainty, 2025b.
+  promoting agi with olympiad-level bilingual multimodal              URL https://arxiv.org/abs/2401.15077.
+  scientific problems, 2024. URL https://arxiv.or
+  g/abs/2402.14008.                                                Lin, C., Tang, J., Yang, S., Wang, H., Tang, T., Tian, B.,
+                                                                     Stoica, I., and Gao, M. Twilight: Adaptive attention
+He, J., Li, T., Feng, E., Du, D., Liu, Q., Liu, T., Xia, Y., and     sparsity with hierarchical top-p pruning. arXiv preprint
+  Chen, H. History rhymes: Accelerating llm reinforcement            arXiv:2502.02770, 2025.
+  learning with rhymerl. arXiv preprint arXiv:2508.18588,
+  2025.                                                            Liu, J., Wang, Q., Wang, J., and Cai, X. Speculative de-
+                                                                     coding via early-exiting for faster llm inference with
+Hu, Y., Wang, K., Zhang, X., Zhang, F., Li, C., Chen, H.,            thompson sampling control mechanism, 2024a. URL
+  and Zhang, J. Sam decoding: Speculative decoding via               https://arxiv.org/abs/2406.03853.
+  suffix automaton, 2024. URL https://arxiv.org/
+                                                                   Liu, X., Hu, L., Bailis, P., Cheung, A., Deng, Z., Stoica, I.,
+  abs/2411.10666.
+                                                                     and Zhang, H. Online speculative decoding, 2024b. URL
+Jain, N., Han, K., Gu, A., Li, W.-D., Yan, F., Zhang, T.,            https://arxiv.org/abs/2310.07177.
+  Wang, S., Solar-Lezama, A., Sen, K., and Stoica, I.
+                                                                   Luo, M., Tan, S., Wong, J., Shi, X., Tang, W. Y., Roongta,
+   Livecodebench: Holistic and contamination free eval-
+                                                                     M., Cai, C., Luo, J., Li, L. E., Popa, R. A., and Stoica, I.
+   uation of large language models for code. arXiv preprint
+                                                                     Deepscaler: Surpassing o1-preview with a 1.5b model by
+   arXiv:2403.07974, 2024a. URL https://arxiv.or
+                                                                     scaling rl. https://pretty-radio-b75.notio
+   g/abs/2403.07974.
+                                                                     n.site/DeepScaleR-Surpassing-O1-Previ
+Jain, N., Han, K., Gu, A., Li, W.-D., Yan, F., Zhang, T.,            ew-with-a-1-5B-Model-by-Scaling-RL-1
+  Wang, S., Solar-Lezama, A., Sen, K., and Stoica, I.                9681902c1468005bed8ca303013a4e2, 2025.
+   Livecodebench: Holistic and contamination free eval-              Notion Blog.
+   uation of large language models for code, 2024b. URL            Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z.,
+   https://arxiv.org/abs/2403.07974.                                Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi,
+Kimi Team. Kimi k1.5: Scaling reinforcement learning with           X., Shi, C., Chen, Z., Arfeen, D., Abhyankar, R., and
+  llms, 2025. URL https://arxiv.org/abs/2501                        Jia, Z. Specinfer: Accelerating large language model
+  .12599.                                                           serving with tree-based speculative inference and ver-
+                                                                    ification. In Proceedings of the 29th ACM Interna-
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,             tional Conference on Architectural Support for Pro-
+ C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient        gramming Languages and Operating Systems, Volume
+                 Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+  3, ASPLOS ’24, pp. 932–949. ACM, April 2024. doi:               Xia, H., Li, Y., Zhang, J., Du, C., and Li, W. Swift: On-the-
+  10.1145/3620666.3651335. URL http://dx.doi.o                      fly self-speculative decoding for llm inference accelera-
+  rg/10.1145/3620666.3651335.                                       tion, 2025. URL https://arxiv.org/abs/2410
+                                                                    .06916.
+Numina, P. Aimo progress prize competition. https:
+ //huggingface.co/datasets/AI-MO/aimo                             Xiao, C., Zhang, P., Han, X., Xiao, G., Lin, Y., Zhang, Z.,
+ -validation-aime, 2025. [Accessed 13-04-2025].                     Liu, Z., and Sun, M. Infllm: Training-free long-context
+                                                                    extrapolation for llms with an efficient context memory,
+Oliaro, G., Jia, Z., Campos, D., and Qiao, A. Suffixdecoding:       2024a. URL https://arxiv.org/abs/2402.0
+  A model-free approach to speeding up large language               4617.
+  model inference. arXiv preprint arXiv:2411.04975, 2024.
+                                                                  Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+OpenAI. Openai o1 system card, 2024. URL https:                     ficient streaming language models with attention sinks,
+ //arxiv.org/abs/2412.16720.                                        2024b. URL https://arxiv.org/abs/2309.1
+                                                                    7453.
+Qwen Team. Qwq-32b: Embracing the power of reinforce-
+ ment learning. https://qwenlm.github.io/b                        Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng,
+ log/qwq-32b/, 2025. [Accessed 13-04-2025].                         B., Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu,
+                                                                    D., Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin,
+Rein, D., Hou, B. L., Stickland, A. C., Petty, J., Pang, R. Y.,     H., Tang, J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang,
+  Dirani, J., Michael, J., and Bowman, S. R. Gpqa: A                J., Zhou, J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang,
+  graduate-level google-proof q&a benchmark. In First               K., Yu, L., Deng, L., Li, M., Xue, M., Li, M., Zhang,
+  Conference on Language Modeling, 2024. URL https:                 P., Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S., Luo,
+  //openreview.net/forum?id=Ti67584b98.                             S., Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang,
+                                                                    X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan,
+Snell, C., Lee, J., Xu, K., and Kumar, A. Scaling llm
+                                                                    Y., Liu, Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and
+  test-time compute optimally can be more effective than
+                                                                    Qiu, Z. Qwen3 technical report, 2025. URL https:
+  scaling model parameters, 2024. URL https://arxi
+                                                                    //arxiv.org/abs/2505.09388.
+  v.org/abs/2408.03314.
+                                                                  Yang, S., Sheng, Y., Gonzalez, J. E., Stoica, I., and Zheng, L.
+Srivatsa, V., Li, D., Zhang, Y., and Abhyankar, R. Can              Post-training sparse attention with double sparsity, 2024.
+  scheduling overhead dominate llm inference perfor-                URL https://arxiv.org/abs/2408.07092.
+  mance? a study of cpu scheduling overhead on two pop-
+  ular llm inference systems. https://mlsys.wukl                  Ye, Z., Chen, L., Lai, R., Lin, W., Zhang, Y., Wang, S.,
+  ab.io/posts/scheduling_overhead/, 2024.                           Chen, T., Kasikci, B., Grover, V., Krishnamurthy, A.,
+  [Accessed 06-04-2025].                                            and Ceze, L. Flashinfer: Efficient and customizable
+                                                                    attention engine for llm inference serving, 2025. URL
+Sun, H., Chen, Z., Yang, X., Tian, Y., and Chen, B. Tri-            https://arxiv.org/abs/2501.01005.
+  force: Lossless acceleration of long sequence generation
+  with hierarchical speculative decoding. arXiv preprint          Zhang, H., Ji, X., Chen, Y., Fu, F., Miao, X., Nie, X., Chen,
+  arXiv:2404.11912, 2024.                                           W., and Cui, B. Pqcache: Product quantization-based
+                                                                    kvcache for long context llm inference, 2025. URL ht
+Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han,        tps://arxiv.org/abs/2407.12820.
+  S. Quest: Query-aware sparsity for efficient long-context
+  llm inference, 2024. URL https://arxiv.org/ab                   Zhang, J., Wang, J., Li, H., Shou, L., Chen, K., Chen, G.,
+  s/2406.10774.                                                     and Mehrotra, S. Draft and verify: Lossless large lan-
+                                                                    guage model acceleration via self-speculative decoding.
+Veeraboina, H. Aime problem set 1983-2024, 2023. URL                In Proceedings of the 62nd Annual Meeting of the Associ-
+  https://www.kaggle.com/datasets/hemi                              ation for Computational Linguistics (Volume 1: Long Pa-
+  shveeraboina/aime-problem-set-1983-2                              pers), pp. 11263–11282. Association for Computational
+  024.                                                              Linguistics, 2024. doi: 10.18653/v1/2024.acl-long.607.
+                                                                    URL http://dx.doi.org/10.18653/v1/202
+Wu, W., Pan, Z., Wang, C., Chen, L., Bai, Y., Wang, T.,             4.acl-long.607.
+ Fu, K., Wang, Z., and Xiong, H. Tokenselect: Efficient
+ long-context inference and length extrapolation for llms         Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+ via dynamic token-level kv cache selection, 2025. URL              R., Song, Z., Tian, Y., Ré, C., Barrett, C., Wang, Z., and
+ https://arxiv.org/abs/2411.02886.                                  Chen, B. H2 o: Heavy-hitter oracle for efficient generative
+                 Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding
+
+  inference of large language models, 2023. URL https:
+  //arxiv.org/abs/2306.14048.
+Zhao, Y., Lin, C.-Y., Zhu, K., Ye, Z., Chen, L., Zheng, S.,
+  Ceze, L., Krishnamurthy, A., Chen, T., and Kasikci, B.
+  Atom: Low-bit quantization for efficient and accurate llm
+  serving, 2024a. URL https://arxiv.org/abs/
+  2310.19102.
+
+Zhao, Y., Yang, S., Zhu, K., Zheng, L., Kasikci, B., Zhou,
+  Y., Xing, J., and Stoica, I. Blendserve: Optimizing offline
+  inference for auto-regressive large models with resource-
+  aware batching, 2024b. URL https://arxiv.org/
+  abs/2411.16102.
+
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+  rett, C., and Sheng, Y. Sglang: Efficient execution
+  of structured language model programs, 2024. URL
+  https://arxiv.org/abs/2312.07104.
+
+Zhu, K., Zhao, Y., Zhao, L., Zuo, G., Gu, Y., Xie, D., Gao,
+  Y., Xu, Q., Tang, T., Ye, Z., Kamahori, K., Lin, C.-Y.,
+  Wang, S., Krishnamurthy, A., and Kasikci, B. Nanoflow:
+  Towards optimal large language model serving through-
+  put, 2024. URL https://arxiv.org/abs/2408
+  .12757.
+Zhu, K., Tang, T., Xu, Q., Gu, Y., Zeng, Z., Kadekodi,
+  R., Zhao, L., Li, A., Krishnamurthy, A., and Kasikci,
+  B. Tactic: Adaptive sparse attention with clustering and
+  distribution fitting for long-context llms, 2025. URL
+  https://arxiv.org/abs/2502.12216.
+

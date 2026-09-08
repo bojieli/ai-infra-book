@@ -1,0 +1,858 @@
+         M O EB LAZE : B REAKING THE M EMORY WALL FOR E FFICIENT M O E
+                            T RAINING ON M ODERN GPU S
+
+
+Jiyuan Zhang 1 Yining Liu 1 Siqi Yan 1 Lisen Deng 1 Jennifer Cao 1 Shuqi Yang 1 Min Ni 1 Bi Xue 2 Shen Li 1
+
+                                                        A BSTRACT
+        The pervasive “memory wall” bottleneck is significantly amplified in modern large-scale Mixture-of-Experts
+        (MoE) architectures. MoE’s inherent architectural sparsity leads to sparse arithmetic compute and also introduces
+        substantial activation memory overheads—driven by large token routing buffers and the need to materialize and
+        buffer intermediate tensors. This memory pressure limits the maximum batch size and sequence length that can fit
+        on GPUs, and also results in excessive data movements that hinders performance and efficient model scaling. We
+        present MoEBlaze, a memory-efficient MoE training framework that addresses these issues through a co-designed
+        system approach: (i) an end-to-end token dispatch and MoE training method with optimized data structures to
+        eliminate intermediate buffers and activation materializing, and (ii) co-designed kernels with smart activation
+        checkpoint to mitigate memory footprint while simultaneously achieving better performance. We demonstrate that
+        MoEBlaze can achieve over 4× speedups and over 50% memory savings compared to existing MoE frameworks.
+
+1       I NTRODUCTION                                               directly reducing the memory footprint and improving ef-
+                                                                    fective bandwidth utilization end-to-end has become critical
+ Over the past several decades, processor throughput has            to break the memory wall for MoE training and achieve
+advanced much faster than memory bandwidth and latency,             efficient model scalings.
+creating a persistent “memory wall” that widens the gap be-
+tween compute and data movement (Wulf & McKee, 1995).               While parameter storage often gets the spotlight, activation
+In practice, this disparity means that even with ample arith-       memory is an equally significant driver of the memory wall
+metic units, end-to-end throughput is often limited by how          during training. In state-of-the-art LLM training at trillion-
+quickly parameters and activations can be read, written, and        token scale (Brown et al., 2020; Touvron et al., 2023; Team
+exchanged (Williams et al., 2009).                                  et al., 2024), the combination of longer sequences, larger
+                                                                    batches, and more complex routing mechanisms leads to a
+Mixture-of-Experts (MoE) architectures have reshaped                dramatic expansion of the memory buffers required to com-
+large-scale deep learning by enabling trillion-parameter            pact, reorder, and stage intermediate tensors. Consequently,
+models at manageable training cost through sparse acti-             these activation buffers consume a significant portion of
+vation (Shazeer et al., 2017; Kaplan et al., 2020; Hoffmann         GPU memory footprint and bandwidth, directly limiting the
+et al., 2022). However, the very sparsity that delivers these       maximum batch size and sequence length a system can han-
+gains simultaneously lowers compute density because only            dle, and thereby capping the model’s scalability and training
+a subset of experts is active per token. This architectural         efficiency.
+sparsity, when combined with the scale of distributed train-
+ing in Large Language Models (LLM), significantly exac-             To address this system bottleneck, earlier methods relied on
+erbates memory pressure in modern systems. As models                heuristics like token dropping or padding to cap and manage
+exceed single-device High-Bandwidth Memory (HBM) ca-                activation buffers (Samuel, 1959; Fedus et al., 2022), which,
+pacity, training must be distributed across more GPUs and           however, often came at the cost of model stability. More
+nodes, increasing pressure on device memory bandwidth               recent systems are focused on optimizing computation and
+and interconnect throughput. With the continuous growth             communication complexity with regards to sparse expert
+in sequence lengths and batch sizes, performance rapidly            computations (Gale et al., 2023; Aminabadi et al., 2025).
+becomes bounded by the system’s memory and communi-                 Nevertheless, the auxiliary activation buffers needed for
+cation subsystems rather than raw FLOPs. In light of this,          token dispatch and the requirement to pad or materialize
+    1
+                                                                    intermediate results still contribute a major portion of the
+   Meta 2 Thinking Machine Labs. Correspondence to: Jiyuan          overall model memory footprint.
+Zhang <jiyuanz@meta.com>, Shen Li <shenli@meta.com>.
+                                                                    To address these limitations, we present MoEBlaze, a
+Proceedings of the 9 th MLSys Conference (Industry Track), Belle-   memory-efficient MoE training framework that drastically
+vue, WA, USA, 2026. Copyright 2026 by the author(s).
+                      MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+improve MoE training memory efficiency without compris-           a linear transformation mapping the input dimension d to
+ing accuracy, while simultaneously achieving better training      the number of experts E, thereby generating a score for each
+throughput. Concretely, we target two principal sources           expert per token. This is followed by a Top-K selection,
+of activation memory bottleneck: (i) token routing, where         where expert-ids corresponding to the highest gating scores
+conventional implementations allocate large auxiliary per-        are collected for each token. The gating output for input x
+expert buffers to compact and store activations; and (ii)         is defined as:
+intermediate activation storage amplified by modern non-
+linearities such as SiLU and SwiGLU (Shazeer, 2020; Ra-                     topk experts = TopK(softmax(Wg x))
+machandran et al., 2017; Elfwing et al., 2017). MoEBlaze          where Wg ∈ RE×d are the gating network parameters and
+is designed to effectively break through the memory wall          K is the number of selected experts per token. The result
+and maximize the utility of modern GPU architectures to           topk experts is the list of selected expert-ids by each token.
+better throughput. Our contributions are:
+                                                                  Following Top-k selection, tokens must be physically routed
+    • We introduce an efficient end-to-end token dispatch         to their corresponding expert’s execution buffer. In conven-
+      and training method that significantly reduces the inter-   tional implementations, this routing process requires sub-
+      mediate activation buffers for token routing and activa-    stantial auxiliary memory and extra processing to compact
+      tion materializing. Our approach avoids both padding        and store the dispatched tokens, which constitutes a critical
+      and token dropping, reducing memory usage and data          memory bottleneck.
+      movement without sacrificing accuracy while simulta-        Earlier work such as Switch Transformers and GShard (Fe-
+      neously achieving better compute efficiency.                dus et al., 2022; Lepikhin et al., 2021) adopts capacity-
+                                                                  limited routing (token-dropping) mechanism to manage to-
+    • We introduce efficient data structure and algorithm for
+                                                                  ken dispatch. Tokens are sorted by their gate score and
+      above memory-efficient compute scheme that can effi-
+                                                                  packed into expert e’s buffer; any tokens exceeding C are
+      ciently leverage GPU’s massive parallelism and high
+                                                                  either dropped or routed to a residual path. A typical choice
+      bandwidth and avoids complex multi-kernel pipelines.
+                                                                  for capacity is:
+    • We co-design training kernels with smart activation                                          Bk
+                                                                                         C≈γ·          .
+      checkpoint schemes, which can further mitigate the                                            E
+      substantial memory footprint associated with modern         where γ is the user-defined capacity factor. Capacity-limited
+      complex activation functions while achieving better         routing is amenable to system implements due to fixed-size
+      compute efficiency on GPU.                                  buffers but comes at the cost of reduced model quality.
+    • Overall our method can achieve over 4× speedups and         More recent literature focuses on dropless routing mech-
+      over 50% compared memory savings to other state-of-         anisms (Rajbhandari et al., 2022; He et al., 2021), which
+      the-art MoE training frameworks across various MoE          generally yields better model quality. This method ensures
+      benchmarks.                                                 every token is processed by an expert, allowing for better
+                                                                  model quality and eliminating the need for capacity factor
+2     BACKGROUND AND M OTIVATIONS                                 tuning. However, since the number of tokens assigned to
+                                                                  each expert is variable, the underlying system must effi-
+In this section, we provide a review of the background of         ciently manage dynamic compute and memory needs. Con-
+MoE training, along with a identification of the key system       sequently, recent literature primarily focuses on optimizing
+bottlenecks that currently limit its performance.                 the computation with these dynamic and varying-length
+We first define the notations that will be used throughout        workloads (Gale et al., 2023; Aminabadi et al., 2025).
+the rest of the paper. We mainly focus on the token-choice        Nevertheless, a fundamental challenge persists across both
+MoE as it has been adopted extensively in production. The         token-dropping and dropless routing schemes: current im-
+MoE computation begins with the token input, which is             plementations require storing the indices and compacted
+represented as a vector x ∈ RL×d , where we denote by L           token data, resulting in memory footprint proportional to
+the number of routed token instances in a step (e.g., batch       L × K × d. In modern LLM training with longer sequence
+size × sequence length), K the number of selected experts         lengths and higher batch sizes, this leads to a dramatic ex-
+per token, E the number of experts, d the model dimension.        pansion of the memory buffers.
+                                                                  Example: To illustrate this token dispatch associated acti-
+2.1   Gating Network and Token Routing
+                                                                  vation footprint, we use the example of a real-world MoE
+The gating network determines the routing of each input           model (e.g DeepSeek) for a quantitative study here. For a
+token to the most relevant experts. The network is typically      typical MoE layer in DeepSeek model, it has L ≈ 2 million
+                      MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+
+
+
+Figure 1. MoE in conventional approach vs. MoEBlaze. Left illustrates the conventional MoE computation, comprising token dispatch,
+expert computation, and weighted aggregation (details in section 2). Right presents the proposed MoEBlaze framework, which introduces
+memory-efficient token-routing and expert computation (details in section 3).
+
+
+tokens, active experts K = 4, model dimension d = 6144,             due to the need to store intermediate values for gradient cal-
+and using a 2 bytes per element (bfloat16) for the routed           culation. The choice of activation function (e.g., SwiGLU)
+token buffer, the memory footprint is:                              will further exacerbate the memory pressure.
+       Memrouting = L × d × k × 2bytes ≈ 94GB                       Example: We use deepseek’s configuration as an example
+                                                                    to illustrate the significance of the activation footprint cre-
+We can see a single MoE layer can consume almost a hun-
+                                                                    ated by FFN computation. We have L ≈ 2 million, FFN
+dred gigabytes of memory for one routing buffer alone.
+                                                                    hidden dimension d = 24576, and using 2 bytes per ele-
+                                                                    ment (bfloat16), we can get the activation footprint for the
+2.2   Expert Feed-Forward Networks (FFNs)                           intermediate :
+Following the token dispatch is the Feed-Forward Networks
+                                                                                     Memact = 2L × h ≈ 98GB
+(FFN) computation across experts. Each FFN computation
+is typically realized as a two-layer Multi-Layer Perceptron
+(MLP). The first layer projects the input from dimension d to       2.3   Output Aggregation
+a higher-dimensional hidden space h, and the second layer           The final stage is output aggregation, where the outputs of
+projects back to the output dimension d′ (assuming d′ = d).         the selected experts are combined using a weighted summa-
+The total memory required for the parameters across all E           tion to produce the final output for each token. The weights
+experts is O(E × (h × d + d × h)), but the conditional              are derived from the gating network’s scores. The MoE
+computation paradigm ensures that only k experts are active         output y for an input token x is:
+for each token, maintaining a low computational cost per
+forward pass. The FFN computation within expert Ei for a                                     E
+                                                                                             X
+given input x is defined as:                                                            y=          gi (x) · Ei (x)
+                                                                                              i=1
+                  Ei (x) = W2,i · σ(W1,i x)
+                                                                    where gi (x) is the gating score for expert i, and only the
+where W1,i ∈ Rh×d and W2,i ∈ Rd×h , and σ is the non-               top-k experts have non-zero scores. The memory required
+linear activation function (e.g., ReLU, GELU, SwiGLU).              for the aggregated outputs is O(L × d). Computationally,
+The second principal memory bottleneck stems from inter-            this involves O(L × k × d) operations, which is generally
+mediate activation storage during the FFN computation. For          efficient given the sparsity (k ≪ E).
+an active expert, the first linear transformation W1,i x gener-
+ates an intermediate activation of size Li × h, where Li is         3     M EMORY-E FFICIENT T OKEN ROUTING
+the number of tokens routed to expert i. While the number                 AND T RAINING A LGORITHM
+of active experts is small, the aggregated memory for these
+activations across all E experts is O(L × h) during the for-        As detailed in Section 2.1, in token-choice MoE, a gating
+ward pass and can be much higher during backpropagation             network assigns each input token to one or more experts. To
+                      MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+facilitate efficient token indexing and organization during        Expert Computation: We perform the expert computa-
+expert computation, conventional systems compact these             tion MLPs with on-the-fly gathers from the original unper-
+tokens into per-expert buffers. This compaction step, fol-         muted activation tensor utilizing the indices recorded in
+lowed by the execution of per-expert Multi-Layer Percep-           the per-expert token list. To maximize memory efficiency,
+tron (MLP) blocks, creates intermediate results kept at the        only the intermediate result between the two back-to-back
+compacted token length before being summed and reduced             MLPs (i.e., the output of the first MLP) is buffered for the
+to the original token length at the output. Crucially, this        backward pass.
+separation and intermediate storage introduces significant
+activation buffers throughout the entire MoE training. In this
+section, we present our memory-efficient routing and expert        Output Aggregation: The final results from the experts
+computation algorithm that substantially reduces the aux-          are aggregated to produce the final (L, d) output. As we
+iliary activation footprint while also allowing for efficient      do not store the activation buffer for the materialized token
+MoE training.                                                      dispatch result, this summation is tightly fused with the 2nd
+Given the input as an activation tensor of shape (L, d), the       MLP computation and we directly leverage the per-token
+core idea of our algorithm is to leverage auxiliary index lists,   expert list to perform on-the-fly reduction into output tensor.
+generated during the token dispatch step, to track routing
+decisions and perform on-the-fly token accessing and result        3.2   Backward Pass
+reduction throughout the Mixture-of-Experts (MoE) com-             The backward pass takes the gradient of the (L, d) tokens
+putation. Concretely, our fused kernel operates as follows:        and propagates it back through the inverse of the forward
+1. it consumes the gating decisions and builds the expert-         steps. The conventional backward process for expert summa-
+token index lists and other associated indexing structures,        tion relies on the routed token activation buffer to perform
+2. it performs the expert MLP computations using on-the-           an ”expansion” or materialization of the (L, d) gradients to
+fly gathers from the original, unpermuted activation tensor,       the (L × k, d) ”routed gradient tokens” before backpropa-
+guided by the expert-token index list, and 3. The expert           gation through the MLP experts. However, our proposed
+summation then uses the token-expert index list to directly        approach avoids this intermediate expansion step by using
+sum and reduce the MLP results into the final output tensor.       the same reverse mapping indices.
+By directly accessing the input and storing only the final
+result, we eliminate many intermediate activations that are
+typically required for materialized token routing in other
+papers. The token-expert index list, which only stores token        1. Expert Summation Backward: Using the token-
+and expert IDs, is extremely lightweight. Moreover, this               mapping structure derived from the dispatch meta-
+approach allows us to tightly fuse the token/expert index-             data, the (L, d) gradient tensor is mapped back to the
+ing with computation, opening possibilities for overlapped             (L × k, d) routed gradient tokens. This is done via
+memory access and computations. This is particularly ad-               an efficient operation that ‘scatters‘ the output gradi-
+vantageous on modern hardware like the latest H100 GPUs,               ent to the corresponding locations in the materialized
+achieving better resource utilization and faster speed.                intermediate MLP result tensor.
+
+Below, we detail the forward and backward passes of our
+proposed method. Data structures and the methods for effi-
+ciently building them will be explained in next section.            2. Expert Computation Backward: Next, the gradients
+                                                                       flow backward through the MLPs. The previously
+3.1   Forward Pass                                                     checkpointed intermediate result between the two back-
+                                                                       to-back MLPs will be used here when computing the
+Token Dispatch: In the token dispatch step, we do not                  weight gradients.
+create dedicated buffer for routed tokens. Instead we gener-
+ate several lightweight indexing data structures based on the
+gating scores produced in the preceding gating stage. These
+structures include: the per-expert token list, which tracks the     3. Token Gradient Accumulation: Finally, the gradients
+token-IDs assigned to each expert; and the per-token expert            with respect to the input tokens are accumulated from
+list, which stores the expert-IDs chosen for each token. No            all experts. This step sums the contributions from the
+memory is allocated or preserved for materialized routed               k experts each token was routed to, producing the final
+token activations at this stage.                                       (L, d) gradient tensor for the input activations. As
+                                                                       we do not have the activation storage the materialized
+                                                                       routed token result, we also leverage the token index
+                                                                       data structure to perform on-the-fly reductions.
+                      MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+4     E FFICIENT AND PARALLELIZABLE                                Example. Figure 2 demonstrates the data structure for an
+      D ISPATCH AND DATA S TRUCTURES                               example of L=6 tokens, E=4 experts, and k = 2 activated
+                                                                   experts. From the gating score matrix, we obtain per-token’s
+4.1   Data Structures                                              assignment as:
+We define the key data structures needed for the memory            Token 0: expert{2, 3}; Token 1: expert{0, 1}; Token 2:
+efficient MoE training algorithm we mentioned above.               expert{0, 3}; Token 3: expert{1, 2}; Token 4: expert{0, 3}.
+                                                                   Concatenate the tokens’ assignment together, we will get
+    • expert token indices: A compact tensor storing the           the token expert indices as:
+      indices of tokens assigned to each expert, concate-
+      nated across all experts. In the token-choice MoE                    token expert indices = [2, 3, 0, 1, 1, 2, 0, 3],
+      training, each token chooses k experts, thus the ex-
+      pert token indices has size L × k. This list is funda-       Similarly we can get for each expert the routed tokens:
+      mental for the experts to retrieve their designated input    Expert 0: token{1, 2, 4}; Expert 1: token{1, 3}; Ex-
+      tokens.                                                      pert 2: token{0, 3}; Expert 3: token{0, 2, 4}. Concate-
+                                                                   nate them together, we get the expert token indices and
+    • expert token offsets: An array of length E + 1               expert token offsets
+      storing the exclusive prefix sums of token counts
+      per expert. For expert i, the indices of its as-                   expert token indices = [1, 2, 4, 1, 3, 0, 3, 0, 2, 4],
+      signed tokens reside from expert token offsets[i] up
+                                                                         expert token offsets = [0, 3, 5, 7, 10]
+      to expert token offsets[i+1] − 1.
+
+    • token expert indices: token expert indices is basi-          The token index map stores the positions of each token
+      cally the inverse mapping of expert token indices. It        within the concatenated experts’ token list. For example,
+      stores the routed expert-ids for each token which are        token index map[0] = {5, 7} as token 0 is routed to 2
+      ordered by the token IDs. Its shape is also L × k. This      experts (k = 2) and placed in the 5th and 7th position of the
+      list is need for coalesced indexing into the intermediate    expert token indices.
+      materialized results (e.g., between two back-to-back
+      MLPs) when processing tokens per expert.                     4.2    Efficient Dispatch Data Structure Construction
+                                                                   We now detail the methods to efficiently construct the
+    • token index map: A L × k compact tensor that stores
+                                                                   aforementioned data structures. The construction process
+      the routed token positions in the expert token indices
+                                                                   presents a challenge: the inherent design of the expert-
+      list. It is logically grouped by the original token ID
+                                                                   centric data structures requires a many-to-one mapping
+      i ∈ L, allowing a token to efficiently find and gather
+                                                                   where multiple tokens are assigned to the same expert. Uti-
+      its k expert outputs from the intermediate buffer for
+                                                                   lizing a naive approach would result in severe thread-level
+      the final combination step.
+                                                                   write contention on the GPU architecture, thereby compro-
+                                                                   mising performance.
+                                                                   One solution is to rely on a sorting-based approach for
+                                                                   building the token dispatch. This method flattens all tokens’
+                                                                   top-k choice results (topk experts) into a 1D array of length
+                                                                   Lk containing (expert id, token id) tuples. The array is
+                                                                   then globally sorted by expert id to group tokens, followed
+                                                                   by index recovery to reconstruct token order and compute
+                                                                   per-expert ranges.
+                                                                   This sorting procedure, while conceptually simple, intro-
+                                                                   duces severe performance bottlenecks at scale. Sorting is
+                                                                   implemented as multi-pass radix sort on GPUs, which re-
+                                                                   quires several global-memory passes proportional to key
+                                                                   width, forcing frequent global-memory passes and mov-
+                                                                   ing O(Lk) data multiple times. This results in a actual
+                                                                   high complexity and poor resource utilization on GPUs.
+                                                                   Furthermore, this global ordering step limits fine-grained
+                                                                   parallelism, forces a multi-kernel dispatch pipeline (multi-
+Figure 2. Data structures for the memory-efficient MoE training.   pass sorts, segmented scans, index recoveries etc) with high
+                      MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+kernel launch latencies. These limitations motivate a more            achieve a compact, per-expert concatenation of indices
+efficient, GPU-friendly approach.                                     in a contention-free manner on the GPU, we employ a
+                                                                      two-phase process centered around generating a location
+To this end, we introduce an efficient method that replaces
+                                                                      map. This map specifies the final destination position-ID
+complex global sortings and organizations with paralleliz-
+                                                                      for every non-zero entry in the dense token map within
+able builds upon local index construction that map well to
+                                                                      the expert token indices list. Once the location map
+GPUs. The method is a simple 3-step process with each step
+                                                                      is built, a simple parallel kernel reads elements from
+designed to be atomic-free and parallelized on GPU which
+                                                                      dense token map and writes them directly to their cal-
+can minimize expensive global-memory passes and avoids
+                                                                      culated, corresponding positions in expert token indices,
+complex multi-kernel pipelines. Below we will go over the
+                                                                      guaranteeing full parallelism without atomics.
+details of the three steps.
+                                                                      The construction of the location map can be challenging.
+Build Dense Token-Expert Map In the first step, we                    We utilize a two-step strategy to ensure its atomic-free con-
+construct a dense bitmap denoted as dense token map to                struction: (i). tile-level scan: We launch one CTA per expert.
+encode the top-k token-to-expert routing. For each token              Threads within the same CTA process contiguous tokens
+i, we consider its top-k assigned experts {ei,0 , . . . , ei,k−1 }.   assigned to that expert in dense token map. They first com-
+For each gate slot, we set dense token map[i, ei,k ] to i. All        pute the tile-level counts within shared memory, followed
+other entries remain unset.                                           by an exclusive scan operation (prefix sum) performed lo-
+                                                                      cally inside the CTA. (ii). The resulting CTA-local exclu-
+The construction of the encoding map is highly paralleliz-            sive scan counts then add with the expert’s pre-computed
+able on the GPU. We initiate the process by allocating an             global expert offsets. This addition yields the correct, final
+L × E dense map and launching the kernel over the CTA                 position-ID in the concatenated indices array.
+grid. The parallelism is managed by assigning each warp a
+disjoint tile of token rows (i) from which it loads the top k
+expert results. Each (i, e) pair is written out at most once          5     T RAINING –K ERNEL C O -D ESIGN FOR
+because expert IDs per token are unique; This guarantees                    E ND - TO -E ND E FFICIENCY
+no intra-warp collisions.                                             This section details our approach to jointly optimize the
+While a dense L × E map might initially appear memory-                Mixture-of-Experts training kernels and smart activation
+intensive at scale, the footprint is highly manageable in             checkpointing method to address the memory issues associ-
+practice. For the motivating large-scale regime (e.g., L ≈            ated with some advanced activation methods.
+2M, E = 100), using 1 byte per element requires only
+∼200MB. Furthermore, this allocation is strictly temporary;           5.1   SwiGLU MoE and the Memory Bottleneck
+it is discarded immediately after the dispatch construction
+                                                                      Modern MoE training has increasingly adopted advanced
+is complete and contributes nothing to the training memory
+                                                                      non-linear activations such as SiLU and SwiGLU in place of
+lifecycle.
+                                                                      ReLU/GELU. Prior work shows these activations provide
+                                                                      smoother nonlinearity, which can improve optimization sta-
+Compute Expert Lengths Leveraging the constructed                     bility and lead to better empirical accuracy on large-scale
+dense token map, the next step is to efficiently compute              language tasks. While numerically favorable, these activa-
+the lengths and offsets for the sparse token-ID list for each         tions introduce more complex compute and larger memory
+expert. We launch a custom kernel with the CTA grid                   footprint during training. We take the SwiGLU activation
+mapped across the columns (experts) of dense token map.               as an example. The SwiGLU activation is defined as:
+Each CTA is dedicated to a single expert ei and counts
+the non-zero entries (token-to-expert assignments) within
+that column. The use of warp-level reductions aggre-
+gates the row-wise sums within the CTA, producing the                       SwiGLU(x; W1 , W2 ) = SiLU(xW1 ) · (xW2 ),
+expert lengths array. The value expert lengths[ei ] repre-
+sents the final number of tokens routed to expert ei . Follow-
+ing the length computation, the expert offsets are derived            where SiLU(u) = u · σ(u) and σ is the sigmoid operation.
+by applying a prefix sum over the expert lengths array                For an MoE layer with E experts, each implementing a
+outside the initial counting kernel.                                  SwiGLU Feed-Forward Network (FFN), a routed batch of
+                                                                      tokens x ∈ RL×d for a single expert induces two projec-
+Route Indices to Gates This 3rd step involves generating              tions: a = xW1 ∈ RL×h and b = xW2 ∈ RL×h . This is
+the per-expert token id list expert token indices, which              followed by the element-wise operations SiLU(a) and the
+serves as the input for subsequent MLP computations. To               final product SiLU(a) ⊙ b.
+                    MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+5.2   Activation Checkpoint and Kernel Codesign                 routed tokens, loads the input x only once, streams it
+                                                                through both (W1 , W2 ) GEMMs simultaneously, computes
+In conventional kernels, the forward pipeline necessitates
+                                                                SiLU(a) in register/shared memory, and immediately per-
+materializing multiple intermediates in order to accommo-
+                                                                forms the multiplication with b, writing only the final output
+date the backward computation (e.g., in the SwiGLU exam-
+                                                                to global memory.
+ple, it includes the two GEMM outputs a and b, the sigmoid
+σ(a), SiLU(a), and the final product). These intermediate       This ”epilogue fusion” eliminates global reads for elemen-
+results are written to and subsequently read from global        twise operations, effectively moving computation from
+memory, which incurs non-negligible overheads. As models        the memory-bound domain to the compute-bound domain
+and batch sizes scale, this incurs significant memory traffic   where possible. It also halves the input reads of x compared
+and storage costs, which quickly becomes a non-negligible       to separate kernels for each projection.
+bottleneck.
+                                                                During backward, fusing the two first-layer projections im-
+To mitigate the observed memory pressure, we present a          plies that gradients w.r.t. the shared input x from both paths
+joint optimization of the MoE training flow and its underly-    must be aggregated. Rather than allocating two separate
+ing GPU kernels that reduces the activation memory foot-        activation buffers and stitching them, our implementation
+print and memory traffic without sacrificing performance.       computes the two branches’ activation derivatives in a fused
+Our optimization is based on below observations:                fashion and aggregates gradients in-place via tiled reduc-
+                                                                tions—completely eliminating temporary global buffers.
+  • Computation of activation functions is generally mem-       On top of the fusion, we further applied the activation check-
+    ory bandwidth bound on modern GPUs. For example,            point strategy – where we skip saving the SwiGLU inter-
+    on an NVIDIA H100 GPU, saturating vector compute            mediate result (SiLU) during forward. Instead, we adopt
+    units requires an arithmetic intensity of roughly 40        a recomputation strategy during the backward pass, lever-
+    FLOPs/byte. In contrast, point-wise operations like         aging the fact that the SiLU function is computationally
+    SiLU in bfloat16 (reading 2 bytes, writing 2 bytes,         inexpensive (e.g elementwise operation), and are heavily
+    and performing ∼5 operations) yield an arithmetic in-       memory bandwidth bounded on modern GPUs.
+    tensity of just ∼1.25 FLOPs/byte. Even at a peak
+    HBM3 bandwidth of 3.35 TB/s, the achievable com-
+                                                                5.3   Putting It Together: E2E Training on Swiglu MoE
+    pute throughput is bounded under 5 TFLOPS—less
+    than 1% of the device’s peak capacity. Consequently,        Algorithm 1 summarizes the end-to-end training process for
+    in LLM training where sequence lengths far exceed           an MoE model utilizing the SwiGLU activation function.
+    embedding dimensions (L ≫ d), materializing these           The pseudo-code specifically demonstrates the integration
+    intermediate activations operates well below peak com-      of activation checkpoint and kernel fusion detailed in sec-
+    pute utilization and remains strictly memory-bound.         tion 5. While the low-level implementation of the fused
+                                                                kernels is omitted for brevity, the high-level methodology is
+  • While activation computation is computationally light,      derived from the memory-efficient token dispatch explained
+    its memory footprint is surprisingly significant. This is   in section 3.
+    particularly true for complex, modern activation func-
+    tions, which requires materialization and saving many
+    intermediate, point-wise results for the backward pass.     6     E XPERIMENTS
+    The resulting memory allocation is substantial, scaling     In this section, we benchmark MoEBlaze against the current
+    linearly with the batch size, sequence length, and FFN      state-of-the-art sparse training system, Megablocks (Gale
+    dimensions. In the context of today’s trillion-token        et al., 2023), demonstrating significant improvements in
+    training environments, the memory required to store         both training speed and memory efficiency across a range
+    these activations can be prohibitive.                       of representative Mixture-of-Experts (MoE) configurations.
+
+Based on this observations, we propose the joint activa-        6.1   Experiment Setups
+tion checkpoint and kernel fusion approach. Our approach
+fuses the two first-layer projections in SwiGLU with the        We conducted all experiments on a single NVIDIA H100
+activation epilogue, and applies activation checkpoint in the   Tensor Core GPU. The software stack utilizes PyTorch 2.0.1
+specialized path to “break the memory wall” arising from        and CUDA 12.1. We measure end-to-end training time
+intermediate activation storage.                                for a single MoE layer, focusing on the Sparse-to-Sparse
+                                                                computation phase. We evaluate performance with two
+To reduce activation traffic and kernel launch overhead, we
+                                                                different activation functions: ReLU (Rectified Linear Unit)
+fuse both first-layer projections and the SwiGLU epilogue
+                                                                and SwiGLU (Swish-Gated Linear Unit).
+into a single kernel. The kernel consumes non-materialized
+                     MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+Algorithm 1 Fused SwiGLU MoE Training
+                                                                 Table 1. MoE configurations used in experiments. The FFN hidden
+Input: Input Tokens X ∈ RL×d , Projection Weights                dim is set to be four times the input dimension (ffn hidden size =
+W1 , W2 ∈ Rd×h , W3 ∈ Rh×d ,                                     4 × input d).
+Output:        Output Yout      ∈    RL×d , Gradients
+∇W1 , ∇W2 , ∇W3 , ∇Z
+                                                                             I NPUT D     E XPERTS #     K    BATCH      S EQ LEN
+ 1: // Forward module for Swiglu MoE training
+                                                                  CONF 1        512            4         1      32         2048
+ 2: Procedure FusedForward(X, W1 , W2 , W3 )
+                                                                  CONF 2       1024            8         2      32         2048
+ 3: // Load input tokens once                                     CONF 3       1024           16         4      32         2048
+ 4: Load X                                                        CONF 4        512           16         4      32         1024
+ 5: // 1st MLP projection:                                        CONF 5       1024           16         4      16         1024
+ 6: // Compute A and B;                                           CONF 6       2048            8         4      16          512
+ 7: // SiLU(A) and Yswi computed in-kernel
+ 8: // SiLU(A) is transient
+ 9: (A, B), Yswi ← Fused SwiGLU(Z, W1 , W2 )                     ing Speed: measured as the speedup factor of MoEBlaze
+10: Yout ← Yswi W3                                               relative to Megablocks in an end-to-end single training
+11: Store A, B, Yswi                                             pass. The training time includes both forward and backward
+12: // Store activations and SwiGLU output for backward          passes, but we exclude optimizer updates as optimizer is
+13: Return Yout                                                  irrelavant to both approach designs. Higher values indicate
+14:                                                              better performance. (2) Activation Memory Consumption:
+15: Procedure FusedBackward                                      measured as the total memory allocated to save the inter-
+16: (Yout , ∇Yout , W1 , W2 , W3 , A, B, Yswi )                  mediate activation tensors for given inputs. To measure the
+17: // Gradient for final projection                             activation memory, we utilize PyTorch’s saved tensor hooks
+18: ∇W3 ← Yswi   T
+                    ∇Yout                                        to trace and calculate the exact activation space allocated
+19: // Backpropagate gradient to SwiGLU output                   during model training with the given input configuration.
+20: ∇Yswi ← ∇Yout W3T
+21: // Load stored activations                                   6.3   Memory Efficiency in MoE Training using SiLU
+22: Load A, B                                                    As shown in Figure 3, MoEBlaze consistently and signifi-
+23: // Recomputes SiLU(A) to save memory                         cantly reduces activation memory consumption compared
+24: Srecomp ← SiLU(A)                                            to the Megablocks baseline across all tested configurations.
+25: // Derivative w.r.t A
+26: ∇A ← ∇Yswi ⊙ B ⊙ ∇SiLU(A)                                    The memory savings achieved by MoEBlaze are espe-
+27: // Derivative w.r.t B                                        cially significant in configurations characterized by large
+28: ∇B ← ∇Yswi ⊙ Srecomp                                         input dimensions and high expert counts, such as conf4.
+29: ∇W1 , ∇W2 ← FusedBwdW(X, ∇A, ∇B)                             Specifically, MoEBlaze requires only 6, 100 MB of mem-
+30: ∇X ← FusedBwdX(∇AW1T , ∇BW2T )                               ory, achieving a nearly 3.6× reduction compared to the
+31: Return ∇W1 , ∇W2 , ∇W3 , ∇Z                                  22, 000 MB consumed by Megablocks. For smaller con-
+                                                                 figurations (e.g., conf1), the activation memory saving is
+                                                                 less pronounced, which is expected since the savings scale
+                                                                 proportionally with the sequence length L and the number
+We selected a set of seven representative MoE configurations     of activated experts k, both of which are small in conf1
+that explore varied dimensions for the input hidden size (d),    (k = 1). This substantial reduction in peak activation mem-
+the number of experts (E), the top-k tokens routed to ex-        ory is a direct outcome of two core system innovations: (1)
+perts, and common training parameters (sequence length L         a more memory-efficient token dispatch mechanism that
+and batch size B). The specific configurations, which mimic      minimizes intermediate buffer allocations, and (2) the adop-
+common settings in large language models, are detailed in        tion of smart recomputation within our custom activation
+Table 1.                                                         checkpoint scheme.
+
+6.2   Baselines and Metrics                                      6.4   Training Speed in SiLU-based MoEs
+Our primary baseline for comparison is Megablocks, a sys-        Figure 4 illustrates the training speedup of MoEBlaze over
+tem that optimizes MoE training through custom kernels           Megablocks over the given configurations. MoEBlaze
+and efficient token dispatch, serving as the industry standard   achieves notable performance gains, showing a speedup
+for high-performance sparse training.                            factor of 1.4× to 3.7×.
+We evaluate performance using two key metrics: (1) Train-        The maximum speedup is achieved at conf4 (Dinput =
+                                                           MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+                                                                                                                  6.5                          Memory Efficiency in MoE Training with SwiGLU
+                                 12500
+                                                                                        MoEBlaze     Megablocks   The SwiGLU activation function inherently requires higher
+                                                                                                                  memory usage due to the additional gating and element-
+                                 10000
+                                                                                                                  wise multiplication operations. Figure 5 shows the mem-
+    Activation Memory (MB)
+
+
+
+
+                                  7500
+                                                                                                                  ory consumption comparison under the SwiGLU setting.
+                                                                                                                  MoEBlaze maintains a substantial memory advantage over
+                                  5000                                                                            Megablocks, with peak activation memory often less than
+                                                                                                                  half of the baseline’s usage. For instance, in configura-
+                                  2500                                                                            tion conf3, Megablocks requires over 40, 000 MB, while
+                                                                                                                  MoEBlaze is contained to approximately 10, 000 MB. This
+                                     0                                                                            consistent 4× reduction in memory pressure confirms that
+                                                 conf1       conf2      conf3     conf4      conf5    conf6
+                                                                                                                  our memory-efficient dispatch and smart recomputation
+                                                                                                                  schemes are highly effective even for more complex ac-
+                                                                                                                  tivation functions.
+Figure 3. Activation memory footprint comparison between MoE-
+Blaze and Megablocks across the set of MoE configs defined in                                                     6.6                          Training Speed in SwiGLU-based MoEs
+Table 1 using SiLU activation function.
+                                                                                                                  Figure 4 presents the speedup of MoEBlaze relative to
+                                                                                                                  Megablocks when using the SwiGLU activation. Compared
+                                                                                                                  to the ReLU results, the speedup factors are generally higher
+2048, E = 16, L = 1024, B = 32), demonstrating that                                                               and more consistent, ranging from 2× to 6.2×. The in-
+MoEBlaze scales particularly well with larger model dimen-                                                        creased relative speed is a result of two factors: (1) The more
+sions. This training speeds are attributed to three factors: (1)                                                  complex computation in SwiGLU exposes greater opportu-
+our highly optimized token dispatch implementation, which                                                         nities for MoEBlaze’s highly fused kernels to outperform
+reduces the latency overheads associated with expensive                                                           the baseline; and (2) the memory-bandwidth savings from
+token dispatch and permute operations; (2) the efficient data                                                     our activation optimization are more critical in the SwiGLU
+dispatch construction kernels, which is very light-weight                                                         case, where intermediate activation sizes are larger and more
+and runs rapidly on GPUs, avoiding the expensive multiple-                                                        compound, thereby reducing the excessive global memory
+passes kernel in other sorting-based approaches and greatly                                                       accesses through smart kernel fusion and recomputation
+eliminating the CPU-side bottlenecks. (3) the fused kernel                                                        allows MoEBlaze to execute the whole kernel faster.
+for the batched-GEMM computations that effectively lever-
+ages H100’s latest hardware acceleration features such as
+warp-group matrix multiplication, tensor memory accelera-                                                                                      50000
+tor, etc.                                                                                                                                                                          MoEBlaze     Megablocks
+
+                                                                                                                                               40000
+                                                                                                                      Activation Memory (MB)
+
+
+
+
+                             4                                                                                                                 30000
+
+
+
+                                                                                                                                               20000
+                             3
+
+                                                                                                                                               10000
+ Speedup
+
+
+
+
+                             2
+                                                                                                                                                   0
+                                                                                                                                                       conf1   conf2   conf3   conf4    conf5    conf6
+
+
+                             1
+
+
+                                                                                                                  Figure 5. Activation memory footprint comparison between MoE-
+                             0                                                                                    Blaze and Megablocks across the set of MoE configs defined in
+                                         conf1           conf2       conf3      conf4       conf5     conf6
+                                                                                                                  Table 1 using SwiGLU activation function.
+
+
+Figure 4. Speedups of MoEBlaze w.r.t to Megablocks on the set of
+                                                                                                                  7                            E XTENDED E VALUATION
+configurations in Table 1 using SiLU as the activation function.
+                                                                                                                  To further validate the performance, scalability, and practi-
+                                                                                                                  cal impact of MoEBlaze, we present extended evaluations
+                             MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+           8                                                           7.2     Real-World Model Configurations
+                                                                       To confirm that these benefits translate to modern archi-
+           6                                                           tectural trends, we evaluate our proposed hash-based dis-
+                                                                       patch mechanism against a standard sorting-based baseline
+                                                                       across a variety of production-scale MoE model settings
+ Speedup
+
+
+
+
+           4                                                           (e.g., Qwen3, DeepSeek V3, DBRX). As shown in Table 3,
+                                                                       for million-scale token counts, our dispatch method consis-
+           2
+                                                                       tently achieves a > 2× speedup over the sorting approach.
+
+
+                                                                       Table 3. Sorting-dispatch vs. hash-dispatch execution time for
+           0
+                  conf1    conf2   conf3   conf4     conf5   conf6     processing 1M tokens across production MoE models. Speedup is
+                                                                       computed as sorting time divided by hash time.
+                                                                                 Model         E/K      Time (ms)     Speedup
+Figure 6. Speedups of MoEBlaze w.r.t to Megablocks on the set of                                       Sorting Hash
+configurations in Table 1 using SwiGLU as the activation function.               Qwen3         128/8      5.1   2.1       2.4
+                                                                                 DeepSeek V3 256/8        6.8   3.0       2.2
+                                                                                 DBRX           16/4      1.7   0.9       1.8
+                                                                                 Mixtral 8×22B 8/2        1.9   1.4       1.3
+                                                                                 gpt-oss-120b  128/4      3.6   1.9       1.9
+covering large-scale motivating regimes, production-grade                        Granite        40/8      3.8   1.6       2.3
+model configurations, and comprehensive ablation studies.
+
+7.1            Large-Scale Evaluation                                  7.3     Ablation Studies
+A primary motivation for MoEBlaze is to address the severe             We conduct a component-wise breakdown to isolate the
+memory bottlenecks encountered in extreme-scale MoE                    contributions of individual optimizations. Memory savings
+training. Table 2 demonstrates MoEBlaze’s performance at               in our approach stem primarily from reduced activation
+configurations matching this motivating regime (up to L =              buffers (scaling linearly with token count, activated experts,
+2M tokens and E = 128 experts). MoEBlaze maintains                     and model dimension) and intermediate activation savings.
+consistent speedups and massive memory savings compared                Compute speedups are driven by our lightweight dispatch
+to Megablocks. Furthermore, as sequence lengths scale                  function and fused expert computation.
+beyond 512k tokens, Megablocks reliably fails due to Out-
+Of-Memory (OOM) errors, whereas MoEBlaze operates                      Tables 4 and 5 illustrate how the baseline PyTorch imple-
+stably up to 2 million tokens.                                         mentation improves sequentially as we apply Triton kernel
+                                                                       optimizations, Smart Activation Checkpointing (SAC), and
+                                                                       our Hash dispatch method across various configurations.
+                                                                       Additionally, we isolate the specific overhead of our on-the-
+Table 2. Execution time and memory footprint of MoEBlaze and           fly gather operations. Microbenchmarks reveal that the on-
+Megablocks across different input sizes (K = 4, E = 128, d =
+                                                                       the-fly gather introduces an overhead of approximately 30%
+d′ = 256). Megablocks runs out-of-memory (OOM) beyond 512k
+tokens, while MoEBlaze scales to 2048k tokens.
+                                                                       compared to standalone, contiguous GEMM kernels (evalu-
+                                                                       ated on a problem size of roughly 400k tokens, d = 1024,
+                   Time (ms) Speedup Mem. (MB) Save
+                                                                       E = 8, and K = 2). However, this kernel-level overhead
+ Act.              L      Blaze Block              Blaze Block   (%)   is substantially outweighed by the end-to-end memory and
+ SwiGLU 8k    1.0   1.8                    1.9   155  495 68.6         latency benefits achieved by avoiding the materialization of
+ SwiGLU 32k   2.3   5.9                    2.6   477 1931 75.3         intermediate token buffers.
+ SwiGLU 128k  7.7 22.5                     2.9 1766 7675 77.0
+ SwiGLU 512k 28.7 OOM                        – 6918 OOM      –
+ SwiGLU 2m 115.2 OOM                         – 27528 OOM     –         Table 4. Ablation study on FastMoE MLP with SwiGLU at L =
+ SiLU              8k       0.7   1.4      1.9   108  303 64.5         512k (d = d′ = 256, E = 128, K = 4).
+ SiLU              32k      1.8   4.4      2.4   334 1163 71.3            Implementation Dispatch Time (ms) Act. Mem (MB)
+ SiLU              128k     6.3 16.1       2.4 1238 4603 73.1
+                                                                             PyTorch        sort         654           11 750
+ SiLU              512k    24.0 OOM          – 4854 OOM      –
+                                                                             Triton         sort         333            7958
+ SiLU              2m      95.3 OOM          – 19320 OOM     –
+                                                                             Triton + SAC   sort         290            6934
+                                                                             Triton + SAC   hash         287            6918
+                      MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+
+Table 5. Ablation study of FastMoE MLP with SwiGLU at L = 512k. Each column group corresponds to a different MoE configuration
+(d, E, K).
+                                    d=256, E=512, K=4            d=256, E=128, K=4             d=512, E=32, K=4
+       Implementation Dispatch Time (ms) Act. Mem (MB) Time (ms) Act. Mem (MB) Time (ms) Act. Mem (MB)
+       PyTorch          sort        1076            8166          654          11 750          887          22 278
+       Triton           sort         352            6294          324           7958           561          14 646
+       Triton + SAC     sort         340            5782          290           6934           511          12 598
+       Triton + SAC     hash         336            5766          287           6918           509          12 582
+
+
+8    S CALABILITY AND D ISTRIBUTED
+     I NTEGRATION
+The applicability of MoEBlaze is not limited to single-
+device execution. Our methodology is fundamentally or-
+thogonal to distributed training strategies and integrates
+seamlessly with existing parallelism schemes. We utilize a
+collective-communication model (AllGather, ReduceScatter,
+All-to-All) rather than point-to-point push/pull semantics.
+Industrial MoE training relies on diverse paradigms, pri-
+marily Fully Sharded Data Parallelism (FSDP), Tensor Par-
+allelism (TP), Pipeline Parallelism (PP), and Expert Paral-
+lelism (EP). MoEBlaze supports these through two distinct
+interactions:                                                    Figure 7. Normalized per-GPU throughput scaling under FSDP
+FSDP, TP, and PP: MoEBlaze integrates natively with              across different MoE configurations up to 8 GPUs. Normalized
+FSDP, TP, and PP without any modification. These paral-          throughput is defined as the per-GPU throughput at N GPUs
+                                                                 divided by the per-GPU throughput of the 1-GPU baseline.
+lel schemes do not shard token activations across devices;
+therefore, the per-device MoE computation remains math-
+ematically identical to the single-device formulation. As
+demonstrated in Figure 7, when applying FSDP across multi-       9    R ELATED W ORK
+ple GPUs, MoEBlaze maintains near-linear scalability with
+                                                                 MoE architectures and scaling. Scaling laws and em-
+minimal overhead as the cluster size increases. Furthermore,
+                                                                 pirical studies established that model performance im-
+because communication in FSDP, TP, and PP happens at
+                                                                 proves predictably with compute, dataset size, and param-
+the module, bucket, or micro-batch level, it remains entirely
+                                                                 eter count (Kaplan et al., 2020; Hoffmann et al., 2022).
+orthogonal to our kernel-level optimizations. This preserves
+                                                                 GPT-3 demonstrated few-shot generalization at 175B pa-
+all existing flexibility for compute-communication overlap.
+                                                                 rameters (Brown et al., 2020), while follow-on models ex-
+Expert Parallelism (EP): MoEBlaze is highly compatible           plored scaling in parameters, training data, and context
+with EP. In EP, after a cross-device All-to-All token shuffle,   length (e.g., Gopher at 280B (Rae et al., 2022); PaLM at
+each device hosts a specific subset of experts. The subse-       540B (Chowdhery et al., 2023)). Open foundation models
+quent computation on each device reduces to a local MoE          such as LLaMA (Touvron et al., 2023) accelerated progress
+problem—precisely the scenario MoEBlaze is designed              by enabling reproducibility and broad evaluation. More re-
+to optimize. While EP naturally interleaves communica-           cently, proprietary systems improved multimodal integration
+tion with compute, modern networking techniques (such as         and long-context capabilities (e.g., GPT-4 (OpenAI et al.,
+NVSHMEM) allow for fine-grained fusion of communica-             2024), Gemini (Team et al., 2023)), while open releases
+tion with compute kernels, preserving overlap opportunities.     distilled insights from such systems (Gemma (Team et al.,
+The specific fusion of cross-node token shuffling with our       2024)). These trends increase pressure on both throughput
+single-device routing is a promising avenue for complemen-       and memory, particularly under longer contexts and larger
+tary future optimization.                                        hidden dimensions.
+                                                                 Mixture-of-Experts (MoE) was popularized for scaling neu-
+                                                                 ral networks via sparse conditional computation, initially
+                                                                 in recurrent architectures with the Sparsely-Gated MoE for-
+                                                                 mulation (Shazeer et al., 2017). Subsequent work demon-
+                    MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+strated large-scale Transformer-based MoEs with automatic       mapping and orchestration, architecture-conscious fusion
+sharding and conditional computation in production-scale        can shorten activation lifetimes (e.g., fusing non-linearities
+systems (e.g., GShard) (Samuel, 1959). Switch Transform-        such as SiLU/SwiGLU with expert GEMMs) and reduce
+ers replaced top-k expert selection with top-1 to simplify      read/write traffic. Our work (MoEBlaze) advances this line
+routing and improve throughput (Fedus et al., 2022). GLaM       by eliminating per-expert routed activation buffers via com-
+explored large-scale MoE training with expert sparsity and      pact metadata and co-fusing routing and expert compute in
+strong efficiency–quality tradeoffs (Du et al., 2021). In the   microarchitecture-optimized kernels for current-generation
+open-source ecosystem, Mixtral 8×7B employs top-2 rout-         GPUs.
+ing with strong performance at 32k context (Jiang et al.,
+2024), while DeepSeek-V3 reports a 671B-parameter MoE           10    C ONCLUSION AND F UTURE W ORK
+with 37B active parameters per token and efficient large-
+scale training (DeepSeek-AI et al., 2025).                      We present MoEBlaze, a fast and memory efficient system
+                                                                for MoE training on GPU. MoEBlaze eliminating the need
+Systems for MoE training and routing. Early GPU-first           for materializing large per-expert activation buffers with
+stacks such as FastMoE offered a PyTorch-based distributed      fused token dispatch and compute kernel designs. Further-
+MoE system with practical acceleration and multi-node ex-       more, MoEBlaze consolidates the MoE computation and
+pert placement (He et al., 2021). Tutel proposed Flex, a de-    activation pipelines to minimize read/write traffic for better
+sign enabling runtime-adaptive parallelism and pipelining to    memory bandwidth savings and footprint reduction. Our ex-
+handle routing-induced workload variability, showing large      perimental shows that MoEBlaze provides a highly efficient
+speedups across scales (Hwang et al., 2023). DeepSpeed-         and scalable solution across a range of configurations with
+MoE introduced both training and inference optimizations        over 4× speedups and over 50% activation memory savings.
+to support next-generation MoE at scale (Rajbhandari et al.,    While this paper primarily focuses on single-device perfor-
+2022). MegaBlocks reformulated MoE computation as               mance, we note that the core mechanisms of MoEBlaze are
+block-sparse operations to avoid padding or token drop-         also applicable to distributed settings. As furture work, we
+ping and map well to GPUs (Gale et al., 2023). TurboMoE         plan to extend MoEBlaze to distributed training frameworks
+argued the gating path is a core bottleneck and introduced      and study the optimizations for multi-node, multi-GPU MoE
+fused, metadata-driven kernels and data-layout transforma-      training.
+tions that reduce sparse-compute overheads and improve
+large-scale throughput (Aminabadi et al., 2025).
+                                                                11    ACKNOWLEDGMENTS
+Routing policies, load balancing, and capacity. MoE             We gratefully acknowledge Carole-Jean Wu for insightful
+quality and efficiency depend on the router. The auxiliary      discussions and consultation. We are also grateful to Hong-
+load-balancing loss in Sparsely-Gated MoE mitigates ex-         tao Yu for his expertise and support on the Triton language..
+pert imbalance (Shazeer et al., 2017); Switch Transformers
+adopted top-1 routing plus capacity constraints to reduce
+compute and simplify gather/scatter (Fedus et al., 2022).       R EFERENCES
+GShard explored routing and tensor-sharding policies at         Aminabadi, R. Y., Holmes, C., Rajbhandari, S., Yao, Z., and
+massive scale (Lepikhin et al., 2021). Open MoE mod-             He, Y. Turbomoe: Enhancing moe model training with
+els such as Mixtral use top-2 routing and capacity fac-          smart kernel-fusion and data transformation. 2025.
+tors tuned for stability and throughput (Jiang et al., 2024).
+DeepSeek-V3 further reports an auxiliary-loss-free strat-       Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan,
+egy for load balancing while scaling training to very large       J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+regimes (DeepSeek-AI et al., 2025). Across these designs,         Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G.,
+routing capacity and token dropping vs. padding interact          Henighan, T., Child, R., Ramesh, A., Ziegler, D. M., Wu,
+with both throughput and memory pressure, particularly at         J., Winter, C., Hesse, C., Chen, M., Sigler, E., Litwin, M.,
+long contexts.                                                    Gray, S., Chess, B., Clark, J., Berner, C., McCandlish,
+                                                                  S., Radford, A., Sutskever, I., and Amodei, D. Lan-
+Kernel and performance optimization. GPU perfor-                  guage models are few-shot learners. In Proceedings of
+mance for MoE hinges on data movement minimization                the 34th International Conference on Neural Informa-
+and on-chip residency. MegaBlocks leverages block-sparse          tion Processing Systems, NIPS ’20, Red Hook, NY, USA,
+kernels to avoid wasteful dense padding (Gale et al., 2023),      2020. Curran Associates Inc. ISBN 9781713829546.
+and TurboMoE fuses gating, scatter/gather, and expert com-
+bination with tailored kernels that avoid expensive sparse      Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,
+MMs (Aminabadi et al., 2025). Complementary to sparse             G., Roberts, A., Barham, P., Chung, H. W., Sutton,
+                     MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+  C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko,               Millican, K., van den Driessche, G., Damoc, B., Guy, A.,
+  S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer,             Osindero, S., Simonyan, K., Elsen, E., Vinyals, O., Rae,
+  N., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B.,             J. W., and Sifre, L. Training compute-optimal large lan-
+  Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari,            guage models. In Proceedings of the 36th International
+  G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S., Dev,            Conference on Neural Information Processing Systems,
+  S., Michalewski, H., Garcia, X., Misra, V., Robinson,              NIPS ’22, Red Hook, NY, USA, 2022. Curran Associates
+  K., Fedus, L., Zhou, D., Ippolito, D., Luan, D., Lim,              Inc. ISBN 9781713871088.
+  H., Zoph, B., Spiridonov, A., Sepassi, R., Dohan, D.,
+  Agrawal, S., Omernick, M., Dai, A. M., Pillai, T. S., Pel-       Hwang, C., Cui, W., Xiong, Y., Yang, Z., Liu, Z., Hu, H.,
+  lat, M., Lewkowycz, A., Moreira, E., Child, R., Polozov,          Wang, Z., Salas, R., Jose, J., Ram, P., Chau, H., Cheng,
+  O., Lee, K., Zhou, Z., Wang, X., Saeta, B., Diaz, M.,             P., Yang, F., Yang, M., and Xiong, Y. Tutel: Adaptive
+  Firat, O., Catasta, M., Wei, J., Meier-Hellstern, K., Eck,        mixture-of-experts at scale. In Song, D., Carbin, M., and
+  D., Dean, J., Petrov, S., and Fiedel, N. Palm: scaling            Chen, T. (eds.), Proceedings of Machine Learning and
+  language modeling with pathways. J. Mach. Learn. Res.,            Systems, volume 5, pp. 269–287. Curan, 2023.
+  24(1), January 2023. ISSN 1532-4435.
+                                                                   Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A.,
+DeepSeek-AI, Liu, A., Feng, B., Xue, B., Wang, B., Wu, B.,            Savary, B., Bamford, C., Chaplot, D. S., de Las Casas,
+  Lu, C., Zhao, C., Deng, C., Zhang, C., Ruan, C., Dai, D.,           D., Hanna, E. B., Bressand, F., Lengyel, G., Bour, G.,
+  Guo, D., Yang, D., Chen, D., Ji, D., Li, E., Lin, F., Dai, F.,      Lample, G., Lavaud, L. R., Saulnier, L., Lachaux, M.,
+  Luo, F., et al. Deepseek-v3 technical report, 2025. URL             Stock, P., Subramanian, S., Yang, S., Antoniak, S., Scao,
+  https://arxiv.org/abs/2412.19437.                                   T. L., Gervet, T., Lavril, T., Wang, T., Lacroix, T., and
+                                                                      Sayed, W. E. Mixtral of experts. CoRR, abs/2401.04088,
+Du, N., Huang, Y., Dai, A. M., Tong, S., Lepikhin, D.,                2024. doi: 10.48550/ARXIV.2401.04088. URL https:
+ Xu, Y., Krikun, M., Zhou, Y., Yu, A. W., Firat, O.,                  //doi.org/10.48550/arXiv.2401.04088.
+  Zoph, B., Fedus, L., Bosma, M., Zhou, Z., Wang, T.,
+ Wang, Y. E., Webster, K., Pellat, M., Robinson, K.,               Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B.,
+  Meier-Hellstern, K. S., Duke, T., Dixon, L., Zhang, K.,            Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and
+  Le, Q. V., Wu, Y., Chen, Z., and Cui, C. Glam: Effi-               Amodei, D. Scaling laws for neural language models.
+  cient scaling of language models with mixture-of-experts.          CoRR, abs/2001.08361, 2020. URL https://arxiv.
+  In International Conference on Machine Learning,                   org/abs/2001.08361.
+  2021. URL https://api.semanticscholar.
+  org/CorpusID:245124124.                                          Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang,
+                                                                     Y., Krikun, M., Shazeer, N., and Chen, Z. Gshard: Scal-
+Elfwing, S., Uchibe, E., and Doya, K. Sigmoid-weighted               ing giant models with conditional computation and auto-
+  linear units for neural network function approximation             matic sharding. In 9th International Conference on Learn-
+  in reinforcement learning. CoRR, abs/1702.03118, 2017.             ing Representations, ICLR 2021, Virtual Event, Austria,
+  URL http://arxiv.org/abs/1702.03118.                               May 3-7, 2021. OpenReview.net, 2021. URL https:
+                                                                     //openreview.net/forum?id=qrwe7XHTmYb.
+Fedus, W., Zoph, B., and Shazeer, N. Switch transformers:
+  scaling to trillion parameter models with simple and effi-       OpenAI, Achiam, J., Adler, S., Agarwal, S., Ahmad, L.,
+  cient sparsity. J. Mach. Learn. Res., 23(1), January 2022.        Akkaya, I., Aleman, F. L., Almeida, D., Altenschmidt,
+  ISSN 1532-4435.                                                   J., Altman, S., Anadkat, S., Avila, R., Babuschkin, I.,
+                                                                     Balaji, S., Balcom, V., Baltescu, P., Bao, H., Bavarian, M.,
+Gale, T., Narayanan, D., Young, C., and Zaharia, M.
+                                                                     Belgum, J., Bello, I., Berdine, J., Bernadett-Shapiro, G.,
+  Megablocks: Efficient sparse training with mixture-of-
+                                                                     Berner, C., Bogdonoff, L., Boiko, O., Boyd, M., Brakman,
+  experts. In Song, D., Carbin, M., and Chen, T. (eds.),
+                                                                    A.-L., Brockman, G., Brooks, T., Brundage, M., Button,
+  Proceedings of Machine Learning and Systems, volume 5,
+                                                                     K., Cai, T., Campbell, R., Cann, A., Carey, B., Carlson,
+  pp. 288–304. Curan, 2023.
+                                                                     C., Carmichael, R., Chan, B., Chang, C., Chantzis, F.,
+He, J., Qiu, J., Zeng, A., Yang, Z., Zhai, J., and Tang, J.          Chen, D., Chen, S., Chen, R., Chen, J., Chen, M., Chess,
+  Fastmoe: A fast mixture-of-expert training system. CoRR,           B., Cho, C., Chu, C., Chung, H. W., Cummings, D.,
+  abs/2103.13262, 2021. URL https://arxiv.org/                       Currier, J., Dai, Y., Decareaux, C., Degry, T., et al. Gpt-4
+  abs/2103.13262.                                                    technical report, 2024. URL https://arxiv.org/
+                                                                     abs/2303.08774.
+Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E.,
+  Cai, T., Rutherford, E., de Las Casas, D., Hendricks,            Rae, J. W., Borgeaud, S., Cai, T., Millican, K., Hoff-
+  L. A., Welbl, J., Clark, A., Hennigan, T., Noland, E.,             mann, J., Song, F., Aslanides, J., Henderson, S., Ring,
+                     MoEBlaze: Breaking the Memory Wall for Efficient MoE Training on Modern GPUs
+
+  R., Young, S., Rutherford, E., Hennigan, T., Menick,            Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+  J., Cassirer, A., Powell, R., van den Driessche, G.,              M., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+  Hendricks, L. A., Rauh, M., Huang, P.-S., Glaese, A.,             Azhar, F., Rodriguez, A., Joulin, A., Grave, E., and
+  Welbl, J., Dathathri, S., Huang, S., Uesato, J., Mellor,          Lample, G. Llama: Open and efficient foundation
+  J., Higgins, I., Creswell, A., McAleese, N., Wu, A.,              language models. CoRR, abs/2302.13971, 2023. doi:
+  Elsen, E., Jayakumar, S., Buchatskaya, E., Budden, D.,            10.48550/ARXIV.2302.13971. URL https://doi.
+  Sutherland, E., Simonyan, K., Paganini, M., Sifre, L.,            org/10.48550/arXiv.2302.13971.
+  Martens, L., Li, X. L., Kuncoro, A., Nematzadeh, A., Gri-
+  bovskaya, E., , et al. Scaling language models: Methods,        Williams, S., Waterman, A., and Patterson, D. Roofline:
+  analysis & insights from training gopher, 2022. URL              an insightful visual performance model for multicore
+  https://arxiv.org/abs/2112.11446.                                architectures. Commun. ACM, 52(4):65–76, April
+                                                                   2009. ISSN 0001-0782. doi: 10.1145/1498765.
+Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi,            1498785.      URL https://doi.org/10.1145/
+  R. Y., Awan, A. A., Rasley, J., and He, Y. DeepSpeed-            1498765.1498785.
+  MoE: Advancing mixture-of-experts inference and train-
+  ing to power next-generation AI scale. In Chaudhuri, K.,        Wulf, W. A. and McKee, S. A. Hitting the memory wall:
+  Jegelka, S., Song, L., Szepesvari, C., Niu, G., and Sabato,      implications of the obvious. SIGARCH Comput. Archit.
+  S. (eds.), Proceedings of the 39th International Confer-         News, 23(1):20–24, March 1995. ISSN 0163-5964. doi:
+  ence on Machine Learning, volume 162 of Proceedings              10.1145/216585.216588. URL https://doi.org/
+  of Machine Learning Research, pp. 18332–18346. PMLR,             10.1145/216585.216588.
+  17–23 Jul 2022. URL https://proceedings.mlr.
+  press/v162/rajbhandari22a.html.
+Ramachandran, P., Zoph, B., and Le, Q. V. Searching for
+  activation functions. CoRR, abs/1710.05941, 2017. URL
+  http://arxiv.org/abs/1710.05941.
+Samuel, A. L. Some studies in machine learning using
+  the game of checkers. IBM Journal of Research and
+  Development, 3(3):211–229, 1959.
+Shazeer, N. GLU variants improve transformer. CoRR,
+  abs/2002.05202, 2020. URL https://arxiv.org/
+  abs/2002.05202.
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le,
+  Q. V., Hinton, G. E., and Dean, J. Outrageously large
+  neural networks: The sparsely-gated mixture-of-experts
+  layer. In 5th International Conference on Learning Rep-
+  resentations, ICLR 2017, Toulon, France, April 24-26,
+  2017, Conference Track Proceedings. OpenReview.net,
+  2017. URL https://openreview.net/forum?
+  id=B1ckMDqlg.
+Team, G., Anil, R., Borgeaud, S., Alayrac, J.-B., Yu, J., Sori-
+  cut, R., Schalkwyk, J., Dai, A. M., Hauth, A., Millican,
+  K., et al. Gemini: a family of highly capable multimodal
+  models. arXiv preprint arXiv:2312.11805, 2023.
+Team, G., Mesnard, T., Hardin, C., Dadashi, R., Bhupatiraju,
+  S., Pathak, S., Sifre, L., Rivière, M., Kale, M. S., Love,
+  J., Tafti, P., Hussenot, L., Sessa, P. G., Chowdhery, A.,
+  Roberts, A., Barua, A., Botev, A., Castro-Ros, A., Slone,
+  A., Héliou, A., Tacchetti, A., Bulanova, A., Paterson,
+  A., Tsai, B., et al. Gemma: Open models based on
+  gemini research and technology, 2024. URL https:
+  //arxiv.org/abs/2403.08295.
+

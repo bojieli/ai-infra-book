@@ -1,0 +1,976 @@
+K ITTY : ACCURATE AND E FFICIENT 2- BIT KV C ACHE Q UANTIZATION WITH
+              DYNAMIC C HANNEL - WISE P RECISION B OOST
+
+
+     Haojun Xia * 1 Xiaoxia Wu * 2 Jisen Li * 3 Tsai-chuan Wu 2 Junxiong Wang 2 Jue Wang 2 Chenxi Li 2
+         Aman Singhal 2 Alay Dilipbhai Shah 2 Alpay Ariyak 2 Donglin Zhuang 1 Zhongzhu Zhou 1
+                          Ben Athiwaratkun 2 Zhen Zheng 4 Shuaiwen Leon Song 2
+
+
+                                                         A BSTRACT
+     The KV cache is a dominant memory bottleneck for LLM inference. While 4-bit KV quantization preserves
+     accuracy, 2-bit often degrades it, especially on long-context reasoning. We close this gap via an algorithm–system
+     co-design for mixed-precision KV caching: Kitty. On the algorithm side, extensive experiments show that Dynamic
+     Channel-wise Precision Boost — which ranks Key-cache channels by sensitivity and keeps only a small fraction
+     at higher precision — maintains near-zero drop in accuracy while approaching 2-bit memory. On the system
+     side, the primary challenge lies in managing these dynamic 4-bit channel boosts without compromising memory
+     efficiency or the execution speed of attention layers. Kitty addresses this through a hardware-aware memory layout
+     and highly optimized system designs, ensuring that our on-the-fly KV quantization incurs negligible runtime
+     overhead while maximizing memory footprint reduction. This synergistic design allows Kitty to unlock the full
+     potential of 2-bit quantization without sacrificing real-time inference throughput. Specifically, Kitty addresses
+     these issues by decomposing each mixed-precision Key page into two tensors with unified 2-bit precision. Based
+     on this, Kitty provides a page-centric KV layout, Triton-compatible page dequantization kernels, and a lightweight
+     runtime pipeline that reduces and amortizes the runtime overhead. Across seven tasks and two model families
+     (Qwen3, LLaMA3), Kitty cuts KV memory by nearly 8× with negligible accuracy loss, enabling up to 8× larger
+     batches and 2.1×–4.1× higher throughput under the same memory budget. We release the full implementation of
+     Kitty at https://github.com/Summer-Summer/Kitty.
+
+1    I NTRODUCTION                                                 data-center GPUs such as the NVIDIA B200 GPUs provide
+                                                                   only 192 GB of memory and cost over $30,000 each, mak-
+As large language models (LLMs) advance, their ability to          ing such deployments prohibitively expensive. The massive
+process extremely long contexts (e.g., 128K tokens (Ope-           KV cache further exacerbates inference latency due to the
+nAI et al., 2024; Dubey et al., 2024)) has enabled power-          heavy data movement between GPU memory and compute
+ful applications such as detailed document understanding,          units.
+extended dialogues, and complex reasoning (e.g., chain-of-
+thought (Wei et al., 2024)). However, their progression has        KV cache quantization offers a compelling direction to ad-
+exposed a severe systems bottleneck: the enormous memory           dress this gap, especially the post-training scheme which
+footprint of the KV cache. Unlike model weights (which are         can be applied without re-training or fine-tuning. Moreover,
+static), the size of the KV cache grows proportionally with        with proper system support (e.g., Du et al. (2025)), it can
+both context length and batch size, leading to outsized GPU        effectively reduce both memory consumption and inference
+memory footprints in long-context inference. For a model           latency. Unlike token pruning, quantization preserves all
+like LLaMA3-70B (Dubey et al., 2024), serving 32 requests          contextual information without discarding tokens. Never-
+with a 128K sequence requires more than 1.2 TB of KV               theless, low-bit (e.g. 2-bit) KV cache quantization remains
+cache storage, which is nearly an order of magnitude larger        challenging in practice. Our empirical investigation shows
+than the model weights themselves. But state-of-the-art            that quantizing the KV cache to 4-bit precision using the
+  *
+                                                                   state-of-the-art method KIVI (Liu et al., 2024) can maintain
+    Core contributors 1 University of Sydney 2 Together AI         accuracy. However, further reducing to 2 bits significantly
+3
+ University of Illinois Urbana-Champaign 4 Microsoft. Correspon-
+dence to: Shuaiwen Leon Song <leon@together.ai>, Zhen Zheng
+                                                                   harms model accuracy across a range of downstream tasks.
+<zhengzhen@microsoft.com>.                                         These findings suggest that more nuanced approaches are
+                                                                   required to unlock the full potential of KV compression at
+Proceedings of the 9 th MLSys Conference, Bellevue, WA, USA,       even lower precision.
+2026. Copyright 2026 by the author(s).
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+To address this problem, we propose a novel approach for                  Most of channels                 Important channels
+2-bit KV cache quantization, which we call channel-wise               aggressively quantized for          in higher precision for
+                                                                        superior compression.                better accuracy.
+precision boost. The key insight is that applying a uni-
+form precision across the entire KV cache is suboptimal.                   INT2 channel                   INT4 channel
+Orthogonal to prior work (Zhang et al., 2024b), which pre-                             S       G                1~G
+serves important tokens in higher precision, channel-wise
+precision boost preserves only critical channels in higher                                                          Q
+precision while aggressively compressing the remainder.                           KT   Sink
+                                                                                                                  Buffer
+                                                                                                                             V
+Our method is motivated by the observation that certain crit-
+ical channels within the key cache play a disproportionately                                                                Sink    S
+important role in maintaining model accuracy. Based on
+this novel method, we propose a systematic quantization                                       𝐴𝑡𝑡𝑛_𝑆𝑐𝑜𝑟𝑒
+algorithm, Kitty, shown in Figure 1. Furthermore, we design         L-1                                    𝑄𝐾𝑇
+                                                                                              = softmax
+and build an end-to-end inference system for our novel 2-bit                                                  𝑑
+KV quantization algorithm on GPU platforms. To support
+our novel KV cache memory layout, we developed GPU                                                                         Local    R
+kernels with Triton (Tillet et al., 2019) for: (1) efficient          1                       Attention Score
+quantization of newly generated KV vectors and cache up-
+dates, and (2) efficient execution of attention mechanism.                    D                     L                        D
+Crucially, Kitty embodies a algorithm-system co-design:
+the quantization algorithm ensures superior model fidelity      Figure 1. Illustration of our KV cache quantization scheme, Kitty.
+and memory efficiency, while the underlying system archi-       The figure shows the decoding phase, where only the current
+tecture effectively masks the dynamic overhead to unlock        query vector (a single token) participates in computation, while all
+high-throughput inference.                                      previously stored key and value vectors in the KV cache are reused.
+                                                                The key cache is organized into three parts: (i) Sink (initial tokens
+This paper makes the following contributions:                   kept in FP16), (ii) a Q-Buffer (quantization buffer, temporarily
+                                                                storing the FP16 KVs before forming a quantization group), and
+   • We observe that state-of-the-art 2-bit KV cache quan-      (iii) quantized channels (Most channels quantized to INT2 for
+     tization methods like KIVI (Liu et al., 2024) substan-     maximum compression, a small fraction of channels preserved in
+     tially degrade the accuracy of reasoning LLMs, reveal-     INT4 for accuracy preservation). The value cache is quantized
+     ing a critical representation bottleneck for low-bit KV    per-token with a sliding window, where both Sink (initial tokens)
+     cache quantization.                                        and the most recent Local (local tokens) are retained in FP16.
+                                                                Here, L denotes the sequence length and D the head size; S is
+   • We introduce Dynamic Channel-wise Precision Boost,         the number of preserved sink tokens, G the quantization group
+     a novel 2-bit quantization algorithm for KV cache, in-     size, and R the local window size. The default configuration is:
+     spired by the key observations in channel-wise patterns    S = 32, R = 128, G = 128, which provides a good balance
+     and channel-wise quantization sensitivity. Combined        between accuracy and memory savings.
+     with other optimizations, we propose a systematic KV
+     cache quantization scheme called Kitty. Extensive ex-
+     periments show that Kitty can significantly outperform     details our experimental results of inference accuracy and
+     prior works in accuracy.                                   throughput.
+
+   • We propose novel system designs and build an end-to-
+     end inference system for our novel 2-bit KV quantiza-      2      BACKGROUND & M OTIVATION
+     tion algorithm on GPU platforms. This system desgin        The KV cache can help avoid the expensive recomputation
+     solve the channels of handling dynamic 4-bit channel       of historical key and value tensors by retrieving them from
+     boosts while keeping the page layout coalesced and         cache memory, significantly accelerating inference. How-
+     the dequantization uniform. Our inference system en-       ever, the cache size grows linearly with context length. As
+     ables 8× larger batch sizes and achieves 2.1× → 4.1×       real-world applications scale, the KV cache quickly domi-
+     higher inference throughput compared to the FP16           nates memory usage and becomes a critical bottleneck for
+     baseline while maintaining the same memory budget.         inference.
+The remainder of this chapter is organized as follows. Sec-
+                                                                2.1       Existing KV Quantization Strategies
+tion 2 details the background and motivation. Section 3
+describes our algorithm design for 2-bit KV cache quantiza-     Low-bit quantization has emerged as a promising direction
+tion. We present our system designs in Section 4. Section 5     to reduce the memory footprint of the KV cache. The con-
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+cept is to convert full-precision keys and values (e.g., FP16)    quantization for Keys and per-token quantization for Values.
+into compact representations such as 8-bit, 4-bit, or even 2-     Meanwhile, it also maintains a small FP16 sliding window
+bit formats. Unlike weight quantization, which is static and      for both Key and Value cache to preserve local context.
+applied once after training, KV cache quantization must be        Comparing to Figure 1, KIVI does not preserve FP16 Sink
+performed dynamically during runtime, making the problem          and has no INT4 channels.
+more challenging.
+                                                                  Non-KV Quantization. While our focus is on KV quanti-
+Per-token vs. Per-channel Quantization. The Key                   zation, it is worth noting that several techniques for weight
+or Value cache can be represented as a matrix in shape            and activation quantization are orthogonal and potentially
+(B, H, L, D), where B is the inference batch size, H is the       complementary (Xiao et al., 2024a; Lin et al., 2024).
+number of KV head, L is the sequence length, and D is
+hidden size for each head. Thus, for each head of a certain       2.2   Motivation: Accuracy Drop for Low-bit KV
+request, the KV cache has shape (L, D), which is a 2-D
+dimensional matrix consisting of L tokens and each token          Despite progress, existing solutions struggle to maintain
+is a vector of size D.                                            accuracy when pushing the precision of KV cache below
+                                                                  4 bits. Liu et al. (2025) shows that quantizing KV cache
+As a result, the KV cache can be quantized along two differ-      to 3 bits already causes significant accuracy degradations
+ent dimensions, L and/or D. Per-token quantization applies        with state-of-the-art quantization algorithms (Hooper et al.,
+a separate scale (and optionally zero-point) to each token’s      2024; Ashkboos et al., 2024). It follows that 2-bit precision
+key or value vector, so each token can be quantized sepa-         should be even more challenging.
+rately. Per-channel quantization instead computes a scale
+per channel, shared across all tokens, and has been observed      We empirically observe that while 4-bit KV cache quanti-
+to preserve accuracy better for Key cache quantization (Liu       zation can match FP16 closely, reducing it further to 2-bit
+et al., 2024; Hooper et al., 2024; Zhang et al., 2024a). In       (INT2) leads to substantial accuracy degradation across rea-
+practice, most recent works adopt per-channel quantization        soning and generation benchmarks.
+for the K cache and per-token quantization for the V cache.       As Table 1 shows, reducing the KV cache precision from
+Mixed-precision Quantization. Quantizing the entire KV            16 to 4 bits causes almost no degradation in accuracy for
+cache to a very low precision (e.g., 2-bit) typically hurts       Qwen3-8B and LLaMA3-8B. However, further reducing
+model quality severely. To mitigate this, hybrid schemes          the cache to 2 bits greatly deteriorates the average drops
+preserve a subset of elements in higher precision while           to -15.23 and -10.15 respectively. These results highlight
+quantizing the rest. For example, KVQuant (Hooper et al.,         that simply applying existing quantization methods to KV
+2024) identifies outliers and stores them in FP16 with a          cache is insufficient, and thus motivate a line of inquiry:
+sparse representation. However, KVQuant is not hardware-          can more nuanced techniques mitigate these losses and
+friendly and usually suffers from low system-level efficiency,    enable practical low-bit KV cache quantization for long-
+since it introduces additional runtime overhead from sparse-      context LLM inference?
+dense multiplications, which could be slow on GPUs (Xia
+et al., 2023; Gale et al., 2020). KIVI (Liu et al., 2024)
+                                                                  Table 1. Accuracy degradation of low-bit KV cache quantization
+and BitDecoding (Du et al., 2025) retain the most recent
+                                                                  on Qwen3-8B (Yang et al., 2025) and LLaMA3-8B (Dubey et al.,
+tokens in full precision to preserve an accurate local context,   2024). While 4-bit KIVI (Liu et al., 2024) maintains accuracy,
+but they still suffer from severe accuracy degradations in        2-bit KIVI shows a significant drop. Note: “MATH” and “GPQA”
+low-precision regimes (e.g. 2-bit). MiniKV (Sharma et al.,        denote the MATH-Algebra and GPQA-Diamond subsets.
+2024) proposes a layer-discriminative bit allocation scheme
+                                                                   Model     Task            FP16     KIVI-4bit     KIVI-2bit
+for each layers. KVTuner (Li et al., 2025) proposes to
+tune layer-wise mixed precision bitwidths for the KV cache.                  GSM8K           94.79       94.41         89.13
+QuaRot (Ashkboos et al., 2024) applies orthogonal rotations                  MATH            88.26       88.46         47.29
+                                                                    Qwen3
+
+
+
+
+to activations and KV cache so that the distributions become                 GPQA            40.71       38.98         32.24
+                                                                     -8B
+
+
+
+
+outlier-free. Several recent studies have explored mixed-                    HumanEval       84.82       84.09         76.89
+precision quantization for weights and activations (Zheng                    AIME24          71.67       77.67         57.00
+et al., 2024; Zhao et al., 2024); however, these approaches                  AIME25          66.00       65.33         52.33
+are orthogonal to the focus of this work.                                    GSM8K           76.75       76.09         63.58
+                                                                    LLaMA3
+
+
+
+
+KIVI (Liu et al., 2024) is a tuning-free, 2-bit KV framework,                MATH            47.15       47.85         31.45
+                                                                      -8B
+
+
+
+
+serving as an important algorithm baseline in this paper. It                 GPQA            26.94       25.82         23.88
+relies on the insight that Keys and Values exhibit differ-                   HumanEval       63.96       62.07         55.30
+ent outlier patterns. Accordingly, it applies per-channel
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+3     A LGORITHM D ESIGN
+As discussed in Section 2.2, pushing KV cache quantization
+to extremely low precision (e.g. INT2) to save memory
+comes at the cost of a wide accuracy gap. In this section,
+we first present our design space exploration in Subsection
+3.1, where we try to reduce this gap with straightforward
+optimizations. Then, we propose channel-wise precision
+boost in Subsection 3.2. We present the overall quantization
+scheme in Subsection 3.4.
+
+3.1   Design Space Exploration
+                                                                                  (a) Visualization of Key-cache.
+Preserving the Initial Tokens in Full Precision The ini-
+tial tokens in a sequence are sometimes referred to as atten-
+tion sinks, as noted in StreamingLLM (Xiao et al., 2024b).
+These tokens typically receive disproportionately high at-
+tention weights and thus contribute significantly to the final
+outputs. In this paper, we stipulate that preserving the ini-
+tial tokens in full precision can help mitigate accuracy loss
+with negligible overhead. We implemented KIVI-K2V2*,
+which is an algorithmic variant of KIVI, where the first
+32 tokens are additionally preserved in full precision in
+KV cache. Empirical results in Table 2 show that KIVI-
+K2V2* substantially alleviates accuracy degradation across       (b) MSE error on attention score after quantizing each channel.
+benchmarks. On average, KIVI-K2V2* outperforms the
+original KIVI-K2V2 by +8.28 and +5.33 on Qwen3-8B                Figure 2. Visual and statistical analysis of Key cache from Layer
+and LLaMA3-8B respectively.                                      10, Qwen3-8B. (a) Visualization of Key-cache magnitude from
+                                                                 the first KV head. The uneven distribution, with a few channels
+                                                                 showing consistently high magnitudes, motivates a channel-aware
+Increasing the Precision of Key Cache. While preserv-            approach to quantization. The vertical axis denotes activation
+ing the precision of sink-token entries recovers some perfor-    magnitudes, while the horizontal axis spans the token and chan-
+mance, this technique still leaves much to be desired when       nel dimensions. (b) The mean squared error (MSE) between the
+compared to the FP16 baseline. To further reduce this gap        original attention score matrix with its perturbed counterpart after
+and better understand the relative importance of the Key and     quantizing each channel of Key cache. The pattern is consistent
+Value caches, we also evaluate two design variants: KIVI-        between different Q heads who share the same Key cache due to
+                                                                 grouped-query attention (Ainslie et al., 2023).) Similar patterns
+K2V4* and KIVI-K4V2*. Results in Table 2 indicate that
+                                                                 are observed on other layers/models.
+increasing the precision of the Key cache proves substan-
+tially more effective than doing so for the Value cache. In
+particular, KIVI-K4V2* outperforms KIVI-K2V4* and
+achieves accuracy approaching the FP16 baseline across           Observation-1: Channel-wise Patterns in Key Cache. We
+multiple benchmarks, underscoring the importance of in-          visualize the absolute values of Key-cache activations across
+creasing the precision of Key cache over the Value cache.        multiple layers on Qwen3-8B, and find that the magnitudes
+                                                                 of different channels in Key cache vary considerably. As
+3.2   Channel-wise Precision Boost                               shown in Figure 2a, a subset of channels consistently ex-
+                                                                 hibits higher magnitudes. While this figure only presents the
+In the previous subsection (§ 3.1), we observe that raising
+                                                                 visualization of layer 10, similar pattern is observed on other
+the precision of the Key cache can effectively mitigates the
+                                                                 layers. These observations align with prior work (Liu et al.,
+accuracy degradation from KV cache quantization. It moti-
+                                                                 2024; Hooper et al., 2024), which leveraged per-channel
+vates a key question: rather than boosting the precision of
+                                                                 quantization to reduce quantization errors.
+the entire Key cache, can we obtain comparable accuracy
+gains by increasing the precision of only a small subset         These observations suggest that not all channels in the Key
+of the Key cache? To explore this idea, we first perform         cache behave equally. Some channels appear to exert a
+both visual and statistical analysis of the Key-cache ten-       stronger influence, while others may have only a marginal
+sors, and then propose our key innovation according to the       effect. This uneven contribution motivates a channel-aware
+observations.                                                    perspective: by selectively allocating higher precision to
+            Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+
+Table 2. Accuracy comparison across KV cache schemes on Qwen3-8B (Yang et al., 2025) and LLaMA3-8B (Dubey et al., 2024). Rows
+are tasks (transposed from original tables); columns are methods. Within each model block, the best per-row is in bold. Note: “MATH”
+= MATH-Algebra, “GPQA” = GPQA-Diamond. Algorithm names ending with an asterisk (*) indicate that the initial 32 tokens are
+preserved in full precision.
+         Model             Task            FP16      KIVI-K2V2        KIVI-K2V2*         KIVI-K2V4*         KIVI-K4V2*
+                           GSM8K           94.79        89.13              89.71             90.14                 93.96
+                           MATH            88.26        47.29              74.92             82.50                 87.92
+                           GPQA            40.71        32.24              36.02             35.82                 40.51
+         Qwen3-8B
+                           HumanEval       84.82        76.89              78.54             81.77                 83.41
+                           AIME24          71.67        57.00              67.67             71.00                 76.00
+                           AIME25          66.00        52.33              57.67             64.33                 64.33
+                           GSM8K           76.75        63.58              71.04             72.38                 76.62
+                           MATH            47.15        31.45              44.12             44.09                 48.41
+         LLaMA3-8B
+                           GPQA            26.94        23.88              23.67             24.80                 25.20
+                           HumanEval       63.96        55.30              56.71             59.02                 62.80
+
+
+the most influential channels, it may be possible to preserve       Key Methods: Boosting Precision of Critical Channels
+model accuracy while still reducing the overall KV cache            Inspired by prior observations, we propose our channel-wise
+memory footprint.                                                   precision boost, where the critical channels are preserved
+                                                                    in higher precision (INT4) while the others are aggressively
+Observation-2: Channel-wise Quantization Sensitivity.
+                                                                    quantized to lower precision (INT2), to reduce the distortion
+To understand the importance of each channel, we isolate the
+                                                                    introduced by uniform 2-bit quantization and improving
+impact of quantization on each individual channels. Specif-
+                                                                    inference accuracy.
+ically, we quantize a single channel to 2 bits (INT2) each
+time while keeping other channels unchanged, and calculate          To apply our channel-wise precision boost method, we need
+its impact on the attention score:                                  to first identify a subset of channels to boost. Directly com-
+                                                                    puting the sensitivity of every channel at runtime, as we did
+                                     QK ⊤
+                                          
+             attn score = softmax √           .          (1)        in Figures 2b, is prohibitively expensive which requires com-
+                                        d                           puting the attention score matrix and measuring its MSE
+                                                                    against an FP16 baseline for each channel. To address
+We compute the mean squared error (MSE) between the
+                                                                    this, we approximate channel importance using lightweight
+original attention score matrix with its perturbed counterpart
+                                                                    heuristics that can be computed in a single pass. In this
+(after quantizing a channel), and use this MSE as the metric
+                                                                    work, we use magnitude-based selection heuristic to ap-
+to quantify the sensitivity of each channel in Figure 2b.
+                                                                    proximate the channel importance. We therefore define the
+Since Grouped-Query Attention (GQA) (Ainslie et al., 2023)
+                                                                    importance score as the average magnitude of channel i
+is used in these models, where one key head is shared across
+                                                                    across all tokens:
+multiple query heads, we report the MSE for each query
+head separately with different colors.                                                               T
+                                                                                                 1X
+                                                                                          si =         |xi,t | .                  (2)
+As shown in Figure 2b, different channels exhibit vastly dif-                                    T t=1
+ferent levels of sensitivity to quantization. A small fraction
+of channels consistently introduce larger errors to the atten-
+tion score upon 2-bit quantization, suggesting they should          Note that the score of each channel is required to be com-
+be preserved in higher precision, e.g. 4-bit. Meanwhile,            puted during inference runtime. Based on these channel-
+quantizing other channels to 2-bit causes less significant          wise scores, top-K 1 channels are selected and stored to KV
+error on the attention score, indicating that they can be quan-     cache in higher precision (e.g., INT4). It is worth noting
+tized more aggressively to 2-bit safely. Similar patterns are       that our channel selection is dynamic and input-adaptive,
+observed on other layers and models. This disparity high-           rather than a static configuration. Specifically, we imple-
+lights a clear opportunity: rather than uniformly quantizing        ment this at a granular level: for each quantization group
+all channels to 2-bit, selectively preserving a small fraction      (e.g., every 128 tokens), the saliency scores of each chan-
+of sensitive channels in higher precision is promising to           nel are recomputed on-the-fly. This allows our strategy to
+preserve inference accuracy while reducing the size of KV              1
+                                                                         K is determined by the anticipated memory budget, e.g. if you
+cache. This insight forms the foundation of the following           want to boost 25% of the channels to higher precision and the size
+key innovation.                                                     per head is 128, then K is 32.
+               Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+identify and boost critical channels based on the real-time                 boosting these critical channels to 4-bit (b = 4), their indi-
+distribution of KV values, ensuring robustness across vary-                 vidual step sizes are reduced by a factor of:
+ing input patterns.
+                                                                                         ∆d,2-bit  24 − 1   15
+                                                                                                  = 2     =    =5×.                   (6)
+3.3       Formal Analysis of Error-bound                                                 ∆d,4-bit  2 −1      3
+
+To provide a deeper algorithmic justification, we incorpo-                  This targeted refinement yields a disproportionate reduc-
+rate a formal theoretical derivation in this subsection. We                 tion in the total error bound |∆Pi,j | with minimal memory
+first analyze the error propagation from the quantized Key                  overhead compared to a global bit-width increase.
+cache to the attention logits P and derive the perturbation
+                                                                            Robustness of Magnitude-based Selection. While the the-
+∆P as a weighted sum of per-channel quantization noise
+                                                                            oretical error bound is influenced by the dynamic query
+E. Then, we provide a formal proof demonstrating that
+                                                                            Qi,d , a robust serving system must minimize the potential
+high-magnitude channels dominate the total error bound
+                                                                            impact across diverse inputs where Q is unknown a priori.
+and describe how channel-wise precision boost helps re-
+                                                                            We prioritize the reduction of ∆d as it represents the ”worst-
+ducing the quantization error. Finally, We further justify
+                                                                            case” noise contribution of a channel. Furthermore, the
+that while the query Q is dynamic, targeting the intrinsic
+                                                                            observed intra-channel similarity ensures that the average
+Rd via magnitude-based selection minimizes the worst-case
+                                                                            magnitude (L1 -mean) is a stable and robust proxy for the
+error, ensuring robust performance across diverse and un-
+                                                                            dynamic range Rd . Unlike the Max-Min range (L∞ ), which
+predictable prompts.
+                                                                            is sensitive to transient outliers, the average magnitude cap-
+                                                                            tures the persistent energy of a channel over the entire page.
+Quantization Error Propagation. Let P = QK T denote                         This allows Kitty to consistently protect the most impact-
+the attention scores in FP16 precision. When the Key cache                  ful dimensions of the KV cache while maintaining O(N )
+is quantized, the quantized Key is represented as K̂ =                      computational efficiency.
+K + E, where E ∈ RT ×D is the quantization noise tensor.
+The perturbation in the attention score ∆P is given by:
+                                                                            3.4   Kitty: Overall Quantization Scheme
+                 ∆P = QK̂ T − QK T = QE T .                           (3)   Our Kitty quantization algorithm builds upon the founda-
+                                                                            tion of KIVI (Liu et al., 2024) while introducing two key
+For a specific query vector Qi and key vector Kj , the ab-                  enhancements to further improve accuracy under aggressive
+solute error ∆Pi,j is bounded by the weighted sum of per-                   low-bit settings. (1) We preserve the initial tokens (Sink to-
+channel quantization errors Ej,d :                                          kens) in full precision for both the Key and Value caches. (2)
+                                                                            More importantly, our novel channel-wise precision boost
+                       D                   D
+                       X                   X                                mechanism is applied to our Kitty. Figure 1 illustrates the
+          |∆Pi,j | =         Qi,d Ej,d ≤         |Qi,d | · |Ej,d |.   (4)
+                                                                            overall design of our quantization scheme, Kitty, which
+                       d=1                 d=1
+                                                                            integrates all the above optimizations into a unified scheme.
+
+Error Reduction via Channel-wise Precision Boost. In                        To evaluate the accuracy impact of this quantization algo-
+uniform quantization, the error for channel d is bounded by                 rithm, we integrated Kitty quantization scheme into the Hug-
+half of its quantization step size2 ∆d , while the step size is             gingFace Transformers framework (Hugging Face Team,
+determined by the dynamic range Rd and the bit-width b of                   2025), and built an accuracy simulation framework to vali-
+that quantization group:                                                    date the accuracy impact of Kitty.
+
+                         ∆d                           Rd                    4     S YSTEM D ESIGN AND I MPLEMENTATION
+             |Ej,d | ≤      ,    where     ∆d =      b
+                                                         .            (5)
+                         2                          2 −1
+                                                                            This section describes the system-level innovations that en-
+Specifically, Rd denotes the dynamic range (the span be-                    able Kitty to efficiently execute mixed-precision quantiza-
+tween maximum and minimum values) of channel d within                       tion on GPUs. Our design includes: (1) a page-centric
+a specific quantization group. As observed in our empirical                 memory layout for Kitty KV Cache, (2) Triton compati-
+analysis (Fig 2a), the dynamic range Rd exhibits significant                ble GPU kernel design for fused dequantization and matrix
+inter-channel disparity. In a uniform 2-bit setting (b = 2),                multiplication, and (3) a lightweight runtime pipeline for
+channels with large Rd result in excessively large ∆d , which               Kitty attention execution. The system and algorithm are
+dominates the total error bound in Eq. (2). By selectively                  inextricably coupled: the algorithm creates the opportunity
+      2
+     The quantization step size ∆d represents the numerical resolu-         for massive throughput but introduces memory irregular-
+tion of the quantized format; a smaller ∆d indicates a finer-grained        ity; the system (page-centric layout, amortized quantization
+representation of the original floating-point values.                       overhead, fused dequantization) resolves this irregularity.
+                   Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+4.1        Page-Centric Memory Layout.                                     also split the Value cache into pages.
+To support our proposed Kitty algorithm, we design a
+                                                                           Dynamic Dense-Sparse Decomposition of Quantized
+memory- and compute-efficient layout for the KV cache.
+                                                                           Pages. During attention computation, all pages of the KV
+Crucially, our page-centric layout maintains seamless com-
+                                                                           cache must be fetched from HBM. However, in our Kitty
+patibility with industry-standard paged attention mecha-
+                                                                           algorithm, different channels in the Key cache are quantized
+nisms (Kwon et al., 2023), which is essential for scalable
+                                                                           with mixed precision (2-bit or 4-bit), which complicates the
+cache management and for reducing memory fragmentation.
+                                                                           page loading process. To address this challenge, inspired
+Specifically, we implement this feature by treating each
+                                                                           by Wu et al. (2023) and Xia et al. (2024), we decompose
+quantization group (e.g., 128 tokens) as an independent page.
+                                                                           each mixed-precision Key page into two tensors with unified
+Moreover, each Key cache page is decomposed into two 2-
+                                                                           2-bit precision, as illustrated in Figure 3a.
+bit matrices: a dense matrix and a structured sparse matrix3 ,
+which are stored separately. This structural consistency—                  We store all 2-bit channels and the lower two bits of boosted
+both matrices now contain only 2-bit elements—simplifies                   4-bit channels in a dense tensor, Tensor 2bits, of shape
+the orchestration of the efficient runtime execution and mem-              (D, G). As shown in the lower part of Figure 3a, the
+ory management detailed in Sections 4.2 and 4.3.                           higher two bits of boosted channels form a 2-bit sparse
+                                                                           tensor. For memory efficiency, we compactly store only
+                   S       G      ……        G 1~G                          the nonzero channels of this sparse tensor, resulting in
+                                                                           Tensor High 2bits of shape (Dboost , G), where Dboost
+                                                    Q
+             KT    Sink
+                                                  Buffer
+                                                            D              denotes the number of channels promoted to 4-bit precision.
+                                                                           To reconstruct the full tensor, we maintain an index tensor
+                                                    Tensor_2bits: [D, G]
+                                                                           Boost IDX uint8 with shape (D, ), defining a mapping
+                                                    Q                      1, 2, . . . , D → 1, 2, . . . , Dboost that maps each logical chan-
+                   Sink
+                                                  Buffer
+                                                            D
+                                                                           nel index to its physical offset in GPU memory. For channels
+                                       Tensor_High_2bits: [D_Boosted, G]   not boosted to INT4 precision, the corresponding index is
+             KT                        Boost_IDX_uint8: [D]                set to a sentinel value of Dboost + 1.
+
+                                                                           4.2    GPU Kernel Design for Page Dequantization.
+                          (a) Memory layout of key cache.
+                                                                           Algorithm 1 Dequantize KeyCache Page()
+                                                                            1: shifts = [0, 2, 4, 6, 0, ...]
+              VT    Sink                                   Local    D       2: Input: Quantized cache C, metadata M, boosted chan-
+                                                                                 nel number Dboost
+                                                  Tensor_2bits: [G, D]
+                                                                            3: Output: Dequantized key page Kfp16 ∈ RD×T
+                                                                            4: scale, zero point ← LoadMeta(M)
+                                                   Q                        5: boost idx ← Load(C)
+              VT    Sink
+                                                 Buffer
+                                                        Local        D
+                                                                            6: boost mask ← (boost idx ≤ Dboost )
+                                                                            7: #Xlow is an uint8 tensor with shape (D, T).
+                                                1~G G
+                                                                            8: Xlow ← LoadLowBits(C)
+                       (b) Memory layout of value cache.                    9: Xlow ← (Xlow ≫ shifts) & 0x3
+                                                                           10: #Xhigh is an uint8 tensor with shape (D, T).
+Figure 3. Illustration of Kitty’s page-centric KV cache layout.            11: Xhigh ← LoadHighBits(C, boost idx, boost mask)
+                                                                           12: Xhigh ← (Xhigh ≫ shifts) & 0x3
+                                                                           13: Combining and dequantization.
+Paged and Quantized Key-Value Cache. As shown in
+                                                                           14: X ← Xlow | (Xhigh ≪ 2)
+Figure 3, we store the KV cache with several full-precision
+                                                                           15: Kfp16 ← X ⊙ scale + zero point
+buffers (i.e. Sink, Q-Buffer, Local) in GPU memory and
+                                                                           16: return Kfp16
+many fixed-size memory pages (inspired by Paged Atten-
+tion (Kwon et al., 2023)). In the design of Kitty shown in
+Figure 1, G (e.g. 128) tokens form a quantization group
+in the Key cache, we naturally choose G as the page size.                  Reconstructing an FP16 page from our quantized represen-
+Thus, each page contains (D, G) elements, where D is                       tation is non-trivial, particularly for the Key cache where
+size per head. For efficient memory management, we                         each channel may have a different precision (2-bit or 4-bit).
+                                                                           To address this challenge, our Kitty system leverages the
+      3
+          We do not store the zero elements within the sparse matrix.      previously introduced Dense–Sparse Decomposition and the
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+index tensor Boost IDX uint8 to enable fully parallel            patched immediately upon the arrival of new tokens. Fur-
+page reconstruction on GPU.                                      thermore, step (3) is triggered only once every G (e.g., 128)
+                                                                 decoding steps, allowing its computational overhead to be
+Algorithm 1 presents the Triton-style pseudo code of this
+                                                                 effectively amortized across the entire generation sequence,
+dequantization kernel, which reconstructs an FP16 tensor
+                                                                 thereby maintaining high inference throughput.
+directly on-chip from quantized memory pages (Figure 3a).
+In line 8, an uint8 tensor of shape (D, T ) is loaded from
+HBM, where each byte encodes four consecutive 2-bit val-         Step (1): Inserting the New KV Vectors in Full Precision.
+ues. As a result, the same byte is logically reused by four      The newly generated KV vectors will be inserted into the
+times, introducing intentional redundancy in on-chip mem-        KV cache before the attention computation. There might
+ory. In line 9, the lower two bits of each packed byte are       be multiple destinations for the KV vectors depending on
+extracted via a bit-shift and mask operation. For the higher     the current state of each buffer. If the Sink is not full, the
+two bits, line 10–11 conditionally fetches additional data       new KV will be directly inserted into it. Otherwise, the
+from HBM according to the boost mask. Only channels              new Key tensor will be inserted into Q-Buffer, which is
+promoted to INT4 precision are read from the secondary           guaranteed to be not full due to Step (3), for the Key cache.
+tensor (Tensor High 2bits), where the boost idx                  For the Value cache, we also allocate a Q-Buffer to store the
+tensor provides direct address mapping between the dense         tensors to be quantized (in a large granularity rather than
+tensor and the compact boosted subspace. Finally, the kernel     per-decoding-step to reduce the cost). Differently, the new
+combines both low and high 2-bit components, applies per-        Value tensor will be inserted into the Local buffer first if
+channel scaling and zero-point correction, and reconstructs      the Sink is full. Then, the oldest token in the Local will be
+the full-precision Kfp16 page on-chip. This design avoids        evicted and inserted into Q-Buffer if Local is full. This is to
+divergent memory accesses and achieves efficient bit-level       guarantee that there is a fixed local window for Value cache.
+unpacking and parallel reconstruction for all channels. No-
+tably, this dequantization process is fully fused within the     Step (2): Attention Computation. We implemented the
+downstream attention mechanism. By overlapping it with           overall attention computation using two customized Tri-
+matrix multiplication, Kitty effectively hides the dequantiza-   ton GPU kernels (qk kernel and sv kernel) and one
+tion latency behind the dominant memory-bound operations,        PyTorch operator (softmax). The attention logits are first
+rendering the dequantization overhead negligible.                computed with qk kernel, where it loads the Query vec-
+                                                                 tor and the (quantized) Key cache from GPU memory and
+4.3   Kitty-Attention Execution Pipeline.                        compute the matrix multiplication. Then, the attention score
+                                                                 (full precision) is computed with PyTorch softmax operator.
+In this subsection, we present our novel execution pipeline      Finally, the attention scores and the (quantized) Value cache
+for attention layers with quantized KV. The execution            are multiplied with sv kernel. We leave the further op-
+pipeline of traditional FP16 attention is straightforward,       timization of these kernels (e.g., fusing these kernels into
+where the KV cache is first updated and then the attention       one (Dao et al., 2022)) for future work.
+output is computed. However, the situation becomes more
+complicated for the Kitty KV cache, as it requires coordi-
+nated management across multiple heterogeneous memory            Step (3): Quantization and Packing After the atten-
+components, including the full-precision buffers (Sink, Q-       tion computation, quantization and packing process will be
+Buffer, and Local) and the quantized pages stored in HBM.        launched once the Q-Buffer is full. During this process,
+Each component serves a distinct purpose in balancing pre-       all the KV vectors in the Q-Buffer will be quantized with
+cision, memory efficiency, and temporal locality.                our customized Triton kernel and packed into one page
+                                                                 (described in Figure 3). Given that the size of Q-Buffer
+To manage these heterogeneous components efficiently,            is G and at most one vector can be inserted to Q-Buffer
+Kitty employs a three-stage execution pipeline. (1) inserting    for each decoding step, this quantization process can be
+the new KV vectors into a static buffer (e.g. Sink, Q-Buffer,    launched at most once every G decoding steps. In this way,
+or Local); (2) loading the KV cache from our heterogeneous       the quantization overhead is efficiently amortized and be-
+memory layout, reconstructing the FP16 KV cache with             comes negligible.
+on-chip memory and computing the attention output; (3)
+and (optionally) performing quantization and packing of the
+KV vectors from the full precision buffers. To minimize the
+                                                                 5     E XPERIMENTAL R ESULTS
+critical path latency, we employ a lazy-update strategy: step    5.1   Setup
+(1) performs only lightweight insertions, while the more
+compute-intensive maintenance operations are deferred to         Evaluated Models.       We evaluate the accuracy of
+step (3). This ensures that the attention kernel can be dis-     Kitty on two families of open-source reasoning models:
+                                                                 Qwen3 (Yang et al., 2025) (8B, 14B, 32B) and LLaMA
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+3 (Dubey et al., 2024) (8B, 70B).                                algorithm. The K16V16 here is the original implementation
+                                                                 of HuggingFace Tranformers with FP16 KV cache. KIVI-
+Evaluation Datasets. The accuracy impact was evalu-
+                                                                 K2V2 uses the KIVI (Liu et al., 2024) algorithm to quantize
+ated mainly on four reasoning benchmarks: (1) two math-
+                                                                 the KV cache into 4 and 2 bits. For better ablations, KIVI-
+ematical reasoning datasets: GSM8K (Cobbe et al., 2021)
+                                                                 K2V2* is the extended version of KIVI-K2V2 where the
+and MATH-Algebra (Hendrycks et al., 2021); (2) a code
+                                                                 initial tokens are preserved in full precision. The details
+generation benchmark HumanEval (Chen et al., 2021);
+                                                                 of our Kitty variants are described in Section 3, where a
+and (3) a graduate-level science question dataset GPQA-
+                                                                 small fraction (12.5%, 25%) of the key-cache channels are
+Diamond (Rein et al., 2023). We also conducted extended
+                                                                 quantized to 4-bit precision while the rest of the channels
+evaluations on advanced math problems AIME24 (math ai,
+                                                                 are quantized to 2-bit precision, results in Kitty and Kitty-
+2024) and AIME25 (math ai, 2025). For HumanEval, we
+                                                                 Pro. Below we summarize the main observations and their
+report functional correctness using pass@1 as the primary
+                                                                 practical implications.
+metric, while for the other benchmarks we report accuracy
+by comparing the extracted model outputs against ground-
+truth labels, following standard practice.                       KIVI-K2V2. The KIVI algorithm fails to preserve model
+                                                                 accuracy under aggressive 2-bit KV cache quantization. As
+Evaluation Frameworks. We conduct end-to-end accuracy            shown in Table 3, KIVI-K2V2 consistently yields signif-
+evaluation using our simulation framework. Meanwhile, we         icantly lower accuracy than the FP16 baseline (K16V16)
+perform system evaluations using our novel inference engine      across all evaluated tasks. This degradation becomes par-
+described in Section 4. Downstream task evaluations are per-     ticularly evident on reasoning benchmarks such as GSM8K
+formed via lm-evaluation-harness (EleutherAI Team, 2025),        and MATH-Algebra.
+a widely adopted framework for standardized benchmarking
+of large language models. To better capture accuracy un-         KIVI-K2V2*. KIVI-K2V2* demonstrates substantial ac-
+der long-context generation, we adopt the chain-of-thought       curacy recovery compared to KIVI-K2V2, effectively nar-
+(CoT) variants of evaluation prompts. Following common           rowing the degradation gap across multiple models. This
+practice, we evaluate GSM8K with 8-shot prompts, MATH            improvement aligns with our findings in Section 3.1, high-
+with 4-shot prompts, and GPQA with 5-shot prompts.               lighting the importance of preserving the initial tokens in
+Evaluation Configurations. All evaluations are conducted         full precision. However, despite the partial recovery, KIVI-
+using PyTorch 2.4.1 with CUDA 12.1 and FlashAttention            K2V2* still lags behind the FP16 baseline, especially on
+2.7.4.post1 (Dao et al., 2022). We evaluate the ac-              complex reasoning tasks such as MATH-Algebra.
+curacy of Qwen3-8B and LLaMA3-8B on NVIDIA A100
+GPUs (NVIDIA, 2020), and the larger models on NVIDIA             Kitty and Kitty-Pro. Our proposed Kitty with channel-
+H100 GPUs (NVIDIA, 2023). Following common practice,             wise precision boost strategy effectively bridges the remain-
+we enable stochastic sampling during inference, setting the      ing accuracy gap left. As shown in Table 3, Kitty consis-
+temperature to 0.6, top p to 0.95, and top k to 20. During       tently recovers accuracy across all evaluated models, sur-
+accuracy evaluation, the maximum number of generated             passing KIVI-K2V2* by 5.17 on Qwen3-8B in terms of
+tokens is limited to 4096. For AIME tasks, we extend the         average accuracy. The enhanced variant, Kitty-Pro, further
+maximum generation length to 32768 tokens to accommo-            increases the boosted channel ratio (from 12.5% to 25%),
+date the long-chain reasoning required by such problems.         achieving near-parity or even slight improvements over the
+To ensure the stability of our results, each experiment is re-   FP16 baseline on several models such as Qwen3-14B and
+peated anywhere from 3 up to 10 times, and we report both        LLaMA3.3-70B-Instruct. These results demonstrate that
+the average accuracy and the maximum observed deviation.         incorporating channel-wise sensitivity is a principled and
+                                                                 scalable approach to restoring accuracy under aggressive
+5.2   Accuracy Results: Accuracy Recovery                        2-bit quantization.
+
+In order to verify the effectiveness of the quantization         Component Isolation. To provide clear ablation of all
+scheme presented in Section 3, we conducted comprehen-           components of our quantization scheme (Figure 1), we iso-
+sive accuracy comparisons between our methods and ex-            late the impact of each component, especially showing the
+isting work. The overall results for Qwen3 models and            isolated accuracy benefits of our channel-wise precision
+LLaMA3 models are summarized in Table 3. “Average”               boost strategy. In Table 4, we explicitly show the incremen-
+here is the mean across benchmarks, and “Difference” is          tal accuracy gains of: KIVI-2 (Baseline) → + FP16 Sink
+the difference of average accuracy versus the FP16 base-         Tokens → + Channel-wise Precision Boost (10% / 20%).
+line (K16V16). For each model, we evaluate the inference         While preserving FP16 Sink Tokens provides an initial re-
+accuracy of the baseline KV cache (K16V16), variances            covery from a highly degraded baseline, our channel-wise
+of KIVI quantization algorithm, and variances of our Kitty       precision boost strategy achieves substantial further gains
+            Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+
+                              Table 3. Benchmark results of different KV cache quantization methods.
+                                                                   MATH           HUMAN           GPQA
+               Model / Method                      GSM8K                                                       Average     Drop
+                                                                  ALGEBRA          EVAL         DIAMOND
+                                K16V16            94.79±0.71      88.26±0.45     84.82±3.72      40.71±2.96     77.15         -
+                                KIVI-K2V2         89.13±0.51      47.29±0.20     76.89±3.11      32.24±3.16     61.39      -15.76
+ Qwen3-8B                       KIVI-K2V2*        89.71±0.63      74.92±1.83     78.54±2.56      36.02±3.27     69.80       -7.35
+                                Kitty             93.61±0.58      85.12±1.54     81.77±1.89      39.39±4.18     74.97       -2.18
+                                Kitty-Pro         94.34±0.48      88.12±1.26     81.34±3.41      40.92±5.00     76.18       -0.97
+                                K16V16            94.69±0.45      90.68±0.14     86.18±2.03      47.62±3.74     79.79         -
+                                KIVI-K2V2         75.82±1.97      83.66±1.01     83.74±0.41      41.50±0.34     71.18      -8.61
+ Qwen3-14B                      KIVI-K2V2*        89.56±0.94      83.74±0.59     85.98±1.83      45.24±2.89     76.13      -3.66
+                                Kitty             94.67±0.94      90.31±0.93     88.21±2.24      47.11±4.25     80.08       0.29
+                                Kitty-Pro         94.90±0.35      90.54±0.39     86.38±1.63      45.92±2.55     79.44      -0.35
+                                K16V16            91.74±0.99      84.84±0.93     85.98±1.22      48.81±1.87     77.84         -
+                                KIVI-K2V2         88.17±0.38      59.70±0.81     84.76±0.61      44.22±1.19     69.21      -8.63
+ Qwen3-32B                      KIVI-K2V2*        89.31±0.91      74.92±0.45     85.37±2.44      48.98±2.55     74.65      -3.19
+                                Kitty             91.56±0.58      83.80±0.62     86.28±5.79      47.45±1.02     77.27      -0.57
+                                Kitty-Pro         90.60±0.91      83.80±1.29     88.21±0.41      51.53±0.51     78.54       0.70
+                                K16V16            76.75±1.16      47.15±0.48     63.96±3.11      26.94±5.00     53.70         -
+                                KIVI-K2V2         63.58±0.63      31.45±0.62     55.30±8.72      23.88±8.57     43.55      -10.15
+ LLaMA3.1-8B-Instruct           KIVI-K2V2*        71.04±0.83      44.12±0.62     56.71±4.88      23.67±3.88     48.89       -4.81
+                                Kitty             75.99±0.96      45.97±1.57     60.00±5.85      25.41±3.47     51.84       -1.86
+                                Kitty-Pro         75.51±1.06      47.37±0.90     61.65±5.43      25.82±3.78     52.59       -1.11
+                               K16V16          94.92±0.30      71.58±1.12       83.13±2.03    45.92±2.55        73.89      -
+                               KIVI-K2V2       93.91±0.56      66.05±0.76       79.07±2.24    45.07±5.44        71.03    -2.86
+ LLaMA3.3-70B-Instruct KIVI-K2V2* 94.77±0.30                   69.64±0.81       82.72±2.85    47.11±2.38        73.56    -0.33
+                               Kitty           95.05±0.63      70.35±0.59       83.13±1.02    45.58±3.23        73.53    -0.36
+                               Kitty-Pro       95.00±0.23      70.77±0.59       82.72±0.81    46.94±3.06        73.86    -0.03
+  Notes. K16V16 denotes 16-bit precision for the KV cache, while KIVI-K2V2 applies 2-bit quantization using the
+ KIVI (Liu et al., 2024) algorithm; an asterisk (*) indicates that the first 32 tokens remain in full precision. Kitty and
+    Kitty-Pro preserve 12.5% and 25% of channels in INT4. The maximum generation length is 4096 tokens.
+
+
+on top of an already optimized state. As illustrated in Ta-        longer-context reasoning, we further evaluated AIME24 and
+ble 4, while the preservation of sink tokens harvests the          AIME25 with a maximum generation length of 32,768 to-
+’low-hanging fruit’ of initial accuracy recovery, our strategy     kens. As shown in Table 5, the degradation of 2-bit quantiza-
+consistently narrows the residual accuracy gap. This task          tion becomes more pronounced, with KIVI-K2V2 suffering
+becomes increasingly non-trivial as the model approaches           an average accuracy drop of around 13 points compared to
+its full-precision ceiling, where the marginal utility of addi-    the FP16 baseline. While KIVI-K2V2* alleviates part of
+tional optimizations typically diminishes.                         the degradation, it still lags behind the FP16 baseline by
+                                                                   6–8 points. In contrast, our proposed Kitty achieves sub-
+Summary. Our results suggest that channel-wise preci-              stantial recovery, narrowing the average gap to only 3–4
+sion boost is an effective strategy to mitigate accuracy loss      points across all models. These results demonstrate that
+from aggressive KV quantization. Kitty-Pro achieves near-          Kitty maintains more stable accuracy even at 32k-token con-
+parity with FP16 accuracy across multiple benchmarks and           text lengths, showing strong robustness under long-context
+models, while retaining the memory benefits of low-bit KV          reasoning settings.
+cache.
+                                                                   5.4   Ablation Study on Channel-wise Precision Boost
+5.3   Extended Results on Longer Context Length
+                                                                   In Section 5.2, we demonstrate the effectiveness of Kitty
+In Table 3, the maximum generation length is set to                and Kitty-Pro. In this section, we conduct ablation study
+4,096 tokens. To examine our method’s robustness under             by more comprehensive investigating the impact of using
+                                  Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+
+Table 4. Isolated accuracy improvements of applying components                                       96                                                  92
+in Figure 1 to KIVI-K2V2 baseline. Each column from left to                                          94                                                  88
+
+
+
+
+                                                                                      Accuracy (%)
+
+
+
+
+                                                                                                                                          Accuracy (%)
+right represents the incremental gain achieved by successively
+                                                                                                                                                         84
+integrating each optimization component. This table is derived                                       92
+                                                                                                                    FP16 KV                              80             FP16 KV
+from the average accuracy shown in Table 3.                                                                         Random_Based                                        Random_Based
+                                                                                                     90
+                                                                                                                    Variance_Based                       76             Variance_Based
+                                           + FP16      + 10%       + Another                                        Magnitude_Based                                     Magnitude_Based
+                      Model                                                                          88                                                  72
+                                            Sinks     INT4 Ch.      10% Ch.                               0   20   40    60   80    100                       0   20   40    60   80    100
+                                                                                                              + INT4 Channels (%)                                 + INT4 Channels (%)
+                      Qwen3-8B              +8.41         +5.17       +1.21
+                      Qwen3-14B             +4.95         +3.95       -0.64                                   (a) GSM8K                                       (b) MATH-Algebra
+                      Qwen3-32B             +5.44         +2.62       +1.27
+                                                                                     Figure 4. Accuracy recovery with channel-wise precision boost on
+                      LLaMA3-8B             +5.34         +2.95       +0.75          Qwen3-8B. Similar trends are observed on other tasks.
+                      LLaMA3-70B            +2.53         -0.03       +0.33
+
+
+                                                                                     Necessity of Selection Heuristic. To examine whether
+Table 5. Qwen3-8B results on AIME24 and AIME25 (max genera-                          heuristics are indeed necessary for channel-wise precision
+tion length: 32k tokens). KIVI-KV2* here denotes the variant of                      boost, we include a random selection baseline, where each
+KIVI where the KVs of initial tokens are not quantized.                              channel is assigned a random importance score. By com-
+  Model / Method                             AIME24          AIME25       Avg.       paring the accuracy curves in Figures 4, we verified that
+                               KV16         71.67±15.00     66.00±7.33    68.84      while randomly boost some channels can improve accuracy,
+ Qwen3-32B Qwen3-14B Qwen-8B
+
+
+
+
+                               KIVI-KV2     57.00±7.00      52.33±9.00    54.67      heuristic-guided channel-wise precision boost yields sub-
+                               KIVI-KV2*    67.67±9.00      57.67±9.00    62.67      stantially greater benefits. To provide an alternative heuristic
+                               Kitty        70.67±7.33      59.67±10.33   65.17      to magnitude-based selection, we also provide a side-by-side
+                                                                                     comparison between Magnitude-based and Variance-based
+                               KV16          80.67±7.33      69.33±7.33   75.00      heuristics in Figure 4. We also notice that on-par accu-
+                               KIVI-KV2      69.00±9.00      55.33±8.67   62.17      racy improvements are achieved for magnitude-based and
+                               KIVI-KV2*     74.67±8.00      61.33±8.67   68.00      variance-based selection. Given that magnitude-based in-
+                               Kitty         75.67±4.33      67.33±9.33   71.50      troduce lower runtime cost in computing the score for each
+                               KV16          81.67±5.00     72.59±7.41    77.13      channel, we mainly discuss this heuristic in this paper.
+                               KIVI-KV2      73.00±9.67     57.41±9.26    65.21
+                               KIVI-KV2*     79.00±9.00     59.05±12.38   69.03      5.5                  System Results: Inference Efficiency
+                               Kitty         79.67±9.67     69.26±9.26    74.47
+                                                                                     To evaluate system-level efficiency of Kitty, we performs
+                                                                                     end-to-end Qwen3-8B inference using our prototype infer-
+                                                                                     ence engine presented in Section 4. A batch of example
+different channel boost rate4 . Figure 4 shows the accuracy                          prompts are fed to the inference system and we let the sys-
+trends on Qwen3-8B when varying the fraction of key-cache                            tem generate tokens until it hits the predefined maximum
+channels boosted to INT4. A flat baselines are also plotted                          sequence length (8192). We also include two Hugging Face
+for K16V16 baseline (upper dashed line).                                             baselines here to demonstrate the system-level benefits of
+                                                                                     our KV quantization method. HF Dynamic FP16 here de-
+Monotonic Accuracy Improvements. As shown in Fig-                                    notes the default configuration of Hugging Face transform-
+ures 4, accuracy on GSM8K and MATH Algebra improves                                  ers library, where the KV cache grows dynamically as more
+almost monotonically as the channel boost rate increases.                            KV vectors are cached in the system. HF Static FP16 is
+Notably, accuracy is effectively recovered once 25% of                               a more runtime-efficient KV cache implementation, where
+channels are boosted to 4-bit precision. This mirrors the                            the KV cache is pre-allocated before the token generation.
+table-level averages in Table 3, where Kitty-Pro reaches                             Furthermore, we also evaluated the INT4 KV cache im-
+parity. Overall, we find that accuracy improves consistently                         plemented by Hugging Face, denoted as HF KIVI INT4,
+with higher channel boost rates across most tasks. Minor                             which is a re-implementation of KIVI (Liu et al., 2024).
+accuracy fluctuations here are attributable to inherent statisti-                    The prompts are around 100 tokens so the inference time
+cal variance in the evaluation process rather than systematic                        is mainly dominated by the decoding phase. For each KV
+regression, consistent with the standard deviation in Table                          cache implementations, we increase the batch size until out-
+3.                                                                                   of-memory, and report the peak memory usage and token
+   4
+     We use the term channel boost rate to denote the fraction of                    generation throughput under different batch sizes. The hard-
+channels boosted from 2-bit to 4-bit precision.                                      ware we used is a single NVIDIA A100 (NVIDIA, 2020)
+                                  Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+                              80
+                                                                                                    pression ratio that significantly outperforms standard 4-bit
+                              70
+        Memory Usage (GB)     60
+                                                                                                    baselines while nearing the theoretical 2-bit limit.
+                              50
+                              40
+                              30
+                                                                      HF_DynamicKV_FP16
+                              20                                      HF_StaticKV_FP16
+                              10                                      HF_KIVI_INT4
+                                                                                                    Throughput Improvements. Our target deployment
+                                                                      Kitty-Pro                     regime is throughput-bound, long-context serving, where
+                                  0
+                                      0         50        100       150         200     250         HBM capacity—not latency—is the primary bottleneck. As
+                                                       Batch Size (#requests)
+                                                                                                    shown in Figure 5, with the same memory budget, Kitty-Pro
+                                              (a) GPU Memory Usage.                                 enables 8× batch sizes and achieves 2.1× → 4.1× higher
+                                                                                                    inference throughput compared to the FP16 baseline. This
+                                  1400
+                                  1200
+                                                                                                    throughput leap stems from our superior memory compres-
+          Throughput (tokens/s)
+
+
+
+
+                                  1000
+                                                                                                    sion, which enables the system to amortize the fixed HBM
+                                  800                                                               access overhead across a significantly larger number of con-
+                                  600                                                               current requests. Consequently, Kitty effectively translates
+                                                                          HF_Dynamic_FP16
+                                  400                                     HF_StaticKV_FP16          its memory efficiency into increased aggregate serving ca-
+                                  200                                     HF_KIVI_INT4              pacity, maximizing GPU utilization under strict memory
+                                                                          Kitty-Pro
+                                      0                                                             constraints.
+                                          0       50        100      150        200     250
+                                                        Batch Size (#requests)                      The throughput gap between HF KIVI and Kitty as illus-
+                                              (b) Inference Throughput.                             trated in Figure 5b is primarily driven by two architectural
+                                                                                                    optimizations. First, Kitty employs on-the-fly dequantiza-
+Figure 5. Memory usage and throughput comparison on Qwen3-
+                                                                                                    tion fused directly into the attention kernels. This integration
+8B generating 8192 tokens. Kitty can achieve higher throughput
+by enabling larger batch sizes.
+                                                                                                    eliminates redundant intermediate memory traffic, whereas
+                                                                                                    the baseline relies on discrete operators that incur heavy
+                                                                                                    Global Memory I/O overhead. Second, while the baseline
+GPU (80GB).                                                                                         performs quantization at every decoding step, Kitty effec-
+                                                                                                    tively amortizes the dynamic quantization costs through our
+Runtime and Memory Overhead Analysis. Our profil-                                                   periodic update strategy (Section 4.3). Furthermore, our
+ing results on Qwen3-8B (batch size 32) demonstrate that                                            current implementation utilizes Triton (Tillet et al., 2019) as
+a typical decoding step takes 47 ms. Within each decoding                                           a high-level abstraction for proof-of-concept. The inference
+step, the raw quantization overhead for Keys and Values                                             efficiency can be further improved if using more low-level
+is 4.4 ms and 1.2 ms, respectively (∼12% of total latency).                                         programming language, e.g., CUDA, and enabling more
+Additionally, computing saliency scores for each channel                                            fine-grained optimizations. We leave these engineering re-
+incurs a 4.6 ms overhead (∼10% of total latency). While the                                         finements as future work.
+aggregate cost of channel selection and KV quantization is
+10.2 ms, this operation is triggered only once every G (e.g.,                                       6    C ONCLUSIONS
+128) steps. When amortized across the generation sequence,
+the effective per-step overhead is reduced to a negligible                                          This paper identified that 4-bit KV cache quantization
+0.08 ms (0.17%). This confirms that our dynamic selection                                           largely preserves accuracy, while existing 2-bit quantiza-
+mechanism—while sophisticated—imposes minimal impact                                                tion method leads to substantial degradation on reasoning-
+on the overall inference throughput.                                                                intensive tasks. Preserving initial tokens in full precision
+                                                                                                    helps but does not fully close the gap with FP16. Our
+In our practical implementation, the total HBM footprint en-                                        channel-wise precision boost method further narrows this
+compasses: (i) the primary quantized payload, (ii) the FP16                                         gap: boosting only 12.5%-25% of key-cache channels to
+sink and local cache buffers, and (iii) the essential quanti-                                       higher precision is often sufficient to recover most of the
+zation metadata. Accounting for these auxiliary overheads,                                          accuracy loss. Based on this innovation, we propose an ac-
+the effective average bit-width can be modeled as:                                                  curate and memory-efficient quantization framework, Kitty.
+                                                                  2200                              Furthermore, we propose corresponding system designs to
+                                      Avg. Bit-width =                 + 2.357,               (7)   support the end-to-end inference with Kitty. The end-to-
+                                                                   N
+                                                                                                    end evaluations show that our 2-bit inference system can
+where N denotes the sequence length. As N increases, the                                            significantly reduce the GPU memory consumption and en-
+fixed costs of sink tokens and metadata are rapidly amor-                                           able 8× larger batch sizes during inference, which results
+tized. For instance, at a 32K sequence length, the effective                                        in 2.1× → 4.1× higher inference throughput compared to
+bit-width converges to ≈ 2.44 bits—achieving a 6.6× com-                                            the FP16 baseline with same memory budget.
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+R EFERENCES                                                      Gale, T., Zaharia, M., Young, C., and Elsen, E. Sparse gpu
+                                                                   kernels for deep learning. In Proceedings of the Inter-
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+                                                                   national Conference for High Performance Computing,
+  Lebrón, F., and Sanghai, S. Gqa: Training generalized
+                                                                   Networking, Storage and Analysis, SC ’20. IEEE Press,
+  multi-query transformer models from multi-head check-
+                                                                   2020. ISBN 9781728199986.
+  points, 2023. URL https://arxiv.org/abs/
+  2305.13245.
+                                                                 Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart,
+Ashkboos, S., Mohtashami, A., Croci, M. L., Li, B., Jaggi,         S., Tang, E., Song, D., and Steinhardt, J. Measuring math-
+  M., Alistarh, D., Hoefler, T., and Hensman, J. Quarot:           ematical problem solving with the math dataset, 2021.
+  Outlier-free 4-bit inference in rotated llms, 2024. URL          URL https://arxiv.org/abs/2103.03874.
+  https://arxiv.org/abs/2404.00456.
+                                                                 Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,        M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+  H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,           Kvquant: Towards 10 million context length llm infer-
+  Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,            ence with kv cache quantization, 2024. URL https:
+  M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,        //arxiv.org/abs/2401.18079.
+  S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-
+  ian, M., Winter, C., Tillet, P., Such, F. P., Cummings,        Hugging Face Team. Transformers library. https:
+  D., Plappert, M., Chantzis, F., Barnes, E., Herbert-            //github.com/huggingface/transformers,
+  Voss, A., Guss, W. H., Nichol, A., Paino, A., Tezak,             2025. GitHub repository, Accessed: 2025-09-17.
+  N., Tang, J., Babuschkin, I., Balaji, S., Jain, S., Saun-
+                                                                 Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  ders, W., Hesse, C., Carr, A. N., Leike, J., Achiam,
+                                                                  C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Ef-
+  J., Misra, V., Morikawa, E., Radford, A., Knight, M.,
+                                                                  ficient memory management for large language model
+  Brundage, M., Murati, M., Mayer, K., Welinder, P., Mc-
+                                                                  serving with pagedattention, 2023. URL https://
+  Grew, B., Amodei, D., McCandlish, S., Sutskever, I., and
+                                                                  arxiv.org/abs/2309.06180.
+  Zaremba, W. Evaluating large language models trained
+  on code, 2021. URL https://arxiv.org/abs/
+                                                                 Li, X., Xing, Z., Li, Y., Qu, L., Zhen, H.-L., Liu, W., Yao, Y.,
+  2107.03374.
+                                                                    Pan, S. J., and Yuan, M. Kvtuner: Sensitivity-aware layer-
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,          wise mixed-precision kv cache quantization for efficient
+  Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,         and nearly lossless llm inference, 2025. URL https:
+  R., Hesse, C., and Schulman, J. Training verifiers to solve      //arxiv.org/abs/2502.04420.
+  math word problems, 2021. URL https://arxiv.
+                                                                 Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang,
+  org/abs/2110.14168.
+                                                                   W.-C., Xiao, G., Dang, X., Gan, C., and Han, S. Awq:
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Ré, C. Flashat-     Activation-aware weight quantization for on-device llm
+  tention: fast and memory-efficient exact attention with          compression and acceleration. Proceedings of machine
+  io-awareness. In Proceedings of the 36th International           learning and systems, 6:87–100, 2024.
+  Conference on Neural Information Processing Systems,
+  NIPS ’22, Red Hook, NY, USA, 2022. Curran Associates           Liu, R., Sun, Y., Zhang, M., Bai, H., Yu, X., Yu, T., Yuan,
+  Inc. ISBN 9781713871088.                                         C., and Hou, L. Quantization hurts reasoning? an empir-
+                                                                   ical study on quantized reasoning models, 2025. URL
+Du, D., Cao, S., Cheng, J., Mai, L., Cao, T., and Yang,            https://arxiv.org/abs/2504.04823.
+  M. Bitdecoding: Unlocking tensor cores for long-
+  context llms with low-bit kv cache, 2025. URL https:           Liu, Z., Yuan, J., Jin, H., Zhong, S. H., Xu, Z., Braverman,
+ //arxiv.org/abs/2503.18773.                                       V., Chen, B., and Hu, X. Kivi: a tuning-free asymmet-
+                                                                   ric 2bit quantization for kv cache. In Proceedings of
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., et al. The          the 41st International Conference on Machine Learning,
+  llama 3 herd of models, 2024. URL https://arxiv.                 ICML’24. JMLR.org, 2024.
+  org/abs/2407.21783.
+                                                                 math ai.     Aime 2024 benchmark.         https:
+EleutherAI Team.             Lm evaluation           harness.     //huggingface.co/datasets/math-ai/
+  https://github.com/EleutherAI/                                  aime24, 2024. American Invitational Mathematics
+  lm-evaluation-harness, 2025.                       GitHub       Examination 2024 problems curated as a reasoning
+  repository, Accessed: 2025-09-17.                               benchmark.
+           Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+math ai.     Aime 2025 benchmark.         https:                  Xia, H., Zheng, Z., Li, Y., Zhuang, D., Zhou, Z., Qiu, X.,
+ //huggingface.co/datasets/math-ai/                                 Li, Y., Lin, W., and Song, S. L. Flash-llm: Enabling
+ aime25, 2025. American Invitational Mathematics                    cost-effective and highly-efficient large generative model
+ Examination 2025 problems curated as a reasoning                   inference with unstructured sparsity. Proc. VLDB Endow.,
+ benchmark.                                                         17(2):211–224, October 2023. ISSN 2150-8097. doi: 10.
+                                                                    14778/3626292.3626303. URL https://doi.org/
+NVIDIA.      Nvidia a100 tensor core gpu archi-                     10.14778/3626292.3626303.
+ tecture.       https://images.nvidia.com/
+ aem-dam/en-zz/Solutions/data-center/                             Xia, H., Zheng, Z., Wu, X., Chen, S., Yao, Z., Youn,
+ nvidia-ampere-architecture-whitepaper.                             S., Bakhtiari, A., Wyatt, M., Zhuang, D., Zhou, Z.,
+ pdf, 2020. Accessed: 2025-09-17.                                   Ruwase, O., He, Y., and Song, S. L. Quant-LLM:
+                                                                    Accelerating the serving of large language models via
+NVIDIA.      Nvidia h100 tensor core gpu archi-                     FP6-Centric Algorithm-System Co-Design on modern
+ tecture.          https://resources.nvidia.                        GPUs. In 2024 USENIX Annual Technical Conference
+ com/en-us-hopper-architecture/                                     (USENIX ATC 24), pp. 699–713, Santa Clara, CA, July
+ nvidia-h100-tensor-c, 2023.          Accessed:                     2024. USENIX Association. ISBN 978-1-939133-41-0.
+ 2025-09-17.                                                        URL https://www.usenix.org/conference/
+                                                                    atc24/presentation/xia.
+OpenAI, Achiam, J., Adler, S., Agarwal, S., Ahmad, L.,
+ Akkaya, I., et al. Gpt-4 technical report, 2024. URL             Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,
+  https://arxiv.org/abs/2303.08774.                                 S. Smoothquant: Accurate and efficient post-training
+                                                                    quantization for large language models, 2024a. URL
+Rein, D., Hou, B. L., Stickland, A. C., Petty, J., Pang, R. Y.,     https://arxiv.org/abs/2211.10438.
+  Dirani, J., Michael, J., and Bowman, S. R. Gpqa: A
+  graduate-level google-proof qa benchmark, 2023. URL             Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+  https://arxiv.org/abs/2311.12022.                                 cient streaming language models with attention sinks,
+                                                                    2024b. URL https://arxiv.org/abs/2309.
+Sharma, A., Ding, H., Li, J., Dani, N., and Zhang,                  17453.
+  M. Minikv: Pushing the limits of llm inference via
+                                                                  Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng,
+  2-bit layer-discriminative kv cache. arXiv preprint
+                                                                    B., Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu,
+  arXiv:2411.18077, 2024.
+                                                                    D., Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin,
+Tillet, P., Kung, H. T., and Cox, D. Triton: an inter-              H., Tang, J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang,
+  mediate language and compiler for tiled neural net-               J., Zhou, J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang,
+  work computations. In Proceedings of the 3rd ACM                  K., Yu, L., Deng, L., Li, M., Xue, M., Li, M., Zhang,
+  SIGPLAN International Workshop on Machine Learn-                  P., Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S., Luo,
+  ing and Programming Languages, MAPL 2019, pp.                     S., Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang,
+  10–19, New York, NY, USA, 2019. Association for Com-              X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan,
+  puting Machinery. ISBN 9781450367196. doi: 10.                    Y., Liu, Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and
+  1145/3315508.3329973. URL https://doi.org/                        Qiu, Z. Qwen3 technical report, 2025. URL https:
+  10.1145/3315508.3329973.                                          //arxiv.org/abs/2505.09388.
+                                                                  Zhang, T., Yi, J., Xu, Z., and Shrivastava, A. Kv cache
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B.,
+                                                                    is 1 bit per channel: Efficient large language model in-
+ Xia, F., Chi, E. H., Le, Q. V., and Zhou, D. Chain-of-
+                                                                    ference with coupled quantization. Advances in Neural
+ thought prompting elicits reasoning in large language
+                                                                    Information Processing Systems, 37:3304–3331, 2024a.
+ models. In Proceedings of the 36th International Confer-
+ ence on Neural Information Processing Systems, NIPS              Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+ ’22, Red Hook, NY, USA, 2024. Curran Associates Inc.               R., Song, Z., Tian, Y., Ré, C., Barrett, C., Wang, Z., and
+ ISBN 9781713871088.                                                Chen, B. H2o: heavy-hitter oracle for efficient generative
+                                                                    inference of large language models. In Proceedings of
+Wu, X., Xia, H., Youn, S., Zheng, Z., Chen, S., Bakhtiari,          the 37th International Conference on Neural Information
+ A., Wyatt, M., Aminabadi, R. Y., He, Y., Ruwase, O.,               Processing Systems, NIPS ’23, Red Hook, NY, USA,
+ Song, L., and Yao, Z. Zeroquant(4+2): Redefining llms              2024b. Curran Associates Inc.
+ quantization with a new fp6-centric strategy for diverse
+ generative tasks, 2023. URL https://arxiv.org/                   Zhao, Y., Lin, C.-Y., Zhu, K., Ye, Z., Chen, L., Zheng,
+ abs/2312.08583.                                                    S., Ceze, L., Krishnamurthy, A., Chen, T., and Kasikci,
+          Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+
+  B. Atom: Low-bit quantization for efficient and
+  accurate llm serving. In Gibbons, P., Pekhimenko,
+  G., and Sa, C. D. (eds.), Proceedings of Machine
+  Learning and Systems, volume 6, pp. 196–209,
+  2024.      URL https://proceedings.mlsys.
+  org/paper_files/paper/2024/file/
+  5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.
+  pdf.
+Zheng, Z., Song, X., and Liu, C. Mixllm: Llm quantization
+  with global mixed-precision between output-features and
+  highly-efficient system design, 2024. URL https://
+  arxiv.org/abs/2412.14590.
+

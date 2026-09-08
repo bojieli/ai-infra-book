@@ -1,0 +1,821 @@
+U SING S PAN Q UERIES TO O PTIMIZE FOR C ACHE AND ATTENTION L OCALITY
+
+
+Paul Castro 1 Nick Mitchell 1 Nathan Ordonez 1 Thomas Parnell 1 Mudhakar Srivatsa 1 Antoni Viros i Martin 1
+
+
+                                                       A BSTRACT
+     Clients are evolving beyond chat completion, and now include a variety of innovative inference-time scaling and
+     deep reasoning techniques. At the same time, inference servers remain heavily optimized for chat completion and
+     thus largely use linear KV cache strategies. Prior work has shown that large improvements to KV cache hit rate
+     are possible if inference servers evolve towards these more non-linear use cases. However, they offer solutions
+     that are also optimized for a single use case, RAG. In this paper, we demonstrate that chat, RAG, inference-time
+     scaling, and agentic workloads can be expressed as special cases of a more general structure, the span query. The
+     critical distinction that had been assumed by prior work lies in whether the order of the inputs matter — do they
+     commute? In chat, they do not. In RAG, they often do. A span query is an expression tree of inference calls,
+     linked together with commutativity constraints. We describe span query syntax and semantics. We show how they
+     can be automatically optimized to improve KV cache locality. We show how a small change to vLLM (affecting
+     only 492 lines) can enable high-performance execution of span queries. Using this stack, we demonstrate that
+     span queries can achieve 10-20x reductions in TTFT for two distinct non-chat use cases. Finally, we show that
+     span queries can also be optimized to improve attention locality, so as to avoid the so-called lost-in-the-middle
+     problem. We demonstrate that an attention-optimized span query on a 2b parameter model vastly outperforms the
+     accuracy of a stock inference server using an 8b model.
+
+1    I NTRODUCTION                                                input is reused changes from request to request. For exam-
+                                                                  ple, with RAG the first request may retrieve fragments F1
+Cache locality is core to the viability of transformer-based      and F2 and present them in that order. The second request
+large language models (Ayoub et al., 2025) (Li et al., 2025).     may present F2 and F3 , thus the order of F2 has changed.
+The Key-Value (KV) cache amortizes the quadratic com-             The tricky part is that whether or not order matters, i.e.
+plexity of self-attention (Vaswani et al., 2017), reducing        whether or not it is valid to permute the order of input, de-
+“prefill” GPU load both within and across requests. In this       pends on the application. There is no blanket rule of thumb,
+paper we focus on improving cross-request KV cache local-         as observed by (Yao et al., 2025) in their CacheBlend work.
+ity for emerging agentic workloads (PwC, 2025) and for the        Implicit in their approach is that, since this constraint is not
+ever-evolving and innovative suite of inference time scaling      known, it is better to optimize for the case that order does
+(ITS) patterns (Davis et al., 2024; Zhou et al., 2025).           matter. We take a complementary approach.
+Inference servers such as vLLM (Kwon et al., 2023) are            The central premise of the paper is this: chat, RAG, ITS,
+optimized for prefix-based memory reuse. For example, in          and agentic workloads are special cases of a more general
+a chatbot the chat history accumulates linearly and thus,         structure, and this more general structure hinges on the
+with each turn of a chat, the prefix remains the same. Model      expression of whether order matters. The algebraic way
+servers have grown to embody this reuse pattern. In contrast,     to express this is via operator commutativity: is A, B the
+agentic and ITS workloads combine the output of multiple          same as B, A? In section 4, we introduce the Span Query,
+separate calls, and make extensive use of a corpus of post-       a declarative intermediate representation that allows one to
+training knowledge — the so-called retrieval augmented            express how model calls can be arranged into a hierarchical
+generation or RAG pattern (Liang et al., 2024; Sarthi et al.,     expression tree that is linked together with commutativity
+2024). Neither one these has a prefix-based pattern of reuse.     constraints. For example, a span query for RAG might
+Rather, with these emerging workloads, the order in which         express that the retrieved fragments can be sequenced in any
+   1
+                                                                  order. A span query for a judge/generator can express that
+     IBM Research.  Correspondence to:         Nick Mitchell      the judge can inspect the generated candidates in any order.
+<nickm@us.ibm.com>.
+                                                                  If the span query expresses that order matters, techniques
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,   such as CacheBlend can be used. If order does not matter,
+2025. Copyright 2025 by the author(s).
+                                                              Span Queries
+
+we shall show in section 5 how to automatically optimize
+span queries in order to improve KV cache locality and
+thus reduce time-to-first-token (TTFT) and prefill GPU load
+by as much as 20x — far exceeding the 3–4x reported by
+CacheBlend. Prior work on Block Attention (Ma et al.,
+2025) achieves similar gains, but in a way that is hard-coded
+for a single use case (RAG). Even on cache miss, we shall
+show that commutative reuse reduces prefill load by 3x due
+to attention sparsity. We show how we did this with the help
+of only 492 lines of code changed in vLLM.
+                                                                      Figure 1. The “dual output paradox”: the model server emits one
+Finally, we share a surprising emergent property of span              thing to the client and something different to KV cache.
+queries: we can also optimize them for attention locality.
+Smaller models struggle to attend to important informa-
+tion located in the middle of long inputs — termed the                erated them. This dependence is a product of the Transform-
+“lost in the middle” phenomenon by (Liu et al., 2024). In             ers’ architecture. The hash code for a block Bi , the ith in a
+section 6, we show how span queries can be optimized to               sequence, depends on the hash code of block Bi−1 . Thus,
+improve attention locality, by treating the expression tree           when provided input blocks [I1 , . . . , In ] and observing out-
+like a divide-and-conquer tree — c.f. map/reduce (Dean &              put blocks [O1 , . . . , Om ], the KV cache can be considered
+Ghemawat, 2008). We show that, as with KV cache locality,             to be keyed by some hash of [I1 , . . . , In , O1 , . . . , Om ]. Fur-
+attention locality optimization also hinges on commutativity.         thermore, when performing a cache lookup for a given se-
+We demonstrate that an optimized span query on a 2b model             quence [B1 , . . . , Bn ], vLLM stops scanning for cache hits
+outperforms the accuracy of an 8b model. This was not our             after the first miss; i.e. it only searches for a prefix of cached
+original design point, and so it was satisfying to find that          blocks [B1 , . . . , Bh≤n ].
+commutativity constraints have more general applicability.
+                                                                      Finally, vLLM’s chat completion API can be considered as
+                                                                      having two distinct outputs. We term this the dual output
+2    A B RIEF T OUR OF V LLM                                          paradox. One is sent to the client [O1 , . . . , OM ], and the
+This section provides an overview of the interaction of               other is inserted into KV cache (as illustrated in Figure 1).
+vLLM and its key-value (KV) cache. We concentrate on the              In some use cases (subsection 2.1), this paradox can be
+chat completion API, which is shared with other inference             resolved by the client, as it can prefix each request with
+servers. The chat completion API takes as input a sequence            the history of all prior interactions. For other use cases
+of typed messages. The most common message types are                  (section 3), resolving the paradox requires changes to vLLM
+System, User, and Assistant; in what follows you                      such as those introduced in this paper.
+may see these designated by their first letter (S, U, A). A
+system message instructs to the model as to how best to               2.1    Use Case: Chat Completion
+respond, a user message represents a question being posed             With that background in mind, we illustrate how well-suited
+to the model, and an assistant message represents the output          vLLM’s architecture is to the chat completion use case.
+of some prior model interaction. Models are trained on a              Consider the example in Figure 2. For illustration purposes,
+language that has been encoded into a lexicon of tokens. We           the hypothetical block holds 2 tokens. If a user submits
+thus consider the input to be sequences of typed tokens.              “Hello” (say 1 token) and the model generates “How are
+Second, vLLM breaks token sequences into fixed (but con-              you?” (say 4 tokens), then vLLM will cache 2 blocks:
+figurable) size blocks.1 All KV cache operations (insertion,          [Hello, how] on the first block and [are, you] on
+lookup, eviction, etc.) are performed at the block granularity.       the second block. The final generated token ? is not cached
+vLLM does not cache partial blocks across requests. For               for future requests as it lies on a partially filled block.
+example, if vLLM is configured to have a block size of 16             The chat session continues as the user responds “I am fine”.
+tokens (the default setting as of this writing) and a message         The OpenAI chat completion API is stateless. Therefore,
+tokenizes to 17 tokens, the last token might not be cached.           the chat client prepends the 5 tokens of chat history (re-
+Third, cached output blocks (i.e. those generated by the chat         ferred to as “context” tokens) to the second request, which
+completion API call) implicitly depend on the input that gen-         becomes “Hello How are you? I am fine”. vLLM can avoid
+    1
+                                                                      recomputing 4 out of 5 of the context tokens (the fifth, as
+      The vLLM literature uses “page” while the source and we use     per above, was not cached due to a partially filled block).
+“block” to mean a fixed-size token sequence. (Ma et al., 2025) uses
+“block” to mean a variably-sized sequence — to us, a “span”.
+                                                                      In our chat completion example cache hit rate approaches
+                                                                      100% as the chat session progresses. This demonstrates that
+                                                               Span Queries
+
+                                                                       across the requests, vLLM will not consider them to be
+                                                                       cache hits because the prefix of F2 in the second request
+                                                                       differs from that in the first request. For this reason, as the
+                                                                       length of the retrieved fragments grows, RAG use cases will
+                                                                       asymptote to a 0% cache hit rate.
+                                                                       Recent work introduced block attention (Ma et al., 2025)
+Figure 2. Chat completion use case. Each rectangle is a token, a       with the goal of improving KV cache locality for RAG. We
+cache block fits 2 tokens, and a token’s sequence position is shown    generalize that work in this paper, implementing it within
+in upper left corner. 80% hit rate on Request 2 (4 of 5 input tokens   the constraints of the production-grade vLLM model server,
+are cached), which asymptotes to 100% as the chat progresses.
+                                                                       and to provide a generalized API that can be automatically
+                                                                       optimized to support new use cases.
+
+                                                                       3.2    Use Case: Nested Generation
+                                                                       RAG is a proven way to improve output quality without
+                                                                       expensive re-training (so-called test-time or inference-time
+                                                                       scaling). A complementary inference scaling approach is
+Figure 3. RAG use case. 33% hit rate on Request 2 (2 of 6 input        to wire together model calls into workflows. This allows
+tokens cached), which asymptotes to 0% as F1 , F2 grow.                each model call in a flow to focus on a smaller part of the
+                                                                       larger problem. The emerging deep research systems and
+                                                                       agentic workflows are examples of this strategy. Whereas
+vLLM is well optimized for the chat completion use case.               chat completion has an additive and append-only pattern of
+                                                                       token accumulation, these use cases have a nested structure.
+With chat completion, blocks maintain their position within
+the accumulating chat context. For example, for the duration           Definition 1 (Nested Generation) A set of model calls G
+of the chat session from Figure 2 “Hello” will always appear           is a nested generation if, for any calls g1 , g2 ∈ G, only the
+first, “How” always second, and so on. Chat completion has             output of g2 (and none of the input to g2 ) is fed as input to
+an append-only pattern of updates. In contrast, while non-             g1 . That is, if they nest like conventional function calls.
+chat use cases also have reuse across requests, the position
+of reused blocks changes from request to request.                      Consider Figure 4. This diagram illustrates a common exam-
+                                                                       ple of nested generation: the judge-generator inference-time
+3     N ON -C HAT U SE C ASES                                          scaling technique (Davis et al., 2024; Zhou et al., 2025; Snell
+                                                                       et al., 2025). Say we want to generate a high quality job
+Next, we introduce the two non-chat use cases: retrieval-              application email. Using this technique one first generates a
+augmented generation (RAG) and “nested generation”.                    set of candidate emails, instructing the model (via system
+                                                                       and user messages) what its job is, and on the specifics of
+3.1   Use Case: Retrieval-augmented Generation                         the email (your name, qualifications, etc.). Next, the gener-
+                                                                       ated email candidates (the output of the “inner” model calls)
+Retrieval-augmented generation (RAG) is a technique for
+                                                                       is passed to the “outer” model call. The instructions on what
+supplementing a chat request with knowledge from an on-
+                                                                       constitutes a good email given to the outer generation will
+line corpus (Liang et al., 2024; Sarthi et al., 2024). Chat
+                                                                       differ from those given to the inner generates. Thus, while
+clients that support RAG operate in two phases: indexing
+                                                                       there is reuse, from inner to outer model calls, there is no
+and retrieval. Figure 3 illustrates a RAG use case.
+                                                                       common prefix as we had in the case of chat completion.
+First the corpus is indexed. A simple indexing strategy
+                                                                       Figure 5 illustrates this situation of reuse without a common
+fragments the corpus into contiguous segments and then
+                                                                       prefix. In Request 1, a candidate email is generated using
+embeds each fragment in a vector space. In Figure 3, the
+                                                                       system prompt S1 and instructions U1 . This produces the
+corpus consists of embedded fragments F1 , F2 , . . ..
+                                                                       candidate email A1 (A for Assistant output). In Request 2,
+Second, in response to a user message, the client embeds it            a second email candidate is generated. Here, we get cache
+in the vector space and then retrieves a list of nearby vectors.       hits on S1 and U1 , because there is a common prefix. The
+The closest vectors are de-embedded back to text and sent,             same is not true for Request 3 which acts as the judge. Even
+along with the user’s message, to the chat completion server.          though the tokens from A1 and A2 reside, in some form,
+In Figure 3, the first query retrieves fragments in the order          in KV cache, they are useless when provided as input to
+[F1 , F2 ] and the second query retrieves fragments in the             Request 3. The judge has the instructions S2 ̸= S1 as a
+reverse order. Even though there is reuse of the fragments             prefix. As a result, cache hit rate approaches 0% as the
+                                                           Span Queries
+
+
+                                                                    Table 1. A span query is an expression tree over these operators.
+                                                                    Desugaring of operators is discussed in subsection 5.1.
+
+                                                                          (a) Syntactic sugar               (b) Message joins
+
+                                                                     C     C HAT COMPLETION             +       COMMUTATIVE
+                                                                     R     CORPUS R ETRIEVAL            1       NON - COMMUTATIVE
+                                                                     F     CORPUS F RAGMENT
+
+                                                                                           (c) Core operators
+
+                                                                          S,A,U      S YSTEM , U SER , A SSISTANT MESSAGES
+                                                                          G          G ENERATE NEW TOKENS
+
+
+
+Figure 4. An example of nested generation: the judge-generator      We show in subsection 5.1 that C, R, F, and G1 can be
+inference-time scaling strategy.                                    desugared and expressed in terms of the core operators. Be-
+                                                                    fore we get there, it is helpful to walk through our use cases
+                                                                    with a visualization. The visuals demonstrate how each use
+                                                                    case is an instance of this general span query structure.
+
+                                                                    4.2   Query Visualization
+                                                                    We introduce a visualization of span queries. The visuals
+                                                                    presented in this paper focus on the relations between the
+                                                                    nodes (the edges) rather than node attributes. For example,
+Figure 5. Nested generation use case, following on from Figure 3.   an S node represents a system message, but the visualization
+29% hit rate on Request 3 (2 of 7 input tokens cached), which       does not show the content of this message. An R node
+asymptotes to 0% as assistant output grows.                         represents retrieval from a corpus, but the visualization does
+                                                                    not identify the location of the corpus. The attributes are
+                                                                    nonetheless important, and will come into play when we
+lengths of the generated candidates A1 , A2 grow.                   serialize span queries in subsection 5.2.
+                                                                    Consider the visualization of a chat completion span query
+4     T HE S PAN Q UERY                                             shown in Figure 6a. At the root of this span query is the
+We introduce a declarative intermediate representation, the         C operator. This operator represents chat completion with
+span query. In this section, we define the syntax and se-           input provided by joining its children together. Conven-
+mantics of span queries, provide a graphical representation         tionally speaking, the input to C is the prompt to the chat
+that helps us to reason about queries, and show how this            completion. In this case, the C operator is fed three typed
+purely declarative form can be transformed and optimized            messages: a system message S, the output of the prior turn
+for high-throughput execution.                                      of chat A, and the user’s question U.
+                                                                    The chat query as shown does not explicitly govern how
+4.1   Query Syntax                                                  those three children should be joined together when pre-
+Our goal is to identify a declarative form that expresses           sented to the model server. For chat completion it may
+our use cases as special cases of a more general structure.         seem obvious, i.e. that the three children should be concate-
+To that end, we start with inspiration from the observation         nated in the order given. For chat completion, order matters.
+made in Definition 1: non-chat use cases seem to have the           For example, one should expect lower quality output if the
+rather conventional structure of a function call graph. We          system message S were placed at the end, or if U came
+thus define the span query as a declarative expression tree         before A. The order of the messages matters for causal
+over a set of operators. An expression tree is simply the           attention (Vaswani et al., 2017), because later messages can
+parse tree of some client-facing library or language. We            attend to earlier messages but not vice versa. There is an
+defer the topic of language design to future work.                  asymmetry, and a concomitant lack of commutativity.
+                                                                    Figure 6b visualizes a RAG query. The structure is nearly
+Definition 2 (Span Query) A span query is an expression             identical to the chat completion query from Figure 6a, with
+tree over the operators C, R, F, + , 1 , S, A, U, G. Con-           R replacing A. The R represents retrieval from a corpus.
+sult Table 1 for definitions of the operators.                      Implicit in retrieval R is a second ordering constraint: how
+                                                           Span Queries
+
+
+                                                                  Table 2. Lines of Code (LoC) changed or added to vLLM.
+
+                                                                       V LLM S OURCE F ILE                                           LOC
+                                                                       C O R E/B L O C K P O O L.P Y                                 68
+                                                                       C O R E/K V C A C H E M A N A G E R.P Y                       89
+            (a) Chat completion                  (b) RAG               C O R E/K V C A C H E U T I L S.P Y                           73
+                                                                       C O R E/S C H E D/O U T P U T.P Y                             4
+                                                                       C O R E/S C H E D/S C H E D U L E R.P Y                       19
+                                                                       C O R E/S I N G L E T Y P E K V C A C H E M A N A G E R.P Y   4
+                                                                       W O R K E R/G P U M O D E L R U N N E R.P Y                   232
+                                                                       T OTAL                                                        492
+
+
+                                                                   the opposite, a commutative join.
+      (c) Nested generation       (d) With commutativity hint
+                                                                   For example, Figure 6d shows how a user might amend the
+               Figure 6. Example span queries.                     nested generation span query from Figure 6c to introduce a
+                                                                   commutativity hint + . This hint serves to relax the order-
+                                                                   ing constraints, thus providing more opportunities for the
+should the retrieved fragments be joined together when
+                                                                   optimizations covered in the remainder of this paper.
+presented as input to the C? It seems reasonable to infer a
+default join semantics from the R node, that order does not
+matter. We can automatically desugar them in a way that            5      I MPROVING KV C ACHE L OCALITY
+makes ordering constraint explicit.
+                                                                  We now describe how span queries, with help from a small
+Figure 6c visualizes a nested generation query. Here again,       change to vLLM, can be optimized for KV cache local-
+are several layers of ordering semantics that need to be          ity. This involves four parts: a) a high-level optimizer that
+teased out. For example, if the output of the inner generates     rewrites span queries; b) a span query tokenizer; c) a low-
+can be safely permuted, then it is a fruitful exercise to reuse   level optimizer that rewrites token sequences; d) the afore-
+their KV cache entries. Some instances of nested genera-          mentioned small updates to vLLM. All told, the changes
+tion may permit permuting the order of the inner generates,       described in this section have a remarkably small impact on
+others may not. We need more semantic information from            vLLM. We added or modified a total of 492 lines of Python
+the user before optimization is allowed or effective.             source code out of 260,000 across all of vLLM. Table 2
+                                                                  breaks down our changes by source file.
+4.3   Query Semantics
+                                                                   5.1     High-level Cache Locality Optimizations
+A span query is declarative, which means query execution
+is free of side effects. From this, it is clear cut that every    We break query optimization for KV cache locality into two
+sub-tree of a node can be safely dispatched in parallel. The      layers, the first of which is covered here. This high-level
+output of every execution is another span query, thus the set     optimizer operates on expression trees. It transforms them
+of valid span queries is closed under query execution.            to be more explicit in their semantics, to resolve dual output
+                                                                  paradoxes, and to simplify them to remove redundancies.
+There is more room for interpretation regarding how a query
+should join child sub-trees in order to construct the input to     The high-level optimizer executes a suite of tree transforma-
+the parent. This structure, of parallel fork but semantically      tion in a fixed point iteration. Four such rules are illustrated
+constrained join, has strong analogies to the map-reduce           in Figure 7, using the visualization from subsection 4.2.
+paradigm (Dean & Ghemawat, 2008).                                  Each illustration shows the left-hand side and right-hand
+                                                                   side of a query-to-query transformation. The optimizer
+For our purposes, the semantics of joining messages depends
+                                                                   looks for matches in a given tree, applies the first match,
+largely on commutativity required by the query. Does order
+                                                                   splices in the replacement sub-tree, and then iterates this
+matter, (M1 , M2 ) versus (M2 , M1 ) for that given pair of
+                                                                   process until convergence.
+messages? The answer will vary by use case, hence a span
+query must allow that choice to be expressed.                      Figure 7a and Figure 7b show two of a family of desugaring
+                                                                   rules. Figure 7a replaces a C with G (generate new tokens)
+Definition 3 Span Query Join Operators A span query can            linked to an explicit 1 (non-commutative join of children
+express a message ordering constraint with two operators. 1        messages). Figure 7b replaces a retrieval node R with an
+indicates a non-commutative join of the inputs. + indicates        explicit commutative join + over the retrieved fragments.
+                                                               Span Queries
+
+
+
+
+          (a) C desugaring          (b) R desugaring
+
+                                                                         (a) Chat (optimized)            (b) RAG (optimized)
+
+
+
+
+        (c) Plus simplification        (d) Plus distribution
+
+Figure 7. Some tree rewriting rules from the high-level optimizer.
+
+
+
+
+                                                                                      (c) Nested generation (optimized)
+
+                                                                      Figure 9. Optimized span queries. Notice that RAG, after opti-
+                                                                      mization, becomes a special case of nested generation.
+  (a) Optimized          (b) Eventually presented to outer generate
+                                                                       5.2    Query Tokenization
+Figure 8. Plus distribution resolves the dual output paradox, be-
+cause it aligns query structure with the behavior of model servers.    First, we must encode span queries into a form that vLLM
+                                                                       can consume. This encoding step allows clients to operate
+                                                                       on queries of arbitrary complexity, while allowing vLLM to
+The desugaring rule for R relies on G1 , which represents              do its job with minimal changes. Since the core of vLLM
+token generate G but with max tokens parameter set to                  operates on token sequences, we must “parenthesize” a
+1. This allows vLLM to prepare the fragments prior to their            query. The parentheses will denote the boundaries of each
+use in the full query.2 Figure 9 illustrates the optimized             sub-tree in the serialized form — c.f. (Merth et al., 2024).
+forms of the chat completion and RAG queries from earlier.
+                                                                      We considered but ultimately decided against several ap-
+Figure 7c shows one of a family of tree simplification rules.         proaches. Prior work (Ma et al., 2025) assumes that a list
+This rule leverages the commutativity of + to avoid an                of spans is given as input. To support span queries of ar-
+unnecessary chain of commutativity hints.                             bitrary nesting, we need something more general than that.
+                                                                      We could introduce a separate reverse index data structure
+Figure 7d illustrates the “plus distribution” rule, which is
+                                                                      that maps sequence index to metadata about the sub-tree in
+used to resolve the dual output paradox. This rule is valid,
+                                                                      which that token resides. It also may be possible to dig more
+because it is valid to distribute the commutative + across
+                                                                      deeply into the vLLM logic so that it accepts trees rather
+token generation G. The rule is also effective. Once we
+                                                                      than sequences. We defer these approaches to future work,
+have distributed the + inside of the G, we ensure that future
+                                                                      as they will necessitate large changes to vLLM.
+use of the output of the token generation G will be prefixed
+by the input; this is precisely the constraint underlying the          Our chosen span query encoding produces minimal impact
+dual output paradox. The effectiveness of this “ahead of               on vLLM. The general approach should not be surprising:
+time” planning is illustrated in Figure 8. Figure 9c illustrates       employ special tokens to represent the parenthesization. Ta-
+the optimized form of the example query from Figure 6d.                ble 3 defines the special tokens. In practice, we can combine
+   2
+                                                                       these so as to reduce the number of special tokens to two;
+      There is an asymmetry between cache lookup and insertion.
+                                                                       e.g. ( can be reused in place of (), and whitespace is usually
+It is straightforward to modify vLLM to avoid biasing at insertion
+time. It would be a monumental effort to change vLLM’s behavior        a safe pad token.
+w.r.t. prefilling. Instead, we opt to “prepare” the fragments in a
+way that is independent of context. Span queries can express this.     Definition 4 (Span) In a token sequence T = [T1 , . . . , Tn ],
+                                                              Span Queries
+
+  Tokens      Meaning
+  2           Padding to achieve block alignment
+  (           Start of independent sub-tree                                             (a) After query tokenization
+  )(          Boundary between independent siblings
+  )n          End independent sub-tree of length n tokens
+                                                                                   (b) After low-level optimization pass
+        Table 3. Special tokens used by query tokenization.
+                                                                      Figure 12. Tokenization and low-level optimization of the nested
+                                                                      generation span query from Figure 9c. Block size of 2 tokens.
+                                                                      Inner generates produce A1 (3 tokens) and A2 (2 tokens).
+
+
+Figure 10. Tokenized RAG span query from Figure 9b. Block
+size of 2 tokens. S1 , U1 , F2 are each messages of 1 token and F1
+occupies 2 tokens. The 6 points to the start of the plus sub-tree.
+
+                                                                      Figure 11 illustrates how padding the serialized query from
+a span is a subsequence of S ⊆ T such that S =                        Figure 10 can be used to ensure block boundary alignment.
+[Ti , . . . , Tj ] and Ti and Tj are parentheses tokens.
+                                                                      By enforcing block alignment, the upcoming logic in sub-
+To further minimize changes to vLLM, we use a minor vari-             section 5.4 can operate under that assumption. Rather than
+ant of this special token approach. We append to the end              scanning every token in a block for special tokens, we can
+token ) a number that points to the sequence position at              limit this search to the first token in every block. This also
+which that serialized sub-tree begins. This design compli-            ensures that all special tokens in cached spans remain in KV
+cates the span query tokenization logic, but allows us to             cache, as they will only be part of partially filled blocks if
+avoid some complexity in vLLM proper — code to maintain               the length of a span is smaller than the length of a block.
+the parsing stack necessary to support nested parenthesiza-
+tion. This strategy is illustrated in Figure 10.                      5.3.2   Trailing Partial Blocks
+
+Some caution is needed when using special tokens. There               We may need to rewrite a serialized span query for the nested
+is no free lunch. Novel special tokens require model fine             generation use case. If the output of an inner generate does
+tuning. Overloading the meaning of existing tokens may                not fully fill the last block, then there will be a disparity
+reduce accuracy. We take the latter approach.                         between what is sent back to the client and what is stored in
+                                                                      KV cache — recall the dual output paradox from Figure 1.
+5.3     Query Low-level Optimization                                  This situation is visualized in Figure 12, which shows a
+In order to maximize KV cache locality, reduce overheads,             tokenized span query for the nested generation example
+and simplify our vLLM footprint, a serialized span query              from Figure 9c. The output of the first inner generate is
+may need to be rewritten. In this paper, we address two con-          denoted A1 , which consists of three tokens in this example.
+cerns: block alignment and coping with vLLM’s propensity              Thus, the last token of the first inner generate will not be
+to avoid caching trailing partial blocks.                             cached. Without deeper changes to vLLM (or to model
+                                                                      fine tuning), we are forced to accept either cache misses
+5.3.1    Block Alignment                                              (where, because of the dual output paradox, we send as
+                                                                      input something different than was output to KV cache)
+We rewrite a serialized span query to ensure that the special         or reduced accuracy (due to the need to crop, in order to
+tokens in a sequence are aligned to block boundaries. We do           prevent the paradox). For now, we accept that the third
+this by employing the padding special token from Table 3.             token of the first inner generate output A1 must be cropped
+                                                                      in order to get good cache locality.
+                                                                      To understand better why cache hit rate suffers and why
+                                                                      padding alone cannot help, recall from section 2 that vLLM
+                                                                      scans only for the prefix of the blocks of a token sequence
+                                                                      that are cache hits. Upon reaching a block that is not in
+Figure 11. RAG span query after low-level optimizations are ap-       cache, it scans no further for cache hits. If we do not crop
+plied to the tokenized span query in Figure 10. The 7 points to the   the third token of A1 , vLLM’s prefix scan will find a cache
+start of the plus sub-tree. Table 3 defines the special tokens.       miss on the block that starts with the third token of A1 .
+                                                           Span Queries
+
+                                                                                                  500
+5.4     Changes to the vLLM Scheduler Layer                                                                                                                              25         Stock vLLM
+
+
+
+
+                                                                   Repo. Throughput (tokens/ms)
+
+
+
+
+                                                                                                                                         Time to First Token (seconds)
+                                                                                                                                                                                    Cache Miss
+                                                                                                  400                                                                    20
+Our first set of changes to vLLM is done to the “scheduler”                                                                                                                         Cache Hit
+
+layer of vLLM. This level of vLLM performs operations                                             300                                                                    15
+that are specific to a single client request. In particular,
+                                                                                                  200                                                                    10
+this logic includes KV cache management. In contrast, the
+layer below (subsection 5.5) deals with optimizing GPU                                            100                                                                     5
+
+utilization across client requests.                                                                                                                                       0
+                                                                                                    0
+                                                                                                        48    640    1408   5936 12624                                              10        20         30
+When scanning a block sequence for cache hits, vLLM                                                          Sequence Length (tokens)                                         Number of Retrieved Documents
+normally accumulates a hash code. This is how it computes                      (a) Repositioning throughput                                                                   (b) TTFT on RAG
+a hash for each block in a way that depends on the hash of
+preceding blocks. We update this logic to allow disabling          Figure 13. CIDRA repositioning throughput and TTFT of span
+the incorporation of the accumulated hash into a block’s           query execution (using CIDRA) in a RAG microbenchmark. The
+hash. If the first token in a block is (, i.e. the start of a      right-hand figure compares stock vLLM execution to one using
+span sub-tree, we suspend the accumulation logic. If the           span queries. Even on cache miss, span queries are much faster.
+first token in a block is ), i.e. the end of a span sub-tree, we
+resume the accumulation logic.
+                                                                   falls back on CPU-based processing. This is rare in our
+5.5     Changes to the vLLM GPU Runner Layer                       experiments, where cycles are small (often size 2).
+
+On a cache hit, the fetched block’s KV vectors likely re-          Finally, CIDRA optimizes tensor operations by concatenat-
+quire updates before they can be reused. As visualized in          ing layers for small batches. Figure 13a plots the reposition-
+Figure 2, Figure 3, and Figure 5, each cached KV vector            ing throughput of CIDRA, showing a maximum throughput
+has a positional encoding. If the position of a cached block       of 500 tokens per millisecond.
+(i.e. the position of its prior use) differs from its new posi-
+tion, adjustments are necessary. This adjustment is termed         5.6                                  Accuracy on RAG
+repositioning — a.k.a. a ReRoPE, which reverses and then
+                                                                   Having generalized prior work and implemented it in a
+re-applies a Rotational Positional Encoding (Su et al., 2024).
+                                                                   production inference server, we now report on experiments
+In order to implement a high-throughput ReROPE we must             that evaluate whether we have harmed accuracy. We do so
+tap into the lower “GPU runner” layer of vLLM. This will           by comparing to prior work on Block Attention (Ma et al.,
+allow us to perform cross-request batching and to avoid race       2025) using the model from that prior work’s experiments:
+conditions between requests.                                       ldsjmdy/Tulu3-Block-FT.
+                                                                   Table 4 summarizes the results on three RAG datasets. First
+5.5.1    CIDRA Repositioning Algorithm
+                                                                   is 2Wiki (Ho et al., 2020), which consists of 3000 docu-
+We implemented a ReROPE algorithm in the GPU runner                ments. Second is NQ (12,000 documents). Both are pre-
+layer. Prior work (Ma et al., 2025) does not handle the sce-       pared using the same methodology as in (Ma et al., 2025).
+nario where multiple concurrent requests reuse overlapping         Third is LongBenchV2 (Bai et al., 2025) (86 documents).
+sets of KV vectors. To address this, we introduce the Con-         For LongBenchV2, we had to filter the dataset to documents
+current In-place Duplicating ReROPE Algorithm (CIDRA).             that fit in the 128,000-token context limit of the tested model.
+                                                                   The first two use rather short documents (in the hundreds
+CIDRA first formulates the dependency graph of block repo-
+                                                                   of tokens), while the last one emphasizes documents in the
+sitionings — e.g. block A moved to block B, B to C, and
+                                                                   tens to hundreds of thousands of tokens. The experiments
+so on. This allows CIDRA to operate in-place, minimizing
+                                                                   were run on an NVIDIA H100. All told, accuracy with span
+scratch memory needed. If a node has out degree greater
+                                                                   queries is on par with prior work. We also experimented
+than 1 (signaling that concurrent requests need to relocate a
+                                                                   with larger batch sizes, to probe effects along that dimen-
+block but to different positions), CIDRA will duplicate that
+                                                                   sion. As the table shows, no such degradations are apparent.
+block. In other words, CIDRA duplicates nodes until it is
+                                                                   Note that on LongBenchV2, we were limited to a batch size
+left with a strict permutation graph.
+                                                                   of 2 due to GPU memory limitations.
+The algorithm then performs a strongly connected compo-
+nents analysis of the repositioning graph. This analysis           5.7                                  TTFT Speedup on RAG
+identifies the cycles and exposes the independent subgraphs
+that can be batched (via bin packing) for parallel GPU exe-        Next, we quantify the benefits to KV cache locality on RAG.
+cution. For large cycles exceeding the batch size, CIDRA           Our first experiment uses a microbenchmark to probe the
+                                                                   limits of what is possible. In the microbenchmark, doc-
+                                                          Span Queries
+
+                                                                  Average Accuracy on Datasets
+          Implementation      Batch Size     2Wiki (4 samples)     NQ (10 samples) LongBenchV2 (10 samples)
+          BlockAttention           1           68.36 ± 0.09%         62.36 ± 0.24%              20.69 ± 2.37%
+          Span Queries             1           69.39 ± 0.07%         61.58 ± 0.28%              20.57 ± 2.95%
+          Span Queries             2                 -                     -                    21.16 ± 1.80%
+          Span Queries             16          68.14 ± 0.80%         61.63 ± 0.45%                    -
+
+Table 4. RAG accuracy on three benchmarks (2Wiki, NQ, and LongBenchV2), comparing prior work on Block Attention (Ma et al., 2025)
+which used a custom inference library for their experiments, to Span Queries run on vLLM using an NVIDIA H100. The numbers denote
+average accuracy over the indicated number of samples. Each number includes the standard deviation across those samples. The Span
+Query experiments were run with Batch Sizes 1, 2, and 16. Due to VRAM limitations, we were limited to batch size 2 for LongBenchV2.
+The Block Attention implementation does not support batching.
+
+
+uments have 2857 tokens (the mean length of a Python               in-haystack style of benchmark that allows us to place the
+source file in vLLM) of randomly generated content. The            needle either at the front, in the middle, or at the very end
+microbenchmark runs three variants across a range of 1–32          of tokens generated by the inner generates.
+documents and measures TTFT for each experiment. Each
+                                                                   The without-cropping experiments use the normal OpenAI
+tuple in this explored space is measured 10 times. The first
+                                                                   chat completion endpoint to process each of the inner and
+(baseline) variant runs vLLM in its stock configuration. The
+                                                                   outer generate requests. The with-cropping experiments use
+documents will never be cache local in this configuration.
+                                                                   our span query execution endpoint. Both use the model fine-
+The second variant measures the TTFT of our stack, but
+                                                                   tuned by prior work (Ma et al., 2025), ldsjmdy/Tulu3-Block-
+when the documents are not cache local. The third variant is
+                                                                   FT. That prior work proves that their fine tuning benefits
+the same, but in the case where the documents are served by
+                                                                   accuracy, as it is trained to respond well to the “plus” tokens
+cache. This variant will help us to understand our overheads.
+                                                                   inserted by the low-level optimizer. It seems to embody the
+We expect the TTFT of the first two variants to grow at            attention sparsity implied by a plus token.
+worst quadratically as the number of documents increases.
+                                                                   Figure 14 shows the results of this nested generation accu-
+In the baseline (stock vLLM), every token in every docu-
+                                                                   racy experiment. Each cell of the heat maps represents the
+ment needs to attend to every prior token. For the second
+                                                                   mean, over 100 experiments, of the F1 score of actual versus
+variant (span queries, cache miss), the presence of spans
+                                                                   expected output. The expected output is the needle and the
+means that attention is sparse. The tokens within a document
+                                                                   actual output is what is emitted by the outer generate. The
+only attend to prior tokens in that same document. Both
+                                                                   grid of the heat map represents where the needle is placed
+are quadratic at worst, but the second variant should have
+                                                                   (beginning, middle, or end) and the length of the documents
+a smaller constant factor. Therefore, we expect a large per-
+                                                                   in which the needle was inserted (10, 100, 1000, 10 000
+formance benefit, even if we miss cache. The third variant
+                                                                   characters). The heat maps are colored by the
+(span queries, cache hit) should grow at worst linearly, as we
+can skip prefill but pay for repositioning. The experimental       Due to the model fine tuning, span queries repeatably ex-
+results, shown in Figure 13b, bear this out.                       cel for shorter documents. In short documents, the begin-
+                                                                   ning/middle/end distinction matters less, and the fine-tuned
+5.8   Accuracy on Nested Generation                                model responds well. For longer documents, especially
+                                                                   when the needle occurs towards the end of the documents,
+Next, we experiment with the accuracy of span query execu-         accuracy suffers. This is unsurprising, as we may uncere-
+tion on the nested generation use case. The main threat here       moniously crop the needle.
+is with respect to the cropping done in subsubsection 5.3.2.
+Since vLLM does not cache trailing partial blocks, the logic       In future work, we will explore an improved approach.
+to find the longest cached prefix match will stop at that first    Rather than cropping, we can use a custom logit processor
+cropping point. This should not harm us if the important           to bias vLLM towards padding the output of inner generates
+information comes before the cropping point. But will cer-         so that they are block-aligned. This is in the same spirit
+tainly be harmful to accuracy if the important information         as vLLM’s min tokens logit processor, which biases the
+lies at the very end of the inner generated sequences. How         sampler to continue until a certain number of tokens have
+often is this the case in practice?                                been generated.
+Unfortunately, existing benchmarks do not isolate this sce-
+nario. Therefore, we constructed a variant of the needle-
+                                                              Span Queries
+
+
+
+
+      (a) Without cropping              (b) With cropping
+
+Figure 14. Accuracy on nested generation, without and with crop-
+ping When the important information is towards the end of longer             (a) TTFT speedup           (b) Repositioning overhead
+documents, cropping hurts accuracy.
+                                                                     Figure 16. Nested generation microbenchmark, showing the distri-
+                                                                     bution of TTFT speedup from span queries and CIDRA overhead.
+
+
+                                                                     Table 5. Bulk span query execution allows for scheduling the
+                                                                     queries such that reused fragments are clustered temporally. Show-
+                                                                     ing average speedup of TTFT by using span queries, for various
+                                                                     bulk request sizes on two benchmarks.
+
+       (a) 1 inner generate          (b) 24 inner generates                        B ULK S IZE         2W IKI     NQ
+                                                                                   1                   1.21 X     1.03 X
+Figure 15. Nested generation microbenchmark, showing median                        1024                1.31 X     1.05 X
+TTFT and varying inner generate temperature.                                       WHOLE CORPUS        1.59 X     1.13 X
+
+
+5.9    TTFT Speedup on Nested Generation                              500 query executions for each valuoe of fan-out. We again
+Next, we expand the nested generation experiments to quan-            compared stock vLLM to our stack. As shown, the TTFT
+tify the effects on prefill speed. The goal is to compare TTFT        speedup is stable up to the 99th percentile (p99), at which
+for stock vLLM with the span query stack, for varying num-            point stability begins to suffer. Further work is therefore
+ber of inner generates (this corresponds to the fan-out of            necessary to ensure stability beyond two 9’s.
+the + node) and for varying temperature of the inner gener-           Figure 16b shows the overhead of CIDRA repositioning.
+ate. We should expect stock VLLM to perform well if the               Observe the non-monotonic shape to the curves, and how
+inner temperature is 0. In this case the output of the inner          these nicely trace the non-monotonic shape to the CIDRA
+generates is the constant, and hence normal prefix caching            repositioning throughput shown in Figure 13a.
+works well. We should also expect stock vLLM to perform
+well if the fan-out is very small, because the cost of recom-
+                                                                      5.10   TTFT Speedups from Bulk Span Query
+putation at some point becomes comparable to the cost of
+                                                                             Execution
+repositioning.
+                                                                     We have explored the TTFT benefits of executing one span
+Figure 15 corroborates this hypothesis. In this experiment,
+                                                                     query at a time. We now consider an additional layer of po-
+we executed a judge/generator span query 100 times with
+                                                                     tential offered by a bulk query execution API. If the queries
+varying inner generate temperature. As shown, when inner
+                                                                     in a bulk request are executed in the given order, KV cache
+temperature is 0, span query benefit to TTFT is near 0. For
+                                                                     locality may suffer if the working set of the bulk is larger
+any non-zero inner temperature, the TTFT benefit depends
+                                                                     than KV cache capacity. To experiment with this possibility,
+on the inner fan-out. For an inner fan-out of 1 (Figure 15a,
+                                                                     we implemented a greedy heuristic that clusters the requests
+the span query stack lowers TTFT by 7–32% depending on
+                                                                     in a given bulk to increase temporal locality. Table 5 shows
+inner temperature. For an inner fan-out of 24 (Figure 15b),
+                                                                     the average TTFT speedup (versus a stock vLLM baseline)
+the span query stack has 12-13x faster TTFT.
+                                                                     of executing span queries in bulk. We explored two datasets:
+Figure 16a digs into this data to verify that the span query         2Wiki (Ho et al., 2020) and NaturalQuestions (Kwiatkowski
+stack has stable performance. In this experiment, we used            et al., 2019) Both datasets are very small (each has around
+an inner temperature of 0.5, varied the inner fan-out, and ran       100 tokens per fragment, placing them at the extreme left of
+                                                              Span Queries
+
+Figure 13b), hence as expected the speedup numbers align
+well with those presented in that figure.
+
+6    I MPROVING ATTENTION L OCALITY
+Finally, we show that the high-level optimizer from subsec-
+tion 5.1 can be extended to target the “lost in the middle”
+problem (Liu et al., 2024). In this well-studied phenomenon,
+model accuracy is U-shaped as a function of the position of
+relevant information within a given input. Models perform
+well if the “needle“ is located near the beginning or end
+of the sequence, but poorly if it is buried in the middle of                 (a) Unoptimized query      (b) Attention-optimized k = 2
+the “hay”. We consider attention locality as the success in
+finding the needle in the haystack.                                    Figure 18. Fraction of runs with good attention locality, as the
+                                                                       length of the “lost in the middle“ data increases.
+Prior work observes that one can increase attention locality
+by increasing the sparsity of the attention matrix (Sun et al.,
+2025). We observe that a span query can be optimized to
+achieve the same effect. Unlike KV cache locality, where
+cache-optimized span queries rely on vLLM support, we
+now show how an attention-optimized span query can work
+without requiring any changes to the model server.                     from the hay. We run each query 1000 times, varying the
+                                                                       amount of hay between the needles and using two variants
+                                                                       of the granite3.3 model: 2b and 8b. Our hypothesis is that
+                                                                       the unoptimized queries should perform well for smaller
+                                                                       values of hay, and then drop off a cliff — i.e. once the
+                                                                       attention mechanism gets lost in the middle. Furthermore,
+       (a) Unoptimized query, but with commutativity hint              the larger 8b model should tolerate more hay, as it is trained
+                                                                       with a longer context length. And lastly, we hypothesize that
+                                                                       the optimized queries should tolerate significantly higher
+                                                                       amounts of hay. Figure 18 shows the results, which bear
+                                                                       this out. Note how the 2b model, using the optimized query,
+                                                                       fares better than the 8b model using the unoptimized query.
+
+                                                                       7     R ELATED W ORK
+                                                                       Researchers are actively looking at techniques to improve
+               (b) Optimized for attention locality                    cache performance, which is especially critical as cache size
+                                                                       grows beyond GPU memory limits. Block Attention (Ma
+Figure 17. High-level optimization for attention locality can trans-   et al., 2025) decomposes operations into discrete compu-
+form a single 8-way judge/generator into 3 2-way judge steps.          tational blocks, enhancing locality and enabling modular
+                                                                       cache segmentation. CacheBlend (Yao et al., 2025) allows
+Figure 17a shows a judge/generator span query that gen-
+                                                                       repositioning of fixed size cache blocks with greatly reduced
+erates 8 candidates and then judges them with an outer
+                                                                       re-calculation of attention between blocks while maintain-
+generate (c.f. Figure 6d). The inner generates commute, as
+                                                                       ing high accuracy. Superposition prompting improves RAG
+specified via + . Alternatively, we could perform a tree re-
+                                                                       cache performance by breaking a prompt into parallel paths
+duction: e.g. judge 2 at a time, then judge the output of each
+                                                                       which allows for more selective attention. SGLang (Zheng
+pair of 2-way judgments, and so on through 3 plies. This
+                                                                       et al., 2024) introduces a programming library to simplify
+query is visualized in Figure 17b. We have automated this
+                                                                       LLM calling and allow more cache-aware optimizations. Re-
+by adding a query rewrite rule to the high-level optimizer.
+                                                                       search in Graphs-of-Thought (Besta et al., 2024) structures
+We implemented a simple needle-in-the-haystack mi-                     LLM processing into a graph structure that is inherently
+crobenchmark. The benchmark executes the two queries                   multi-generate and potentially allows for cache-aware place-
+shown above, where the inner generates produce random                  ment of computation. Span Queries captures and extends
+names (the needles) interspersed with randomly generated               these ideas into a declarative framework to co-optimize se-
+content (the hay). The judge is tasked to extract the names            lective application of attention and cache locality.
+                                                       Span Queries
+
+8   F UTURE W ORK                                                A benchmark for evaluating llms on nested sequences
+                                                                 of api calls. In Proceedings of the 2025 Conference
+We believe that nested model calls are an increasingly rel-      on Empirical Methods in Natural Language Processing,
+evant pattern. For example, nested tool calls (Basu et al.,      2025. URL https://aclanthology.org/2025.
+2025), calls to sub-agents or other compound-AI decom-           emnlp-main.1702/.
+positions (Davis et al., 2024), and techniques that combine
+multiple sampled or parallel model outputs to improve ac-      Besta, M., Blach, N., Kubicek, A., Gerstenberger, R.,
+curacy and reliability (Snell et al., 2025; Hu et al., 2026)     Gianinazzi, L., Gajda, J., Lehmann, T., Podstawski,
+are all naturally expressed as span queries. This suggests       M., Niewiadomski, H., Nyczyk, P., and Hoefler,
+that span queries could help avoid large amounts of repeated     T.   Graph of Thoughts: Solving Elaborate Prob-
+prefill work in these settings.                                  lems with Large Language Models. Proceedings of
+Another natural fit for span queries would be integra-           the AAAI Conference on Artificial Intelligence, 38(16):
+tion with datacenter-scale LLM inference engines such as         17682–17690, Mar 2024. doi: 10.1609/aaai.v38i16.
+DeepServe (Hu et al., 2025), Mooncake (Qin et al., 2024),        29720. URL https://ojs.aaai.org/index.
+and llm-d (Ayoub et al., 2025), where entire corpora of doc-     php/AAAI/article/view/29720.
+uments or chunks could be uploaded, prefilled, and stored      Davis, J. Q., Hanin, B., Chen, L., Bailis, P., Stoica, I., and
+in anticipation of retrieval requests through RAG or agentic     Zaharia, M. Networks of networks: Complexity class
+systems.                                                         principles applied to compound ai systems design, 2024.
+                                                                 URL https://arxiv.org/abs/2407.16831.
+9   C ONCLUSION
+                                                               Dean, J. and Ghemawat, S. Mapreduce: simplified data
+We introduced the span query as an intermediate represen-        processing on large clusters. Communications of the
+tation for analysis and optimization. Our focus to date has     ACM, 51(1):107–113, 2008.
+been on locality, for KV cache and for attention. There
+are many prospects for other optimization avenues. For         Ho, X., Duong Nguyen, A.-K., Sugawara, S., and Aizawa,
+example, is there any reason a nested generation structure      A. Constructing a multi-hop QA dataset for compre-
+should flow through KV cache at all? One could imagine           hensive evaluation of reasoning steps. In Scott, D.,
+analyzing a span query with nested generation to produce an      Bel, N., and Zong, C. (eds.), Proceedings of the 28th
+optimized scheduler, where the inner and outer generates are    International Conference on Computational Linguis-
+arranged in a gather/scatter structure (c.f. SQL). This kind     tics, pp. 6609–6625, Barcelona, Spain (Online), De-
+of optimization would benefit from span queries, because         cember 2020. International Committee on Computa-
+the query provides the full scope of the connectivity and        tional Linguistics. doi: 10.18653/v1/2020.coling-main.
+ordering constraints — the kind of information needed to         580. URL https://aclanthology.org/2020.
+make gather/scatter work well. This is one of many exciting      coling-main.580/.
+avenues of exploration enabled by span queries.
+                                                               Hu, J., Xu, J., Liu, Z., He, Y., Chen, Y., Xu, H., Liu, J.,
+                                                                 Meng, J., Zhang, B., Wan, S., Dan, G., Dong, Z., Ren,
+R EFERENCES                                                      Z., Liu, C., et al. Deepserve: Serverless large language
+Ayoub, M., Harnik, D., Smith, T., Swain, K., Wang, X.,           model serving at scale, 2025. URL https://arxiv.
+  Yin, H., and Yan, K. From prefix caching in vllm to            org/abs/2501.14417.
+  distributed scheduling with llm-d. https://llm-d.
+                                                               Hu, J., Zhang, Y., Shang, S., Yang, X., et al. Pacore: Learn-
+  ai/blog/kvcache-wins-you-can-see,
+                                                                 ing to scale test-time compute with parallel coordinated
+  September 2025.        URL https://llm-d.ai/
+                                                                 reasoning, 2026. URL https://arxiv.org/abs/
+  blog/kvcache-wins-you-can-see. Accessed:
+                                                                 2601.05593.
+  2025-10-25.
+
+Bai, Y., Tu, S., Zhang, J., Peng, H., Wang, X., Lv, X.,        Kwiatkowski, T., Palomaki, J., Redfield, O., Collins, M.,
+  Cao, S., Xu, J., Hou, L., Dong, Y., et al. Longbench v2:      Parikh, A., Alberti, C., Epstein, D., Polosukhin, I., De-
+  Towards deeper understanding and reasoning on realis-         vlin, J., Lee, K., Toutanova, K., Jones, L., Kelcey, M.,
+  tic long-context multitasks. In Proceedings of the 63rd       Chang, M.-W., Dai, A. M., Uszkoreit, J., Le, Q., and
+  Annual Meeting of the Association for Computational           Petrov, S. Natural questions: A benchmark for question
+  Linguistics (Volume 1: Long Papers), pp. 3639–3664,           answering research. Transactions of the Association for
+  2025.                                                         Computational Linguistics, 7:452–466, 2019. doi: 10.
+                                                                1162/tacl a 00276. URL https://aclanthology.
+Basu, K., Abdelaziz, I., Lastras, L., and Kapanipathi, P.       org/Q19-1026/.
+                                                      Span Queries
+
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,       Snell, C. V., Lee, J., Xu, K., and Kumar, A. Scaling
+ C. H., Gonzalez, J., Zhang, H., and Stoica, I. Effi-           LLM test-time compute optimally can be more effective
+ cient memory management for large language model               than scaling parameters for reasoning. In The Thirteenth
+ serving with pagedattention. In Proceedings of the             International Conference on Learning Representations,
+ 29th Symposium on Operating Systems Principles, SOSP           2025. URL https://openreview.net/forum?
+ ’23, pp. 611–626, New York, NY, USA, 2023. Associa-            id=4FWAwZtd2n.
+ tion for Computing Machinery. ISBN 9798400702297.
+ doi: 10.1145/3600006.3613165. URL https://doi.               Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., and Liu, Y.
+ org/10.1145/3600006.3613165.                                   Roformer: Enhanced transformer with rotary position
+                                                                embedding. Neurocomputing, 568:127063, 2024.
+Li, H., Li, Y., Tian, A., Tang, T., Xu, Z., Chen, X., Hu,
+                                                              Sun, Y., Li, Z., Zhang, Y., Pan, T., Dong, B., Guo, Y.,
+  N., Dong, W., Li, Q., and Chen, L. A survey on large
+                                                                and Wang, J. Efficient attention mechanisms for large
+  language model acceleration based on kv cache man-
+                                                                language models: A survey, 2025. URL https://
+  agement, 2025. URL https://arxiv.org/abs/
+                                                                arxiv.org/abs/2507.19595.
+  2412.19442.
+                                                              Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+Liang, L., Sun, M., Gui, Z., Zhu, Z., Jiang, Z., Zhong, L.,     L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+  Qu, Y., Zhao, P., Bo, Z., Yang, J., Xiong, H., Yuan, L.,      tention is all you need. Advances in neural information
+  Xu, J., Wang, Z., Zhang, Z., Zhang, W., Chen, H., Chen,       processing systems, 30, 2017.
+  W., and Zhou, J. Kag: Boosting llms in professional do-
+  mains via knowledge augmented generation, 2024. URL         Yao, J., Li, H., Liu, Y., Ray, S., Cheng, Y., Zhang, Q., Du,
+  https://arxiv.org/abs/2409.13731.                             K., Lu, S., and Jiang, J. Cacheblend: Fast large lan-
+                                                                guage model serving for rag with cached knowledge fu-
+Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua,     sion, 2025. URL https://arxiv.org/abs/2405.
+  M., Petroni, F., and Liang, P. Lost in the middle: How        16444.
+  language models use long contexts. Transactions of
+  the Association for Computational Linguistics, 12:157–      Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  173, 2024. doi: 10.1162/tacl a 00638. URL https:              Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+  //aclanthology.org/2024.tacl-1.9/.                            rett, C., and Sheng, Y. Sglang: Efficient execution
+                                                                of structured language model programs, 2024. URL
+Ma, D., Wang, Y., and Lan, T. Block-attention for efficient     https://arxiv.org/abs/2312.07104.
+ prefilling. In The Thirteenth International Conference
+ on Learning Representations, 2025. URL https://              Zhou, Y., Xu, A., Wang, P., Xiong, C., and Joty, S. Evalu-
+ openreview.net/forum?id=7zNYY1E2fq.                            ating judges as evaluators: The jetts benchmark of llm-
+                                                                as-judges as test-time scaling evaluators, 2025. URL
+Merth, T., Fu, Q., Rastegari, M., and Najibi, M. Superpo-       https://arxiv.org/abs/2504.15253.
+ sition prompting: Improving and accelerating retrieval-
+ augmented generation, 2024. URL https://arxiv.
+ org/abs/2404.06910.
+
+PwC. Pwc’s ai agent survey. Tech Effect: AI &
+  Analytics, PwC US, May 2025.       URL https:
+  //www.pwc.com/us/en/tech-effect/
+  ai-analytics/ai-agent-survey.html.
+  Survey of 308 US executives conducted Apr 22–28,
+  2025.
+
+Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W.,
+  and Xu, X. Mooncake: A kvcache-centric disaggregated
+  architecture for llm serving, 2024. URL https://
+  arxiv.org/abs/2407.00079.
+
+Sarthi, P., Abdullah, S., Tuli, A., Khanna, S., Goldie,
+  A., and Manning, C. D. Raptor: Recursive abstrac-
+  tive processing for tree-organized retrieval, 2024. URL
+  https://arxiv.org/abs/2401.18059.
+

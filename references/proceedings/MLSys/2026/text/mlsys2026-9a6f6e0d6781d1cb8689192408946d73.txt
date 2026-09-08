@@ -1,0 +1,1046 @@
+         F LASH AGENTS : ACCELERATING M ULTI -AGENT LLM S YSTEMS VIA
+                          S TREAMING P REFILL OVERLAP
+
+
+         Taosong Fang 1 2 Zhen Zheng 3 Zhengzhao Ma 1 2 Yaojie Lu 1 Hongyu Lin 1 Xianpei Han 1 Le Sun 1
+
+
+                                                             A BSTRACT
+        Large Language Models (LLMs) are increasingly deployed as collaborating agents in Multi-Agent Systems
+        (MAS), where sequential agent interactions create significant latency bottlenecks. Traditional serving systems
+        require each downstream agent to wait for complete upstream generation before starting prefill, leaving substantial
+        idle time during inter-agent transitions. We present F LASH AGENTS, a system that accelerates multi-agent
+        workflows through token-level streaming and prefix-aware coordination. F LASH AGENTS introduces Inter-agent
+        streaming and incremental prefill, which streams tokens between agents and performs incremental prefill to
+        overlap downstream prefill with upstream decode, reducing inter-agent latency. For concurrent workloads, an
+        intra-turn prefix cache built on radix trees detects and eliminates redundant prefill across requests sharing common
+        instruction templates, avoiding recomputation of shared prefixes within the same processing turn. Implemented on
+        SGLang, F LASH AGENTS achieves up to 40% end-to-end latency reduction on real workflows and 3.5× speedup in
+        controlled two-agent benchmarks, demonstrating consistent improvements across diverse models and interaction
+        patterns.
+
+1       I NTRODUCTION                                               dencies where the output of one agent becomes the input
+                                                                    to another, creating sequential data dependencies absent in
+Large Language Models (LLMs) (Achiam et al., 2023; Team             traditional serving workloads. While existing techniques op-
+et al., 2023; Touvron et al., 2023; Zhao et al., 2023) are          timize individual LLM invocations, they leave unaddressed
+increasingly serving as the core reasoning engines within           the inter-agent coordination latency—the idle time between
+advanced Multi-Agent Systems (MAS) (Han et al., 2024;               when an upstream agent completes generation and a down-
+Wang et al., 2024). The rise of MAS reflects a fundamen-            stream agent begins processing.
+tal insight: single, linear AI workflows struggle to handle
+open-ended, dynamic, and path-dependent tasks that charac-          This inter-agent bottleneck manifests as follows. Before
+terize real-world research and problem-solving (Anthropic,          a subsequent agent (AGENT B) can generate its response
+2025; Zhang et al., 2025). MAS address this challenge               (decode phase), it must first process the output from the pre-
+through multiple specialized or collaborating LLM-powered           ceding agent (AGENT A) as input (prefill phase). Traditional
+agents that tackle complex problems via distributed problem-        serving systems treat each agent invocation as an indepen-
+solving and expertise application (Li et al., 2025a).               dent request, requiring AGENT B to wait for AGENT A’s
+                                                                    complete generation before starting prefill. This sequential
+Optimizing LLM inference for multi-agent systems presents           dependency creates substantial idle time that accumulates
+fundamentally different challenges than single-LLM serv-            across agent chains and multi-turn conversations, markedly
+ing. Traditional inference optimizations (Kwon et al., 2023;        impairing responsiveness.
+Zheng et al., 2024a) focus on intra-request efficiency (re-
+ducing prefill and decode latency within individual requests)       To address this challenge, we introduce F LASH AGENTS, a
+and cross-request batching (serving independent concurrent          serving approach that reduces inter-agent latency through
+requests). In contrast, MAS introduce inter-agent depen-            token streaming and incremental prefill. The central concept
+    1
+                                                                    is to overlap sequentially dependent agent computations: as
+    Chinese Information Processing Laboratory, Institute of         AGENT A produces output tokens during its decode phase,
+Software, Chinese Academy of Sciences 2 University of Chi-
+nese Academy of Sciences 3 Microsoft. Correspondence to:
+                                                                    partial results from AGENT A (streamed tokens) are fed
+Zhen Zheng <zhengzhen@microsoft.com>, Yaojie Lu <luyao-             to AGENT B for prefill execution in a streaming manner.
+jie@iscas.ac.cn>.                                                   Each newly streamed token can be processed immediately
+                                                                    through causal attention, allowing AGENT B’s prefill phase
+Proceedings of the 8 th MLSys Conference, Santa Clara, CA, USA,     to proceed concurrently with AGENT A’s decode phase.
+2026. Copyright 2026 by the author(s).
+                                                                    This eliminates idle time during agent transitions and en-
+                                                                  F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+                                                 Prefill (256 tokens)          Decode (bs=1..32)          MTP upper bound (accepted   3)
+                                                                                                                                                                                                                                Time
+                                  8,000 7,644                                                                                                                           Prefetch               Prefill            Decode
+Aggregate Throughput (tokens/s)
+
+
+
+
+                                                     5,766         5,904                                     6,006
+                                  6,000
+                                                                                                                                               System Prompt    Tools      Examples/Knowledge            Message/History   Genearated Tokens
+                                                                                              4,475
+                                  4,000                                                                      3,697
+                                                                                  3,239
+                                                                                                                        2,924
+                                                     2,554
+                                  2,000                                           1,453                                               1,745
+
+                                                                                                    418                                707     Cached in GPU/DRAM/SSD         Load from File              Transfer from
+                                           269                           157                                                 68                  from previous requests                                  Upstream Agents
+                                     0
+                                          P 1 2 4 8 1632                P 1 2 4 8 1632             P 1 2 4 8 1632          P 1 2 4 8 1632
+                                          Qwen3-8B                      Qwen3-14B            Qwen3-30B-A3B                 Qwen3-32B
+                                                                                                                                              Figure 2. Agent context composition and execution timeline (Ra-
+                                                                                                                                              jasekaran et al., 2025). F LASH AGENTS eliminates idle time by
+    Figure 1. Prefill vs. decode aggregate throughput across models                                                                           streaming tokens incrementally and overlapping downstream pre-
+    (A800-80GB). The gradient region shows the upper bound with                                                                               fill with upstream decode.
+    multi-token prediction (mean accepted tokens ≤ 3).
+
+
+                                                                                                                                              2     BACKGROUND
+     ables early prefetching of model weights and KV cache
+     data.                                                                                                                                    2.1    Multi-Agent Systems
+
+    Beyond pairwise streaming, F LASH AGENTS addresses re-                                                                                    Agent context composition. As illustrated in Figure 2,
+    dundant computation when multiple downstream agents                                                                                       an agent’s context comprises multiple components with dis-
+    perform incremental prefill concurrently. In multi-agent                                                                                  tinct characteristics: static elements like system prompts and
+    workflows, concurrent requests often share common pre-                                                                                    tools can leverage prefix caching, while the message/history
+    fixes—such as identical instruction templates or partially                                                                                portion must be transferred from upstream agents. In stan-
+    overlapping upstream outputs. We introduce an intra-turn                                                                                  dard multi-agent frameworks (Wu et al., 2023; Li et al.,
+    prefix cache that detects and eliminates redundant prefill                                                                                2023), upstream agent outputs are appended sequentially
+    across concurrent incremental operations within the same                                                                                  to the downstream agent’s context, following the conversa-
+    trigger event, significantly reducing computation when                                                                                    tional flow.
+    agents share instruction templates.                                                                                                       Workflow patterns. Modern MAS applications span a
+     Our contributions are threefold:                                                                                                         spectrum from predefined workflows to fully autonomous
+                                                                                                                                              agents (Schluntz & Zhang, 2024). Workflows orchestrate
+                                                                                                                                              LLMs through fixed code paths—such as prompt chaining
+                                                                                                                                              (sequential pipelines), orchestrator-workers (hierarchical
+     • We introduce Inter-agent streaming and incremental                                                                                     delegation), and parallelization (concurrent execution with
+       prefill, which overlaps upstream decode and downstream                                                                                 aggregation). Autonomous agents, conversely, dynamically
+       prefill through token streaming and incremental prefill,                                                                               determine their own execution strategies based on runtime
+       reducing idle time across agent transitions.                                                                                           conditions. Figure 3 illustrates common interaction patterns,
+     • We propose an Intra-turn prefix cache based on radix                                                                                   ranging from basic workflow templates (evaluator-optimizer,
+       trees that detects and reuses shared prefixes across concur-                                                                           pipeline, group, hierarchical) to complex dynamic work-
+       rent requests, eliminating redundant prefill when multiple                                                                             flows (coding, research). Production deployments from
+       downstream agents share instruction templates.                                                                                         Anthropic (Anthropic, 2025), autonomous research systems
+     • We implement F LASH AGENTS on SGLang and integrate                                                                                     like DeepResearch (Zhang et al., 2025), and coding assis-
+       it with AutoGen, demonstrating up to 40% end-to-end                                                                                    tants like MapCoder (Islam et al., 2024) exemplify dynamic
+       latency reduction on real workflows and 3.5× speedup in                                                                                workflows where execution graphs emerge at runtime. Re-
+       controlled benchmarks across diverse models and interac-                                                                               gardless of their complexity, these systems commonly fea-
+       tion patterns.                                                                                                                         ture sequential agent interactions where agents exchange
+                                                                                                                                              text processed by their underlying LLMs, creating inter-
+                                                                                                                                              agent dependencies.
+    As multi-agent systems grow in complexity and scale,                                                                                      Heterogeneous model deployment. Increasingly, MAS
+    system-level architectural optimizations are becoming criti-                                                                              deployments leverage heterogeneous model combinations,
+    cal for performance (Cemri et al., 2025; Chen et al., 2025).                                                                              pairing large models (LLMs) with small models (SLMs) to
+    F LASH AGENTS represents a key step towards more respon-                                                                                  balance capability and efficiency (Belcak, 2025). In multi-
+    sive and efficient LLM-based multi-agent systems by en-                                                                                   agent programming tools (Islam et al., 2024), LLMs orches-
+    abling concurrent processing at the inter-agent level.                                                                                    trate high-level plans while SLMs execute implementation
+                    F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+                                                               LLM
+            LLM                    LLM                                                                      LLM
+               (a) Evaluator-optimizer                                                          LLM         LLM           LLM
+            LLM         LLM           LLM           LLM                      LLM                            LLM
+                    (b) Pipeline                             (c) Group                                 (d) Hierarchical
+
+                          Coordinator                         Coder                                          Coordinator
+               User            Plan              LLM             Code                Executor                     LLM
+
+
+               Goal            LLM            Feedback            LLM                  Result                    Finish
+
+                                   Refine Plan              Debugger
+                                                         (e) Coding
+                            Planner            Query Generator               Information Finder                Reporter
+                                                                                 LLM
+               User            Plan                         Query            with Explorer   Finding              LLM
+                                                                                 LLM
+                                                 LLM        Query            with Explorer   Finding
+             Question          LLM                          Query
+                                                                                 LLM
+                                                                                             Finding            Report
+                                                                             with Explorer
+
+
+                                                               Iterative Search
+                                                          (f) DeepResearch
+
+Figure 3. Common interaction patterns in Multi-Agent Systems (MAS). (a)-(d) show basic workflow patterns: Evaluator-optimizer,
+Pipeline (prompt chaining), Group (parallelization), and Hierarchical (orchestrator-workers) (Schluntz & Zhang, 2024). (e) Coding and
+(f) DeepResearch demonstrate real-world dynamic workflows with adaptive agent interactions. F LASH AGENTS optimizes sequential
+inter-agent interactions prevalent in these patterns.
+
+
+steps; in research systems (Li et al., 2025b; Zhang et al.,          2023) maintain radix trees mapping token sequences to their
+2025), SLMs perform searches while LLMs handle orches-               computed KV caches. When a new request arrives, the
+tration. When SLMs generate lengthy outputs to larger                serving system searches the tree for the longest matching
+downstream models, the downstream prefill can become a               prefix and reuses its KV cache, only computing the remain-
+significant bottleneck that inter-agent streaming optimiza-          ing tokens. However, these persistent caches are updated
+tions can address.                                                   only after a request completes its prefill phase, meaning con-
+                                                                     current requests arriving during the same turn cannot share
+2.2   LLM Inference                                                  prefill computation even when they have common prefixes.
+Prefill and decode phases. Modern decoder-only LLMs                  Prefill–decode throughput gap. Figure 1 compares pre-
+typically execute requests in two main phases (Kamath et al.,        fill and decode throughput for processing the same number
+2025): a compute-intensive Prefill Phase that processes the          of tokens (256) across four models. At moderate decode
+input prompt in parallel to produce the first token and a Key-       concurrency, the two phases operate within the same order
+Value (KV) cache, which is a major factor in Time-to-First-          of magnitude—e.g., Qwen3-8B prefill at 7,644 tokens/s vs.
+Token (TTFT) latency; and a memory-bandwidth-bound                   decode at 2,554 tokens/s (batch size 32)—indicating that
+Decode Phase that autoregressively generates subsequent              overlapping them yields meaningful latency reduction. With
+tokens one by one, using the KV cache, which determines              multi-token prediction (MTP), effective decode throughput
+the Time-Per-Output-Token (TPOT). The KV Cache stores                increases further (up to 5,766 tokens/s for Qwen3-8B), nar-
+attention key and value states to prevent redundant compu-           rowing the gap and making each overlapped prefill step
+tations (Dao et al., 2022; Dao, 2023).                               cover a proportionally larger fraction of useful work. In
+                                                                     practice, the optimization opportunity is even larger for two
+Prefix caching. Prefix caching exploits the observation              reasons. First, as illustrated in Figure 2, a downstream
+that many requests share common prompt prefixes (e.g.,               agent’s prefill must process not only the upstream output but
+system instructions, few-shot examples). Systems like                also its own system prompt, tool descriptions, and conver-
+SGLang (Zheng et al., 2024a) and vLLM (Kwon et al.,                  sation history, substantially increasing the effective prefill
+                    F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+workload beyond the streamed tokens alone. Second, in het-          tion mechanisms against the incrementally built KVB ,
+erogeneous deployments where a smaller upstream model               preserving causal consistency across all tokens received
+(e.g., 8B) streams to a larger downstream model (e.g., 32B),        from SA . Specifically, when processing the i-th chunk
+the upstream decode runs fast while the downstream prefill          with query tokens Qi ∈ Rni ×d , the attention mechanism
+is heavier, widening the overlap window that F LASH A-              attends to all accumulated key-value pairs from previous
+GENTS exploits.                                                     chunks:
+
+                                                                                                             Qi K:i⊤
+                                                                                                                    
+3     F LASH AGENTS : I NTER -AGENT                                   Attention(Qi , K:i , V:i ) = softmax    √        V:i (1)
+                                                                                                                d
+      S TREAMING AND P REFILL OVERLAP
+                                                                                                          Pi
+The F LASH AGENTS approach accelerates Multi-Agent Sys-             where K:i = [K1 ; . . . ; Ki ] ∈ R( j=1 nj )×d represents
+tems (MAS) primarily through its core mechanism, Inter-             the concatenated keys, with the key-value sequence
+agent streaming and incremental prefill (Inter-Agent                length growing with i while query length ni remains
+Streaming and Incremental Prefill). Inter-agent streaming           small.
+and incremental prefill optimizes inter-agent communica-         4. Overlap Continuation and Synchronization:
+tion and the transition of execution control, speeding up           AGENT A continues streaming while AGENT B
+individual AGENT A → AGENT B transitions (Figure 4).                concurrently updates KVB . After AGENT A completes
+When multiple Inter-agent streaming and incremental pre-            SA (Algorithm 1, line 14), any remaining tokens in
+fill pipelines execute concurrently, Prefix-aware chunk             BufB are processed by EB (Algorithm 1, lines 15-17).
+scheduling (Prefix-Aware Chunk Scheduling) coordinates              AGENT B then immediately starts its decode phase using
+their incremental prefill operations to maximize prefix shar-       the complete KVB (Algorithm 1, line 18).
+ing and reduce redundant computation.
+                                                                 Let Tdecode,A , Tprefill,B , and Tdecode,B be the decode time for
+3.1   Inter-agent streaming and incremental prefill              AGENT A, prefill time for AGENT B, and decode time for
+                                                                 AGENT B, respectively. In standard sequential execution,
+The fundamental challenge in sequential MAS operations           end-to-end latency is:
+is the idle time incurred by a subsequent agent (AGENT B)
+while waiting for a preceding agent (AGENT A) to complete                    Lseq = Tdecode,A + Tprefill,B + Tdecode,B          (2)
+its full token generation (decode phase) before AGENT B
+can begin processing this output as its input (prefill phase).
+                                                                 With Inter-agent streaming and incremental prefill, the la-
+Inter-agent streaming and incremental prefill directly ad-
+                                                                 tency for a single pipeline becomes:
+dresses this by allowing computational overlap. As illus-
+trated in Figure 4 and Algorithm 1, the Inter-agent streaming
+                                                                        L = Tdecode,A + Tprefill,B − Toverlap + Tdecode,B       (3)
+and incremental prefill mechanism operates as follows:
+                                                                 where the overlap time Toverlap is strictly bounded by the
+1. AGENT A Decode Start and Token Streaming: Upon                shorter of the two overlapped phases:
+   receiving its initial prompt PA , AGENT A’s LLM engine
+   (EA ) commences its decode phase (Algorithm 1, line                         Toverlap ≤ min(Tdecode,A , Tprefill,B )          (4)
+   5). Generated tokens (toki ) are directly streamed to a
+                                                                 This bound holds per pipeline regardless of concurrency.
+   dedicated buffer (BufB ) for AGENT B (Algorithm 1,
+                                                                 In practice, Toverlap depends on how effectively incremen-
+   lines 7-9). This stream forms AGENT A’s output, SA .
+                                                                 tal prefill chunks are scheduled during upstream decode;
+2. AGENT B Incremental Prefill: Simultaneously,
+                                                                 when the upstream decode phase is long relative to each
+   AGENT B’s LLM engine (EB ) monitors BufB . Upon a
+                                                                 incremental chunk, Toverlap approaches the bound.
+   predefined criterion C (e.g., token count, EB idle), EB
+   fetches a token chunk (Tchunk ) and performs an incremen-     Concurrency benefits. When N agent pairs execute con-
+   tal prefill operation (IncPrefill) to update AGENT B’s        currently, two additional system-level effects amplify the
+   Key-Value (KV) cache, KVB (Algorithm 1, lines 10-12).         end-to-end speedup beyond what Equation 4 alone predicts.
+   This early start of prefill enables not only computational    First, incremental prefill operations from multiple pipelines
+   overlap but also early data prefetching: model weights        are co-batched by the serving engine, improving GPU com-
+   and existing KV cache entries can be loaded into GPU          pute utilization compared to isolated single-pipeline exe-
+   memory before AGENT A completes, hiding memory                cution. Second, the intra-turn prefix cache (Section 3.2)
+   transfer latency behind AGENT A’s decode phase.               eliminates redundant prefill across concurrent requests shar-
+3. Causal KV Cache Update: The IncPrefill operation              ing common instruction prefixes, effectively reducing the
+   ensures correct processing of incoming tokens by atten-       per-pipeline Tprefill,B . Denoting the effective prefill time after
+                        F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+ def agent_a_decode(prompt, agent_b_buffer):                                                                     def agent_b_process(agent_a, threshold,
+     with LLMEngine() as engine:                                                                                                     buffer, tree, req_id):
+         for token in engine.generate(prompt):                                                                       kv_cache = []
+             # Stream token to downstream                                                                            while agent_a.is_generating():
+             yield token                                                                                                 if buffer.should_trigger(threshold):
+             agent_b_buffer.add(req_id, token)               Prefill    Decode                                               kv_cache += prefix_aware_prefill(
+                                                                                                                                 buffer, tree, req_id
+ class AgentBuffer:                                                    Streaming                                             )
+     def add(self, token, req_id):                                                        Prefill    Decode
+                                                                                                                     return decode(kv_cache)
+         self.buffers[req_id].append(token)
+     def should_trigger(self, thres):
+                                                                       Prefill Prefill   Decode                  def prefix_aware_prefill(buffer, tree, req_id):
+         return any(len(self.unbuffered(r)) >= thres
+                                                                                          Latency                    # Get all unbuffered & insert to tree
+                    or buf[-1].is_final                Concurrent Execution Zone                         Time
+                                                                                         Reduction                   for rid, tokens in buffer.get_all_unbuffered():
+            for r, buf in self.buffers.items())
+                                                                                                                         tree.insert(tokens, rid)
+     def get_all_unbuffered(self):
+                                                                                                                     # Prefill once per unique prefix
+         return {r: buf[self.computed.get(r, 0):]
+                                                                                                                     for node in tree.new_nodes():
+            for r, buf in self.buffers.items()}
+                                                                                                                         node.kv = prefill(node.tokens, node.parent.kv)
+     def mark_all_computed(self):
+                                                                                                                     # Apply & mark computed
+         self.computed.update({r: len(buf)
+                                                                                                                     buffer.mark_all_computed()
+            for r, buf in self.buffers.items()})
+                                                                                                                     return tree.get_kv(req_id)
+
+
+
+
+Figure 4. Conceptual illustration of F LASH AGENTS with implementation details. Left: Agent A’s streaming generator with yield tokens
+to buffer. Middle: Timeline showing overlapped execution across multiple concurrent agent pairs. Right: Agent B’s incremental prefill
+process with prefix-aware buffer management that tracks computed vs. unbuffered tokens for each request.
+
+
+Algorithm 1 Core Inter-agent streaming and incremental                                       3.2       Prefix-Aware Incremental Prefill via Intra-Turn
+prefill Mechanism (AGENT A → AGENT B)                                                                  Prefix Cache
+Input: Prompt PA for AGENT A; engines EA , EB with KV
+                                                                                             Motivation. Naıve incremental prefill performs the prefill
+cache KVB
+                                                                                             step independently for each request when new tokens arrive,
+ 1: BufB ← ∅; KVB ← ∅                                                                        which may redundantly re-process long overlapping token
+ 2: EA .StartDecode(PA )                                                                     prefixes among concurrently active downstream requests.
+ 3: while EA is decoding do                                                                  Existing prefix caching systems like SGLang (Zheng et al.,
+ 4:      tok ← EA .NextToken()                                                               2024a) and vLLM (Kwon et al., 2023) update their per-
+ 5:      BufB .Append(tok)                                                                   sistent radix trees only after a request completes its prefill
+ 6:      if |BufB | ≥ threshold or tok is final then                                         phase, meaning concurrent requests arriving during the same
+ 7:          EB .Prefill(BufB , KVB )        ▷ updates prefix                                turn cannot share prefill computation even when they have
+     cache                                                                                   common prefixes. This limitation becomes pronounced in
+ 8:          BufB ← ∅                                                                        multi-agent workflows where multiple downstream agents
+ 9:      end if                                                                              often share instruction templates or receive partially over-
+10: end while                                                                                lapping upstream outputs simultaneously.
+11: return EB .Decode(KVB )
+                                                                                             Approach. We introduce an intra-turn prefix cache that
+                                                                                             detects and eliminates redundant prefill across concurrent
+                 ′                                                                           incremental operations. The key insight is to build a tem-
+prefix reuse as Tprefill,B ≤ Tprefill,B , the per-pipeline latency
+                                                                                             porary radix tree at prefill trigger time to identify common
+under concurrency becomes:
+                                                                                             prefixes among buffered token sequences, compute each
+                         ′                                                                   unique prefix once, and reuse the results across all requests
+       LN = Tdecode,A + Tprefill,B − Toverlap + Tdecode,B                      (5)
+                                                                                             sharing that prefix.
+                                                                                             Mechanism. For each request r, we maintain a buffer Ur of
+Section 6.1 empirically validates this model: for 7B models,
+                                                                                             tokens that have arrived but not yet been processed. When
+speedup increases from 1.05× at concurrency=1 to 3.5×
+                                                                                             a prefill trigger occurs (e.g., total buffered tokens exceed a
+at higher concurrency, driven by improved GPU utilization
+                                                                                             threshold), the system performs three steps (illustrated in
+and prefix reuse rather than increased per-pipeline overlap.
+                                                                                             Figure 5):
+F LASH AGENTS naturally supports multiple concurrent
+                                                                                             Step 1: Build radix tree. Insert all buffered sequences {Ur }
+Inter-agent streaming and incremental prefill pipelines exe-
+                                                                                             into a shared radix tree T . The tree structure naturally
+cuting simultaneously. Each agent pair operates according
+                                                                                             identifies common prefixes: if two requests buffer “System:
+to Algorithm 1, with incremental prefill requests coordinated
+                                                                                             Analyze” and “System: Summarize”, the tree creates one
+through a prefix-aware scheduling mechanism. When mul-
+                                                                                             shared node for “System: ” and two separate child nodes
+tiple downstream agents buffer tokens concurrently, their
+                                                                                             for “Analyze” and “Summarize”.
+prefill operations are aggregated and scheduled to maximize
+prefix sharing, as detailed in the next subsection.
+                      F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+      Inter-turn prefix cache               Update after turn          Algorithm 2 Prefix-Aware Aggregation for Incremental
+                                                                       Prefill
+            1                                        1                 Input: Active requests R with unbuffered tokens Ur ; radix
+                  Intra-turn prefix cache                              tree T
+            2                                        2
+                      5               6                                  1: for request r ∈ R with Ur ̸= ∅ do
+      3     4                                  3                         2:     Insert(T , Ur , r) ▷ create nodes for unique prefixes
+                                  7
+                                                                         3: end for
+                                                     6    7
+                                                                         4: N ← newly created nodes in T , ordered by depth
+                                                                         5: for node n ∈ N do                 ▷ from shallow to deep
+Figure 5. Intra-turn prefix cache. Each rectangle denotes a radix-       6:     KVn ← E.Prefill(tokens(n), KVparent(n) )
+tree node that aggregates a token span; paths encode shared prefixes     7: end for
+across requests. Prefill is carried out once per newly created node      8: for request r ∈ R do
+and reused by all traversing requests.
+                                                                         9:     for node n on path from root to r do
+                                                                       10:          KVr ← KVr ∪ KVn
+                                                                       11:      end for
+Step 2: Compute unique prefixes. Traverse T and compute
+                                                                       12: end for
+KV cache only for newly created nodes—i.e., token se-
+quences that no request has processed yet. Each node’s KV
+cache is computed by extending its parent’s KV cache with
+the node’s token span. Nodes shared by multiple requests               all end-to-end latency reduction builds up across the chain,
+are computed once.                                                     though it can be limited by the slowest (decode or incremen-
+Step 3: Propagate results. For each request r, assemble its            tal prefill) step in any given link. If any agent in the chain
+complete KV cache by collecting KV deltas from all nodes               (e.g., AGENT B) itself processes batches of inputs or gener-
+along its path in T . This allows multiple requests sharing            ates batches of outputs, it can manage its batch processing
+instruction templates to reuse the same prefill computation.           using principles similar to Prefix-aware chunk scheduling
+                                                                       to efficiently feed subsequent Inter-agent streaming and in-
+Analysis. The cache preserves causal correctness because               cremental prefill links (e.g., AGENT B→AGENT C).
+each incremental prefill update is applied in lexical order
+along a path from a request’s current committed node to                4.2   Complex Topologies
+its new leaf. Reuse arises whenever two or more requests
+expose a common prefix, which frequently occurs in MAS                 F LASH AGENTS also applies to complex interaction
+pipelines where downstream prompts share instruction tem-              graphs. In Fan-out scenarios (e.g., AGENT A →
+plates. Building T is linear in P
+                                the total number of unbuffered         {AGENT B, AGENT C}), AGENT A can use Inter-agent
+tokens across all requests (O( r |Ur |)). Memory overhead              streaming and incremental prefill to stream tokens in parallel
+is bounded by the number of unique prefix extensions cre-              to multiple recipients (AGENT B, AGENT C); if AGENT A
+ated. Prefill computation is performed only once per unique            handles input batches, its batch processing approach (akin
+node, enabling substantial reuse when requests share com-              to Prefix-aware chunk scheduling) influences how these con-
+mon token prefixes.                                                    current output streams are managed. In Fan-in patterns
+                                                                       (e.g., {AGENT B, AGENT C} → AGENT D), correctness
+                                                                       requires that position IDs in AGENT D’s prompt match the
+4     E XTENSIONS FOR M ULTI -AGENT                                    final linearized order. Because modern decoder-only Trans-
+      T OPOLOGIES                                                      formers apply positional encodings (e.g., RoPE) before
+The F LASH AGENTS approach, with its two orthogonal                    attention, F LASH AGENTS can only incrementally prefill
+mechanisms, can be extended to settings with more than                 position-stable segments—those whose absolute positions
+two interacting agents (N > 2), though managing synchro-               are already determined. Concretely, if AGENT D’s prompt is
+nization and dependencies grows in complexity.                         linearized as [system prompt]∥[outputB ]∥[outputC ], the sys-
+                                                                       tem prompt and outputB can be incrementally prefilled as
+                                                                       tokens arrive, but outputC ’s prefill is deferred until outputB
+4.1       Linear Agent Chains
+                                                                       is finalized (since C’s positions depend on B’s length). This
+In a linear sequence of agents, Inter-agent streaming and              conservative strategy preserves correctness while still en-
+incremental prefill can be applied serially to each link:              abling overlap for all position-stable prefixes. While such
+AGENT A streams to AGENT B, AGENT B streams to                         complex topologies raise coordination demands (manag-
+AGENT C, and so on. This creates a pipelined effect, where             ing concurrent streams, completion signals, and resource
+each agent AGENT I +1 can start its incremental prefill as             contention), the considerable latency reduction achievable
+soon as agent AGENT I begins generating tokens. The over-              through pipelined and parallelized execution is a significant
+                   F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+driving factor.                                                monitors total buffered tokens across all requests. Upon
+                                                               triggering, the system inserts all unbuffered token sequences
+5     S YSTEM I MPLEMENTATION                                  into the radix tree, creating new nodes for unique prefix
+                                                               extensions. These nodes are then topologically ordered by
+We implement F LASH AGENTS by extending the                    depth and materialized in sequence (Algorithm 2, lines 5–8),
+SGLang (Zheng et al., 2024a) runtime with streaming and        ensuring parent KV caches are available before processing
+prefix-aware coordination capabilities. As described in        child nodes.
+Section 6, our implementation operates without modifying
+                                                               After materializing new nodes, the computed KV deltas
+SGLang’s core RadixAttention tree, instead adding a
+                                                               are applied to each request by traversing its path in the
+modular extension layer that realizes the mechanisms in
+                                                               radix tree (Algorithm 2, lines 9–12). This approach allows
+Algorithms 1 and 2. Figure 4 illustrates the implementation
+                                                               multiple requests sharing instruction templates or partially
+architecture with code-level details.
+                                                               overlapping upstream outputs to reuse prefill computations,
+                                                               significantly reducing redundant work. The radix tree state
+5.1   Token Streaming and Incremental Prefill                  persists within a turn but is lightweight and can be pruned
+To enable token streaming from upstream agents (Algo-          between trigger events.
+rithm 1, lines 2–9), we extend SGLang’s generation API
+with a streaming mode. As shown in the left panel of Fig-      5.3   Integration with Multi-Agent Frameworks
+ure 4, upstream agents invoke the engine with a generator
+                                                               AutoGen integration. We integrate F LASH AGENTS with
+pattern that yields tokens incrementally. Each generated to-
+                                                               AutoGen (Wu et al., 2023) by developing an asynchronous
+ken is immediately added to the downstream agent’s buffer
+                                                               client that manages streaming requests. When an upstream
+via a lightweight message-passing mechanism, enabling
+                                                               agent generates a response, the client submits it in stream-
+low-latency token propagation between co-located agents.
+                                                               ing mode and creates a linked downstream request that
+For downstream agents, we implement an incremental prefill     incrementally prefills from the stream. Request identifiers
+interface that accepts token chunks and updates KV caches      propagate through agent interactions, enabling the runtime
+dynamically. The engine maintains per-request buffers track-   to associate producer-consumer pairs and coordinate their
+ing unbuffered tokens and their computed state (as illus-      execution according to Algorithm 1.
+trated in the AgentBuffer class in Figure 4). When the
+                                                               Runtime coordination. The MAS framework manages
+trigger condition is met—either buffer size exceeding a
+                                                               inter-agent dependencies and token transfer through a coor-
+threshold or receiving a final token marker—the scheduler
+                                                               dination layer. For concurrent agent pairs, the framework
+batches pending incremental prefill operations with regular
+                                                               tracks active streaming sessions and notifies the SGLang
+inference workloads, enabling efficient GPU utilization.
+                                                               scheduler when new tokens are available, triggering incre-
+Each incremental prefill operation processes a chunk of to-    mental prefill operations. This design separates framework-
+kens using Equation 1, where the new query tokens attend to    level orchestration from engine-level execution, allowing
+all previously accumulated KV pairs. The engine maintains      F LASH AGENTS to integrate with diverse MAS frameworks
+causal consistency by ensuring that KV updates are applied     through a standard streaming interface.
+in the order tokens arrive. Upon completion of upstream
+                                                               Error handling and synchronization. The implementation
+generation, any remaining buffered tokens are processed,
+                                                               includes mechanisms for handling upstream failures, stream
+and the downstream agent transitions to its decode phase
+                                                               interruptions, and timeout conditions. If an upstream agent
+with a complete KV cache.
+                                                               fails during generation, downstream agents are notified to
+                                                               finalize prefill with available tokens or abort gracefully. Syn-
+5.2   Prefix-Aware Coordination via Intra-Turn Cache           chronization primitives ensure that downstream decode does
+To implement Algorithm 2, we extend the SGLang scheduler       not commence until all streamed tokens are processed and
+with an auxiliary radix tree that operates during incremen-    the KV cache is complete.
+tal prefill aggregation, separate from SGLang’s persistent
+RadixAttention tree. Each tree node stores a token span,       6     E VALUATION
+a reference to its parent’s KV cache, and the computed
+KV delta for that span. This structure enables detection       Implementation and Testbed. We implement the F LASH A-
+and reuse of common prefixes across concurrent requests        GENTS data structures and scheduling policies within the
+without modifying the underlying cache management.             SGLang (Zheng et al., 2024a) runtime. Our implementation
+                                                               operates without modifying SGLang’s core RadixAttention
+As shown in the right panel of Figure 4, when multiple         tree, enabling the algorithms described in Section 3 through
+downstream agents buffer tokens concurrently, the scheduler    a modular extension layer.
+                    F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+All experiments are conducted on NVIDIA A100-80GB                 For the 7B model under single concurrency, prefill opera-
+GPUs with CUDA 12.6. For 7B and 32B parameter models,             tions complete rapidly relative to decode, resulting in mod-
+we deploy on a single A100 GPU. For the 235B parameter            est speedups of 1.05× to 1.2×. The limited overlap oppor-
+model, we use tensor parallelism (Shoeybi et al., 2019)           tunity arises because the downstream prefill finishes quickly,
+(TP=8) across eight A100-80GB GPUs to accommodate the             leaving little room for concurrent execution with upstream
+model size and enable efficient inference.                        decode. However, as concurrency increases, the system tran-
+                                                                  sitions into a sustained compute-bound state where multiple
+6.1   Microbenchmark Evaluation                                   downstream agents perform prefill simultaneously. This
+                                                                  enables Prefix-aware chunk scheduling coordination and the
+Experimental configurations. We conduct controlled                intra-turn prefix cache to deliver substantial benefits, achiev-
+AGENT A→AGENT B cascade experiments to isolate the                ing peak speedups of 3.52× at concurrency=2 through im-
+core benefits of Inter-agent streaming and incremental pre-       proved GPU utilization and elimination of redundant prefill
+fill. Our evaluation spans three representative configura-        computations across concurrent requests.
+tions to simulate diverse system loads: Qwen2.5-7B (Yang
+et al., 2024), Qwen3-235B (Yang et al., 2025) with high-          For the 235B model under single concurrency, the prefill
+throughput upstream generation, and Qwen3-235B with               phase is considerably slower due to the larger model capac-
+low-throughput upstream generation. The high-throughput           ity and increased computational requirements. This natu-
+setting represents scenarios where the upstream agent gen-        rally provides more overlap opportunity with upstream de-
+erates tokens rapidly, while the low-throughput setting sim-      code, yielding higher single-request speedups compared to
+ulates cases with slower upstream generation due to model         the 7B model. Under high concurrency, the speedup initially
+capacity or resource constraints. For each configuration,         increases as Prefix-aware chunk scheduling effectively coor-
+we systematically vary concurrency levels in {1, 2, 4, 8} to      dinates multiple pipelines. However, as concurrency grows
+assess performance under both single-request and batch sce-       further, the cumulative downstream prefill time begins to
+narios. Each workload is labeled as TPS/Prefix/Upstream           exceed the upstream decode time, particularly when mul-
+in Figure 6, where TPS denotes upstream token generation          tiple downstream agents process long streamed sequences
+rate (tokens/second), Prefix is the shared context length for     simultaneously. This causes the overlap benefit to plateau
+RadixAttention cache reuse, and Upstream is the total token       and then decline slightly, as the bottleneck shifts from up-
+count streamed from upstream to downstream agents.                stream decode to aggregate downstream prefill capacity.
+                                                                  The high-throughput and low-throughput upstream config-
+Performance metric. To quantify the latency reduction             urations exhibit similar trends, though the low-throughput
+achieved by F LASH AGENTS, we define the downstream               setting shows slightly higher speedups at moderate concur-
+response latency T as the elapsed time from when the up-          rency due to extended upstream decode phases that provide
+stream agent emits its first token to when the downstream         more overlap opportunity.
+agent produces its first output token. Formally, let tA
+                                                      first de-
+note the timestamp at which AGENT A generates its first
+                                                                  6.2   End-to-end Performance With Real Workflows
+token, and tBfirst denote the timestamp at which AGENT B
+generates its first token. The metric is then:                    Workflow configurations. We evaluate F LASH AGENTS on
+                      T = tB        A                             two representative real-world multi-agent workflows and
+                           first − tfirst                  (6)
+                                                                  one document-driven pipeline. All Chain and MapReduce
+                                                                  experiments use heterogeneous model deployment with
+This metric directly captures the inter-agent transition la-      upstream agents running Qwen2.5-7B (Yang et al., 2024)
+tency that F LASH AGENTS aims to minimize through over-           on one A100 GPU and the downstream aggregator using
+lapped execution. We compare F LASH AGENTS against                Qwen2.5-32B on a separate GPU. Chain is a sequential
+Sequential execution, where AGENT B initiates prefill only        travel planning assistant1 (Planner → Local → Language
+after AGENT A completes its entire generation, representing       → Summary) with four agents in a pure pipeline, where
+the standard execution model in existing serving systems          each agent receives a shared 2,500-token destination guide
+such as SGLang (Zheng et al., 2024a) without streaming            as context. MapReduce is inspired by the literature review
+support.                                                          pattern2 and implemented as three Reviewer agents that
+Results and analysis. Figure 6 presents the speedup               independently evaluate the same paper, followed by a Meta-
+achieved by F LASH AGENTS across all 240 tested configura-          1
+                                                                      https://microsoft.github.io/autogen/
+tions. Notably, F LASH AGENTS outperforms the Sequential          stable/user-guide/agentchat-user-guide/
+baseline in every single configuration, demonstrating con-        examples/travel-planning.html
+                                                                    2
+sistent benefits across diverse settings. The improvements            https://microsoft.github.io/autogen/
+range from 1.05× to 3.52× depending on model size, con-           stable/user-guide/agentchat-user-guide/
+currency, and workload characteristics.                           examples/literature-review.html
+                                     F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+                                        C=1                              C=2                                C=4                   C=8
+         2.0
+                                                                                       Qwen2.5-7B
+                                                                 2.14×         3.52×                2.33×         2.57×   2.14×
+                              Baseline
+         1.5                  FlashAgents
+         1.0
+         0.5
+         2.0
+                                                                                Qwen3-235B-high-tpt
+Speedup
+
+
+
+
+         1.5
+         1.0
+         0.5
+            20 /100 /200
+            20 /200 /400
+            20 /200 /200
+            40 /200 /400
+            40 /100 /800
+            40 /100 /200
+            40 /200 /400
+            40 /200 /200
+            20 /200 /400
+            20 /100 /800
+            20 /100 /200
+            20 /200 /400
+            20 /200 /200
+            40 /200 /400
+            40 /100 /800
+            40 /100 /200
+            40 /200 /400
+            40 /200 /200
+            20 /200 /400
+            20 /100 /800
+            20 /100 /200
+            20 /200 /400
+            20 /200 /200
+            40 /200 /400
+            40 /100 /800
+            40 /100 /200
+            40 /200 /400
+            40 /200 /200
+            20 /200 /400
+            20 /100 /800
+            20 /100 /200
+            20 /200 /400
+            20 /200 /200
+            40 /200 /400
+            40 /100 /800
+            40 /100 /200
+            40 /200 /400
+            40 /200 /200
+                 00 00
+                       00
+              0/2 0/4
+                    0/8
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+              0 0
+            20 /100
+              0
+            20
+
+
+
+
+         2.0
+                                                                                Qwen3-235B-low-tpt
+         1.5
+         1.0
+         0.5
+               50 000 00
+               50 000 00
+               50 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               50 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+               25 000 00
+                     00 0
+                           0
+                  /20 /20
+                       /40
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+                  /2 /2
+                  /1 /4
+                  /1 /1
+                  /2 /2
+                  /2 /1
+               50 000
+                  /1
+               50
+
+
+
+
+ Figure 6. Microbenchmark results across concurrency levels and workload configurations. F LASH AGENTS consistently outperforms the
+ Sequential baseline, with peak speedups reaching 3.52× at concurrency=2.
+
+
+                                 Baseline     Cascade      N=1       N=8                   quests, widening the benefit to 11.9%. For MapReduce, the
+     Normalized Time
+
+
+
+
+                       1.0                                                                 baseline runs the three Reviewers sequentially (AutoGen
+                                                                                           default); F LASH AGENTS parallelises them (fan-out) and
+                       0.5                                                                 pre-warms the Meta-Reviewer’s shared paper prefix during
+                                                                                           their decode. At N =1 this produces a 40.3% reduction; at
+                       0.0                                                                 N =8, decode contention on the shared 32B GPU moderates
+                             Chain             MapReduce          PPTAgent
+                                                                                           the gain to 14.7%.
+ Figure 7. Normalized latency for real-world workflows (N : con-
+ current requests), including two AutoGen-based workflows and                              6.3   End-to-end Performance on an Agentic
+ PPTAgent (Zheng et al., 2025).                                                                  Generation Workflow
+                                                                                           Workflow configuration. We further evaluate F LASH A-
+                                                                                           GENTS on PPTAgent (Zheng et al., 2025), a realistic
+
+ Reviewer that synthesizes their opinions. Both workflows                                  document-driven presentation generation pipeline, deployed
+ are evaluated at N =1 (single request) and N =8 (concurrent                               on two heterogeneous A800-80GB GPUs. The work-
+ requests), with the baseline running agents sequentially (one                             flow involves two agent roles: (1) a VLM Analyzer
+ at a time, waiting for each to complete before starting the                               (Qwen2.5-VL-7B-Instruct, GPU 0) that reads a real re-
+ next).                                                                                    search paper and generates a structured 12-slide outline;
+                                                                                           and (2) twelve concurrent Content Generators (Qwen3-
+ Results. Figure 7 compares F LASH AGENTS against the                                      14B, GPU 1) that each produce slide content from the doc-
+ baseline. For Chain, F LASH AGENTS pre-warms the                                          ument and outline. Each content generator’s prompt fol-
+ position-stable portion of the Summary prompt (system                                     lows the structure [sys prompt + doc content +
+ template plus the shared 2,500-token guide, ≈98% of the                                   outline item + slide instr], where the first two
+ full input) on the 32B GPU concurrently with Planner’s                                    components (3,013 tokens) form a position-stable shared
+ decode on the 7B GPU, so nearly all prefill is hidden be-                                 prefix (Section 4) fully determined before the Analyzer be-
+ fore the upstream agents finish. At N =1 this yields a 1.8%                               gins. A VLM layout selector (GPU 0) also runs concurrently
+ latency reduction; at N =8, the intra-turn prefix cache elim-                             to assign visual templates to each slide.
+ inates redundant per-instance prefill across concurrent re-
+                     F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+
+Table 1. Ablation study isolating IASIP and intra-turn prefix cache                                 Min Prefill Time     KV Cache Redundant Access
+contributions. Speedup is computed as Baseline / Full F LASH A-                                    Qwen2.5-32B         Qwen2.5-7B      Qwen3-235B
+GENTS.
+    Prefix Pipelines Baseline IASIP-only Full Speedup
+                                                                                            3.0                                                                 4.6% 7.9% 5.1%
+      1000      1        4.46        4.16      4.11   1.09×                                                                                               1.0
+
+
+
+
+                                                                                                                                  Normalized Chunk Time
+                                                                      Normalized E2E Time
+      1000      8        6.93        4.11      4.11   1.69×
+      2000      1        4.77        4.15      4.11   1.16×                                 2.5                                                           0.8
+      2000      8       10.10        5.32      4.20   2.40×
+                                                                                            2.0                                                           0.6
+                                                                                                                                                          0.4
+                                                                                            1.5
+                                                                                                                                                          0.2
+                                                                                            1.0
+                                                                                                  128 256 384 512          1024                                 32B   7B 235B
+                                                                         Figure 8. Overhead analysis of incremental prefill. Left: Total
+Results. F LASH AGENTS pre-warms the shared prefix on                    GPU computation time for processing 1024 tokens as a function
+GPU 1 via a single incremental prefill that executes concur-             of chunk size, normalized to single-pass prefill. Right: Time
+rently with the Analyzer’s decode window on GPU 0, lever-                difference between the longest chunk (final chunk with maximum
+aging the intra-turn prefix cache to avoid redundant compu-              historical KV) and shortest chunk (first chunk with no history),
+tation across all 12 generators. By the time the outline is              showing modest overhead from accumulated KV cache access.
+ready, each generator’s KV cache already covers the batch
+prefix; only outline item + slide instr (≈300
+tokens each) remain to be prefilled, fitting within a single
+chunked-prefill batch step. In the baseline, all 12 genera-               6.5                     Overhead Analysis
+tors submit their full token inputs only after the Analyzer               While incremental prefill enables execution overlap that
+finishes; SGLang’s chunked-prefill step covers at most 2–3                reduces end-to-end latency, it introduces computational
+complete requests before the shared prefix is cached, leav-               overhead compared to single-pass prefill. This overhead
+ing sequential prefill on the critical path. On a real research           stems from two sources: (1) splitting context into smaller
+paper , F LASH AGENTS achieves 3.41s versus the baseline’s                chunks reduces computational intensity, making operations
+4.49s, a 24.1% downstream responese latency reduction                     memory-bound; (2) each incremental prefill incurs redun-
+(1.32× speedup), consistent with the gains on AutoGen-                    dant memory accesses by repeatedly loading model weights
+based workflows above and confirming that F LASH AGENTS                   and accessing previously computed KV cache entries. As
+generalizes to heterogeneous multi-GPU deployments in                     shown in Equation 1, processing the i-th chunk requires
+realistic agentic pipelines.                                              attending to all accumulated key-value pairs, with the KV
+                                                                          sequence length growing while the query remains small.
+6.4    Ablation Study
+                                                                          Experimental setup. We process a fixed 1024-token con-
+To isolate the contribution of each component, we com-                    text under varying chunk sizes {128, 256, 384, 512, 1024},
+pare three configurations: Baseline (sequential execution),               measuring cumulative GPU computation time across all
+IASIP-only (streaming + incremental prefill without the                   incremental prefill operations. Each experiment is re-
+intra-turn prefix cache), and Full F LASH AGENTS (IASIP +                 peated five times with median reported across Qwen2.5-7B,
+intra-turn prefix cache). Table 1 reports results on Qwen3-               Qwen2.5-32B (Yang et al., 2024), and Qwen3-235B (Yang
+32B with upstream TPS=50.                                                 et al., 2025).
+At single concurrency, IASIP accounts for nearly all gains                Aggregate computational overhead. The left panel of
+(1.09–1.16×) and the prefix cache adds minimal benefit,                   Figure 8 shows total GPU computation time normalized to
+since there is no cross-request prefix sharing opportunity.               single-pass prefill. At chunk size 128, incremental prefill
+At concurrency=8, however, IASIP alone leaves substan-                    incurs up to 3× overhead from memory-bound execution
+tial redundant prefill: with prefix=2000 and 8 pipelines,                 and repeated weight loading across eight operations. How-
+IASIP-only takes 5.32s while Full F LASH AGENTS reduces                   ever, overhead diminishes rapidly as chunk size increases,
+this to 4.20s—a 21% additional reduction from prefix dedu-                approaching 1.2× at chunk size 512. This demonstrates
+plication. The full system achieves 2.40× speedup, con-                   that the overhead-latency trade-off can be effectively man-
+firming that the two components address complementary                     aged through chunk size tuning. Critically, F LASH AGENTS
+regimes: IASIP removes the handoff barrier, while the intra-              still achieves significant end-to-end latency reductions by
+turn prefix cache eliminates redundant computation under                  overlapping these operations with upstream decode (Sec-
+concurrency.                                                              tion 6.1).
+                                        F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+                                   Concurrency=1           Concurrency=10          ating at different granularities: F LASH AGENTS targets
+Normalized Avg Latency
+
+                                                                                   intra-workflow token-level coordination, while systems like
+                         1.0                                                       Kairos (Chen et al., 2025) optimize inter-workflow request
+                                                                                   scheduling and Teola (Tan et al., 2024) perform workflow-
+                         0.5                                                       level graph optimization. These layers compose naturally,
+                                                                                   enabling deployment alongside existing serving infrastruc-
+                         0.0 Baseline   Baseline+SJF FlashAgents FlashAgents+SJF
+                                                                                   ture.
+
+
+    Figure 9. Orthogonality of F LASH AGENTS with scheduling poli-                 7   R ELATED W ORK
+    cies. F LASH AGENTS’s streaming overlap and SJF scheduling                     LLM serving optimizations. Recent serving systems have
+    provide complementary benefits, with combined improvements of
+                                                                                   introduced diverse optimization techniques. vLLM (Kwon
+    56% at concurrency=1 and 37% at concurrency=10.
+                                                                                   et al., 2023) and SGLang (Zheng et al., 2024a) pioneered
+                                                                                   continuous batching and prefix caching through PagedAt-
+                                                                                   tention and RadixAttention, respectively, while FlashAtten-
+    Isolating KV cache access overhead. In realistic deploy-                       tion (Dao et al., 2022; Dao, 2023) and FlashInfer (Ye et al.,
+    ments, incremental prefill chunks share GPU resources with                     2025) optimize attention kernels with memory-efficient im-
+    other concurrent requests. While model weight loading is                       plementations, including efficient computation for prefix-
+    amortized across all co-scheduled requests, accessing accu-                    cached sequences. Prompt Cache (Gim et al., 2024) and
+    mulated historical KV cache represents a unique overhead                       CacheBlend (Yao et al., 2025) explore modular attention
+    specific to incremental prefill. The right panel of Figure 8                   reuse and cached knowledge fusion beyond strict prefix
+    isolates this cost: for chunk size 128 (8 operations), we                      matching, though these approaches involve approximations
+    compare the final chunk—which attends to 896 tokens of                         rather than lossless caching. BatchLLM (Zheng et al.,
+    history—against the first chunk with no history. Across                        2024b) constructs offline prefix trees for batch-level cache
+    all models, the longest chunk is only 4.6% to 7.9% slower.                     sharing, and systems like Splitwise (Patel et al., 2024) and
+    This confirms that historical KV access overhead is mod-                       DistServe (Zhong et al., 2024) disaggregate prefill and de-
+    est, and the true incremental burden imposed on shared                         code to reduce phase interference. Chunked prefill, widely
+    GPU resources by F LASH AGENTS’s streaming mechanism                           adopted in vLLM, Sarathi (Agrawal et al., 2024), TensorRT-
+    is minimal.                                                                    LLM (NVIDIA, 2023), and DeepSpeed-FastGen (Holmes
+                                                                                   et al., 2024), splits long prompts into smaller chunks to re-
+     6.6                   Orthogonality with Existing Optimizations               duce TTFT and peak GPU memory within single requests.
+     F LASH AGENTS’s token-level streaming mechanism oper-                         While these techniques substantially improve intra-request
+     ates orthogonally to request-level scheduling policies. Fig-                  efficiency and cross-request batching, F LASH AGENTS ad-
+     ure 9 demonstrates this by combining F LASH AGENTS with                       dresses a distinct bottleneck: inter-agent coordination la-
+     Shortest Job First (SJF) scheduling (Silberschatz et al.,                     tency when agents interact sequentially. By enabling token
+     2018), which prioritizes requests with shorter expected ex-                   streaming and incremental prefill across agent boundaries,
+     ecution time—a key strategy employed by Kairos (Chen                          F LASH AGENTS achieves execution overlap orthogonal to
+     et al., 2025) for multi-agent serving. We evaluate four con-                  existing optimizations and can be deployed alongside con-
+     figurations across the workflows from Section 6.2 at con-                     tinuous batching and prefix caching.
+     currency=1 and concurrency=10, assuming single workflow                       Multi-agent system optimizations. Several system-
+     type serving with pre-profiled agent execution times.                         level optimizations have emerged for multi-agent serving.
+    Results show independent and complementary benefits: SJF                       KVFlow (Pan et al., 2025) introduces workflow-aware KV
+    alone reduces latency to 65-70% through improved request                       cache management through static Agent Step Graphs, using
+    ordering, while F LASH AGENTS alone achieves 57% via                           steps-to-execution metrics to predict agent invocations and
+    streaming overlap. Combined, F LASH AGENTS+SJF deliv-                          implement predictive eviction, though this relies on prede-
+    ers 44% (56% reduction) at low concurrency and 63% (37%                        termined workflow structures. Kairos (Chen et al., 2025)
+    reduction) at high concurrency, confirming orthogonality.                      targets low-latency serving under cloud resource contention
+    At low concurrency, streaming overlap dominates as each                        through request-level priority scheduling and adaptive batch-
+    agent pair fully exploits prefill-decode pipelining without                    ing. Teola (Tan et al., 2024) demonstrates primitive-level
+    contention. At high concurrency, SJF mitigates resource                        DAG optimization for modular LLM applications, requiring
+    competition, allowing F LASH AGENTS to maintain overlap                        predefined workflow templates to construct offline execution
+    benefits despite increased GPU pressure.                                       graphs.
+
+    This orthogonality extends to other optimizations oper-                        In contrast, F LASH AGENTS addresses inter-agent execution
+                    F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+coordination through token-level streaming and reactive          Anthropic.    How we built our multi-agent re-
+incremental prefill, achieving temporal overlap between se-        search system, June 2025.    URL https:
+quentially dependent agent phases without requiring work-         //www.anthropic.com/engineering/
+flow prediction or predefined templates. This approach             multi-agent-research-system.
+naturally adapts to dynamic execution paths and variable
+generation lengths. F LASH AGENTS is complementary to            Belcak, P.    How small language models are key
+these systems: it composes with KVFlow’s cache manage-             to scalable agentic ai, August 2025.     URL
+ment (what to cache), Kairos’s request scheduling (which           https://developer.nvidia.com/blog/
+request first), and Teola’s graph optimization (how to struc-      how-small-language-models-are-key-to-
+ture workflows), while focusing uniquely on execution over-        scalable-agentic-ai.
+lap (when to start processing). This orthogonality enables       Cemri, M., Pan, M. Z., Yang, S., Agrawal, L. A., Chopra,
+joint deployment where existing optimizations handle their         B., Tiwari, R., Keutzer, K., Parameswaran, A., Klein, D.,
+respective dimensions while F LASH AGENTS maximizes                Ramchandran, K., et al. Why do multi-agent llm systems
+inter-agent computation overlap.                                   fail? arXiv preprint arXiv:2503.13657, 2025.
+
+8    C ONCLUSION                                                 Chen, J., Shi, J., Chen, Q., and Guo, M. Kairos: Low-latency
+                                                                   multi-agent serving with shared llms and excessive loads
+F LASH AGENTS is a serving approach centered on Inter-             in the public cloud. arXiv preprint arXiv:2508.06948,
+agent streaming and incremental prefill that reduces the           2025.
+prefill barrier in Multi-Agent Systems by overlapping up-
+stream decode and downstream prefill via token streaming         Dao, T. Flashattention-2: Faster attention with bet-
+and incremental prefill. For high-concurrency deployments,         ter parallelism and work partitioning. arXiv preprint
+Intra-turn prefix cache eliminates redundant prefill across        arXiv:2307.08691, 2023.
+requests using a radix-tree representation. Implemented          Dao, T., Fu, D., Ermon, S., Rudra, A., and Ré, C. Flashat-
+on SGLang and integrated with standard MAS frameworks,             tention: Fast and memory-efficient exact attention with
+F LASH AGENTS enables more responsive and efficient multi-         io-awareness. Advances in neural information processing
+agent applications.                                                systems, 35:16344–16359, 2022.
+Future work includes deeper algorithm–system co-design
+                                                                 Gim, I., Chen, G., Lee, S.-s., Sarda, N., Khandelwal, A.,
+(e.g., enabling non-generative operations during overlapped
+                                                                   and Zhong, L. Prompt cache: Modular attention reuse for
+prefill), adaptive streaming policies, and advanced schedul-
+                                                                   low-latency inference. Proceedings of Machine Learning
+ing strategies that jointly consider memory footprint, overlap
+                                                                   and Systems, 6:325–338, 2024.
+opportunities, and fairness at scale.
+                                                                 Han, S., Zhang, Q., Yao, Y., Jin, W., Xu, Z., and He, C.
+ACKNOWLEDGEMENTS                                                   Llm multi-agent systems: Challenges and open problems.
+                                                                   arXiv preprint arXiv:2402.03578, 2024.
+We sincerely thank the reviewers for their insightful com-
+ments and valuable suggestions. This work was sup-               Holmes, C., Tanaka, M., Wyatt, M., Awan, A. A., Rasley, J.,
+ported by the National Key R&D Program of China                    Rajbhandari, S., Aminabadi, R. Y., Qin, H., Bakhtiari, A.,
+(2024YFC3308000), Natural Science Foundation of China              Kurilenko, L., et al. Deepspeed-fastgen: High-throughput
+(No. 62536008, 62476265, 62306303).                                text generation for llms via mii and deepspeed-inference.
+                                                                   arXiv preprint arXiv:2401.08671, 2024.
+R EFERENCES                                                      Islam, M. A., Ali, M. E., and Parvez, M. R. Mapcoder:
+Achiam, J., Adler, S., Agarwal, S., Ahmad, L., Akkaya, I.,          Multi-agent code generation for competitive problem
+  Aleman, F. L., Almeida, D., Altenschmidt, J., Altman, S.,         solving. arXiv preprint arXiv:2405.11403, 2024.
+  Anadkat, S., et al. Gpt-4 technical report. arXiv preprint     Kamath, A. K., Prabhu, R., Mohan, J., Peter, S., Ramjee,
+  arXiv:2303.08774, 2023.                                          R., and Panwar, A. Pod-attention: Unlocking full prefill-
+                                                                   decode overlap for faster llm inference. In Proceedings of
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,             the 30th ACM International Conference on Architectural
+  N., Gulavani, B., Tumanov, A., and Ramjee, R. Taming             Support for Programming Languages and Operating Sys-
+  {Throughput-Latency} tradeoff in {LLM} inference with            tems, Volume 2, pp. 897–912, 2025.
+  {Sarathi-Serve}. In 18th USENIX Symposium on Operat-
+  ing Systems Design and Implementation (OSDI 24), pp.           Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+ 117–134, 2024.                                                   C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+                    F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+  memory management for large language model serving               Team, G., Anil, R., Borgeaud, S., Alayrac, J.-B., Yu, J., Sori-
+  with pagedattention. pp. 611–626, 2023.                            cut, R., Schalkwyk, J., Dai, A. M., Hauth, A., Millican,
+                                                                     K., et al. Gemini: a family of highly capable multimodal
+Li, G., Hammoud, H. A. A. K., Itani, H., Khizbullin, D., and
+                                                                     models. arXiv preprint arXiv:2312.11805, 2023.
+   Ghanem, B. Camel: Communicative agents for ”mind”
+   exploration of large language model society. In Thirty-         Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+   seventh Conference on Neural Information Processing               M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+  Systems, 2023.                                                     Azhar, F., et al. Llama: Open and efficient foundation lan-
+                                                                     guage models. arXiv preprint arXiv:2302.13971, 2023.
+Li, W., Chen, Z., Lin, J., Cao, H., Han, W., Liang, S., Zhang,
+   Z., Dong, K., Li, D., Zhang, C., et al. Reinforcement           Wang, L., Ma, C., Feng, X., Zhang, Z., Yang, H., Zhang, J.,
+   learning foundations for deep research systems: A survey.        Chen, Z., Tang, J., Chen, X., Lin, Y., et al. A survey on
+   arXiv preprint arXiv:2509.06733, 2025a.                          large language model based autonomous agents. Frontiers
+Li, X., Dong, G., Jin, J., Zhang, Y., Zhou, Y., Zhu, Y., Zhang,     of Computer Science, 18(6):186345, 2024.
+   P., and Dou, Z. Search-o1: Agentic search-enhanced              Wu, Q., Bansal, G., Zhang, J., Wu, Y., Li, B., Zhu, E., Jiang,
+   large reasoning models. arXiv preprint arXiv:2501.05366,         L., Zhang, X., Zhang, S., Liu, J., et al. Autogen: Enabling
+   2025b.                                                           next-gen llm applications via multi-agent conversation.
+NVIDIA.       Streamlining ai inference performance                 arXiv preprint arXiv:2308.08155, 2023.
+ and deployment with nvidia tensorrt-llm chun-                     Yang, A., Yang, B., Zhang, B., Hui, B., Zheng, B., Yu,
+ ked prefill.    NVIDIA Developer Blog, November                     B., Li, C., Liu, D., Huang, F., Wei, H., et al. Qwen2. 5
+ 2023.       URL https://nvidia.github.io/                           technical report. arXiv preprint arXiv:2412.15115, 2024.
+ TensorRT-LLM/advanced/gpt-attention.
+ html#chunked-context.                                             Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+                                                                     Yu, B., Gao, C., Huang, C., Lv, C., et al. Qwen3 technical
+Pan, Z., Patel, A., Hu, Z., Shen, Y., Guan, Y., Li, W.-L.,
+                                                                     report. arXiv preprint arXiv:2505.09388, 2025.
+  Qin, L., Wang, Y., and Ding, Y. Kvflow: Efficient prefix
+  caching for accelerating llm-based multi-agent workflows.        Yao, J., Li, H., Liu, Y., Ray, S., Cheng, Y., Zhang, Q., Du,
+  arXiv preprint arXiv:2507.07400, 2025.                             K., Lu, S., and Jiang, J. Cacheblend: Fast large language
+                                                                     model serving for rag with cached knowledge fusion. In
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í., Maleki,
+                                                                     Proceedings of the Twentieth European Conference on
+  S., and Bianchini, R. Splitwise: Efficient generative llm
+                                                                     Computer Systems, pp. 94–109, 2025.
+  inference using phase splitting. In 2024 ACM/IEEE 51st
+  Annual International Symposium on Computer Architec-             Ye, Z., Chen, L., Lai, R., Lin, W., Zhang, Y., Wang, S.,
+  ture (ISCA), pp. 118–132. IEEE, 2024.                              Chen, T., Kasikci, B., Grover, V., Krishnamurthy, A.,
+Rajasekaran, P., Dixon, E., Ryan, C., and Hadfield, J.               et al. Flashinfer: Efficient and customizable attention
+  Effective context engineering for ai agents, Septem-               engine for llm inference serving. In Eighth Conference
+  ber 2025.       URL https://www.anthropic.                         on Machine Learning and Systems, 2025.
+  com/engineering/effective-context-                               Zhang, W., Li, X., Zhang, Y., Jia, P., Wang, Y., Guo, H., Liu,
+  engineering-for-ai-agents.                                         Y., and Zhao, X. Deep research: A survey of autonomous
+Schluntz, E. and Zhang, B.    Building effec-                        research agents. arXiv preprint arXiv:2508.12752, 2025.
+  tive agents, December 2024.  URL https:                          Zhao, W. X., Zhou, K., Li, J., Tang, T., Wang, X., Hou, Y.,
+  //www.anthropic.com/engineering/                                   Min, Y., Zhang, B., Zhang, J., Dong, Z., et al. A survey of
+  building-effective-agents.                                         large language models. arXiv preprint arXiv:2303.18223,
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper,           1(2), 2023.
+  J., and Catanzaro, B. Megatron-lm: Training multi-
+                                                                   Zheng, H., Guan, X., Kong, H., Zhang, W., Zheng, J., Zhou,
+  billion parameter language models using model paral-
+                                                                     W., Lin, H., Lu, Y., Han, X., and Sun, L. Pptagent: Gener-
+  lelism. arXiv preprint arXiv:1909.08053, 2019.
+                                                                     ating and evaluating presentations beyond text-to-slides.
+Silberschatz, A., Galvin, P. B., and Gagne, G. Operating             In Proceedings of the 2025 Conference on Empirical
+   system concepts. Wiley, 10th edition, 2018.                       Methods in Natural Language Processing, pp. 14413–
+                                                                     14429, 2025.
+Tan, X., Jiang, Y., Yang, Y., and Xu, H. Teola: Towards
+  end-to-end optimization of llm-based applications. arXiv         Zheng, L., Yin, L., Xie, Z., Sun, C. L., Huang, J., Yu, C. H.,
+  preprint arXiv:2407.00326, 2024.                                   Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+                    F LASH AGENTS: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap
+
+  Sglang: Efficient execution of structured language model
+  programs. Advances in Neural Information Processing
+  Systems, 37:62557–62583, 2024a.
+Zheng, Z., Ji, X., Fang, T., Zhou, F., Liu, C., and Peng,
+  G. Batchllm: Optimizing large batched llm inference
+  with global prefix sharing and throughput-oriented token
+  batching. arXiv preprint arXiv:2412.03594, 2024b.
+
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X.,
+  and Zhang, H. {DistServe}: Disaggregating prefill and
+  decoding for goodput-optimized large language model
+  serving. In 18th USENIX Symposium on Operating Sys-
+  tems Design and Implementation (OSDI 24), pp. 193–210,
+  2024.
+
