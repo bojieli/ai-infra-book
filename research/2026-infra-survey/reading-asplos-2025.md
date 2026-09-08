@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 34 份代表 PDF、完成 35 篇原始完整摘要筛选，五篇有声明范围的正文阅读；其余 149 篇摘要未读。本轮选读 Diffuse 的物理页 2–13 与 CXLfork 的物理页 2–14，共 25 页，八页图表已查看；未新增摘要或 PDF。各补现有融合与环境恢复的设计判断，不增论文专题。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 34 份代表 PDF、完成 35 篇原始完整摘要筛选，六篇有声明范围的正文阅读；其余 149 篇摘要未读。本轮补读 DarwinGame 物理页 1–13，七页图表已查看，未新增摘要或 PDF。它只补现有自动调优实验的比较条件，不增赛制专题。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -25,7 +25,7 @@
 | 28. [PICACHU: Plug-In CGRA Handling Upcoming Nonlinear Operations in LLMs](../../references/proceedings/ASPLOS/2025/public/paper-028.pdf) | 候选待读 | PICACHU 以可重构单元加速非线性操作，候选对应第 4／13 章资源配比；需核模型、精度、仿真和实际接口，不从摘要采用加速比。 |
 | 33. [Coach: Exploiting Temporal Patterns for All-Resource Oversubscription in Cloud Platforms](../../references/proceedings/ASPLOS/2025/public/paper-033.pdf) | 候选待读 | Azure 多资源超售与时间互补，可能补 11 的 CPU 环境容量；需与 CASSINI／Weave 的互补调度比较，避免泛化到 GPU。 |
 | 34. [Cooperative Graceful Degradation in Containerized Clouds](../../references/proceedings/ASPLOS/2025/public/paper-034.pdf) | 备查 | Phoenix 按应用依赖和关键性关闭非关键容器，作为第 11 章故障降级备查；不把一般微服务的可用性直接当作 Agent 成功率。 |
-| 35. [DarwinGame: Playing Tournaments for Tuning Applications in Noisy Cloud Environments](../../references/proceedings/ASPLOS/2025/public/paper-035.pdf) | 候选待读 | 共享机器上的噪声可能改变自动调优的排序，候选对应 5.3.5；先核配对比较和干扰假设，作者稿晚于正式出版且保留占位 DOI。 |
+| 35. [DarwinGame: Playing Tournaments for Tuning Applications in Noisy Cloud Environments](../../references/proceedings/ASPLOS/2025/public/paper-035.pdf) | 重点阅读并整合 | 物理页 1–13 已读；配对测量与候选之间的争用补 5.3.5／实验 5-6。公开工件与论文算法有差距，仅作方法对照，不采用 CPU 加速比或声称 GPU 可复现。 |
 | 79. [MVQ: Towards Efficient DNN Compression and Acceleration with Masked Vector Quantization](../../references/proceedings/ASPLOS/2025/public/paper-079.pdf) | 备查 | N:M 剪枝、向量码本和阵列协同，实验主要是视觉 CNN；已有模型量化主线，暂不增算法小节。 |
 | 87. [Bounding Speculative Execution of Atomic Regions to a Single Retry](../../references/proceedings/ASPLOS/2025/public/paper-087.pdf) | 排除 | 共享内存原子区域的事务重试与 cacheline 锁，区别于 LLM 的推测解码和 rollout 重试。 |
 | 94. [FSMoE: A Flexible and Scalable Training System for Sparse Mixture-of-Experts Models](../../references/proceedings/ASPLOS/2025/public/paper-094.pdf) | 重点阅读并整合 | 已读物理页 1–13；采用梯度就绪、共享跨机链路与分桶空隙的判断，接 10.3 和实验 10-5；历史改型模型与当前预算分开。 |
@@ -67,6 +67,10 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 **CXLfork**：物理页 2–14 共十三页已读，包含设计、评估、讨论和参考文献起始；15–17 页未读。图 4／5、方法页与图 8／9 所在四页已查看，见[阅读记录](../../references/proceedings/ASPLOS/2025/cxlfork-reading.json)。检查点制作会把数据复制到 CXL，恢复时只读映射与写时复制改变的是后续成本；全局 OS 状态仍需重建。所谓 ghost container 在正文中仍占约 512 KB；只报本地内存减少会漏掉共享池容量。
 
 作者原型为 Linux 6.6、一台双路主机上的两个 VM 和 FPGA CXL 装置，Mitosis-CXL 比较在单 VM 内替代 RDMA。独立函数恢复不含容器和检查点制作；服务突发结果又包含 ghost container 条件差异。正文明确未验证大规模节点和共享带宽，延迟敏感性由校准模拟获得。这些条件不等于生产 E2B microVM 的部署或 GPU 状态恢复。[固定 E2B 缺页调用链](../../references/framework-history/2026-09-09/snapshot-residency/README.md)提供六份响应、十个选读范围：模板读取后安装虚拟机内存，与直接映射共享只读页分开。[同一模板推算](../../case-studies/snapshot-residency-and-first-use.md)独立算并发驻留、共享读取、首次访问粒度，接入 11.2、实验 11-2 与原图 11-3，不采用论文加速比作为当前结果。
+
+**DarwinGame**：物理页 1–13 通读，参考文献页 14–16 未读，七张图页已查看，见[正文记录](../../references/proceedings/ASPLOS/2025/darwingame-reading.json)。论文在 CPU 云端运行不同配置的应用副本，用相对比赛应对噪声；外界噪声接近不代表候选造成的争用相同。采用这一限制来连接独占内核、并发片段和实际请求，而不将整个赛制写进大纲。
+
+[作者工件与真实框架](../../references/framework-history/2026-09-09/tuning-measurement/README.md)补出了具体差距：随机等待的应用入口、没有进度提前停止的所读比赛、时间减一致性的分数、顺序执行的决赛，都不能冒充论文对应机制的复现。配置还需单独验证质量与应用语义；论文的 CPU 测试不证明当前 GPU 引擎收益。对应的 vLLM 2024／2025／2026 RMSNorm 仍测主机循环，激活 benchmark 与 FlashInfer-Bench 又使用不同计时入口。用[现有案例](../../case-studies/optimization-evaluation-and-deployment.md)的测量顺序、条件混合与 Qwen3 拼接宽度推算补实验 5-6，不新增正文事实清单。
 
 ## 尚缺的材料
 

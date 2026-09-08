@@ -748,3 +748,6 @@
 | `asplos25-cxlfork-body` | [CXLfork 正文范围](../references/proceedings/ASPLOS/2025/cxlfork-reading.json) | 6、11 | 补充／版本参照 | 十三页正文与四张图页；进程原型、共享页和分层限制 |
 | `snapshot-residency-e2b` | [E2B 模板读取与内存安装](../references/framework-history/2026-09-09/snapshot-residency/README.md) | 11 | 补充／版本参照 | 固定提交、六份响应／十个范围；不将原型当作云服务实现 |
 | `snapshot-residency-case` | [快照恢复与首次访问预算](../case-studies/snapshot-residency-and-first-use.md) | 11 | 扩写 11 | 实验 11-2／图 11-3 的容量、共享带宽与粒度变体 |
+| `asplos25-darwingame-body` | [DarwinGame 正文范围](../references/proceedings/ASPLOS/2025/darwingame-reading.json) | 5 | 补充／版本参照 | 十三页正文与七张图页；CPU 配置比赛的噪声与争用条件 |
+| `tuning-measurement-framework` | [公开工件与框架计时](../references/framework-history/2026-09-09/tuning-measurement/README.md) | 5、8 | 补充／版本参照 | vLLM 三个年份、FlashInfer-Bench 固定入口；十四份响应和二十一个范围 |
+| `tuning-measurement-case` | [比较顺序与实际形状](../case-studies/optimization-evaluation-and-deployment.md) | 2、5 | 扩写 5 | 实验 5-6／5-9：配对、争用和 Qwen3 SwiGLU 局部宽度 |

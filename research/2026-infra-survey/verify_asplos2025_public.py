@@ -86,10 +86,10 @@ def verify():
         title = re.search(r'^Title:\s*(.+)', info, re.M)
         assert norm(p['title']) in norm(data.decode()) or (title and norm(p['title']) == norm(title[1]))
     selected = [p for p in papers.values() if p['reading_status'] == 'selected_sections_read']
-    assert len(selected) == manifest['selected_sections_read'] == 5
-    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 94}
-    expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 94: range(1, 14)}
-    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (94, 'fsmoe-reading.json')]:
+    assert len(selected) == manifest['selected_sections_read'] == 6
+    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 35, 94}
+    expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 35: range(1, 14), 94: range(1, 14)}
+    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (35, 'darwingame-reading.json'), (94, 'fsmoe-reading.json')]:
         proof = json.loads((D / filename).read_text()); reading = proof['reading']
         assert reading == papers[order]['selected_reading']
         assert reading['physical_pdf_pages'] == list(expected_pages[order])
