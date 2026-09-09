@@ -1,6 +1,6 @@
 # POD：从研究内核到库接口
 
-2026-09-09。固定 `microsoft/vattention` 为 `71a0e91aa46ff8fa985bcca3327efe0ab9929a39`（2026-08-24），`flashinfer-ai/flashinfer` 为 `b6aed59786374d437b64b054488d0740ad5f5468`（2026-09-09）。十一份原始响应及散列见 [sources.json](sources.json)，实际读取范围见 [reading.json](reading.json)。保存源码不表示全部读过；本轮没有运行下载代码、编译器、模型或 GPU 测试。
+2026-09-09。固定 `microsoft/vattention` 为 `71a0e91aa46ff8fa985bcca3327efe0ab9929a39`（2026-08-24），`flashinfer-ai/flashinfer` 为 `b6aed59786374d437b64b054488d0740ad5f5468`（2026-09-09）。十七份原始响应（十六份成功、一份旧路径 404）及散列见 [sources.json](sources.json)，实际读取范围见 [reading.json](reading.json)。保存源码不表示全部读过；本轮没有运行下载代码、编译器、模型或 GPU 测试。
 
 论文方法及算例已在[前一阶段](../../../proceedings/ASPLOS/2025/serving-113-117/README.md)记录。这里补充库接口的边界，不再新增小节或实验。
 
@@ -23,4 +23,16 @@
 
 这给已有实验增加的是测量边界：分别记录输入准备、计数区初始化、主 kernel、split KV 合并，以及完整迭代时间，再解释融合减少了哪部分等待。没有运行实验，不能将静态路径转写为实测加速结论。
 
-后续仍需读 FlashInfer 的底层 POD dispatch／launch、对照上层服务调用方与不同图模式。研究版源码与 FlashInfer wrapper 是不同实现，不能用前者的分配路径解释后者的运行开销。没有新增论文摘要或正文阅读计数。
+后续补读的 FlashInfer 底层 POD dispatch／launch 见下文；上层服务调用方与不同图模式仍待核对。研究版源码与 FlashInfer 是不同实现，不能用前者的分配路径解释后者的运行开销。没有新增论文摘要或正文阅读计数。
+
+
+FlashInfer 固定提交的底层核对进一步区分了准备与稳态：
+
+- `get_pod_module` 对参数组合缓存构建结果；`gen_customize_pod_module` 按 prefill／decode 各四种 mask 枚举生成 16 个实例源文件，另加 `pod.cu`、binding 两个源文件。18 个源文件不等于 18 次 kernel 启动，也不代表测得了编译时间。首次构建、已有 JIT 缓存及 CUDA Graph 准备需要分别计时。
+- 所读 `pod.cu` 将 decode 的 CTA tile 固定为 16；`pod.cuh` 则结合 prefill 长度、GQA 组大小、head dimension 和设备能力选择 prefill tile，并根据共享内存等条件决定 split KV。这里存在启发式与 TODO 注释，不能把规则当作最优分块的保证。两阶段 dtype、head 数也受共同约束，不是任意两个注意力任务都能拼接。
+- FlashInfer 的计数区是模板函数中的 `static` 指针：为空时分配，每次路径都会清零。研究版所读 launch 则在局部指针上直接分配；不能把二者写成相同的每次分配行为。当前未核验跨设备、跨流并发调用的生命周期与安全性，不据这一片段宣称存在运行故障或全面兼容。
+- 主 kernel 之后，prefill 按条件调用 `MergeStates`／`AttentionSum`，decode 按条件调用变长合并；该分支也区分普通 launch 与 PDL launch。因此图内主 attention 与整个调用仍有不同的计时边界。这里确认了合并调用存在，未继续阅读所有合并内核和 PDL 的实际执行效果。
+
+此次路径是 Python wrapper → JIT 生成函数 → CUDA 入口 → POD dispatch，尚未核对最终构建工具、链接导出和完整 device kernel。也没有找到并验证上层 vLLM／SGLang 服务调用，因此不能把库实现存在写成上层框架已采用。网页搜索无结果不作为未采用的证据。
+
+原 `flashinfer/jit/attention.py` 路径在固定提交返回 404，响应原样保留；随后以完整 Git tree 定位 `flashinfer/jit/attention/modules.py`。目录改动不推断为行为改动。所有新增材料只深化既有第 5 章 POD／图执行说明，不新增章节或实验。

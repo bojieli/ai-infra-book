@@ -1,0 +1,2208 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import os
+from typing import Any, List, Optional
+
+import jinja2
+import torch
+
+from .. import env as jit_env
+from ..core import (
+    JitSpec,
+    common_nvcc_flags,
+    gen_jit_spec,
+    logger,
+    sm90a_nvcc_flags,
+    current_compilation_context,
+)
+from ...jit.cubin_loader import get_artifact, get_meta_hash
+from ..utils import (
+    dtype_map,
+    dtype_map_kv,
+    filename_safe_dtype_map,
+    filename_safe_dtype_map_kv,
+    mask_mode_literal,
+    pos_encoding_mode_literal,
+    write_if_different,
+)
+from .utils import _is_nvfp4_kv_dtype, generate_additional_params
+from .fmha_v2.generate_kernels import enumerate_kernels
+from .fmha_v2.fmha_library import generate_jit_sources
+
+
+class _BatchMLAModuleProxy:
+    """Stages Batch MLA planner metadata through PyTorch-owned pinned memory."""
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    @staticmethod
+    def _validate_workspace(
+        int_workspace: torch.Tensor, page_locked_workspace: torch.Tensor
+    ) -> None:
+        if (
+            page_locked_workspace.device.type != "cpu"
+            or not page_locked_workspace.is_pinned()
+            or not page_locked_workspace.is_contiguous()
+        ):
+            raise ValueError(
+                "page_locked_workspace must be a pinned, contiguous CPU tensor."
+            )
+        if int_workspace.device.type != "cuda" or not int_workspace.is_contiguous():
+            raise ValueError("int_workspace must be a contiguous CUDA tensor.")
+
+    def plan_with_staged_workspace_bytes(self, *args: object) -> tuple[object, int]:
+        if (
+            len(args) < 3
+            or not isinstance(args[1], torch.Tensor)
+            or not isinstance(args[2], torch.Tensor)
+        ):
+            raise ValueError("Batch MLA plan requires integer and pinned workspaces.")
+        int_workspace = args[1]
+        page_locked_workspace = args[2]
+        self._validate_workspace(int_workspace, page_locked_workspace)
+        plan_info, staged_int_workspace_bytes = self._module.plan(*args)
+        staged_int_workspace_bytes = int(staged_int_workspace_bytes)
+        scratch_bytes = page_locked_workspace.view(torch.uint8)
+        device_bytes = int_workspace.view(torch.uint8)
+        if (
+            staged_int_workspace_bytes < 0
+            or staged_int_workspace_bytes > scratch_bytes.numel()
+            or staged_int_workspace_bytes > device_bytes.numel()
+        ):
+            raise ValueError(
+                "Batch MLA planner returned invalid "
+                f"staged_int_workspace_bytes={staged_int_workspace_bytes} for "
+                f"scratch={scratch_bytes.numel()} and device={device_bytes.numel()}."
+            )
+        staging = torch.empty(
+            staged_int_workspace_bytes, dtype=torch.uint8, pin_memory=True
+        )
+        staging.copy_(scratch_bytes[:staged_int_workspace_bytes])
+        with torch.cuda.device(int_workspace.device):
+            device_bytes[:staged_int_workspace_bytes].copy_(staging, non_blocking=True)
+        return plan_info, staged_int_workspace_bytes
+
+    def plan(self, *args: object) -> object:
+        return self.plan_with_staged_workspace_bytes(*args)[0]
+
+
+def get_single_decode_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> str:
+    return (
+        f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}"
+    )
+
+
+def get_batch_decode_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> str:
+    return (
+        f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}"
+    )
+
+
+def get_batch_mla_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    use_profiler: bool,
+) -> str:
+    return (
+        f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_ckv_{head_dim_ckv}_"
+        f"head_dim_kpe_{head_dim_kpe}_"
+        f"profiler_{use_profiler}_planabi2"
+    ) + ("_sm90" if backend == "fa3" else "")
+
+
+def gen_batch_mla_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    use_profiler: bool,
+) -> JitSpec:
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
+    uri = get_batch_mla_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_ckv,
+        head_dim_kpe,
+        use_profiler,
+    )
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    os.makedirs(gen_directory, exist_ok=True)
+
+    if backend == "fa2":
+        with open(jit_env.FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+        generated_config_path = gen_directory / "batch_mla_config.inc"
+        write_if_different(
+            generated_config_path,
+            config_templ.render(
+                dtype_q=dtype_map[dtype_q],
+                dtype_kv=dtype_map_kv[dtype_kv],
+                dtype_o=dtype_map[dtype_o],
+                dtype_idx=dtype_map[dtype_idx],
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+            ),
+        )
+
+        source_paths = []
+        for filename in [
+            "batch_mla_plan.cu",
+            "batch_mla_run.cu",
+            "batch_mla_binding.cu",
+        ]:
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+    elif backend == "fa3":
+        with open(jit_env.FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+        generated_config_path = gen_directory / "batch_mla_sm90_config.inc"
+        write_if_different(
+            generated_config_path,
+            config_templ.render(
+                dtype_q=dtype_map[dtype_q],
+                dtype_kv=dtype_map_kv[dtype_kv],
+                dtype_o=dtype_map[dtype_o],
+                dtype_idx=dtype_map[dtype_idx],
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+            ),
+        )
+        source_paths = []
+        for filename in [
+            "batch_mla_sm90_plan.cu",
+            "batch_mla_sm90_run.cu",
+            "batch_mla_sm90_binding.cu",
+        ]:
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    extra_cuda_cflags = []
+    if backend == "fa3":
+        extra_cuda_cflags += sm90a_nvcc_flags
+    if use_profiler:
+        extra_cuda_cflags += ["-DFLASHINFER_ENABLE_PROFILER"]
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=extra_cuda_cflags,
+        post_load_adapter=_BatchMLAModuleProxy,
+    )
+
+
+def get_batch_decode_mla_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_ckv: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    arc: str,
+) -> str:
+    return (
+        f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_ckv{head_dim_ckv}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"arc_{arc}"
+    )
+
+
+def gen_batch_decode_mla_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    num_qo_heads: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_tensor_cores: bool,
+) -> JitSpec:
+    cuda_arch_major = torch.cuda.get_device_properties(0).major
+
+    if cuda_arch_major >= 9:  # smem size of SM90 can accommodate all 128 qo-heads data
+        qo_tile_len = 128
+    else:
+        qo_tile_len = 64
+
+    if (
+        use_tensor_cores
+        and cuda_arch_major >= 8
+        and num_qo_heads % qo_tile_len == 0
+        and dtype_q == torch.float16
+        and dtype_kv == torch.float16
+        and dtype_o == torch.float16
+    ):
+        logger.info("Use tensor-core SM80 version of MLA decode kernel.")
+        arc = "sm80"
+    else:
+        logger.info("Fall back to cuda-core version of MLA decode kernel.")
+        arc = "cuda_core"
+
+    uri = get_batch_decode_mla_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        use_sliding_window,
+        use_logits_soft_cap,
+        arc,
+    )
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    os.makedirs(gen_directory, exist_ok=True)
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+    generated_config_path = gen_directory / "mla_config.inc"
+    write_if_different(
+        generated_config_path,
+        config_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map_kv[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            dtype_idx=dtype_map[dtype_idx],
+            head_dim_ckv=head_dim,
+            head_dim_kpe=head_dim // 8,
+            qo_tile_len=qo_tile_len,
+            use_sliding_window=str(use_sliding_window).lower(),
+            use_logits_soft_cap=str(use_logits_soft_cap).lower(),
+        ),
+    )
+
+    filenames = []
+    if arc == "sm80":
+        filenames = [
+            "batch_decode_mla_cute_sm80.cu",
+            "batch_decode_mla_binding.cu",
+        ]
+    else:
+        filenames = [
+            "batch_decode_mla_plan.cu",
+            "batch_decode_mla_run.cu",
+            "batch_decode_mla_binding.cu",
+        ]
+
+    source_paths = []
+    for filename in filenames:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    return gen_jit_spec(uri, source_paths)
+
+
+def get_single_prefill_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> str:
+    return (
+        f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+    )
+
+
+def get_pod_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode_p: int,
+    use_sliding_window_p: bool,
+    use_logits_soft_cap_p: bool,
+    use_fp16_qk_reduction: bool,
+    dtype_idx: torch.dtype,
+    pos_encoding_mode_d: int,
+    use_sliding_window_d: bool,
+    use_logits_soft_cap_d: bool,
+) -> str:
+    return (
+        f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"head_dim_{head_dim}_"
+        f"posenc_p_{pos_encoding_mode_p}_"
+        f"use_swa_p_{use_sliding_window_p}_"
+        f"use_logits_cap_p_{use_logits_soft_cap_p}_"
+        f"posenc_d_{pos_encoding_mode_d}_"
+        f"use_swa_d_{use_sliding_window_d}_"
+        f"use_logits_cap_d_{use_logits_soft_cap_d}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"f16qk_{use_fp16_qk_reduction}"
+    )
+
+
+def get_batch_prefill_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> str:
+    return (
+        f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+    )
+
+
+def get_batch_prefill_attention_sink_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+) -> str:
+    return (
+        f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"use_swa_{use_sliding_window}_" + ("_sm90" if backend == "fa3" else "")
+    )
+
+
+def get_batch_attention_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+) -> str:
+    return (
+        f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_logits_soft_cap_{str(use_logits_soft_cap).lower()}_"
+        f"use_profiler_{str(use_profiler).lower()}"
+    )
+
+
+def gen_single_decode_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> JitSpec:
+    uri = get_single_decode_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+    )
+    return gen_customize_single_decode_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        ["maybe_alibi_slopes"],  # additional_tensor_names
+        ["float"],  # additional_tensor_dtypes
+        [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+        ],  # additional_scalar_names
+        ["double", "double", "double", "double"],  # additional_scalar_dtypes
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        "#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+    )
+
+
+def gen_single_prefill_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    uri = get_single_prefill_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+    )
+
+    # use `fp8_enabled` flag to use separate kernel template
+    # this is used for fp8 tensor core computation
+    # KV-only quant is not influenced by this flag
+    fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+    if backend == "fa2":
+        assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
+        additional_tensor_names = [
+            "maybe_custom_mask",
+            "maybe_alibi_slopes",
+            "maybe_k_cache_sf",
+            "maybe_v_cache_sf",
+        ]
+        additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
+        additional_scalar_names = [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+        ]
+        additional_scalar_dtypes = ["double", "double", "double", "double"]
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_decl = "#include<flashinfer/attention/variants.cuh>"
+    else:
+        if not fp8_enabled:
+            additional_tensor_names = ["maybe_scale_v"]
+            additional_tensor_dtypes = ["float"]
+            additional_scalar_names = ["logits_soft_cap", "sm_scale", "scale_v_scalar"]
+            additional_scalar_dtypes = ["double", "double", "double"]
+            variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+        else:
+            additional_tensor_names = [
+                "maybe_scale_q",
+                "maybe_scale_k",
+                "maybe_scale_v",
+            ]
+            additional_tensor_dtypes = ["float", "float", "float"]
+            additional_scalar_names = [
+                "sm_scale",
+                "scale_q_scalar",
+                "scale_k_scalar",
+                "scale_v_scalar",
+            ]
+            additional_scalar_dtypes = ["double", "double", "double", "double"]
+            variant_name = "DefaultFP8Attention"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+
+    return gen_customize_single_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+        fp8_enabled=fp8_enabled,
+    )
+
+
+def gen_pod_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode_p: int,
+    use_sliding_window_p: bool,
+    use_logits_soft_cap_p: bool,
+    use_fp16_qk_reduction: bool,
+    dtype_idx: torch.dtype,
+    pos_encoding_mode_d: int,
+    use_sliding_window_d: bool,
+    use_logits_soft_cap_d: bool,
+) -> JitSpec:
+    uri = get_pod_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        pos_encoding_mode_p,
+        use_sliding_window_p,
+        use_logits_soft_cap_p,
+        use_fp16_qk_reduction,
+        dtype_idx,
+        pos_encoding_mode_d,
+        use_sliding_window_d,
+        use_logits_soft_cap_d,
+    )
+    additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
+    additional_tensor_dtypes = ["uint8_t", "float"]
+    additional_scalar_names = [
+        "logits_soft_cap",
+        "sm_scale",
+        "rope_rcp_scale",
+        "rope_rcp_theta",
+    ]
+    additional_scalar_dtypes = ["float", "float", "float", "float"]
+    variant_name_p = f"DefaultAttention<use_custom_mask_p, {str(use_sliding_window_p).lower()}, {str(use_logits_soft_cap_p).lower()}, {str(pos_encoding_mode_p == 2).lower()}>"
+    variant_name_d = f"DefaultAttention<use_custom_mask_d, {str(use_sliding_window_d).lower()}, {str(use_logits_soft_cap_d).lower()}, {str(pos_encoding_mode_d == 2).lower()}>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
+
+    return gen_customize_pod_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name_p,
+        variant_name_d,
+        variant_decl,
+        pos_encoding_mode_p=pos_encoding_mode_p,
+        use_sliding_window_p=use_sliding_window_p,
+        use_logits_soft_cap_p=use_logits_soft_cap_p,
+        pos_encoding_mode_d=pos_encoding_mode_d,
+        use_sliding_window_d=use_sliding_window_d,
+        use_logits_soft_cap_d=use_logits_soft_cap_d,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+    )
+
+
+def gen_batch_pod_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode_p: int,
+    use_sliding_window_p: bool,
+    use_logits_soft_cap_p: bool,
+    use_fp16_qk_reduction: bool,
+    dtype_idx: torch.dtype,
+    pos_encoding_mode_d: int,
+    use_sliding_window_d: bool,
+    use_logits_soft_cap_d: bool,
+) -> JitSpec:
+    uri = "batch_" + get_pod_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        pos_encoding_mode_p,
+        use_sliding_window_p,
+        use_logits_soft_cap_p,
+        use_fp16_qk_reduction,
+        dtype_idx,
+        pos_encoding_mode_d,
+        use_sliding_window_d,
+        use_logits_soft_cap_d,
+    )
+    additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
+    additional_tensor_dtypes = ["uint8_t", "float"]
+    additional_scalar_names = [
+        "logits_soft_cap",
+        "sm_scale",
+        "rope_rcp_scale",
+        "rope_rcp_theta",
+    ]
+    additional_scalar_dtypes = ["float", "float", "float", "float"]
+    variant_name_p = f"DefaultAttention<use_custom_mask_p, {str(use_sliding_window_p).lower()}, {str(use_logits_soft_cap_p).lower()}, {str(pos_encoding_mode_p == 2).lower()}>"
+    variant_name_d = f"DefaultAttention<use_custom_mask_d, {str(use_sliding_window_d).lower()}, {str(use_logits_soft_cap_d).lower()}, {str(pos_encoding_mode_d == 2).lower()}>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
+
+    return gen_customize_batch_pod_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name_p,
+        variant_name_d,
+        variant_decl,
+        pos_encoding_mode_p=pos_encoding_mode_p,
+        use_sliding_window_p=use_sliding_window_p,
+        use_logits_soft_cap_p=use_logits_soft_cap_p,
+        pos_encoding_mode_d=pos_encoding_mode_d,
+        use_sliding_window_d=use_sliding_window_d,
+        use_logits_soft_cap_d=use_logits_soft_cap_d,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+    )
+
+
+def gen_customize_pod_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name_p: str,
+    variant_name_d: str,
+    variant_decl: str,
+    pos_encoding_mode_p: int = 0,
+    use_sliding_window_p: bool = False,
+    use_logits_soft_cap_p: bool = False,
+    pos_encoding_mode_d: int = 0,
+    use_sliding_window_d: bool = False,
+    use_logits_soft_cap_d: bool = False,
+    use_fp16_qk_reduction: bool = False,
+) -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+
+    (
+        additional_params_decl,
+        additional_func_params,
+        additional_params_setter,
+    ) = generate_additional_params(
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+    )
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "pod_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "pod_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs = {
+        "additional_func_params": additional_func_params,
+        "additional_params_decl": additional_params_decl,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name_p": variant_name_p,
+        "variant_name_d": variant_name_d,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[dtype_idx],
+        "head_dim_qk": head_dim,
+        "head_dim_vo": head_dim,
+        "pos_encoding_mode_p": pos_encoding_mode_literal[pos_encoding_mode_p],
+        "pos_encoding_mode_d": pos_encoding_mode_literal[pos_encoding_mode_d],
+        "use_sliding_window_p": str(use_sliding_window_p).lower(),
+        "use_logits_soft_cap_p": str(use_logits_soft_cap_p).lower(),
+        "use_sliding_window_d": str(use_sliding_window_d).lower(),
+        "use_logits_soft_cap_d": str(use_logits_soft_cap_d).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+
+    os.makedirs(gen_directory, exist_ok=True)
+    generated_config_path = gen_directory / "pod_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+
+    source_paths = []
+
+    for mask_mode_p in [0, 1, 2, 3]:
+        for mask_mode_d in [0, 1, 2, 3]:
+            kwargs["mask_mode_p"] = mask_mode_literal[mask_mode_p]
+            kwargs["mask_mode_d"] = mask_mode_literal[mask_mode_d]
+
+            filename = f"pod_kernel_mask_{mask_mode_p}p_{mask_mode_d}d.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+    for filename in [
+        "pod.cu",
+        "pod_jit_binding.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    return gen_jit_spec(uri, source_paths)
+
+
+def gen_customize_batch_pod_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name_p: str,
+    variant_name_d: str,
+    variant_decl: str,
+    pos_encoding_mode_p: int = 0,
+    use_sliding_window_p: bool = False,
+    use_logits_soft_cap_p: bool = False,
+    pos_encoding_mode_d: int = 0,
+    use_sliding_window_d: bool = False,
+    use_logits_soft_cap_d: bool = False,
+    use_fp16_qk_reduction: bool = False,
+) -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+
+    (
+        additional_params_decl,
+        additional_func_params,
+        additional_params_setter,
+    ) = generate_additional_params(
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+    )
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_pod_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_pod_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs = {
+        "additional_func_params": additional_func_params,
+        "additional_params_decl": additional_params_decl,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name_p": variant_name_p,
+        "variant_name_d": variant_name_d,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[dtype_idx],
+        "head_dim_qk": head_dim,
+        "head_dim_vo": head_dim,
+        "pos_encoding_mode_p": pos_encoding_mode_literal[pos_encoding_mode_p],
+        "pos_encoding_mode_d": pos_encoding_mode_literal[pos_encoding_mode_d],
+        "use_sliding_window_p": str(use_sliding_window_p).lower(),
+        "use_logits_soft_cap_p": str(use_logits_soft_cap_p).lower(),
+        "use_sliding_window_d": str(use_sliding_window_d).lower(),
+        "use_logits_soft_cap_d": str(use_logits_soft_cap_d).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+
+    os.makedirs(gen_directory, exist_ok=True)
+    generated_config_path = gen_directory / "batch_pod_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+
+    source_paths = []
+
+    for mask_mode_p in [0, 1, 2, 3]:
+        for mask_mode_d in [0, 1, 2, 3]:
+            kwargs["mask_mode_p"] = mask_mode_literal[mask_mode_p]
+            kwargs["mask_mode_d"] = mask_mode_literal[mask_mode_d]
+
+            filename = f"batch_pod_kernel_mask_{mask_mode_p}p_{mask_mode_d}d.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+    for filename in [
+        "batch_pod.cu",
+        "batch_pod_jit_binding.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    return gen_jit_spec(uri, source_paths)
+
+
+def gen_batch_decode_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> JitSpec:
+    uri = get_batch_decode_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+    )
+    return gen_customize_batch_decode_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        ["maybe_alibi_slopes"],  # additional_tensor_names
+        ["float"],  # additional_tensor_dtypes
+        [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+        ],  # additional_scalar_names
+        ["double", "double", "double", "double"],  # additional_scalar_dtypes
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        "#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+    )
+
+
+def gen_batch_prefill_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    uri = get_batch_prefill_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+    )
+
+    # use `fp8_enabled` flag to use separate kernel template
+    # this is used for fp8 tensor core computation
+    # KV-only quant is not influenced by this flag
+    fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+    assert backend in ["fa2", "fa3"], (
+        f"backend must be fa2 or fa3 in gen_batch_prefill_module(), got: {backend}"
+    )
+    assert dtype_o not in [torch.float8_e4m3fn, torch.float8_e5m2], (
+        "FP8 output is not supported in fa2/fa3 backends yet"
+    )
+
+    if backend == "fa2":
+        assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
+        additional_tensor_names = [
+            "maybe_custom_mask",
+            "maybe_mask_indptr",
+            "maybe_alibi_slopes",
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
+            "maybe_k_cache_sf",
+            "maybe_v_cache_sf",
+        ]
+        additional_tensor_dtypes = [
+            "uint8_t",
+            "int32_t",
+            "float",
+            "uint32_t",
+            "uint16_t",
+            "uint16_t",
+            "uint8_t",
+            "uint8_t",
+        ]  # NOTE(Zihao): int32_t should follow dtype_idx
+        additional_scalar_names = [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+            "token_pos_in_items_len",
+        ]
+        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_decl = "#include<flashinfer/attention/variants.cuh>"
+    else:
+        if not fp8_enabled:
+            additional_tensor_names = [
+                "maybe_prefix_len_ptr",
+                "maybe_token_pos_in_items_ptr",
+                "maybe_max_item_len_ptr",
+                "maybe_scale_v",
+            ]
+            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t", "float"]
+            additional_scalar_names = [
+                "logits_soft_cap",
+                "sm_scale",
+                "scale_v_scalar",
+                "token_pos_in_items_len",
+            ]
+            additional_scalar_dtypes = ["double", "double", "double", "int64_t"]
+            variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+        else:
+            additional_tensor_names = [
+                "maybe_scale_q",
+                "maybe_scale_k",
+                "maybe_scale_v",
+            ]
+            additional_tensor_dtypes = ["float", "float", "float"]
+            additional_scalar_names = [
+                "sm_scale",
+                "scale_q_scalar",
+                "scale_k_scalar",
+                "scale_v_scalar",
+            ]
+            additional_scalar_dtypes = ["double", "double", "double", "double"]
+            variant_name = "DefaultFP8Attention"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+        fp8_enabled=fp8_enabled,
+    )
+
+
+def gen_batch_prefill_attention_sink_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+) -> JitSpec:
+    from flashinfer.jit.attention.variants import attention_sink_decl
+
+    uri = get_batch_prefill_attention_sink_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+    )
+
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        ["sink"],
+        ["float"],
+        ["sm_scale"],
+        ["double"],
+        "AttentionSink",
+        attention_sink_decl[backend],
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=False,
+        use_fp16_qk_reduction=False,
+        fp8_enabled=False,
+    )
+
+
+def gen_batch_attention_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    uri = get_batch_attention_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+    )
+
+    additional_tensor_names: List[str] = ["maybe_k_cache_sf", "maybe_v_cache_sf"]
+    additional_tensor_dtypes: List[str] = ["uint8_t", "uint8_t"]
+    additional_scalar_names: List[str] = []
+    additional_scalar_dtypes: List[str] = []
+    variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
+
+    return gen_customize_batch_attention_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_profiler=use_profiler,
+    )
+
+
+def _fa2_head_dim_nvcc_flags(
+    head_dim_qk: int,
+    head_dim_vo: int,
+    dtype_kv: torch.dtype,
+    *,
+    allow_nvfp4_sm8_large_head: bool = False,
+) -> Optional[List[str]]:
+    """Return arch flags for FA2 large-head modules.
+
+    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
+    can opt into the same arch set only for validated FA2 prefill read paths.
+    Other one-byte large-head modules remain restricted to SM100+ until those
+    variants are validated separately.
+    """
+    if head_dim_qk > 256 or head_dim_vo > 256:
+        if dtype_kv.itemsize == 1:
+            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
+                return current_compilation_context.get_nvcc_flags_list(
+                    supported_major_versions=[10, 11, 12]
+                )
+        return current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[8, 9, 10, 11, 12]
+        )
+    return None
+
+
+def _fa2_prefill_head_dim_nvcc_flags(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> Optional[List[str]]:
+    return _fa2_head_dim_nvcc_flags(
+        head_dim_qk,
+        head_dim_vo,
+        dtype_kv,
+        allow_nvfp4_sm8_large_head=True,
+    )
+
+
+def _append_nvfp4_sf_stride_setter(
+    additional_params_setter: str,
+    additional_tensor_names: List[str],
+    params_expr: str = "params",
+) -> str:
+    stride_setters = []
+    if "maybe_k_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.k_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.k_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.k_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if "maybe_v_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.v_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.v_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.v_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if not stride_setters:
+        return additional_params_setter
+    if additional_params_setter:
+        return additional_params_setter + " \\\n" + " \\\n".join(stride_setters)
+    return " \\\n".join(stride_setters)
+
+
+def gen_customize_single_decode_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+) -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+
+    (
+        additional_params_decl,
+        additional_func_params,
+        additional_params_setter,
+    ) = generate_additional_params(
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+    )
+
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "single_decode_customize_config.jinja"
+    ) as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "single_decode_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs = {
+        "additional_func_params": additional_func_params,
+        "additional_params_decl": additional_params_decl,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+    }
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+
+    dest_path = gen_directory / "single_decode_kernel.cu"
+    source_paths.append(dest_path)
+    source = kernel_inst_templ.render(
+        **kwargs,
+    )
+    write_if_different(dest_path, source)
+
+    for filename in [
+        "single_decode.cu",
+        "single_decode_jit_binding.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "single_decode_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
+    )
+
+
+def gen_customize_single_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> JitSpec:
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
+    elif backend == "fa2":
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+        additional_params_decl, additional_func_params, additional_params_setter = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+            )
+        )
+
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "single_prefill_customize_config.jinja"
+        ) as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "single_prefill_kernel_inst.jinja"
+        ) as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_func_params": additional_func_params,
+            "additional_params_decl": additional_params_decl,
+            "additional_params_setter": additional_params_setter,
+        }
+
+        generated_inc_str = config_templ.render(
+            **kwargs,
+        )
+        os.makedirs(gen_directory, exist_ok=True)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2, 3]:
+            filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            "single_prefill.cu",
+            "single_prefill_jit_binding.cu",
+        ]:
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = gen_directory / "single_prefill_config.inc"
+        write_if_different(generated_config_path, generated_inc_str)
+
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
+            ),
+        )
+    elif backend == "fa3":
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+
+        (additional_params_decl, additional_func_params, additional_params_setter) = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+                is_sm90_template=True,
+            )
+        )
+
+        _file_config = "single_prefill_sm90_customize_config.jinja"
+        if fp8_enabled:
+            _file_kernel_inst = "single_prefill_fp8_sm90_kernel_inst.jinja"
+            _file_csrc = "single_prefill_fp8_sm90.cu"
+        else:
+            _file_kernel_inst = "single_prefill_sm90_kernel_inst.jinja"
+            _file_csrc = "single_prefill_sm90.cu"
+
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_kernel_inst) as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_func_params": additional_func_params,
+            "additional_params_decl": additional_params_decl,
+            "additional_params_setter": additional_params_setter,
+        }
+
+        generated_inc_str = config_templ.render(
+            **kwargs,
+        )
+        os.makedirs(gen_directory, exist_ok=True)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2, 3]:
+            filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            _file_csrc,
+            "single_prefill_sm90_jit_binding.cu",
+        ]:
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = gen_directory / "single_prefill_sm90_config.inc"
+        write_if_different(generated_config_path, generated_inc_str)
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=sm90a_nvcc_flags,
+        )
+    else:
+        raise ValueError(f"Invalid backend: {backend}")
+
+
+def gen_customize_batch_decode_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+) -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    (additional_params_decl, additional_func_params, additional_params_setter) = (
+        generate_additional_params(
+            additional_tensor_names,
+            additional_tensor_dtypes,
+            additional_scalar_names,
+            additional_scalar_dtypes,
+        )
+    )
+
+    kwargs = {
+        "additional_params_decl": additional_params_decl,
+        "additional_func_params": additional_func_params,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+    }
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+
+    source_paths = []
+
+    dest_path = gen_directory / "batch_decode_kernel.cu"
+    source_paths.append(dest_path)
+    source = kernel_inst_templ.render(
+        **kwargs,
+    )
+    write_if_different(dest_path, source)
+
+    for filename in [
+        "batch_decode.cu",
+        "batch_decode_jit_binding.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "batch_decode_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
+    )
+
+
+def gen_customize_batch_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> JitSpec:
+    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if require_fp4_kv_cache:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "require_fp4_kv_cache": require_fp4_kv_cache,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
+    elif backend == "fa2":
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+        (additional_params_decl, additional_func_params, additional_params_setter) = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+            )
+        )
+        additional_params_setter = _append_nvfp4_sf_stride_setter(
+            additional_params_setter, additional_tensor_names
+        )
+
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja"
+        ) as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_paged_kernel_inst.jinja"
+        ) as f:
+            paged_kernel_inst_templ = jinja2.Template(f.read())
+
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja"
+        ) as f:
+            ragged_kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_params_decl": additional_params_decl,
+            "additional_func_params": additional_func_params,
+            "additional_params_setter": additional_params_setter,
+        }
+
+        generated_inc_str = config_templ.render(
+            **kwargs,
+        )
+        os.makedirs(gen_directory, exist_ok=True)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2, 3]:
+            dest_path = (
+                gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
+            )
+            source_paths.append(dest_path)
+            source = paged_kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+            dest_path = (
+                gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
+            )
+            source_paths.append(dest_path)
+            source = ragged_kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            "batch_prefill.cu",
+            "batch_prefill_jit_binding.cu",
+        ]:
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = gen_directory / "batch_prefill_config.inc"
+        write_if_different(generated_config_path, generated_inc_str)
+        extra_cuda_cflags = _fa2_prefill_head_dim_nvcc_flags(
+            head_dim_qk, head_dim_vo, dtype_kv
+        )
+        if kwargs["require_fp4_kv_cache"]:
+            # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
+            # when the head_dim helper returns no arch-specific flags.
+            extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=extra_cuda_cflags,
+        )
+    elif backend == "fa3":
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+        (additional_params_decl, additional_func_params, additional_params_setter) = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+                is_sm90_template=True,
+            )
+        )
+
+        _file_config = "batch_prefill_sm90_customize_config.jinja"
+        if fp8_enabled:
+            _file_paged_kernel_inst = "batch_prefill_fp8_paged_sm90_kernel_inst.jinja"
+            _file_ragged_kernel_inst = "batch_prefill_fp8_ragged_sm90_kernel_inst.jinja"
+            _file_csrc = "batch_prefill_fp8_sm90.cu"
+        else:
+            _file_paged_kernel_inst = "batch_prefill_paged_sm90_kernel_inst.jinja"
+            _file_ragged_kernel_inst = "batch_prefill_ragged_sm90_kernel_inst.jinja"
+            _file_csrc = "batch_prefill_sm90.cu"
+
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_paged_kernel_inst) as f:
+            paged_kernel_inst_templ = jinja2.Template(f.read())
+
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_ragged_kernel_inst) as f:
+            ragged_kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_params_decl": additional_params_decl,
+            "additional_func_params": additional_func_params,
+            "additional_params_setter": additional_params_setter,
+        }
+        generated_inc_str = config_templ.render(**kwargs)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2, 3]:
+            filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = paged_kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+            filename = f"batch_prefill_ragged_sm90_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = ragged_kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            _file_csrc,
+            "batch_prefill_sm90_jit_binding.cu",
+        ]:
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = gen_directory / "batch_prefill_sm90_config.inc"
+        write_if_different(generated_config_path, generated_inc_str)
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=sm90a_nvcc_flags,
+        )
+    else:
+        raise ValueError(f"Invalid backend: {backend}")
+
+
+def get_fmha_cutlass_sm100a_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> str:
+    # NOTE(Zihao): use different uri after when support customize attention
+    return "fmha_cutlass_sm100a"
+    # return (
+    #     f"fmha_cutlass_sm100a_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+    #     f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+    #     f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+    #     f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+    #     f"head_dim_qk_{head_dim_qk}_"
+    #     f"head_dim_vo_{head_dim_vo}_"
+    #     f"posenc_{pos_encoding_mode}_"
+    #     f"use_swa_{use_sliding_window}_"
+    #     f"use_logits_cap_{use_logits_soft_cap}"
+    # )
+
+
+def gen_fmha_cutlass_sm100a_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> JitSpec:
+    uri = get_fmha_cutlass_sm100a_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+    )
+
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_binding.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
+    ]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
+    )
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_trtllm_gen_fmha_module():
+    from ...artifacts import ArtifactPath, CheckSumHash
+
+    include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
+    header_name = "flashInferMetaInfo"
+
+    # Check if checksums.txt exists in the cubin directory
+    checksum_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/checksums.txt"
+    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_FMHA)
+    assert checksum, f"Failed to get checksums.txt from {checksum_path}"
+
+    meta_hash = get_meta_hash(checksum)
+    # use `get_artifact` to get "flashinferMetaInfo.h"
+    metainfo = get_artifact(
+        f"{include_path}/{header_name}.h",
+        meta_hash,
+    )
+
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
+
+    return gen_jit_spec(
+        "fmha_gen",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_sage_quant.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/common/sageQuant.cu",
+        ],
+        # link "include" sub-directory in cache
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_cuda_cflags=[
+            f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
+            f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{meta_hash}\\"',
+        ],
+    )
+
+
+def gen_customize_batch_attention_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_logits_soft_cap: bool = False,
+    use_profiler: bool = False,
+):
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+    }
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    (additional_params_decl, additional_func_params, _) = generate_additional_params(
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+    )
+    # batch_attention.cu loops over params[i], so generate a setter using params[i] syntax
+    # instead of the params.X syntax from generate_additional_params.
+    batch_additional_params_setter = " \\\n".join(
+        [
+            (
+                f"params[i].{var} = {var} ? static_cast<{dtype}*>({var}.value().data_ptr()): nullptr;"
+                if var.startswith("maybe")
+                else f"params[i].{var} = static_cast<{dtype}*>({var}.data_ptr());"
+            )
+            for dtype, var in zip(
+                additional_tensor_dtypes, additional_tensor_names, strict=True
+            )
+        ]
+        + [f"params[i].{var} = {var};" for var in additional_scalar_names]
+    )
+    batch_additional_params_setter = _append_nvfp4_sf_stride_setter(
+        batch_additional_params_setter, additional_tensor_names, params_expr="params[i]"
+    )
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
+    ) as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "batch_attention_paged_kernel_inst.jinja"
+    ) as f:
+        paged_kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs |= {
+        "additional_params_decl": additional_params_decl,
+        "additional_func_params": additional_func_params,
+        "additional_params_setter": batch_additional_params_setter,
+    }
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+    for mask_mode in [0, 1, 2, 3]:
+        dest_path = gen_directory / f"batch_attention_paged_kernel_mask_{mask_mode}.cu"
+        source_paths.append(dest_path)
+        source = paged_kernel_inst_templ.render(
+            mask_mode=mask_mode_literal[mask_mode],
+            **kwargs,
+        )
+        write_if_different(dest_path, source)
+
+    for filename in [
+        "batch_attention.cu",
+        "batch_attention_jit_binding.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "batch_attention_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [],
+    )
+
+
+def gen_cudnn_fmha_module():
+    from ...artifacts import ArtifactPath
+
+    return gen_jit_spec(
+        "fmha_cudnn_gen",
+        [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
+        extra_cuda_cflags=[
+            f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
+        ],
+    )
+
+
+def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
+    uri = "trtllm_fmha_v2"
+    cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
+    cached_ops.mkdir(parents=True, exist_ok=True)
+
+    fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
+
+    # Generate kernel source
+    enumerate_kernels(fmha_v2_src_dir, cached_ops)
+
+    kernels = [
+        "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_64x64_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
+    ]
+
+    kernel_paths = [
+        jit_env.FLASHINFER_JIT_DIR / "trtllm_fmha_v2" / "generated" / kernel
+        for kernel in kernels
+    ]
+    binding_source_path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
+    source_paths = kernel_paths + [binding_source_path]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
+    nvcc_flags.append("-Wno-deprecated-gpu-targets")
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_fmha_v2_module(
+    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+) -> JitSpec:
+    # Setup generated source directory
+    if output_dtype is None:
+        output_dtype = input_dtype
+
+    dtype_map = {
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+        torch.float8_e4m3fn: "e4m3",
+    }
+    input_dtype_str = dtype_map[input_dtype]
+    output_dtype_str = dtype_map[output_dtype] if output_dtype is not None else None
+
+    uri = f"trtllm_fmha_v2_{input_layout.lower()}_{input_dtype_str}_{output_dtype_str}"
+
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory.mkdir(parents=True, exist_ok=True)
+
+    # Source directories
+    csrc_dir = jit_env.FLASHINFER_CSRC_DIR
+    fmha_v2_src_dir = csrc_dir / "fmha_v2"
+    # Determine which SM major versions are available in the compilation context
+    # so we only generate kernel sources for architectures that will be compiled.
+    source_paths = generate_jit_sources(
+        uri,
+        input_layout,
+        input_dtype_str,
+        output_dtype_str,
+        compilation_context=current_compilation_context,
+    )
+
+    # copy static fmha_v2_run.cu
+    static_run_path = csrc_dir / "fmha_v2_run.cu"
+    run_path = gen_directory / "fmha_v2_run.cu"
+    with open(static_run_path, "r") as f:
+        write_if_different(run_path, f.read())
+    source_paths.append(run_path)
+
+    # copy static fmha_v2_jit_binding.cu
+    static_binding_path = csrc_dir / "fmha_v2_jit_binding.cu"
+    binding_path = gen_directory / "fmha_v2_jit_binding.cu"
+    with open(static_binding_path, "r") as f:
+        write_if_different(binding_path, f.read())
+    source_paths.append(binding_path)
+
+    # Setup compilation flags
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 12]
+    )
+    nvcc_flags.extend(
+        [
+            f"-I{fmha_v2_src_dir}",
+            f"-I{gen_directory}",  # For fmha_v2_api.h
+            f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}",
+            f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # For flashinfer headers
+            "-Wno-deprecated-gpu-targets",
+        ]
+    )
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
