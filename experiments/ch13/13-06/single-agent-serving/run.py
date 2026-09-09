@@ -100,7 +100,9 @@ def expected_tiles(b, k, experts, tile=32):
     return union,padded
 
 
-def estimate(m, n, b, dcp, profile):
+def estimate(m, n, b, dcp, profile, hardware=None, kv_bytes=2):
+    hw = hardware or HW
+    kv_scale = 1 if kv_bytes == 2 else (1 + 1/128)/2
     st=m['state'](n); tp,pp=m['tp'],m['pp']; cards=tp*pp; p=PROFILES[profile]
     v4=m['name']=='DeepSeek-V4-Flash'
     # TP replicates shared latent KV unless explicitly context-sharded.
@@ -109,8 +111,8 @@ def estimate(m, n, b, dcp, profile):
         state_rank=st['resident_bytes']*b
     else:
         c=load('k3-config.json')['text_config']['linear_attn_config']
-        stages=[list(range(1,48)),list(range(48,94))]
-        state_rank=max(b*(len(set(ids)&set(c['full_attn_layers']))*n*576*2/dcp +
+        stages=[list(range(math.ceil(i*93/pp)+1, math.ceil((i+1)*93/pp)+1)) for i in range(pp)]
+        state_rank=max(b*(len(set(ids)&set(c['full_attn_layers']))*n*576*2*kv_scale/dcp +
                           len(set(ids)&set(c['kda_layers']))*(5*96*128*128*4+3*96*128*4*2)/tp)
                        for ids in stages)
     # 5% allowance for layer/embedding imbalance; another 20% card reserve is unavailable.
@@ -119,31 +121,34 @@ def estimate(m, n, b, dcp, profile):
     union,padded=expected_tiles(b,m['k'],m['experts'])
     routed_read=m['routed_bytes']*union/m['experts']
     padded_flops=m['routed_flops']/m['k']*padded
-    bw=HW['hbm_bytes_s']*p['hbm_eff']
-    fp8=HW['dense_fp8_flops_s']*p['tensor_eff']
-    bf16=HW['dense_bf16_flops_s']*p['tensor_eff']
+    bw=hw['hbm_bytes_s']*p['hbm_eff']
+    fp8=hw['dense_fp8_flops_s']*p['tensor_eff']
+    bf16=hw['dense_bf16_flops_s']*p['tensor_eff']
+    expert_rate=bf16 if (not v4 and hw.get('kimi_expert_dtype')=='bf16') else fp8
     # Sum sequential stages: divide latency by TP only, never by TP*PP.
-    routed_s=max(routed_read/(tp*bw),padded_flops/(tp*fp8))*1.2
+    routed_s=max(routed_read/(tp*bw),padded_flops/(tp*expert_rate))*1.2
     other_s=max(m['nonrouted_bytes']/(tp*bw),b*m['other_matrix_flops']/(tp*bf16))
-    traffic=b*(st['history_read_bytes']/dcp + (0 if v4 else 2*st['recurrent_bytes']/tp))
+    traffic=b*(st['history_read_bytes']*(1 if v4 else kv_scale)/dcp + (0 if v4 else 2*st['recurrent_bytes']/tp))
     attention_s=max(traffic/bw,b*st['attention_flops']/(tp*bf16))
     # Communication startup and payload; no tensor-product multiplication of bandwidth.
     collectives=2*m['layers']+(48 if dcp>1 else 0)
-    comm=collectives*(p['communication_us']*1e-6+2*(tp-1)/tp*b*m['hidden']*2/HW['effective_nvlink_bytes_s'])
+    link_bw=hw['effective_inter_node_bytes_s'] if tp>8 else hw['effective_nvlink_bytes_s']
+    startup=max(p['communication_us'],20) if tp>8 else p['communication_us']
+    comm=collectives*(startup*1e-6+2*(tp-1)/tp*b*m['hidden']*2/link_bw)
     if pp>1:
-        comm+=20e-6+b*m['hidden']*2/HW['effective_inter_node_bytes_s']
+        comm+=(pp-1)*(20e-6+b*m['hidden']*2/hw['effective_inter_node_bytes_s'])
     overhead=m['layers']*p['layer_overhead_us']*1e-6
     step=routed_s+other_s+attention_s+comm+overhead
     # Rebuild retained history after every 10% of the context worth of new output.
     # Full-length rebuild is conservative versus actually rebuilding 90%; compute-only model.
     # Aggregate hardware used for chunked prefill, unlike the serial decode trajectory.
-    prefill=(n*m['routed_flops']/(cards*fp8)+
+    prefill=(n*m['routed_flops']/(cards*expert_rate)+
              (n*m['other_matrix_flops']+st['prefill_attention_flops'])/(cards*bf16))
     cycle_output=.1*n
     decode_fraction=cycle_output*step/(cycle_output*step+b*prefill)
     r=1/step; sustained=r*decode_fraction
-    cost=HOURS*cards*HW['gpu_usd_hour']/b
-    feasible=peak<=HW['memory_bytes']*HW['usable_fraction']
+    cost=HOURS*cards*hw['gpu_usd_hour']/b
+    feasible=peak<=hw['memory_bytes']*hw['usable_fraction']
     return dict(model=m['name'],context_tokens=n,batch=b,tp=tp,pp=pp,dcp=dcp,gpus=cards,
                 profile=profile,capacity_feasible=feasible,rank_peak_gib=peak/2**30,
                 rank_weight_gib=weight_rank/2**30,rank_state_gib=state_rank/2**30,
