@@ -1,0 +1,4 @@
+继续原10-8真实训练闭环，不能停在初始权重同步。Root此前两条queue可能未进入活跃turn，现明确重复：用户授权用RTX资源；原8GiB GPU/12GiB RSS是本任务调度预算，不是机器上限，现允许GPU自身进程合计16GiB、RSS自身全进程树24GiB（含supervisor），MemAvailable至少16GiB、启动GPUfree10GiB、CPU12-15/4线程、每批20分钟、私有磁盘25GiB与不碰原服务/OpenROAD/共享环境维持。先重验实际余量，然后更新守护阈值和协议，不因旧人为限额将实验停掉。
+当前另有agent_exit_status通过原既存QwenVL30B HTTP服务做12轮小Agent，无新GPU引擎，也不reset共享缓存。你的GPU是唯一新引擎，允许按新限额完成至少2次实际verl rollout/reward/advantage/backward/optimizer/参数变化/版本同步/再rollout；若原短算术奖励全部相同或梯度全零需如实报告并在独立预设控制中验证非零学习，不能假造更新。保持正式协议门槛，不做择优质量结论。训练主入口和核心计算保持官方实际实现，必要兼容补丁精确diff。
+用户新要求：被成功重跑替代的启动/依赖调试失败记录不要保留，只交付最终成功运行与复现需要的源码/版本/协议。成功后清理旧attempt01-06等调试记录、旧ray日志、README失败历史，analyzer只分析最终成功及正式控制；保留成功运行中的科学负结果/实际奖励失败，不挑掉。旧封存规则服从最新用户要求，可重封存。无成功前可临时用排障记录，不能以初始化作为最终成功清除尚需诊断。若有真正新阻塞给root具体证据，但不要把暂时问题变成整个任务的阻塞。
+独占原ch10/10-08与私有远端env和parallel-workers/verlrl；calculations绝不触碰，正文/inventory/PROGRESS由root负责。完成实际数据与传输后再写结论/图（需要时）、独立校验和最终manifest。

@@ -1,0 +1,8 @@
+已交付至 [experiments/ch10/10-05/](/Users/boj/book/ai-infra-book/experiments/ch10/10-05/README.md)，[worker 状态](/Users/boj/book/ai-infra-book/experiments/parallel-workers/pipeline/status.md)已更新。**结论为 CPU 环境阻断，未宣称完成真实 Megatron 流水训练。**
+
+- **固定源码与阻断依据**：保存 Megatron Core `core_v0.16.0`、提交 `3bec9aa97dda898d16ff5a89bac0ed2b6682b172` 的完整源码归档及十份关键文件。三种官方调度入口均有无条件 CUDA 分配，P2P 接收也直接使用 CUDA 设备；[官方安装说明](https://docs.nvidia.com/megatron-core/developer-guide/0.16.0/get-started/install.html)要求 CUDA/cuDNN/NCCL。
+- **真实环境记录**：Mac arm64、Python 3.14.7、Torch 2.14.0 CPU，CUDA/NCCL 不可用。预检退出码 `2`、GPU 程序的 CPU 保护检查退出码 `1`，原始输出、错误、共存进程记录均保留。预检峰值 RSS 约 **198 MiB**；下载约 **8.91 MB**，未安装或修改共享依赖。
+- **GPU 交接**：[gpu_handoff.py](/Users/boj/book/ai-infra-book/experiments/ch10/10-05/gpu_handoff.py) 调用官方非交错 1F1B，使用四阶段、每阶段九个真实小型残差块。已写入固定 batch/seed/数值门槛、逐元素参考比较、profiler、autograd 保存张量生命周期和分配器快照；详见[事前协议](/Users/boj/book/ai-infra-book/experiments/ch10/10-05/PROTOCOL.md)。**该模型不是 Qwen3，脚本及依赖组合尚未经 GPU 实机验证。**
+- **验证**：Python 与 shell 语法、源码 SHA256、十份快照与完整归档一致性、CPU 阻断保护检查通过，详见 [validation.json](/Users/boj/book/ai-infra-book/experiments/ch10/10-05/validation.json)。
+
+尚未完成四 rank 真实执行、数值通过、激活寿命分析和 trace QA，以及 Qwen3-8B、微批扫描和选做扩展。没有生成模拟结果或性能图；仅写入授权目录及状态文件，未操作 `calculations/`、提交 git、启动其他 agent 或远端任务。

@@ -1,0 +1,23 @@
+已完成四次真实 Agent 尝试，交付 **完整 negative**，待主 agent 统一审核/回填。
+
+| 固定顺序 | 轮数 | 原六例 | finish | 独立严格检查 | 合格修复 |
+|---|---:|---:|---|---:|---|
+| baseline | 12 | 2/6 | 否 | 1/1013 | 否 |
+| feedback | 11 | 2/6 | 是 | 1/1013 | 否 |
+| feedback | 11 | 2/6 | 是 | 1/1013 | 否 |
+| baseline | 12 | 2/6 | 否 | 1/1013 | 否 |
+
+两次 feedback 各收到五轮实际诊断，最终仍输出相同失败代码，并在承认测试失败时调用 finish。四次独立检查均为值正确且调用后输入不变 **315/1013**，其中 **314** 例追加别名检查失败。没有追加尝试、手写替换答案或覆盖旧失败。
+
+单引擎模型作业共 **93.05 秒**；自有显存采样峰值 **18.125 GiB**，进程树总 RSS 峰值约 **5.90 GiB**，绑定核 **8–11**。自有进程组已清空，原五项 GPU 服务全部保留。macOS 拒绝原地址空间限额后，独立检查改在模型关闭后的远端 Linux 受限子进程执行，适配记录已保留。
+
+交付文件：
+
+- [中文 README 与结果表](/Users/boj/book/ai-infra-book/experiments/ch11/11-09/quality-feedback/README.md)
+- [事先冻结的 PROTOCOL](/Users/boj/book/ai-infra-book/experiments/ch11/11-09/quality-feedback/PROTOCOL.md)
+- [机器可读结果](/Users/boj/book/ai-infra-book/experiments/ch11/11-09/quality-feedback/summary.json)
+- [离线检查：722 项通过](/Users/boj/book/ai-infra-book/experiments/ch11/11-09/quality-feedback/checks.json)
+- [完整 manifest](/Users/boj/book/ai-infra-book/experiments/ch11/11-09/quality-feedback/manifest.json)
+- [worker 状态](/Users/boj/book/ai-infra-book/experiments/parallel-workers/agentquality/status.md)
+
+原始数据约 **2.40 MB**；远端 **109 个交付文件及 status 哈希全部核对通过**。未改共享进度、正文、旧实验或 calculations，未联系 owner、派生 worker 或提交 git。此次仅完成冻结的质量反馈对照；matched 资源比较、正式扩容收益和整体实验验收仍未执行。

@@ -1,0 +1,12 @@
+已完成本批离线证据交付，状态已标记为**待主 agent 统一复核回填**。
+
+- [DECISION.md](/Users/boj/book/ai-infra-book/experiments/ch11/11-10/DECISION.md)：一页中文资源选择与验证计划。
+- [README.md](/Users/boj/book/ai-infra-book/experiments/ch11/11-10/README.md)：选择依据、跨实验边界、缺失数据，以及下一轮 matched-workload 实验设计和接受判据。
+- [analyze.py](/Users/boj/book/ai-infra-book/experiments/ch11/11-10/analyze.py)：独立离线分析；固定 **228 个来源文件**，生成 **77 条分组记录**。
+- [manifest.json](/Users/boj/book/ai-infra-book/experiments/ch11/11-10/manifest.json)：封存全部 9 个交付文件及 status 引用；机器可读结果包括 `records.json`、`summary.json`、`decision.json` 和 `checks.json`。
+
+主证据是 11-01 的单次真实 Agent 轨迹：循环 **9.357789 秒**，模型请求合计 **8.995477 秒**，模型区间控制器 CPU **0.157146 秒**；最终仅 **2/6**，未完成任务。建议先验证模型服务路径及质量门槛，再决定资源干预；没有据此推断 GPU 饱和、网络拥塞或扩容收益。
+
+核验通过 **7053 项数据一致性检查**，本地链接和 manifest 均已核对。分析为单线程、零子进程，峰 RSS 约 **32.9 MiB**；新增文件含 status 共 **239,697 字节**。
+
+所有写入限于授权范围；未重跑模型或计算任务，未执行或修改 calculations，未提交 git。**本批完成的是证据和验证计划，扩容、成本与 SLO 仍待验证。**

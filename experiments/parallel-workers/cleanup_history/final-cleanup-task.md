@@ -1,0 +1,3 @@
+Root已通过SSH只读检查remote-plan.json的27个pending文件，实际内容均为旧启动/配置调试及附属输入/脚本：编译器不兼容、初始化失败、asdict错误、router正式请求503（worker日志中的request.finished仅HEALTH_CHECK）、缺包/链接/资源句柄错误、profile拒绝已有输出且无reports。逐项当前SHA与remote-plan观察SHA均一致。用户要求清理失败记录已充分授权；缺少删除前本地原始SHA不是必须留存旧调试文件的用户限制。现在放宽我先前自行设置的“必须恢复旧SHA”条件，按实际内容身份确认清理，绝不把当前SHA伪称历史SHA。
+请完成这27项：再次确认仅为startup调试，没有正式有效输出；requests.json/prompts.json只含旧输入，不是生成结果，worker请求日志只有healthcheck；runtime_bootstrap.py须确认现有成功入口/环境未引用（只查本实验源码，不动服务/其他目录）。路径必须与remote-plan完全相同，再核对该计划中现有SHA防止并发改动，才精确unlink。4个no_disposable_copy继续保留当前成功脚本，不虚构旧副本。若某项实际含有效科学结果或成功依赖就明确保留并报告具体证据，而不是仅因历史hash缺失暂停。
+删除后更新对应远端manifest，核验除明确删除项/manifest外其余科学raw全部未变，并把counts合并为实际最终清理结果。不要保存旧日志内容副本，简洁记录路径/清理依据即可。所有任务目录独占和不碰calculations/不运行GPU规则保持。等待真实完成再退出。

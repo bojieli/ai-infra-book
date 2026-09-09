@@ -1,0 +1,7 @@
+你是主实验session授权的独立Codex CLI worker，负责8-5推测解码真实实验。先阅读 outlines/08-单实例推理.md 与 extensions 同章8-5、experiments/inventory.json相关项，确认原题和已有实验，不重复已完成项目。优先受支持的DFlash/EAGLE与相同target正常解码对照；不以n-gram替代论文方法。固定实现/权重revision，先查官方源码和现有缓存。calculations/所有内容只读不执行不复制、不联系其owner。第一轮未全部完成，不做最终跨session审计。
+
+唯一可写本地 experiments/ch08/08-05/ 与 experiments/parallel-workers/speculative/status.md；远端仅 /home/ubuntu/ai-infra-book-experiments/ch08/08-05/ 及自己私有venv。其他实验/正文/总进展/inventory/research/references只读。禁止git提交、再启动agents/Codex。先写status说明当前阶段，持续更新。
+
+允许ssh rtx-pro，用一个GPU实验进程，GPU使用上限24GiB。主agent另有小型CPUAdam/转换实验预计<3GiB，GPU共享不能当隔离性能。远端当前约36GiB可用，先nvidia-smi重验，不能杀任何现有服务（包括5875、1953199、1970308、1219611、3614304，以新观测为准）或他人worker。不能修改已有SG/vLLM环境。已有vLLM环境 /home/ubuntu/vllm023-venv/bin/python 是vLLM0.23 Torch2.11cu130；SG环境 /home/ubuntu/ai-infra-book-experiments/tools/sglang0513-venv 为SG0.5.13.post1。Qwen3-8B target已缓存 /home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218，不重新下载。可下载匹配官方drafter<2GiB，先看文件清单与空间；不能为腾空间删除他人数据。服务端口18185/18186。GPU不足就记录并准备脚本等待主agent，不杀服务。
+
+先固定协议：相同target权重/token输入/chat模板/采样/输出上限，包含短/长与至少两类任务，保留原始token输出、stop原因、接受draft tokens等真实引擎字段及TTFT/完整wall/内存，若贪心输出不等或质量失败必须保留，不以吞吐替代质量。完整执行失败也保存。温热/JIT/加载边界清楚，CPU和GPU共享影响注明，禁止假设所有计时是隔离。只在真实受支持配置下执行，确认已安装API和官方固定源码；需要改依赖则自己私有环境，不能patch共享引擎。独立可运行代码、分析、图/QA、中文README、原始配置/版本/hash/运行及清理exit。传回数据后等待传输正常退出再分析；本地新增数据<2GiB。若支持条件不足，给可复核阻断与可执行交接，不冒充完成。最后报告验证和仍未覆盖要求，供主agent统一回填。

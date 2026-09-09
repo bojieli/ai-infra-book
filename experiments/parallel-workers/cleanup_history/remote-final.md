@@ -1,0 +1,11 @@
+已完成 9 个目录的远端发现与可核实清理，并合并更新 [counts.json](/Users/boj/book/ai-infra-book/experiments/parallel-workers/cleanup_history/counts.json)。**仍有 27 个文件因缺少独立原始 SHA-256 而保留。**
+
+本轮 72 个候选的处理结果：
+
+- **删除 41 个**：原始哈希已从既有记录恢复或核实，远端 SHA-256 全部匹配。
+- **4 个没有独立旧副本**：当前成功脚本或配置的 SHA 与本地成功版本一致，已保留。
+- **27 个暂留**：诊断摘录和大小一致，但 candidates.json 本身没有 SHA 字段，现有记录也不足以恢复其独立原始哈希。精确远端路径、当前 SHA 和原因已写入 [remote-audit.json](/Users/boj/book/ai-infra-book/experiments/parallel-workers/cleanup_history/remote-audit.json)。
+
+已同步 **12 份成功文档、15 份附件**，新建或更新 **9 份 manifest**，383 个条目及 42 个目录内链接验证通过。**981 个远端保留文件、727 个本地保留文件的 SHA-256 全部未变。**
+
+累计远端已删除 **57 个文件**、完成 **11 份 manifest**。所有传输、清理与核验均已结束；未运行 GPU、模型或实验。
