@@ -799,6 +799,12 @@ from verify_partir_shardy import verify as verify_partir_shardy
 partir_shardy=verify_partir_shardy()
 from verify_serving_batch import verify as verify_serving_batch
 serving_batch=verify_serving_batch()
+from verify_asplos_testing_batch import verify as verify_asplos_testing_batch
+asplos_testing_batch=verify_asplos_testing_batch()
+from verify_pod_implementation import verify as verify_pod_implementation
+pod_implementation=verify_pod_implementation()
+from verify_asplos2025_coverage import verify as verify_asplos2025_coverage
+asplos2025_coverage=verify_asplos2025_coverage(asplos2025_public, serving_batch, asplos_testing_batch)
 from verify_ascend_components import verify as verify_ascend_components
 ascend_components=verify_ascend_components()
 from verify_snapshot_residency import verify as verify_snapshot_residency
@@ -831,6 +837,8 @@ abstracts_screened_total=sum(p['abstracts_screened'] for p in stats)+sum(p['abst
 selected_reading_total=sum(p['selected_sections_read'] for p in stats)+sum(p['selected_sections_read'] for p in usenix_reading)+catalog_review['asplos2024']['selected_sections_read']+asplos2025_public['selected_sections_read']+isca2024['selected_sections_read']+isca2025['selected_sections_read']+micro2024['selected_sections_read']+micro2025['selected_sections_read']
 abstracts_screened_total+=asplos2026['primary_abstracts_screened']
 selected_reading_total+=asplos2026['selected_sections_read']
+abstracts_screened_total+=asplos2025_coverage['additional_abstracts_over_canonical']
+selected_reading_total+=asplos2025_coverage['additional_selected_scopes_over_canonical']
 report={'verified_at':datetime.now(timezone.utc).isoformat(),'scope':'Archived and screened phases only; long-running goal remains active. USENIX full physical-volume audit is separate; selected pages checked here.','mlsys':stats,'usenix_reading':usenix_reading,'usenix_catalog_totals':{'papers':usenix_catalog_papers,'volume_pages':usenix_volume_pages,'summary_prose_matches':True},'pdf_bytes':totalbytes,'new_document_local_links':links,'source_map_rows':len(ids),'arithmetic':'passed','pagination_notes':pagination_notes,'conference_entry_discovery':discovery,'catalog_review':catalog_review,'asplos2025_metadata':asplos2025_metadata,'asplos2025_public':asplos2025_public,'abstracts_screened_total':abstracts_screened_total,'selected_reading_total':selected_reading_total,'errors':errors}
 report['isca2024']=isca2024
 report['isca2025']=isca2025
@@ -848,4 +856,8 @@ report['trace_identification']=trace_identification
 report['pipellm_preparation']=pipellm_preparation
 report['interview_ninth']=interview_ninth
 report['interview_tenth']=interview_tenth
+report['asplos2025_coverage']=asplos2025_coverage
+report['serving_batch']=serving_batch
+report['asplos_testing_batch']=asplos_testing_batch
+report['pod_implementation']=pod_implementation
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors

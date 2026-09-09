@@ -18,6 +18,10 @@
 
 ## 公开稿与读取进度
 
+当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续两批阅读记录，覆盖 **106 篇完整摘要、98 份代表 PDF／1,675 页、21 篇声明正文范围**，仍缺 78 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
+
+新增八篇来自 [COMET／POD／TAPAS](serving-113-117/README.md)及[编译器与测试筛选](screening-111-123/README.md)。其中 COMET、POD、TAPAS、Ratte 合计选读 30 页，只补现有量化、混合批处理、资源约束和 Agent 优化实验的判断条件，其余四篇归档备查。MetaMut 属于正式 2024 卷、2025 日程，保留原始年份。维护命令为 `python research/2026-infra-survey/verify_asplos2025_coverage.py`；该检查复核原清单及两批来源、身份与页级证据，再生成统一索引。它不代表全部正文已读。
+
 [selected-sources.json](selected-sources.json) 另存 177 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。90 份代表 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。十六份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
 
 [98 篇摘要](public-abstracts.json)直接来自作者 arXiv 页面、作者／机构论文 PDF 或作者摘要页，逐项保存来源及提取范围。作者稿可能晚于正式出版，HAL 的封面页与正文页也分开计；不混用卷页码。具体取舍见[阅读记录](../../../../research/2026-infra-survey/reading-asplos-2025.md)，其中 IKS、FSMoE 作者 v1 的物理页 1–13 各已读，相关图已查看；其余 PDF 主要完成身份与摘要核对。页级范围见 [IKS](iks-reading.json) 与 [FSMoE](fsmoe-reading.json)，历史模型和数值疑点留在阅读记录。

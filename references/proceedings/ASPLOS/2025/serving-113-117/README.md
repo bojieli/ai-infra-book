@@ -1,5 +1,9 @@
 # 推理服务专题：摘要筛选与 POD-Attention 方法选读
 
+当前本批已纳入[统一阅读索引](../reading-coverage.json)，下文“尚未计入／待合并”为原阶段记录；原始清单仍单独保存，合并后的阅读覆盖按正式日程 DOI 去重。
+
+POD 的固定实现后续已读 JIT 特化、CUDA dispatch 和融合内核的声明范围，见[实现记录](../../../../framework-history/2026-09-09/pod-implementation/README.md)；当前上层服务的实际调用和运行表现仍未验证。
+
 2026-09-09。新增九个原始 HTTP 响应，八个成功、一个 ACM PDF 403。COMET、POD-Attention、TAPAS 的完整 arXiv 摘要已读，三份作者 PDF 共 44 页已归档并查看首页；第 113 项目前只有两位作者的出版页面和失败的出版方请求，不能计为完整摘要。逐项身份、版本、取舍见 [screening.json](screening.json)。本批尚未合并正式 proceedings 计数。
 
 COMET 的 HTML 题名拼写为 Partical，PDF 与正式目录为 Practical；作者集合相同，但 Haimeng Ren 与 Long Cheng 的署名次序在预印本和正式目录中不同。作者稿所写 A100-80G-SMX4 也保留原文，不替它补造产品规格。它是混合 W4A4／W4A8 路径，后续应查例外比例、转换和质量评估，不能仅按“四位激活”估算所有流量。
