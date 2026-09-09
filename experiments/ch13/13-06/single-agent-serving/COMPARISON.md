@@ -1,5 +1,7 @@
 # 24×7 Agent：比较 GPU 卡型与官方 API
 
+**适用性更正：原结果未计 MTP／DSpark 收益，且逐层开销和全量重建假定显著推高 K3 成本。请先读[优化审计](OPTIMIZATION-AUDIT.md)；不能由本基线认定 API 更便宜或某卡最优。**
+
 完整计算见 [COMPARISON-RESULTS.md](COMPARISON-RESULTS.md)，机器可读记录见 [comparison.json](comparison.json)。这是对原 [自建估算](README.md)的扩展，仍只研究 DeepSeek V4 Flash 与 Kimi K3、实际占用 200K／1M 的历史。所有资源效率是分析情景，未做收费租卡或 API 性能实测。
 
 从仓库根目录执行：

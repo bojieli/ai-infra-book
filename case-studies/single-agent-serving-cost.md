@@ -9,3 +9,5 @@
 [选卡与 API 比较](../experiments/ch13/13-06/single-agent-serving/COMPARISON-RESULTS.md)进一步枚举 H100、H200、B200、B300，按同一 Agent 调用序列核算新输入和所有员工自己的重建工作，再用相同月输出量比较官方 API。当前 central 情景中，V4 的 200K／1M 由 B200 领先；K3 的 200K 由 B300 领先，1M 由 B200 领先。API 在四个主情景中较便宜，但 fast 情景下 V4 的 200K 可反过来由 GPU 较便宜。租金、缓存命中和调用粒度的交叉点一并保留。
 
 原表保留持续 decode 基线，扩展比较已计周期重建：每名员工都支付自己的重建工作，不能把一次 prefill 免费摊给全池。加入重建后，部分主表候选不再达到 30 token/s，须降低共享人数或改变配置。所有速度、费用与效率敏感性均可复算；本次没有租卡实测。
+
+[优化审计](../experiments/ch13/13-06/single-agent-serving/OPTIMIZATION-AUDIT.md)更正上述解释：比较尚未计入 V4 的 MTP 与 K3 的 DSpark；固定逐层开销及附加的频繁重建假设占 K3 原估算时间约七成。原选卡和 API 排序仅属于未优化基线，不代表生产结论。配套另给 decode 净加速的条件敏感性，保留 prefill 成本，并要求重新验证草稿／验证状态容量与共享并发。

@@ -133,6 +133,7 @@ def main():
             candidates=[b['best'] for b in central if b['model']==name and b['context_tokens']==n and b['best']]
             overall.append(min(candidates,key=lambda x:x['gpu_workflow_usd_per_million']) if candidates else None)
     sections=['# 持续 Agent 负载：GPU 选型与官方 API 比较',
+      '**适用性更正：本表是未启用 MTP／DSpark、效率未经校准的基线，不代表优化后的自建成本或最终选卡结论。见 [优化审计](OPTIMIZATION-AUDIT.md)及[条件敏感性](AUDIT-RESULTS.md)。',
       '2026-09-09。以同一模型档、200K／1M 实际历史、每轮生成 4096 token + 1024 工具输入为主情景。GPU 持续有工作；所有员工自己的 prefill／重建都计入。未实测运行速度，API 持续额度亦作为待满足条件。方法与适用边界见 [COMPARISON.md](COMPARISON.md)。',
       '## 官方 API 单价（美元／百万 token）',
       run.table(['模型','缓存命中输入','未命中输入','输出'],[[m,f"{p['hit']:.6f}",f"{p['miss']:.6f}",f"{p['output']:.6f}"] for m,p in PRICES.items()]),
