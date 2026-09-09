@@ -16,7 +16,7 @@
 
 ## 当前入口
 
-2026-09-09 最新局部更新：[MICRO 第九批](../../references/proceedings/MICRO/2024/parallel-abstracts-ninth/NOTES.md)通过来源、提取与去重核验，该届累计 **84 篇完整摘要、72 份 PDF／1,106 页、3 篇声明正文范围，29 篇摘要待补**。本批未扩张提纲。另补[RL 框架选型依据](../../references/framework-history/2026-09-09/rl-framework-selection/NOTES.md)，接入[RL 问题覆盖](rl-question-coverage.md)第 16 项。下方各轮统计是历史快照；本次局部核验没有刷新全库总量。
+2026-09-09 最新局部更新：[MICRO 第九批](../../references/proceedings/MICRO/2024/parallel-abstracts-ninth/NOTES.md)通过来源、提取与去重核验，该届累计 **84 篇完整摘要、72 份 PDF／1,106 页、4 篇声明正文范围，29 篇摘要待补**。第九批未扩张提纲；另已核验 vTrain 第 4–7 页选读，并接入 13.5 的现有敏感性分析。另补[RL 框架选型依据](../../references/framework-history/2026-09-09/rl-framework-selection/NOTES.md)，接入[RL 问题覆盖](rl-question-coverage.md)第 16 项。下方各轮统计是历史快照；本次局部核验没有刷新全库总量。
 
 ### 此前阶段记录
 
