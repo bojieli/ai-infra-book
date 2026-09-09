@@ -60,6 +60,18 @@ def verify(base=None):
     entry['selected_reading'] = {'proof_file': str(scope_path.relative_to(ROOT)), 'physical_pdf_pages': sparse['full_page_text_read_pages'], 'partial_physical_pages': sparse['partial_page_text_read_pages'], 'scope': 'Full text of p3–13 and two partial p14 ranges; no new abstract/PDF.'}
     entry['provenance'].append(str(scope_path.relative_to(ROOT)))
     entry['adoption'] = {'decision': 'existing_experiment_extension', 'reason': 'Existing5.3.1 distinguishes intermediate-vector traffic from same-matrix reuse; ideal byte example, not current GPU framework implementation.'}
+    from verify_floatap_body import verify as check_floatap_body
+    floatap = check_floatap_body()
+    entry = entries[49]
+    assert entry['doi'].lower() == '10.1109/micro61859.2024.00055'
+    assert entry['abstract_read'] and entry['selected_reading'] is None
+    floatap_path = D / 'floatap-body-reading/reading.json'
+    entry['selected_reading'] = {'proof_file': str(floatap_path.relative_to(ROOT)),
+        'physical_pdf_pages': floatap['full_body_text_pages'], 'partial_physical_pages': [13],
+        'scope': 'Reading agent full p2–12, p13 left-column related work/conclusion; root visually checked p9. Not full paper.'}
+    entry['provenance'].append(str(floatap_path.relative_to(ROOT)))
+    entry['adoption'] = {'decision': 'existing_experiment_optional_variant',
+        'reason': 'Existing5.2.1/5-2 separates replicated operand slots from instruction cycles; no framework performance or full-workset claim.'}
     summary = {
         'status': 'passed', 'scope': 'Unique MICRO2024 DOIs; original archive preserved; abstract batches add no body scope; separately verified Sparsepipe reading is counted once.',
         'matched_papers': len(entries),
@@ -71,7 +83,7 @@ def verify(base=None):
         'additional_full_primary_abstracts': 34, 'errors': [],
     }
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (75, 65, 1000, 2)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (75, 65, 1000, 3)
     (D / 'reading-coverage.json').write_text(json.dumps({'summary': summary, 'records': list(entries.values())}, ensure_ascii=False, indent=2) + '\n')
     return summary
 
