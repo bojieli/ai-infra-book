@@ -797,6 +797,8 @@ from verify_neusight import verify as verify_neusight
 neusight=verify_neusight()
 from verify_partir_shardy import verify as verify_partir_shardy
 partir_shardy=verify_partir_shardy()
+from verify_serving_batch import verify as verify_serving_batch
+serving_batch=verify_serving_batch()
 from verify_ascend_components import verify as verify_ascend_components
 ascend_components=verify_ascend_components()
 from verify_snapshot_residency import verify as verify_snapshot_residency
