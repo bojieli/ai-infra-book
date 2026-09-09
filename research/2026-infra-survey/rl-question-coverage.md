@@ -18,7 +18,7 @@
 | 10 EP 吞吐 | 6.3→9.4；[专家工作](../../case-studies/moe-and-startup.md) | 已有入口。活跃专家并集、热点、padding 与复制一起计量。 |
 | 11 长上下文的并行与重叠 | 10.2–10.3；[长度与通信](../../case-studies/training-compute.md) | 已有入口。Megatron SP、CP 与 Ulysses 的词义按实现区分。 |
 | 12 确定性 | 5.1→8.1→10.5；[数值案例](../../case-studies/rl-state-and-reproducibility.md) | 已有入口。atomic add 不是唯一来源，确定性条件不能外推全部版本。 |
-| 13 AReaL 与 slime 的瓶颈判断 | 10.5；[slime 补读](../../references/framework-history/2026-09-09/slime-dataflow/NOTES.md) | 待补同任务对照。已读普通同步入口，不足以代表 slime 的所有异步模式。 |
+| 13 AReaL 与 slime 的瓶颈判断 | 10.5；[slime 补读](../../references/framework-history/2026-09-09/slime-dataflow/NOTES.md) | 已有同任务阶段预算对照，见状态案例；不把框架名称当执行模式。尚未测量两套真实配置，不代表 slime 的所有异步模式。 |
 | 14 样本滞后 | 10.5；[状态与准入](../../case-studies/rl-state-and-reproducibility.md) | 原理已有入口；没有足够依据给统一“典型值”。实际阈值应绑定算法、版本和质量目标。 |
 | 15 slime 数据流与 loss | 10.2、10.5；[固定源码](../../references/framework-history/2026-09-09/slime-dataflow/NOTES.md) | 部分闭合。已读同步入口、局部 reducer 和训练交接；默认 Megatron 的 CP1 普通 DP 缩放已用源码与标量算式核对；实际数据分派和特殊配置尚未完整核对。 |
 | 16 训练框架选择 | 10.1、10.5 的任务与后端选择 | 待补简短选型依据。TRL、Unsloth 等不能仅因都支持后训练就当作相同规模和角色的替代品；本次不提供未验证排名。 |
