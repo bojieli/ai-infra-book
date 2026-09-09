@@ -16,7 +16,7 @@
 
 ## 当前入口
 
-2026-09-09 最新局部更新：[MICRO 第十批](../../references/proceedings/MICRO/2024/parallel-abstracts-tenth/NOTES.md)通过来源、提取与去重核验，该届累计 **86 篇完整摘要、74 份 PDF／1,137 页、6 篇声明正文范围，27 篇摘要待补**。新摘要留作备查，未扩张提纲；vTrain、TACOS、Duplex 的局部正文与采用边界分别核验后计入既有案例。另补[RL 框架选型依据](../../references/framework-history/2026-09-09/rl-framework-selection/NOTES.md)，接入[RL 问题覆盖](rl-question-coverage.md)第 16 项。下方各轮统计是历史快照；本次局部核验没有刷新全库总量。
+2026-09-09 最新局部更新：[MICRO 第十批](../../references/proceedings/MICRO/2024/parallel-abstracts-tenth/NOTES.md)通过来源、提取与去重核验，该届累计 **86 篇完整摘要、74 份 PDF／1,137 页、6 篇声明正文范围，27 篇摘要待补**。新摘要留作备查，未扩张提纲；vTrain、TACOS、Duplex 的局部正文与采用边界分别核验后计入既有案例。另补[RL 框架选型依据](../../references/framework-history/2026-09-09/rl-framework-selection/NOTES.md)，接入[RL 问题覆盖](rl-question-coverage.md)第 16 项。下方各轮统计是历史快照；随后完成全库归档核验（2026-09-09T10:19:22Z）：1,508 篇摘要、87 篇声明正文范围，错误列表为空，见 [archive-audit.json](archive-audit.json)。该核验证明所覆盖归档的一致性，不证明剩余会议已读完；新增第十一批面试来源另外检查原件哈希与链接。
 
 ### 此前阶段记录
 
