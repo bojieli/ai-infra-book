@@ -83,6 +83,17 @@ def verify(base=None):
     entry['provenance'].append(str(vtrain_path.relative_to(ROOT)))
     entry['adoption'] = {'decision': 'existing_experiment_optional_variant',
         'reason': '13.5 / experiment13-6: isolated profile and ranking sensitivity, teaching arithmetic rather than current framework timings.'}
+    from verify_tacos_body import verify as check_tacos_body
+    tacos = check_tacos_body()
+    entry = entries[64]
+    assert entry['abstract_read'] and entry['selected_reading'] is None
+    tacos_path = D / 'tacos-body-reading/reading.json'
+    entry['selected_reading'] = {'proof_file': str(tacos_path.relative_to(ROOT)),
+        'physical_pdf_pages': tacos['full_text_pages_read'],
+        'scope': 'Root read full text p4–10, visually checked p8, and read fixed README; implementation not audited.'}
+    entry['provenance'].append(str(tacos_path.relative_to(ROOT)))
+    entry['adoption'] = {'decision': 'existing_experiment_optional_variant',
+        'reason': '6.4 / experiment6-5: route synthesis, shared-port accounting, and documented artifact limitations; no NCCL replacement claim.'}
     summary = {
         'status': 'passed', 'scope': 'Unique MICRO2024 DOIs; original archive preserved; abstract batches add no body scope; separately verified body readings are counted once.',
         'matched_papers': len(entries),
@@ -94,7 +105,7 @@ def verify(base=None):
         'additional_full_primary_abstracts': 43, 'errors': [],
     }
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (84, 72, 1106, 4)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (84, 72, 1106, 5)
     (D / 'reading-coverage.json').write_text(json.dumps({'summary': summary, 'records': list(entries.values())}, ensure_ascii=False, indent=2) + '\n')
     return summary
 
