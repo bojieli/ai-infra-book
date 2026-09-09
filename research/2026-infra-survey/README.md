@@ -18,9 +18,9 @@
 
 本轮并行成果已按实际范围整合：[PartIR／Shardy](../../references/framework-history/2026-09-09/partir-shardy/expanded-reading/NOTES.md)补证明、搜索与生成通信的边界；[Ollama](parallel-ollama/NOTES.md)补后端准入／去重及思考控制。沿[第 6–10 章复核](parallel-case-audit.md)统一了 decode 需求与训练效率定义，修正见[记录](qa/parallel-case-resolutions.json)。这些都是已有小节和实验的增补。
 
-[PIM／Serverless 摘要批](../../references/proceedings/ASPLOS/2025/parallel-pim-serverless/READINGS.md)新增六篇，[MICRO 第二摘要批](../../references/proceedings/MICRO/2024/parallel-abstracts-next/NOTES.md)新增五篇；十一份 PDF 共 167 页，均只读摘要和身份，未增加正文范围。经各批来源、重提取与 DOI 去重核验，ASPLOS 2025 的覆盖为 **129 篇摘要、119 份代表 PDF、26 篇声明正文范围，55 篇摘要待补**；MICRO 2024 为 **52 篇摘要、48 份 PDF、1 篇声明正文范围，61 篇摘要待补**。PAPI 的 13 页预印本与正式 17 页稿分别标记；CARS 的 PDF／作者网页数字冲突保留，Atomic Cache 的原始摘要仍缺失。
+[Dilu／Medusa 正文比较](../../references/proceedings/ASPLOS/2025/serverless-body-reading/READINGS.md)沿现有 11.3.1／实验 11-3 区分执行份额调整与实例加载，保留动态共置导致离线容量信息失效的条件。[Sparsepipe](../../references/proceedings/MICRO/2024/sparsepipe-body-reading/NOTES.md)只在 5.3.1 增加两笔字节节省的可选推算。三个已有 DOI 新增正文范围，不新增摘要或 PDF；Dilu／Medusa 合计 17 个完整物理页（含 1 页 artifact appendix），Sparsepipe 为 11 个完整页与第 14 页两段局部。
 
-全局最近一次完整核验仍为 **1,439 篇摘要／79 篇正文范围、无错误**（2026-09-09 06:32:38 UTC），发生在上述十一篇接入之前。本批通过局部来源和覆盖检查，不将其写成全库重验。Dilu／Medusa 与 Sparsepipe 正文正在围绕已有章节问题比较，尚未计入新的正文范围，也未据摘要扩张大纲。
+ASPLOS 2025 当前为 **129 篇摘要、119 份代表 PDF、28 篇声明正文范围，55 篇摘要待补**；MICRO 2024 为 **52 篇摘要、48 份 PDF、2 篇声明正文范围，61 篇摘要待补**。全库核验已通过：**1,450 篇摘要／82 篇正文范围，无错误**（2026-09-09T06:55:35.123924+00:00）。见[本阶段核验](qa/serverless-sparsepipe-phase.json)。后续 GPU／存储、可靠性与 MICRO 新批次尚待索引验收，不计入这个快照。
 
 [主机调度时间线](parallel-host-timeline/NOTES.md)和[同一 MoE 放置](parallel-moe-ownership/NOTES.md)已完成有界补读与推算，分别接入现有第 5／8 章及第 6／7／9 章。案例审计补清 I01 的串行计时分母和 I09 的累计接受率定义；I19／I20 的积压和双缓冲算式经[独立复算](qa/answers-19-20-audit.json)未发现错误。实际引擎 trace 的验收与后续实验保持独立，不把教学时间代入实测。更多会议摘要、正文候选及全书逐例复查继续并行推进。
 

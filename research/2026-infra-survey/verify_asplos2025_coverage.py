@@ -174,6 +174,18 @@ def verify(base=None, serving=None, testing=None):
         entry['provenance'].append(str(pim_path.relative_to(ROOT)))
         entry['adoption'] = {'decision': 'abstract_screening_only', 'reason': record['editorial_decision']}
         additional.append(n)
+    from verify_serverless_body import verify as check_serverless_body
+    assert check_serverless_body()['status'] == 'pass'
+    serverless_path = D / 'serverless-body-reading/reading-records.json'
+    serverless = json.loads(serverless_path.read_text())
+    for record in serverless['records']:
+        entry = entries[record['program_order']]
+        assert entry['doi'] == record['doi'] and entry['abstract_read'] and entry['selected_reading'] is None
+        assert entry['representative_pdf']['sha256'] == record['existing_source_pdf']['sha256']
+        entry['selected_reading'] = {'proof_file': str(serverless_path.relative_to(ROOT)), 'physical_pdf_pages': record['physical_pdf_pages'], 'scope': 'Selected full physical pages; Medusa p13 artifact appendix; not full paper.'}
+        entry['provenance'].append(str(serverless_path.relative_to(ROOT)))
+        entry['adoption'] = {'decision': 'existing_experiment_extension', 'reason': 'Existing11.3.1/11-3 compares resource-share adjustment with loading critical path and capacity invalidation.'}
+    assert len(serverless['records']) == 2 and sum(len(r['physical_pdf_pages']) for r in serverless['records']) == 17
     assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134, 145, 146, 147, 148, 149, 151, 152, 153, 154, 156, 158, 170, 171, 172, 175, 182]
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
@@ -183,14 +195,14 @@ def verify(base=None, serving=None, testing=None):
         'public_pdf_pages': sum(e['representative_pdf']['pages'] for e in entries.values() if e['representative_pdf']),
         'selected_sections_read': sum(e['selected_reading'] is not None for e in entries.values()),
         'additional_abstracts_over_canonical': len(additional),
-        'additional_selected_scopes_over_canonical': len(proof_names) + len(followups) + memory_selected,
+        'additional_selected_scopes_over_canonical': len(proof_names) + len(followups) + memory_selected + len(serverless['records']),
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (129, 119, 2005, 26)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (129, 119, 2005, 28)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages
-    assert summary['additional_selected_body_pages'] == 57
+    summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages + 17
+    assert summary['additional_selected_body_pages'] == 74
     output = {'summary': summary, 'records': [entries[n] for n in sorted(entries)]}
     (D / 'reading-coverage.json').write_text(json.dumps(output, ensure_ascii=False, indent=2) + '\n')
     return summary

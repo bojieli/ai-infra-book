@@ -58,3 +58,5 @@
 2026-09-09 补齐[主机调度代表性演进](parallel-host-timeline/NOTES.md)：选读 4 份文章和 12 份固定源码，校验五个提交的 13 份 Git blob。第 5、8 章共用四次 decode 的教学时间线，区分调度摊销与重叠、当前推测长度和语法依赖；历史性能不移植到新模型。已完成该专题的有界资料补读，实际完整 trace 仍属于后续实验验证。
 
 2026-09-09 补读 [EDM／Aqua](../../references/proceedings/ASPLOS/2025/parallel-next/READINGS.md)：Aqua 的 4 页正文把邻卡容量接到拷贝粒度、调度和共置干扰，仅扩展现有 9.5.1／实验 9-7。其 vLLM v0.5.3 改造与当前框架支持分开；EDM 仅读完整摘要，保留正文候选。OS2G 原始摘要和公开稿仍缺失，不计阅读完成。
+
+Dilu／Medusa 的[正文比较](../../references/proceedings/ASPLOS/2025/serverless-body-reading/READINGS.md)将减少启动次数、缩短 loading 与恢复有效性分开，接现有 11.3.1／实验 11-3。Medusa 研究 fork 的版本声明与依赖不等于当前 vLLM 上游支持。Sparsepipe 的[两笔字节节省](../../references/proceedings/MICRO/2024/sparsepipe-body-reading/NOTES.md)只补 5.3.1 的依赖／复用推算；模拟器、表示转换及未实现通用 GPU 路径边界保留。
