@@ -34,4 +34,6 @@ vLLM／SGLang 的归约融合沿[已核分派与通信组](collective-paths-and-
 
 ## 提纲采用
 
+TACOS（MICRO 2024）提供另一层选择：先按拓扑和数据块生成路由与时序，再考虑运行参数。与 AutoCCL 的实际通信反馈对照，读者先检查共享端口是否被多条逻辑边重复计入带宽，以及生成的计划是否已有可执行后端。[论文与公开入口核对](../references/proceedings/MICRO/2024/tacos-body-reading/NOTES.md)表明，所读 README 只声明 All-Gather 和预计时间输出，All-Reduce／MSCCL-XML 尚在进行；论文的仿真收益不能写成当前 NCCL 或推理框架的现成能力。实验 6-5 仅将其作为计划与执行的可选对照，不要求安装替换通信库。
+
 只深化第 6.4.4／6.4.5，扩展实验 6-5 和图 6-5：先算模型片段，再比较独占、并发和整步结果，最后判断调优／卸载是否值得。第 5 章的 Agent profiling 与第 10 章的训练时序通过交叉引用连接；I12 增加同一配置选择的追问，不新增题号或面试来源。NSDI 2026 本轮另筛读前 40 篇摘要，SYMI、DroidSpeak、Checkmate、HydraServe、PIPEMORPH 等仍是比较候选，尚未读正文或采用。
