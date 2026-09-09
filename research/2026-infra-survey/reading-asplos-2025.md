@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 55 份代表 PDF／941 页、完成 58 篇原始完整摘要筛选，十一篇有声明范围的正文阅读；其余 126 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 65 份代表 PDF／1110 页、完成 68 篇原始完整摘要筛选，十二篇有声明范围的正文阅读；其余 116 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -130,3 +130,7 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 前一批十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。首轮将 StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，四篇随后均完成声明范围的正文阅读；StreamGrid／ARC 留作备查；该批其他论文备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。
 
 本批[存储与系统摘要记录](../../references/proceedings/ASPLOS/2025/storage-screening-notes.json)新增十篇完整摘要、八份代表 PDF／130 页，以及六份其他原始响应。OWL 属于正式 2024 卷；CRUSH 采用实验室链接的十五页 ASPLOS 版，保留先前错误路径的 404，不混用同名 IWLS 版。IBM／SNU 两条采用机构完整摘要元素，明确没有 PDF 正文阅读。AMuLeT／HyperHammer 的跨栏摘要经首页图像复核，作者脚注与版权文字不进入提取范围。Necro-reaper、Tela、Marionette 仍未取得本地可核的完整摘要，保留作者页、403 和传输失败，不用搜索片段补足阅读计数。
+
+**Helix**：物理页 1–15 与五页图像已读，见[页级记录](../../references/proceedings/ASPLOS/2025/helix-reading.json)。采用层段／链路容量、相交流水线与固定请求路径的分析方法，补已有实验 6-2 的选做；不同长度下的 KV 与单请求延迟继续约束吞吐方案。vLLM 0.4.0.post1 原型、跨地域模拟、筛过长度的轨迹与 dummy weights 工件分别保留，当前框架接口载荷另由固定源码核对。不能由静态 PP 配置推断逐请求路径规划已经集成。
+
+同批[十篇完整摘要](../../references/proceedings/ASPLOS/2025/heterogeneous-screening-notes.json)中，llm.npu、FlexSP、Spindle 分别对应 NPU 执行、变长序列并行和多任务共享组件调度，先保留候选待读；其余按现有案例的解释力筛选，不为摘要里出现的机制另增章节。第 65／66 项仍缺原始完整摘要。

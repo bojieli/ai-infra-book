@@ -768,3 +768,7 @@
 | `asplos25-streamgrid-body` | [StreamGrid 正文范围](../references/proceedings/ASPLOS/2025/streamgrid-reading.json) | 5、13 | 补充／版本参照 | 十一页与五张图页；算法质量、数据流建模及缓冲，备查不新增正文 |
 | `asplos25-arc-body` | [ARC 正文范围](../references/proceedings/ASPLOS/2025/arc-reading.json) | 5、13 | 补充／版本参照 | 十二页与四张图页；原子排队、warp 归约代价与硬件模拟边界 |
 | `asplos25-storage-screen` | [存储与系统摘要筛选](../references/proceedings/ASPLOS/2025/storage-screening-notes.json) | 5、11、13 | 补充／版本参照 | 十篇完整摘要、八份 PDF；机构原文与跨栏范围核对，三项缺口保留 |
+| `asplos25-heterogeneous-screen` | [异构与训练系统摘要筛选](../references/proceedings/ASPLOS/2025/heterogeneous-screening-notes.json) | 4、6、10、12 | 补充／版本参照 | 十篇完整摘要、十份 PDF；两项缺口及三个正文候选保留 |
+| `asplos25-helix-body` | [Helix 正文与工件范围](../references/proceedings/ASPLOS/2025/helix-reading.json) | 6、7、9 | 补充／版本参照 | 十五页与五页图像；容量网络、请求路径、KV 预测和模拟条件 |
+| `heterogeneous-pipeline-framework` | [异构流水线与框架接口](../references/framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md) | 6、7、9 | 补充／版本参照 | 历史 vLLM 原型、2025 指南与固定 2026 接口；八个源码读取范围 |
+| `qwen3-heterogeneous-pipeline-case` | [Qwen3 异构 PP 的链路与状态](../case-studies/model-parallelism.md#异构流水线的链路与状态) | 6、7、9 | 补充／版本参照 | 实验 6-2／图 6-2 选做；双张量载荷、最小割与 KV 容量约束 |

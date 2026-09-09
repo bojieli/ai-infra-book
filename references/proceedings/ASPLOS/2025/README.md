@@ -1,6 +1,6 @@
 # ASPLOS 2025：出版目录核对
 
-官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 55 份代表公开 PDF，另存 PipeLLM 一个十五页作者版本；筛读 58 篇原始摘要，其中十一篇有声明范围的正文阅读；其余 126 篇摘要与更多公开正文待补。
+官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 65 份代表公开 PDF，另存 PipeLLM 一个十五页作者版本；筛读 68 篇原始摘要，其中十二篇有声明范围的正文阅读；其余 116 篇摘要与更多公开正文待补。
 
 | 日程对应的正式卷 | 匹配条目 | 出版元数据中的日期 |
 | --- | ---: | --- |
@@ -18,7 +18,7 @@
 
 ## 公开稿与读取进度
 
-[selected-sources.json](selected-sources.json) 另存 101 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。55 份有效 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。八份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
+[selected-sources.json](selected-sources.json) 另存 117 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。55 份有效 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。八份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
 
 [58 篇摘要](public-abstracts.json)直接来自作者 arXiv 页面、作者／机构论文 PDF 或作者摘要页，逐项保存来源及提取范围。作者稿可能晚于正式出版，HAL 的封面页与正文页也分开计；不混用卷页码。具体取舍见[阅读记录](../../../../research/2026-infra-survey/reading-asplos-2025.md)，其中 IKS、FSMoE 作者 v1 的物理页 1–13 各已读，相关图已查看；其余 PDF 主要完成身份与摘要核对。页级范围见 [IKS](iks-reading.json) 与 [FSMoE](fsmoe-reading.json)，历史模型和数值疑点留在阅读记录。
 
@@ -41,3 +41,7 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 2026-09-09 补读 [StreamGrid](streamgrid-reading.json) 十一页与 [ARC](arc-reading.json) 十二页，九张正文图页实际查看。两篇均转为备查：分别保留算法质量与缓冲约束、原子争用与额外指令的判断，不增加主大纲内容。当前十一篇有声明正文范围，并不表示十一篇全文读完。
 
 同批[十四份响应](storage-screening-notes.json)补八份代表 PDF／130 页、十篇完整摘要；累计 55 份代表 PDF／941 页、58 篇摘要，尚缺 126 篇摘要。另有一次 TLS 传输失败，单列而不计为响应。IBM／SNU 机构摘要保留精确 HTML 元素；两个跨栏 PDF 摘要已查看首页图像。第 57／59／62 项保留缺口，未以搜索摘要或 2026 Top Picks 版本替代正式论文。
+
+2026-09-09 增加[十六份响应](heterogeneous-screening-notes.json)，含十份代表 PDF／169 页及十篇完整摘要；第 65／66 项仍缺完整摘要，另留一次已由作者备用链接解决的传输错误。NACHO 的机构封面与实际论文页分开核对，FlexSP／Spindle 保留 arXiv v3 日期而不冒称出版副本。三页摘要图像已查看。累计 65 份代表 PDF／1110 页、68 篇完整摘要，尚缺 116 篇。
+
+同批选读 [Helix](helix-reading.json) 物理页 1–15 与五页图像，现共十二篇有声明正文范围。其异构请求路径与 vLLM 静态 PP 的差距见[专题笔记](../../../framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md)；只补现有第 6 章实验的变体。llm.npu、FlexSP、Spindle 留作候选待读，未据摘要采用性能结论。
