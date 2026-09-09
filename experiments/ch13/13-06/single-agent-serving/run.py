@@ -1,138 +1,215 @@
 #!/usr/bin/env python3
-"""Offline serving-cost estimates from frozen records and explicit scenarios."""
+"""Offline resource-based estimates: V4 Flash / Kimi K3, full long contexts.
+No API prices, small-model timings, or measured production-speed claims.
+"""
 import hashlib
 import json
 import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SECONDS = 30 * 24 * 3600
-HOURS = 30 * 24
-RATE = 2.09  # Runpod Secure Cloud advertised starting rate, frozen 2026-09-09.
-USABLE = 96e9 * .8  # Conservative decimal capacity; 20% scenario reserve.
+S = ROOT / 'long-context-sources'
+HOURS, SECONDS = 720, 2592000
 
 
 def load(name):
-    return json.loads((ROOT / 'sources' / name).read_text())
+    return json.loads((S / name).read_text())
 
 
 def table(headers, rows):
-    return '\n'.join(['| ' + ' | '.join(headers) + ' |',
-                     '| ' + ' | '.join(['---'] * len(headers)) + ' |'] +
-                    ['| ' + ' | '.join(map(str, r)) + ' |' for r in rows])
+    return '\n'.join(['| ' + ' | '.join(headers) + ' |', '| ' + ' | '.join(['---']*len(headers)) + ' |'] +
+                     ['| ' + ' | '.join(map(str, row)) + ' |' for row in rows])
 
 
-for item in json.loads((ROOT / 'manifest.json').read_text()):
-    assert hashlib.sha256((ROOT / item['file']).read_bytes()).hexdigest() == item['sha256']
+# All editable performance assumptions are explicit; GPU specification != achieved rate.
+PROFILES = {
+    'slow': dict(hbm_eff=.35, tensor_eff=.10, layer_overhead_us=250, communication_us=10),
+    'central': dict(hbm_eff=.50, tensor_eff=.20, layer_overhead_us=150, communication_us=5),
+    'fast': dict(hbm_eff=.65, tensor_eff=.30, layer_overhead_us=75, communication_us=3),
+}
+HW = dict(gpu='B200', memory_bytes=180_000_000_000, hbm_bytes_s=8e12,
+          dense_fp8_flops_s=4.5e15, dense_bf16_flops_s=2.25e15,
+          gpu_usd_hour=6.79, usable_fraction=.8, effective_nvlink_bytes_s=450e9,
+          effective_inter_node_bytes_s=25e9)
 
-# Keep decode interval and finite-batch end-to-end throughput as separate estimates.
-measured = []
-for s in load('batch-summary.json')['summary']:
-    if s['kind'] != 'prefix':
-        continue
-    b = s['batch']
-    r = 1000 / s['median_time_per_output_ms']
-    cost = HOURS * RATE / b
-    out = SECONDS * r / 1e6
-    finite_r = s['output_tokens_per_s'] / b
-    measured.append(dict(batch=b, decode_tokens_s=r, monthly_output_million=out,
-                         monthly_usd=cost, usd_per_million=cost/out,
-                         finite_batch_tokens_s_per_user=finite_r,
-                         finite_batch_usd_per_million=cost/(SECONDS*finite_r/1e6),
-                         meets_20_tokens_s=r >= 20, meets_30_tokens_s=r >= 30,
-                         preemptions=s['preemptions_observed']))
 
-# Poolable weight + independent BF16 KV capacity, not a validated TP/EP deployment.
-capacity = []
-offload = []
-for model, filename in [('Qwen3-8B','qwen8.json'),
-                        ('R1-Distill-Llama-70B','llama70.json'),
-                        ('Qwen3-235B-A22B','qwen235.json')]:
-    d = load(filename); s = d['summary']; dim = d['dimensions']
-    kv_per_token = 2 * dim['num_hidden_layers'] * dim['num_key_value_heads'] * dim['head_dim'] * 2
-    assert kv_per_token == s['kv_bytes_per_token_per_request']
-    assert sum(w['parameters'] for w in d['weights']) == s['parameters']
-    for history in [8192, 32768, 131072]:
-        kv = (history + 1) * kv_per_token
-        for bits in [16, 4]:
-            # 4-bit is a payload scenario with a declared 5% metadata allowance.
-            weight = s['weight_resident_bytes'] if bits == 16 else s['parameters'] * .5 * 1.05
-            for b in [1, 16]:
-                need = weight + b * kv
-                n = next(x for x in [1,2,4,8,16,32,64] if x * USABLE >= need)
-                assert n*USABLE >= need and (n == 1 or n/2*USABLE < need)
-                capacity.append(dict(model=model, history=history, weight_bits=bits,
-                    independent_users=b, weight_gib=weight/2**30, kv_gib_per_user=kv/2**30,
-                    capacity_candidate_cards=n, pool_usd_month=n*HOURS*RATE,
-                    usd_month_per_user=n*HOURS*RATE/b, speed_status='not measured'))
-        # Explicit uniform-residency scenario, not a rigorous implementation bound.
-        available_weights = max(0, USABLE-kv)
-        missing_fraction = max(0, 1-available_weights/s['weight_resident_bytes'])
-        transfer = missing_fraction * s['weight_read_once_per_operator_bytes']
-        if transfer:
-            r_ceiling = 25e9 / transfer
-            offload.append(dict(model=model, history=history,
-                missing_weight_fraction=missing_fraction,
-                assumed_transfer_gb_per_step=transfer/1e9,
-                transfer_only_tokens_s_ceiling=r_ceiling,
-                gpu_only_usd_month=HOURS*RATE,
-                gpu_only_usd_per_million_floor=HOURS*RATE/(SECONDS*r_ceiling/1e6)))
+def v4_state(n):
+    c = load('v4-config.json')
+    resident = read = flops = 0
+    prefill_attn = prefill_index = 0
+    for r in c['compress_ratios'][:c['n_layers']]:
+        z = n//r if r else 0
+        chosen = min(z, c['index_topk']) if r == 4 else z
+        coff = 2 if r == 4 else 1
+        buf = 2*(coff*r)*(coff*c['head_dim'])*4
+        if r == 4:
+            buf += 2*(coff*r)*(coff*c['index_head_dim'])*4
+        resident += (min(n,128)+z)*512*2 + buf
+        read += (min(n,128)+chosen)*512*2
+        flops += 4*64*512*(min(n,128)+chosen)
+        # Conservative full-window / selected-record upper work for the whole prefill.
+        prefill_attn += 4*64*512*(n*128 + (n*512 if r==4 else n*n/(2*r) if r else 0))
+        if r == 4:
+            resident += z*128*2
+            read += z*128*2
+            flops += 2*64*128*z
+            # Reference rectangular index scores; not a sparsity discount on the scan.
+            prefill_index += 2*64*128*n*(n//4)
+    return dict(resident_bytes=resident, history_read_bytes=read, attention_flops=flops,
+                prefill_attention_flops=prefill_attn+prefill_index)
 
-# Exact endpoint prices; speed is a requested scenario, not provider performance.
-api = []
-for model, ip, op in [('Llama-3-8B-Instruct-Lite',.14,.14),
-                      ('Llama-3.3-70B-Instruct-Turbo',1.04,1.04),
-                      ('Qwen3-235B-A22B-Instruct-2507-tput',.20,.60)]:
-    for r in [20,50,100]:
-        out = SECONDS*r/1e6
-        api.append(dict(model=model, requested_tokens_s=r,
-            monthly_output_million=out, input_usd_per_million=ip, output_usd_per_million=op,
-            output_only_usd_month=out*op,
-            total_with_1pct_billed_input=out*(op+.01*ip),
-            total_with_16x_billed_input=out*(op+16*ip),
-            speed_status='conditional on endpoint sustaining this single-stream rate'))
 
-prefill=[]
-for overhead in [0,60,300,900]:
-    fraction=(3600-overhead)/3600
-    prefill.append(dict(nonoverlapped_seconds_per_hour=overhead,
-                        output_multiplier=fraction, unit_cost_multiplier=1/fraction))
+def k3_state(n):
+    c = load('k3-config.json')['text_config']; linear = c['linear_attn_config']
+    mla, kda = len(linear['full_attn_layers']), len(linear['kda_layers'])
+    recurrent = kda*96*128*128*4
+    conv = kda*3*96*128*4*2
+    history = mla*n*(512+64)*2
+    return dict(resident_bytes=history+recurrent+conv, history_read_bytes=history,
+                recurrent_bytes=recurrent, convolution_bytes=conv,
+                attention_flops=2*mla*96*n*(512+64+512),
+                prefill_attention_flops=mla*96*n*(n+1)*(512+64+512))
 
-result=dict(status='completed estimate; no new GPU run or 24x7 endurance measurement',
-    days=30,hours=HOURS,seconds=SECONDS,price_usd_gpu_hour=RATE,
-    measured_record_projection=measured,capacity_scenarios=capacity,
-    offload_scenarios=offload,api_scenarios=api,prefill_sensitivity=prefill)
-(ROOT/'results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
 
-sections=['# 单 Agent、24×7 serving 成本：估算结果',
-    '2026-09-09。每月 30 天、720 小时、2,592,000 秒。金额为美元。输入与适用范围见 README；本文件由 run.py 自动生成。',
-    '## 1. Qwen3-8B：沿实测 decode 间隔外推',
-    table(['共享人数','每人 decode tok/s','月输出 M','每人月费用','$/M 输出','有限批次含 prefill 的 $/M'],
-          [[r['batch'],f"{r['decode_tokens_s']:.2f}",f"{r['monthly_output_million']:.2f}",
-            f"{r['monthly_usd']:.2f}",f"{r['usd_per_million']:.2f}",
-            f"{r['finite_batch_usd_per_million']:.2f}"] for r in measured]),
-    '按已测四个 batch 点、decode 至少 30 tok/s 的门槛，最多选 16 人共享，每人约 $94.05/月；64 人共享约 $23.51/月，但每人仅约 17.54 tok/s。此选择只在四个样本点内，未声称全局最优或满足 P99。有限批次列另用池吞吐除以人数，不能与纯 decode 月输出混算。',
-    '## 2. 不同规模：32K 历史下的容量候选与月租',
-    table(['模型','权重位宽','每人 KV GiB','1人所需卡数候选','1人 $/月','16人所需卡数候选','16人每人 $/月'],
-          [[m,str(bits),f"{one['kv_gib_per_user']:.2f}",one['capacity_candidate_cards'],
-            f"{one['usd_month_per_user']:.2f}",many['capacity_candidate_cards'],f"{many['usd_month_per_user']:.2f}"]
-           for m in ['Qwen3-8B','R1-Distill-Llama-70B','Qwen3-235B-A22B'] for bits in [16,4]
-           for one in [next(x for x in capacity if x['model']==m and x['history']==32768 and x['weight_bits']==bits and x['independent_users']==1)]
-           for many in [next(x for x in capacity if x['model']==m and x['history']==32768 and x['weight_bits']==bits and x['independent_users']==16)]]),
-    '上述是总容量候选，不保证逐卡放置、互联、速度或质量可行。4-bit 为统一打包加 5% 元数据的情景，不是已测量化文件。GPU 月租不含另购的磁盘、网络、控制器与运维。8K／128K 和完整 36 行矩阵见 results.json；128K 只算容量压力，不声明所有模型支持该长度。',
-    '## 3. 单卡 BF16 卸载：32K 历史的传输约束',
-    table(['模型','假设每步换入 GB','仅传输 tok/s 上限','仅GPU $/M 成本下限'],
-          [[x['model'],f"{x['assumed_transfer_gb_per_step']:.2f}",f"{x['transfer_only_tokens_s_ceiling']:.2f}",
-            f"{x['gpu_only_usd_per_million_floor']:.2f}"] for x in offload if x['history']==32768]),
-    '均匀权重驻留／专家访问假设、25 GB/s 有效主机到GPU带宽；忽略算子与其他传输，主机内存费用尚未计入。该条件算例说明省卡可能付出串行换入代价，不是 KTransformers 或某卸载后端的实测性能。CPU直接算专家是另一条路径，不能套用本表。',
-    '## 4. API：若每人持续 50 tok/s',
-    table(['精确模型端点','月输出 M','仅输出 $/月','计费输入为输出1%时','反复输入为输出16倍时'],
-          [[x['model'],f"{x['monthly_output_million']:.2f}",f"{x['output_only_usd_month']:.2f}",
-            f"{x['total_with_1pct_billed_input']:.2f}",f"{x['total_with_16x_billed_input']:.2f}"] for x in api if x['requested_tokens_s']==50]),
-    '20／100 tok/s 情景见 JSON。价格取官方端点页面，速度、持续额度和质量尚未验证。API模型与本地模型并非全部相同版本，不能按规模标签宣称同质量优劣。16倍输入是每生成256 token又计费4096历史token的敏感性情景，不宣称服务端没有缓存；缓存的实际账单应依其计费字段替换。',
-    '## 5. Prefill／压缩占用时间',
-    table(['每小时不可重叠开销秒','月输出乘数','独占 $/M 乘数'],
-          [[x['nonoverlapped_seconds_per_hour'],f"{x['output_multiplier']:.4f}",f"{x['unit_cost_multiplier']:.4f}"] for x in prefill]),
-    '较少的 prefill 可以作为修正：每小时60秒使产出减少1.67%、每百万成本增加1.69%；若每小时900秒，产出少25%、单位成本增加33.33%。费用按整月持续预留，额外服务另计。']
-(ROOT/'RESULTS.md').write_text('\n\n'.join(sections)+'\n')
-print('Verified source hashes and model dimensions; wrote 4 measured projections, 36 capacity scenarios, API and overhead sweeps.')
+def model(name):
+    d = load('v4-forward.json' if name=='DeepSeek-V4-Flash' else 'k3-forward.json')
+    v4 = name=='DeepSeek-V4-Flash'; base_batch=d['scenario']['batch']
+    e=d['components']['experts']; g=e['geometry']
+    routed_params=sum(m['parameters'] for m in e['matrices'] if m['category']=='routed')
+    routed_bytes=routed_params*17//32  # FP4 payload + one-byte group-32 scales.
+    weight=d['checkpoint']['byte_groups']['base_total_bytes' if v4 else 'text_total_bytes']
+    assert (routed_bytes == e['routed_expert_format']['summary']['resident_weight_and_scale_bytes']) if v4 else (routed_bytes == d['checkpoint']['byte_groups']['text_U8_bytes'])
+    attn0=(d['components']['attention']['summary']['effective_qk_pv_matrix_flops']+
+           d['components']['attention']['summary']['reference_index_matrix_flops']) if v4 else d['components']['mla']['summary']['valid_attention_matrix_flops']
+    total_flops=d['summary']['matrix_flops_effective_attention' if v4 else 'matrix_flops']/base_batch
+    routed_flops=e['summary']['routed_matrix_flops']/base_batch
+    return dict(name=name, weight_bytes=weight, routed_bytes=routed_bytes,
+                nonrouted_bytes=weight-routed_bytes, experts=g['experts'], k=g['top_k'],
+                layers=43 if v4 else 93, hidden=g['hidden'], routed_flops=routed_flops,
+                other_matrix_flops=total_flops-attn0/base_batch-routed_flops,
+                tp=4 if v4 else 8, pp=1 if v4 else 2,
+                state=v4_state if v4 else k3_state)
+
+
+def expected_tiles(b, k, experts, tile=32):
+    # Per expert X~Binomial(B,k/E), since each sequence selects k distinct experts.
+    p=k/experts
+    probs=[math.comb(b,x)*p**x*(1-p)**(b-x) for x in range(b+1)]
+    union=experts*(1-probs[0])
+    padded=experts*sum(math.ceil(x/tile)*tile*probs[x] for x in range(1,b+1))
+    return union,padded
+
+
+def estimate(m, n, b, dcp, profile):
+    st=m['state'](n); tp,pp=m['tp'],m['pp']; cards=tp*pp; p=PROFILES[profile]
+    v4=m['name']=='DeepSeek-V4-Flash'
+    # TP replicates shared latent KV unless explicitly context-sharded.
+    # Five KDA slots/request budget ongoing state plus prefix/reuse bookkeeping.
+    if v4:
+        state_rank=st['resident_bytes']*b
+    else:
+        c=load('k3-config.json')['text_config']['linear_attn_config']
+        stages=[list(range(1,48)),list(range(48,94))]
+        state_rank=max(b*(len(set(ids)&set(c['full_attn_layers']))*n*576*2/dcp +
+                          len(set(ids)&set(c['kda_layers']))*(5*96*128*128*4+3*96*128*4*2)/tp)
+                       for ids in stages)
+    # 5% allowance for layer/embedding imbalance; another 20% card reserve is unavailable.
+    weight_rank=m['weight_bytes']/cards*(1.05 if pp>1 else 1)
+    peak=weight_rank+state_rank
+    union,padded=expected_tiles(b,m['k'],m['experts'])
+    routed_read=m['routed_bytes']*union/m['experts']
+    padded_flops=m['routed_flops']/m['k']*padded
+    bw=HW['hbm_bytes_s']*p['hbm_eff']
+    fp8=HW['dense_fp8_flops_s']*p['tensor_eff']
+    bf16=HW['dense_bf16_flops_s']*p['tensor_eff']
+    # Sum sequential stages: divide latency by TP only, never by TP*PP.
+    routed_s=max(routed_read/(tp*bw),padded_flops/(tp*fp8))*1.2
+    other_s=max(m['nonrouted_bytes']/(tp*bw),b*m['other_matrix_flops']/(tp*bf16))
+    traffic=b*(st['history_read_bytes']/dcp + (0 if v4 else 2*st['recurrent_bytes']/tp))
+    attention_s=max(traffic/bw,b*st['attention_flops']/(tp*bf16))
+    # Communication startup and payload; no tensor-product multiplication of bandwidth.
+    collectives=2*m['layers']+(48 if dcp>1 else 0)
+    comm=collectives*(p['communication_us']*1e-6+2*(tp-1)/tp*b*m['hidden']*2/HW['effective_nvlink_bytes_s'])
+    if pp>1:
+        comm+=20e-6+b*m['hidden']*2/HW['effective_inter_node_bytes_s']
+    overhead=m['layers']*p['layer_overhead_us']*1e-6
+    step=routed_s+other_s+attention_s+comm+overhead
+    # Rebuild retained history after every 10% of the context worth of new output.
+    # Full-length rebuild is conservative versus actually rebuilding 90%; compute-only model.
+    # Aggregate hardware used for chunked prefill, unlike the serial decode trajectory.
+    prefill=(n*m['routed_flops']/(cards*fp8)+
+             (n*m['other_matrix_flops']+st['prefill_attention_flops'])/(cards*bf16))
+    cycle_output=.1*n
+    decode_fraction=cycle_output*step/(cycle_output*step+b*prefill)
+    r=1/step; sustained=r*decode_fraction
+    cost=HOURS*cards*HW['gpu_usd_hour']/b
+    feasible=peak<=HW['memory_bytes']*HW['usable_fraction']
+    return dict(model=m['name'],context_tokens=n,batch=b,tp=tp,pp=pp,dcp=dcp,gpus=cards,
+                profile=profile,capacity_feasible=feasible,rank_peak_gib=peak/2**30,
+                rank_weight_gib=weight_rank/2**30,rank_state_gib=state_rank/2**30,
+                context_state_gib_one_copy=st['resident_bytes']/2**30,
+                expected_expert_union=union,expected_padded_expert_rows=padded,
+                ms=dict(routed=1000*routed_s,other_weights=1000*other_s,attention=1000*attention_s,
+                        communication=1000*comm,other_execution=1000*overhead),
+                decode_tokens_s=r,decode_only_monthly_output_million=SECONDS*r/1e6,
+                rebuild_compute_seconds=prefill,pool_rebuild_compute_seconds=b*prefill,decode_time_fraction=decode_fraction,
+                sustained_tokens_s=sustained,monthly_output_million=SECONDS*sustained/1e6,
+                usd_month_per_worker=cost,usd_per_million=cost/(SECONDS*sustained/1e6),
+                status='analytical scenario, not measured; rejected when capacity_feasible=false')
+
+
+def main():
+    for s in json.loads((ROOT/'long-context-manifest.json').read_text()):
+        assert hashlib.sha256((ROOT/s['file']).read_bytes()).hexdigest()==s['sha256']
+    # Cross-check independent frozen state ledgers at their original 1,048,576-token point.
+    for fn,name in [(v4_state,'v4-state-audit.json'),(k3_state,'k3-state-audit.json')]:
+        assert fn(1048576)['resident_bytes']*64==load(name)['summary']['resident_bytes']
+    models=[model(n) for n in ['DeepSeek-V4-Flash','Kimi-K3']]
+    layouts=[dict(models[0],tp=t) for t in [2,4,8]]+[models[1]]
+    rows=[estimate(m,n,b,dcp,p) for m in layouts for n in [200000,1000000]
+          for b in [1,2,4,8,16,32,64,128] for dcp in ([1] if m['name']=='DeepSeek-V4-Flash' else [1,8]) for p in PROFILES]
+    selected=[]
+    for name in [m['name'] for m in models]:
+        for n in [200000,1000000]:
+            for p in PROFILES:
+                for target in [20,30]:
+                    candidates=[x for x in rows if x['model']==name and x['context_tokens']==n and x['profile']==p
+                                and x['capacity_feasible'] and x['decode_tokens_s']>=target]
+                    best=min(candidates,key=lambda x:(x['usd_month_per_worker'],-x['sustained_tokens_s'])) if candidates else None
+                    selected.append(dict(model=name,context_tokens=n,profile=p,target_tokens_s=target,best=best))
+    result=dict(status='completed analytical revision; no measured long-context serving',
+                hardware=HW,profiles=PROFILES,models=[{k:v for k,v in m.items() if k!='state'} for m in models],
+                scenarios=rows,selected=selected)
+    (ROOT/'results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
+    central=[s for s in selected if s['profile']=='central' and s['target_tokens_s']==30]
+    report=['# 数字员工：V4 Flash / Kimi K3 的长上下文自建 serving 估算',
+      '2026-09-09 修订。200K = 200,000，1M = 1,000,000 个已占用历史 token。每月 720 小时。金额 USD。下面均为资源与效率假设推导，未租卡实测；输入和公式见 [README](README.md)。',
+      '## 权重与单员工状态',
+      table(['模型','权重及量化元数据 GB','200K 状态 GiB','1M 状态 GiB','GPU 组'],
+            [[m['name'],f"{m['weight_bytes']/1e9:.2f}",f"{m['state'](200000)['resident_bytes']/2**30:.2f}",f"{m['state'](1000000)['resident_bytes']/2**30:.2f}",'2/4/8×B200' if m['name']=='DeepSeek-V4-Flash' else '16×B200'] for m in models]),
+      '状态列为不复制的一份逻辑状态。V4 的状态在 TP2/4/8 上复制；K3 分开算 TP 复制与 DCP8 分片，容量检查另保留每请求 5 个 KDA 状态槽、逐阶段不均匀及 20% 卡容量余量。K3 仅文本主干；视觉编码服务另计。',
+      '## 主情景：至少 30 token/s 的员工',
+      '主表遵循持续 decode 基线，以纯 decode 30 token/s 为比较门槛；这是题设情景，不是实测 SLO。周期重建另列敏感性，加入后可能不再满足 30 token/s。只在枚举 batch 和指定拓扑内选择，不声称全局最低成本。',
+      table(['模型','占用历史','共享人数','TP/PP/DCP','纯 decode tok/s','重建后 tok/s','纯 decode 月输出 M','每人 $/月','纯 decode $/M'],
+            [[s['model'],s['context_tokens'],x['batch'],f"{x['tp']}/{x['pp']}/{x['dcp']}",f"{x['decode_tokens_s']:.1f}",f"{x['sustained_tokens_s']:.1f}",f"{x['decode_only_monthly_output_million']:.1f}",f"{x['usd_month_per_worker']:.2f}",f"{x['usd_month_per_worker']/x['decode_only_monthly_output_million']:.2f}"] if (x:=s['best']) else [s['model'],s['context_tokens'],'无候选','—','—','—','—','—','—'] for s in central]),
+      '## 独占一组 GPU：只服务一名员工',
+      table(['模型','历史','GPU数','布局 DCP','重建后 tok/s','$/月','$/M 输出'],
+            [[x['model'],x['context_tokens'],x['gpus'],x['dcp'],f"{x['sustained_tokens_s']:.1f}",f"{x['usd_month_per_worker']:.2f}",f"{x['usd_per_million']:.2f}"] for x in rows if x['batch']==1 and x['profile']=='central' and x['tp']==(2 if x['model']=='DeepSeek-V4-Flash' else 8) and x['dcp']==(1 if x['model']=='DeepSeek-V4-Flash' else 8)]),
+      '## 效率敏感性：纯 decode 30 token/s 门槛',
+      table(['模型','历史','效率情景','选中人数','$/人月'],
+            [[s['model'],s['context_tokens'],s['profile'],s['best']['batch'] if s['best'] else '无候选',f"{s['best']['usd_month_per_worker']:.2f}" if s['best'] else '—'] for s in selected if s['target_tokens_s']==30]),
+      '这不是统计置信区间。slow／central／fast 是尚未校准的 HBM、矩阵效率与每层固定开销组合；价格每变化 10%，相同配置费用也变化 10%。B200 多节点集群需另询价，公开 Pod 价格仅作统一 GPU 租金基准。',
+      '## K3：复制缓存与分片缓存的容量差异',
+      table(['历史','DCP','主情景容量允许的最大枚举 batch','其中满足30 tok/s的最大 batch'],
+            [[n,dcp,max([x['batch'] for x in rows if x['model']=='Kimi-K3' and x['context_tokens']==n and x['dcp']==dcp and x['profile']=='central' and x['capacity_feasible']],default=0),max([x['batch'] for x in rows if x['model']=='Kimi-K3' and x['context_tokens']==n and x['dcp']==dcp and x['profile']=='central' and x['capacity_feasible'] and x['decode_tokens_s']>=30],default=0)] for n in [200000,1000000] for dcp in [1,8]]),
+      '## Agent 周期重建',
+      table(['模型','历史','一次重建计算时间秒','主情景选中 batch','可用于 decode 的时间占比'],
+            [[s['model'],s['context_tokens'],f"{s['best']['rebuild_compute_seconds']:.1f}" if s['best'] else '—',s['best']['batch'] if s['best'] else '—',f"{s['best']['decode_time_fraction']:.1%}" if s['best'] else '—'] for s in central]),
+      '持续生成使上下文触及边界。本题保留约 90% 历史，每生成相当于窗口 10% 的 token 后重建；上表按满窗口计算该次 prefill。B 名员工一轮共支付 B 次重建，未把一次重建成本摊成 B 人免费复用。这里只预算重建矩阵工作，摘要模型、工具返回的新输入及其他 prefill 开销尚未计入，所以重建后产出仍有乐观偏差。无重建的理想 decode 另列，不能把省 prefill 当作长上下文 attention 免费。',
+      '完整 240 个容量／速度情景（含被容量排除的候选）、逐阶段延迟、20 token/s 门槛、效率输入保存在 [results.json](results.json)。不以 API 售价折算，不用 8B 速度外推，也不把两模型串成一个员工或假设两者完成任务的质量相同。']
+    (ROOT/'RESULTS.md').write_text('\n\n'.join(report)+'\n')
+    print('Verified source hashes and independent state baselines; wrote',len(rows),'scenarios.')
+
+
+if __name__=='__main__':
+    main()

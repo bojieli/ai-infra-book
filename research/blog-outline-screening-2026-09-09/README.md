@@ -18,4 +18,4 @@
 - [数字员工综合估算](../../case-studies/single-agent-serving-cost.md)
 - [七份作者来源快照与校验值](../../references/author-materials/2026-09-09/sources.json)
 
-两朵云短例直接列公开论文入口；本次核对标题、摘要和版本，未把演讲数字冒充全文复测。AI Agent 书读取上下文相关正文和实验台账；既有实验未重跑。数字员工已完成[综合估算](../../experiments/ch13/13-06/single-agent-serving/README.md)，使用冻结的已有测量、官方价格及模型张量记录；容量与速度的适用范围分别标明，全部计算和结果放在 experiments。训练语料采集故事按作者最后反馈删除。
+两朵云短例直接列公开论文入口；本次核对标题、摘要和版本，未把演讲数字冒充全文复测。AI Agent 书读取上下文相关正文和实验台账；既有实验未重跑。数字员工已完成[综合估算](../../experiments/ch13/13-06/single-agent-serving/README.md)，按最新反馈采用 DeepSeek V4 Flash 与 Kimi K3、接近满载的 200K／1M 历史，以 GPU 租金、模型张量与状态记录推导自建成本；所有计算和结果放在 experiments，效率假设与部署实测明确区分。训练语料采集故事按作者最后反馈删除。
