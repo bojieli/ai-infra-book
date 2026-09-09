@@ -23,7 +23,7 @@ def verify():
             assert hashlib.sha256(b"".join(lines[span["first"]-1:span["last"]])).hexdigest() == span["sha256"]
     assert json.loads((D / "vattention-commit.json").read_text())["sha"] == "71a0e91aa46ff8fa985bcca3327efe0ab9929a39"
     assert json.loads((D / "flashinfer-commit.json").read_text())["sha"] == "b6aed59786374d437b64b054488d0740ad5f5468"
-    result = {"status": "passed", "source_responses": len(sources), "partial_source_files_read": len(reading["records"]), "read_ranges": sum(len(r["ranges"]) for r in reading["records"]), "downloaded_code_executed": False, "new_paper_reading_credit": 0}
+    result = {"status": "passed", "source_responses": len(sources), "partial_source_files_read": sum(r["scope"] == "partial" for r in reading["records"]), "complete_source_files_read": sum(r["scope"] == "complete" for r in reading["records"]), "read_ranges": sum(len(r["ranges"]) for r in reading["records"]), "downloaded_code_executed": False, "new_paper_reading_credit": 0}
     (D / "validation.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     return result
 
