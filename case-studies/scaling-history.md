@@ -54,3 +54,6 @@ Qwen3 表 21 的 **17,920 与 1,800 GPU 小时**比较特定 8B 模型的 RL 与
 ## 复核与后续交付
 
 新增报告、模型卡与网页的 URL、获取时间和 SHA-256 见[来源记录](../references/outline-checks/2026-09-07/scaling-history/sources.json)。本轮核对了相关章节、表与配置；未声称完整复现训练，也未将未公开项填成估计事实。实验 3-8 至 3-10 在扩写时提供输入、脚本与参考分析，正文按拟合、投入变化、系统选择展开。
+
+
+对应的可复算入口为 `python3 calculations/calc.py training-history --format md`，见[锁定历史字段及条件预算](../calculations/results/training-history-published.md)。Llama405的GPU小时与最大卡数来源范围需额外对齐，78.430176天仅为该条件下的下界；论文阶段MFU单列，不用某一阶段代表全程。MoE总参数用于区分容量侧，6ND仍明确使用激活代理；精确逐算子训练工作另由训练矩阵模块计量。

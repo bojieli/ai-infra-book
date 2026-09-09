@@ -41,3 +41,9 @@ attention、embedding 与输出头另算：DP／EP 下可能复制，TP 下还�
 固定 verl V1 指南继续说明部分轨迹保留 token 和行为 logprob，换版本后重建 KV；跨角色异步还需样本版本与准入规则。这里沿用[状态与概率身份](rl-state-and-reproducibility.md)，不把“引擎恢复”当作整个 RL 系统的可复现性保证。
 
 采用位置：5.4.4 用稳定地址引出后续问题；10.5.3、实验 10-8 和图 10-7 展开阶段峰值与分发下界。基础部分只运行一种受支持的小模型后端，大模型使用真实配置与分片元数据推算；不要求读者安装全部框架。
+
+## 可复算入口
+
+[weight-handoff计算](../calculations/results/weight-handoff-book.md)按锁定官方Qwen235配置复算全BF16权重470187269120bytes，专家454192791552bytes、非专家15994477568bytes。EP16每rank接收专家加完整非专家共44381527040bytes；一个EP组选择性单播总出口710104432640bytes，向16rank各发完整模型则7522996305920bytes。这是指定单播策略的生产端载荷，不是树广播链路量或实测加速。
+
+[Qwen8阶段容量](../calculations/results/weight-handoff-qwen8.md)使用本节40/24/4GiB教学分配复现83.2564/59.2564GiB峰值。运行`python3 calculations/calc.py weight-handoff --format md`，用`--inputs`切换模型、EP、副本与有效带宽；旧KV失效、源端重组、接收缓冲与引擎版本屏障仍需另外验证。

@@ -737,37 +737,37 @@
 | `torus-allocation-arithmetic` | [Qwen3 消息与位置枚举](../research/2026-infra-survey/torus-allocation-arithmetic.json) | 6、7、11 | 补充／版本参照 | 现有实验 6-4、7-8、11-3；计算示例不替代物理系统实测 |
 | `asplos26-m2xfp-body` | [M²XFP 正文范围](../references/proceedings/ASPLOS/2026/m2xfp-reading.json) | 4、5、8 | 补充／版本参照 | 4.2.5→5.3→8.4；静态与动态编码、元数据及专用架构条件 |
 | `metadata-quantization-implementations` | [格式与实际实现](../references/framework-history/2026-09-09/metadata-quantization/README.md) | 4、5、8 | 补充／版本参照 | 伪量化、vLLM v0.12.0 与固定当前路径；质量与执行分别核对 |
-| `metadata-quantization-qwen3-case` | [同一 Qwen3 权重的表示](../case-studies/kernel-orchestration-and-quantization.md) | 4、5、8 | 补充／版本参照 | 现有实验 4-2／5-4 与图 4-3；容量、搜索与缓冲推算，不新增编号 |
+| `metadata-quantization-qwen3-case` | [同一 Qwen3 权重的表示](../case-studies/kernel-orchestration-and-quantization.md) | 4、5、8 | 扩写 5 | 现有实验 4-2／5-4 与图 4-3；容量、搜索与缓冲推算，不新增编号 |
 | `asplos26-wave-body` | [Wave 正文范围](../references/proceedings/ASPLOS/2026/wave-reading.json) | 1、11 | 补充／版本参照 | 2025 出版卷、2026 日程；十三页正文范围与五张实际查看图页 |
 | `smartnic-policy-interfaces` | [Wave 与公开 ghOSt 接口](../references/framework-history/2026-09-09/smartnic-policy/README.md) | 1、5、8、11 | 补充／版本参照 | 固定接口、硬件与主机请求路径分别核对；无引擎集成结论 |
 | `smartnic-policy-agent-budget` | [主机调度与 Agent 平台预算](../case-studies/host-policy-and-dispatch.md) | 1、11 | 扩写 1,11 | 实验 1-6／11-1 的延伸；核数翻转点、环境容量与任务吞吐 |
 | `asplos25-ascend-components-body` | [昇腾单元分析正文范围](../references/proceedings/ASPLOS/2025/ascend-components-reading.json) | 4、5 | 补充／版本参照 | 历史 MindSpore 与芯片条件、十三页正文和五张实际查看图页 |
 | `ascend-components-framework` | [激活分支与性能采集](../references/framework-history/2026-09-09/ascend-components/README.md) | 5、8、9 | 补充／版本参照 | 固定普通／310P 入口、三段发行说明及 PD 采集；不把接口当作论文工件 |
-| `ascend-components-qwen3-case` | [同一 Qwen3 的单元与流水推算](../case-studies/component-utilization-and-overlap.md) | 4、5 | 扩写 5 | 5.2.3／5.3.5、实验 5-6、图 5-5；R×E、缓冲和资源共享 |
+| `ascend-components-qwen3-case` | [同一 Qwen3 的单元与流水推算](../case-studies/component-utilization-and-overlap.md) | 4、5 | 扩写 4,5,12,13 | 5.2.3／5.3.5、实验 5-6、图 5-5；R×E、缓冲和资源共享 |
 | `asplos25-diffuse-body` | [Diffuse 正文范围](../references/proceedings/ASPLOS/2025/diffuse-reading.json) | 5、6 | 补充／版本参照 | 十二页正文与四张图页；任务、内核和临时存储的不同边界 |
 | `asplos25-cxlfork-body` | [CXLfork 正文范围](../references/proceedings/ASPLOS/2025/cxlfork-reading.json) | 6、11 | 补充／版本参照 | 十三页正文与四张图页；进程原型、共享页和分层限制 |
 | `snapshot-residency-e2b` | [E2B 模板读取与内存安装](../references/framework-history/2026-09-09/snapshot-residency/README.md) | 11 | 补充／版本参照 | 固定提交、六份响应／十个范围；不将原型当作云服务实现 |
 | `snapshot-residency-case` | [快照恢复与首次访问预算](../case-studies/snapshot-residency-and-first-use.md) | 11 | 扩写 11 | 实验 11-2／图 11-3 的容量、共享带宽与粒度变体 |
 | `asplos25-darwingame-body` | [DarwinGame 正文范围](../references/proceedings/ASPLOS/2025/darwingame-reading.json) | 5 | 补充／版本参照 | 十三页正文与七张图页；CPU 配置比赛的噪声与争用条件 |
 | `tuning-measurement-framework` | [公开工件与框架计时](../references/framework-history/2026-09-09/tuning-measurement/README.md) | 5、8 | 补充／版本参照 | vLLM 三个年份、FlashInfer-Bench 固定入口；十四份响应和二十一个范围 |
-| `tuning-measurement-case` | [比较顺序与实际形状](../case-studies/optimization-evaluation-and-deployment.md) | 2、5 | 扩写 5 | 实验 5-6／5-9：配对、争用和 Qwen3 SwiGLU 局部宽度 |
+| `tuning-measurement-case` | [比较顺序与实际形状](../case-studies/optimization-evaluation-and-deployment.md) | 2、5 | 正文 5；章末 5 | 实验 5-6／5-9：配对、争用和 Qwen3 SwiGLU 局部宽度 |
 | `lora-admission-versions` | [多 LoRA 版本与实际准入](../references/framework-history/2026-09-09/lora-admission/README.md) | 5、8、10 | 补充／版本参照 | 十九份框架响应／三十七个范围；动态接口、加载事件、排空和专用模型条件 |
-| `lora-admission-case` | [槽位、分组与等待](../case-studies/multi-lora-serving.md) | 5、8 | 扩写 8 | 实验 8-3／图 8-2；同一 Qwen3 的准入、空槽和合批时间变体 |
+| `lora-admission-case` | [槽位、分组与等待](../case-studies/multi-lora-serving.md) | 5、8 | 正文 8；章末 8 | 实验 8-3／图 8-2；同一 Qwen3 的准入、空槽和合批时间变体 |
 | `interview-eighth-discovery` | [第八次面试资料核对](../references/interviews/2026-09-09/eighth-pass/README.md) | 8、10 | 补充／版本参照 | 二次整理与受限原页，仅作线索；未新增一手样本或题号 |
 | `asplos25-picachu-body` | [PICACHU 正文范围](../references/proceedings/ASPLOS/2025/picachu-reading.json) | 4、5、13 | 补充／版本参照 | 十一页正文范围与五张实际查看图页；资源配比、共享缓冲与建模条件 |
 | `nonlinear-resources-framework` | [实际函数求值与缓存](../references/framework-history/2026-09-09/nonlinear-resources/README.md) | 4、5、13 | 补充／版本参照 | 固定 vLLM 基类入口；准备与稳态分别计量，不代表完整设备内核审计 |
-| `nonlinear-resources-case` | [同一 Qwen3 的非矩阵工作](../case-studies/component-utilization-and-overlap.md) | 4、5、13 | 扩写 4,13 | 既有实验 4-1／图 4-2；旋转、系数表、主张量流量与缓冲条件 |
+| `nonlinear-resources-case` | [同一 Qwen3 的非矩阵工作](../case-studies/component-utilization-and-overlap.md) | 4、5、13 | 扩写 4,5,12,13 | 既有实验 4-1／图 4-2；旋转、系数表、主张量流量与缓冲条件 |
 | `asplos25-apophenia-body` | [Apophenia 正文与工件附录](../references/proceedings/ASPLOS/2025/apophenia-reading.json) | 5、8 | 补充／版本参照 | 十三页声明范围与六张实际查看图页；重复身份、匹配等待与稳态条件 |
 | `trace-identification-framework` | [任务匹配与图封装](../references/framework-history/2026-09-09/trace-identification/README.md) | 5、8 | 补充／版本参照 | 公开 Legion 工件与固定 vLLM 源码；缓冲责任和实现范围分别取证 |
-| `trace-identification-case` | [图执行的身份与等待](../case-studies/graph-execution-tradeoffs.md) | 5、8 | 扩写 5 | 同一输入槽位与独立流水推算；既有实验 5-8／图 5-7 |
+| `trace-identification-case` | [图执行的身份与等待](../case-studies/graph-execution-tradeoffs.md) | 5、8 | 正文 8；章末 5,8 | 同一输入槽位与独立流水推算；既有实验 5-8／图 5-7 |
 | `interview-ninth-provenance` | [第九次面试寻源与日期核对](../references/interviews/2026-09-09/ninth-pass/README.md) | 1、3、10、11 | 补充／版本参照 | 一篇候选人原帖；历史平台、试读和推广线索分别记，不新增题号 |
 | `shared-gpu-group-readiness` | [整组就绪与模型恢复](../case-studies/resource-sharing-and-placement.md#同时可用的一组-gpu) | 6、9、11 | 扩写 11 | 实验 11-3／图 11-4；相同工作量的期限、填空与恢复变体 |
 | `asplos25-pipellm-body` | [PipeLLM 正文与作者版本](../references/proceedings/ASPLOS/2025/pipellm-reading.json) | 5、8、9 | 补充／版本参照 | 十三页声明正文与六张图页；提前准备、保护条件及预测工作 |
 | `pipellm-preemption-framework` | [工件与三期 vLLM 抢占路径](../references/framework-history/2026-09-09/pipellm-swap/README.md) | 5、8、9 | 补充／版本参照 | 九份新响应、十六个读取范围；旧式换出、重计算与 connector 缓存 |
-| `pipellm-preparation-case` | [主机准备、复制与有效工作](../case-studies/host-transfer-and-buffer-lifetime.md#提前准备的工作是否有用) | 5、8、9 | 扩写 5,8,9 | 实验 5-2／图 5-2 选做；同一张量的等待、三类双槽与无用准备预算 |
+| `pipellm-preparation-case` | [主机准备、复制与有效工作](../case-studies/host-transfer-and-buffer-lifetime.md#提前准备的工作是否有用) | 5、8、9 | 补充／版本参照 | 实验 5-2／图 5-2 选做；同一张量的等待、三类双槽与无用准备预算 |
 | `asplos25-streamgrid-body` | [StreamGrid 正文范围](../references/proceedings/ASPLOS/2025/streamgrid-reading.json) | 5、13 | 补充／版本参照 | 十一页与五张图页；算法质量、数据流建模及缓冲，备查不新增正文 |
 | `asplos25-arc-body` | [ARC 正文范围](../references/proceedings/ASPLOS/2025/arc-reading.json) | 5、13 | 补充／版本参照 | 十二页与四张图页；原子排队、warp 归约代价与硬件模拟边界 |
-| `asplos25-storage-screen` | [存储与系统摘要筛选](../references/proceedings/ASPLOS/2025/storage-screening-notes.json) | 5、11、13 | 补充／版本参照 | 十篇完整摘要、八份 PDF；机构原文与跨栏范围核对，三项缺口保留 |
+| `asplos25-storage-screen` | [存储与系统摘要筛选](../references/proceedings/ASPLOS/2025/storage-screening-notes.json) | 5、11、13 | 补充／版本参照 | 十篇完整摘要、七份 PDF；机构原文与跨栏范围核对，三项缺口保留 |
 | `asplos25-heterogeneous-screen` | [异构与训练系统摘要筛选](../references/proceedings/ASPLOS/2025/heterogeneous-screening-notes.json) | 4、6、10、12 | 补充／版本参照 | 十篇完整摘要、十份 PDF；两项缺口及三个正文候选保留 |
 | `asplos25-helix-body` | [Helix 正文与工件范围](../references/proceedings/ASPLOS/2025/helix-reading.json) | 6、7、9 | 补充／版本参照 | 十五页与五页图像；容量网络、请求路径、KV 预测和模拟条件 |
 | `heterogeneous-pipeline-framework` | [异构流水线与框架接口](../references/framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md) | 6、7、9 | 补充／版本参照 | 历史 vLLM 原型、2025 指南与固定 2026 接口；八个源码读取范围 |

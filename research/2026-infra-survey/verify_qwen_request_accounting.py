@@ -2,12 +2,23 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import hashlib
+import html
+import re
 import json
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 D = ROOT/'research/2026-infra-survey/qwen-request-accounting'
+
+
+def verify_pd_budget(text):
+    """Keep the complete conditional budget together, allowing prose edits."""
+    required = ('36 层', '8,192 token', '8 个 KV 头', '128 维', 'BF16',
+                '1.125 GiB', '25 GB/s', '48.32 ms', '条件式')
+    paragraphs = re.split(r'\n\s*\n|</p>', text)
+    visible = [html.unescape(re.sub(r'<[^>]+>', '', p)) for p in paragraphs]
+    assert any(all(term in p for term in required) for p in visible), 'Missing or inconsistent conditional Qwen3 PD budget'
 
 
 def verify():
@@ -27,7 +38,7 @@ def verify():
     for name in ['outlines/02-模型架构.md','outlines/extensions/02-模型架构.md','skeleton.html']:
         assert 'D×H+D(D−1)/2' in (ROOT/name).read_text()
     for name in ['outlines/09-分布式推理.md','outlines/extensions/09-分布式推理.md','skeleton.html']:
-        assert '36 层、1.125 GiB，得到约 48.32 ms' in (ROOT/name).read_text()
+        verify_pd_budget((ROOT/name).read_text())
     assert 'DH+D(D−1)/2' in (ROOT/'case-studies/model-resource-accounting.md').read_text()
     report=dict(verified_at=datetime.now(timezone.utc).isoformat(),status='passed',configs=2,
                 corrected_files=6,ordinary_request_boundaries=len(rows),

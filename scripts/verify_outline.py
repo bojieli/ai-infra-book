@@ -9,6 +9,7 @@ import html
 import json
 import re
 import tarfile
+from outline_text import rendered_inline
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTLINES = ROOT / 'outlines'
@@ -44,10 +45,6 @@ all_labs = set()
 all_figures = set()
 all_sections = set()
 page = (ROOT / 'skeleton.html').read_text()
-def rendered_inline(text):
-    """Match visible words independently of Markdown/HTML formatting."""
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    return html.unescape(re.sub(r'[*`]', '', text))
 
 
 for c in catalog:

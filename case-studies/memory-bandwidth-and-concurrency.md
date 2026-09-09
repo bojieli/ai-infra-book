@@ -19,6 +19,8 @@
 
 第一项说明依赖与并发不足可以让高带宽闲置。第二、三项说明只把接口带宽翻倍，给定并发下的上界改善有限。第四项提醒读者：更重的负载也可能提高完成延迟。表中不是四次测量，也没有预测某款 GPU 的队列大小；各工作点假设需要测量校准，不能通过自洽公式证明它们可达。[独立复算](../research/2026-infra-survey/arithmetic.json)保存全部输入。
 
+四个教学算例现由统一项目的 `python3 calculations/calc.py memory-concurrency --format md` 及注册场景复现，见[结果索引](../calculations/results/README.md)和[实现](../calculations/src/infra_calc/topics/memory_concurrency.py)。整数纳秒输入保证所需事务数向上取整；batch 只改变逻辑载荷，不被解释为在途事务数。
+
 ## 用 Mess 的方法校准
 
 [Mess 作者接受稿](../references/proceedings/MICRO/2024/paper-011.pdf)的物理页 3–6 给出一种实用方法：让一个 CPU core 或 GPU SM 运行 pointer chase，其他执行单元产生可控读写流量，分别记录探针延迟和硬件计数器带宽。改变流量强度与读写组成，就得到一组带宽—延迟曲线。探针是观察争用的手段，它不直接测得每个模型事务的延迟。

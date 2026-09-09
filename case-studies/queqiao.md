@@ -2,7 +2,7 @@
 
 本案例用于第 3 章“推理与训练负载”和第 12 章“端边云协同”。第 3 章刻画数据流与时间指标，第 12 章分析传输、执行位置和测量方法。
 
-取材于本地 `~/queqiao` 项目，读取日期为 2026-09-05，版本为 `168ff4bb44a9f8a7be94fbca0ca3513f6b40fe6d`。主要依据是 [DESIGN-DC-PROFILE.md](/Users/boj/queqiao/docs/DESIGN-DC-PROFILE.md)，其中记录的实验最后复核于 2026-08-26；原始测量索引见 [PATH-CHARACTER-DC-20260826.md](/Users/boj/queqiao/docs/PATH-CHARACTER-DC-20260826.md)。所用两个文件在读取时均无未提交修改。该配置仍为实验性质，设计文档明确说明只在一条路径上测试过。
+取材于本地 `~/queqiao` 项目，读取日期为 2026-09-05，版本为 `168ff4bb44a9f8a7be94fbca0ca3513f6b40fe6d`。主要依据是 [DESIGN-DC-PROFILE.md](../references/author-context/queqiao-168ff4b/DESIGN-DC-PROFILE.md)，其中记录的实验最后复核于 2026-08-26；原始测量索引见 [PATH-CHARACTER-DC-20260826.md](../references/author-context/queqiao-168ff4b/PATH-CHARACTER-DC-20260826.md)。所用两个文件在读取时均无未提交修改。该配置仍为实验性质，设计文档明确说明只在一条路径上测试过。
 
 ## 数据流
 

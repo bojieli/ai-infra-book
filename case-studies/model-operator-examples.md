@@ -2,6 +2,8 @@
 
 本笔记支持第 2 章的具体模型计算和第 5 章的算子／融合安排。核对日期为 2026-09-07；正式实验与完整算子表在扩写时制作。正文以 Qwen3 跟算，再沿 V4 与 Kimi K3 的真实路径比较，代码清单留在配套材料。
 
+2026-09-08 补充：[统一计算项目](../calculations/README.md)已生成 Qwen3-8B／32B 的[逐算子表与逐层 CSV](../calculations/results/README.md)，并以官方 checkpoint 索引逐键及总字节检查参数枚举。V4-Pro、V4-Flash、Kimi K3 和 Qwen3-235B 的官方配置已集中归档，完整算子适配按[计划](../calculations/PLAN.md)继续。
+
 ## 固定来源
 
 - Qwen3-8B：[官方配置](../references/outline-checks/2026-09-07/scaling-history/qwen3-8b-config.json)、[模型仓库 revision](../references/outline-checks/2026-09-07/scaling-history/qwen3-8b-revision.json)、[vLLM Qwen3 实现](../references/outline-checks/2026-09-07/scaling-history/vllm-qwen3.py)。

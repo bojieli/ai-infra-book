@@ -32,6 +32,8 @@ BF16 梯度为 **96 MiB**，FP32 为 **192 MiB**。比较两种执行顺序：
 
 再检查容量：不计两条路径共有的 GPU BF16 梯度，CPU 转换需要主机 96 MiB 暂存和 192 MiB 输出；GPU 转换需要额外 192 MiB GPU 暂存，主机只存 192 MiB 输出。后一条路径虽可能更快，也可能因 HBM 不足而不可行。分块可以降低暂存，却增加启动并改变吞吐；回到第 5 章的缓冲时序继续算。[脚本](../research/2026-infra-survey/calculate_superoffload.py)和[数值结果](../research/2026-infra-survey/superoffload-arithmetic.json)保留单位和全部假设。
 
+统一计算项目已承接上述纸笔算例：运行 `python3 calculations/calc.py gradient-cast --format md`，查看[默认结果](../calculations/results/gradient-cast-book.md)、[快链路](../calculations/results/gradient-cast-fast-link.md)与[显存不足边界](../calculations/results/gradient-cast-tight-gpu.md)。JSON保留精确有理数时序、每段缓冲寿命和容量内可选路径；旧研究脚本保留为原始推算记录。新模块仍不声称已运行GPU实验。
+
 ## 论文能支持的判断
 
 选读 [SuperOffload 的 2025-09-25 arXiv v1](../references/proceedings/ASPLOS/2026/paper-023.pdf)物理页 3–12、16，涵盖设计、评估和模型／基线附录；正式 ASPLOS 2026 身份另由日程 DOI 核对，不能把早期稿当成正式版本全文。页级记录见[阅读范围](../references/proceedings/ASPLOS/2026/superoffload-reading.json)。

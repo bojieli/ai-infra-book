@@ -7,9 +7,12 @@
 目前完成草案 22 的结构与逐章写作大纲，尚未扩写正式书稿。
 
 - [网页大纲](skeleton.html)与[逐章 Markdown](outlines/README.md)：十三章的主张、推导、练习和配图。
+- [量化计算项目](calculations/README.md)：[全书计算计划](calculations/PLAN.md)、官方模型配置与硬件规格、统一 CLI 和[已复算结果](calculations/results/README.md)，持续实现中。
 - [全书主线与章节依赖](outlines/structure.md)、[跨章设计决定](outlines/decision-record.md)：共同表示、固定输入和逐章修正。
 - [阅读路径与配套](outlines/writing-support.md)、[完整扩写资料](outlines/extensions/README.md)：核心练习和详细技术材料。
 - [本轮改动记录](research/outline-revision-2026-09-08/README.md)：主要建议的落地、章节映射及修改前快照。
+
+论文和较大的计算输入、测量记录使用 Git LFS 保存。需要复算或读取原始记录时，克隆仓库后先运行 `git lfs install` 和 `git lfs pull`，再按对应项目的说明执行校验。
 
 ## 这本书怎样讲
 
@@ -41,7 +44,7 @@
 
 每章三项核心练习，共 39 项，其余就地标为延伸。练习先预测，再计算或测量，最后改变条件并修改选择；完整变体见扩写资料。公式、练习与图共用输入，机制图自绘 SVG，数据图由原始记录与脚本生成 SVG／PDF。
 
-十三章共 70 节、240 个小节、117 项实验与计算、105 项配图计划。实验代码、配套数据和正式图片尚待扩写时制作。本书拟测 M2 Max 38 核 GPU／96 GB 与 RTX PRO 6000 Blackwell Workstation Edition；H100／4090 保留为历史判断，昇腾使用已有公开证据，配置不同的结果分别使用。
+十三章共 70 节、240 个小节、117 项实验与计算、105 项配图计划。[统一计算项目](calculations/README.md)已开始交付配置、可复现代码与分析结果；[独立实验项目](experiments/README.md)已交付 CPU 分块、GPU 融合、attention 后端、编译代码及图重放五项实跑、原始数据与结果图，其余实验继续制作。本书拟测 M2 Max 38 核 GPU／96 GB 与 RTX PRO 6000 Blackwell Workstation Edition；H100／4090 保留为历史判断，昇腾使用已有公开证据，配置不同的结果分别使用。
 
 ## 材料入口
 

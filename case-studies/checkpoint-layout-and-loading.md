@@ -12,6 +12,8 @@
 
 论文保存规划还会在拥有相同状态的 rank 之间分摊写入；加载时可把一次存储读取与 GPU 间分发结合。是否值得，要比较存储、主机复制和组内互联各自的余量。优化器分片的所有权不同，不能像完整权重副本一样消重。名称一致、全局坐标和数值格式正确是重分片基础，不能据此保证任意框架与融合／量化格式自动互通。
 
+统一计算入口现为 `python3 calculations/calc.py checkpoint-reshard --format md`，提供[TP4→8的四状态计划](../calculations/results/checkpoint-reshard-book.md)、[仅权重](../calculations/results/checkpoint-reshard-weights.md)和[展平7片→行切5片](../calculations/results/checkpoint-reshard-flat.md)。每个读取范围保存全局元素区间、源文件偏移及目标缓冲偏移；小数组字节重建检查完整性和重复覆盖，仍不代表真实框架恢复实验。
+
 ## 返回、稳定快照和持久化是不同事件
 
 第 10.4.3 沿保存时间线区别：请求保存、形成不再受训练修改影响的快照、后台序列化／上传、所有必要分片完整可恢复。异步只改变这些操作与训练怎样重叠，还要算后台带宽、主机内存及最慢 rank。
@@ -19,6 +21,8 @@
 以取整的 8B 教学模型计，BF16 权重为 16 GB，加三份 FP32 Adam 数组为 112 GB，暂不含 CPU 和存储放大。若全局有效上传带宽是 8 GB/s，单次传输下界为 14 秒。每 10 秒生成一份状态，供给为 11.2 GB/s，超过写入能力；若允许排队，待写数据净增 3.2 GB/s，有限缓冲最终耗尽。每 20 秒保存一次则为 5.6 GB/s，才通过这项必要检查。不能因为 API 的暂停只有 0.5 秒，就认为任意频率的保存都能隐藏。
 
 再给两次快照的明确时间点：在 20、40 秒捕获，在 20.5、40.5 秒结束各自的 staging；后台写入分别到 34.5、54.5 秒完成。若 50 秒故障，此时只能用第一份已完整持久化的快照。有效写入带宽翻倍时，完成点为 27.5、47.5 秒，可用第二份。两个方案阻塞训练的时间相同，但恢复起点不同。这个教学例子假定两个阶段串行、没有其他争用，恢复点是快照捕获时间；不把 API 返回或主机内存副本当作远端持久化完成。[教学时间线](../research/2026-infra-survey/arithmetic.json)
+
+统一项目的 `python3 calculations/calc.py checkpoint-async --format md` 现已覆盖[官方Qwen8全参数载荷](../calculations/results/checkpoint-async-book.md)、[上述112GB时间线](../calculations/results/checkpoint-async-rounded.md)、[写入翻倍](../calculations/results/checkpoint-async-fast.md)与[单槽背压](../calculations/results/checkpoint-async-one-slot.md)。输出分别记录请求、实际capture、staging、upload与durable，并以故障时刻筛选可用快照；仍是显式服务时间与持久化语义下的教学计划。
 
 PyTorch 的 2024 公告主要说明把 GPU→CPU staging 后的保存移至线程，并使用独立通信组防止与训练集合调用错序。2025 公告进一步指出后台线程仍会竞争 GIL、拖慢主机提交，同时元数据规划有多轮通信；后台进程与计划缓存一起减少了这些影响。其 1856 H200、TorchTitan、Llama3-70B 的结果报告后台处理约 436→67 秒，不能写成训练整体快 6.5 倍，也不是当前 V4／K3 的测量。第一次进程初始化和规划与后续缓存命中分开；完整吞吐影响应看保存期间的下降面积。[2024 公告](https://pytorch.org/blog/reducing-checkpointing-times/)、[2025 公告](https://pytorch.org/blog/6x-faster-async-checkpointing/)
 

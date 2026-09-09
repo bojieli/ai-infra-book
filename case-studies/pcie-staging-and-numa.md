@@ -45,3 +45,5 @@ NCCL 官方文档给出共享内存机制的版本边界：2.23 加入 cuMem hos
 图 6-6 增加局部放大图：相同四张 GPU、两种缓冲放置、两个 ring 次序，箭头标数据方向和字节数；整体仍是拓扑与物理组织的一张 SVG 计划图。第 7.3.3 节引用这个路径，不再重算一次。
 
 算术输入与三个结果记录在[计算记录](../research/2026-infra-survey/arithmetic.json)，验证脚本通过逐轮、逐边累计物理资源流量复核。尚未运行 GPU 或模型性能实验。
+
+三个教学候选现已接入统一计算项目：运行 `python3 calculations/calc.py numa-staging --format md`，并以 `--placement sender-local`、`--order alternating` 切换。见[物理路径实现](../calculations/src/infra_calc/topics/numa_staging.py)及[生成结果](../calculations/results/README.md)。逐轮共享资源累加器同时保留全局资源下界与逐轮依赖下界，不以流量反推缓冲驻留容量。
