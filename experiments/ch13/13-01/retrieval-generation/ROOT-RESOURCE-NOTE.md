@@ -1,0 +1,9 @@
+# 本次运行的进程资源观察范围
+
+generation-001实际完成全部288请求，控制器exit0，vLLM EngineCore PID851453及引擎管理器正常shutdown日志保留。结束后的nvidia-smi仅有运行前的四个原GPU服务，未发现本次GPU进程。
+
+原guard按自定义环境token识别进程，但vLLM engine子进程没有出现在该token筛选集合内。因此resources.jsonl的178个样本只覆盖带token的进程；RSS峰2,233,159,680 bytes不是完整任务RSS，GPU列全0不是未使用GPU，也不是有效的GPU峰值测量。supervisor的leftovers仅对该筛选集合成立，不能扩大为完整子进程树的证明。全机MemAvailable最小129,800,568,832 bytes是实际系统采样。
+
+实际GPU执行有原生引擎日志、逐请求返回、scheduler KV块事件与worker自身CUDA/KV快照交叉证据。GPU框架峰仅以worker快照中的cuda_peak_allocated报告，不能替代nvidia-smi总显存峰；没有用缺失样本补数。此观察缺口不改变已有回答、真实管线时间或KV块记录，但限制资源上限监控的覆盖证明。
+
+executed-source/保存与本次environment.json执行SHA完全匹配的原脚本。BASE run_guard.py在执行后补上本次创建的session、真实父子关系与PID出生时间跟踪，以覆盖不继承环境token的后代；尚未在新GPU运行验证，不声称修正已保护历史运行。没有为修复资源观测而重做已成功的288请求。
