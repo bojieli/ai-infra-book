@@ -33,6 +33,7 @@ from .topics import image_request_budget
 from .topics import image_request_streaming
 from .topics import connection_window
 from .topics import connection_sequence
+from .topics import protocol_handshake, protocol_early_stream
 from .topics import growing_remote_kv
 from .topics import paired_projection_cost
 from .topics import matrix_vector_handoff
@@ -285,6 +286,12 @@ def parser() -> argparse.ArgumentParser:
     cohort.add_argument("--inputs", type=Path)
     cohort.add_argument("--format", choices=("json", "md"), default="json")
     cohort.add_argument("--output", type=Path)
+    for name, help_text in (("protocol-handshake", "TLS1.3/QUICv1 declared message dependencies"),
+                            ("protocol-early-stream", "QUIC long early upload key transition and authorized replay")):
+        protocol = sub.add_parser(name, help=help_text)
+        protocol.add_argument("--inputs", type=Path)
+        protocol.add_argument("--format", choices=("json", "md"), default="json")
+        protocol.add_argument("--output", type=Path)
     sequence_window = sub.add_parser("connection-sequence", help="Sequential requests with shared directional windows and pending ACKs")
     sequence_window.add_argument("--inputs", type=Path)
     sequence_window.add_argument("--format", choices=("json", "md"), default="json")
@@ -1150,6 +1157,10 @@ def main(argv: list[str] | None = None) -> None:
             result = render()
         elif args.command == "workload-profiles":
             result = workload_profiles.calculate()
+        elif args.command == "protocol-handshake":
+            result = protocol_handshake.calculate(json.loads(args.inputs.read_text()) if args.inputs else None)
+        elif args.command == "protocol-early-stream":
+            result = protocol_early_stream.calculate(json.loads(args.inputs.read_text()) if args.inputs else None)
         elif args.command == "connection-sequence":
             result = connection_sequence.calculate(**(json.loads(args.inputs.read_text()) if args.inputs else {}))
         elif args.command == "connection-window":

@@ -949,3 +949,5 @@ Qwen3.6-35B-A3B：`python3 calculations/calc.py qwen36-forward --format md` 输�
 有限ACK窗口：`python3 calculations/calc.py connection-window --inputs calculations/scenarios/connection-window-example.json --format md`。显式完整图片消息、共享上下行、ACK可见前缀、发送/接收窗口、一次指定丢段与固定timeout；所有轨迹可查。它是自定义有限教学协议，不是TCP/QUIC实现。
 
 连续请求与窗口：`python3 calculations/calc.py connection-sequence --inputs calculations/scenarios/connection-sequence-example.json --format md`。声明协议的完整事件记录区分成片与最后 ACK；不是实际 TCP/QUIC 测量。
+
+协议消息图与长早期上传：`python3 calculations/calc.py protocol-handshake --inputs calculations/scenarios/protocol-handshake-example.json --format md`；`python3 calculations/calc.py protocol-early-stream --inputs calculations/scenarios/protocol-early-stream-example.json --format md`。七份RFC固定校验，包布局与链路输入声明，不是完整协议栈或实测网络性能。

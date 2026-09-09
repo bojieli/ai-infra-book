@@ -1068,5 +1068,17 @@ def sync() -> dict:
            '[等待ACK排空](../calculations/results/sequence-image-quiet-reuse_warm.md)与[64KiB小请求](../calculations/results/sequence-small-complete_received-reuse_warm.md)分开比较；[只在第二轮丢段](../calculations/results/sequence-image-request2-loss.md)保留额外wire bytes而不增加唯一输入。每请求记录提交、连接就绪、模型、完整响应与最后ACK，响应时长用完成减提交，握手等待不再与链路忙时重复相加。'
            '运行 `python3 calculations/calc.py connection-sequence --inputs calculations/scenarios/connection-sequence-example.json --format md` 可改策略、提交触发、think time和双向初窗。真实TLS/QUIC握手/0RTT、拥塞控制器及媒体/截图截止时间仍待，不以本教学事件结果作实际协议性能排名。',
            '### 12.3.3 多流传输与媒体截止时间')
+    insert('12-端边云协同.md', 'C68-protocol-handshake',
+           '[TCP+TLS1.3首次](../calculations/results/handshake-tcp_tls13-fresh.md)、[恢复但无early](../calculations/results/handshake-tcp_tls13-resume.md)与[QUICv1首次](../calculations/results/handshake-quic_v1-fresh.md)按固定RFC消息依赖及声明包长度计双向FIFO和传播；不额外重复加RTT。有效请求100B/响应200B、承载包180/280B与握手布局分别声明，默认值不是标准规定的握手大小。'
+           '[接受早期数据](../calculations/results/handshake-quic_v1-early_accept.md)与[拒绝后应用授权重试](../calculations/results/handshake-quic_v1-early_reject.md)分别记录执行和有效输入；[未授权重试](../calculations/results/handshake-quic_v1-reject-no-retry.md)不产生完整响应。PSK有效、允许发送early、应用执行policy和允许重试是不同条件。'
+           'QUIC反放大账只计实际到达UDPpayload；Initial至少1200B，[3600B边界](../calculations/results/handshake-quic-budget-3600-ack-False.md)、[4800B缺解除消息](../calculations/results/handshake-quic-budget-4800-ack-False.md)与[Handshake ACK到达后解除](../calculations/results/handshake-quic-budget-4800-ack-True.md)分列。缺解除事件的图受阻不等于真实QUIC死锁。'
+           '运行 `python3 calculations/calc.py protocol-handshake --inputs calculations/scenarios/protocol-handshake-example.json --format md`。JSON保留包字节、排程、预算和来源，线上字节仅为已建模消息；完整编码、HRR/Retry、一般ACK/PTO和真实拥塞流控仍待。',
+           '### 12.3.2 短请求与大图传输')
+    insert('12-端边云协同.md', 'C68-early-stream',
+           '[30MB早期上传接受](../calculations/results/early-stream-30mb-accept-retry-True.md)使用逐包STREAM offset、共享应用包号与发送时密钥，安装1RTT密钥后未发送尾部换用1RTT；已开始包不抢占，同刻先处理密钥。默认1100B有效payload、0RTT/1RTT额外64/48B加IPv4UDP28B，均为声明布局；20/100Mbps、每向50ms和处理0.3s下，232100B有效数据在切换前发送，其余29767900B走1RTT，5MB完整响应13.65867488s。'
+           '[拒绝且授权](../calculations/results/early-stream-30mb-reject-retry-True.md)以新包号重发原offset前缀，再发未发送尾部，共30000000B的1RTT有效载荷，完整响应13.75792928s；业务有效输入仍30MB。[未授权](../calculations/results/early-stream-30mb-reject-retry-False.md)停止未发尾部并保持零执行、无完整响应。'
+           '[整数边界](../calculations/results/early-stream-oracle-accept-retry-True.md)和[包中途切换](../calculations/results/early-stream-mid-packet-keys-accept.md)保留控制ACK/Finished与业务竞争，避免用整段0RTT或总bytes集合掩盖重发范围。'
+           '运行 `python3 calculations/calc.py protocol-early-stream --inputs calculations/scenarios/protocol-early-stream-example.json --format md`，逐包检查有效覆盖和声明线上bytes。时间不是实测QUIC吞吐；未实现一般ACK/PTO、丢失、实际拥塞/流控、HTTP语义与媒体截止，C68继续保留这些范围。',
+           '### 12.3.3 多流传输与媒体截止时间')
     return {"updated": sorted(updated),
             "next": "python3 scripts/render_outline.py; python3 scripts/verify_outline.py"}

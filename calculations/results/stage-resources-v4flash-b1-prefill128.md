@@ -21931,27 +21931,27 @@ Conditional known-work service bounds; full runtime remains unknown.
 | effective_resource_rates.matrix_fp8 | 1978900000000000.0 |
 | effective_resource_rates.vector_fp32 | 66900000000000.01 |
 | effective_resource_rates.interface_bytes | 3350000000000.0 |
-| effective_resource_rates.special:amax_compare | unknown (null) |
-| effective_resource_rates.special:fp4_decode | unknown (null) |
-| effective_resource_rates.special:power_of_two_scale_bit_round | unknown (null) |
-| effective_resource_rates.special:fp8_decode | unknown (null) |
-| effective_resource_rates.special:sigmoid | unknown (null) |
+| effective_resource_rates.special:silu | unknown (null) |
 | effective_resource_rates.special:topk_rows | unknown (null) |
+| effective_resource_rates.special:scale_floor_compare | unknown (null) |
+| effective_resource_rates.special:fp4_decode | unknown (null) |
+| effective_resource_rates.special:fp8_decode | unknown (null) |
+| effective_resource_rates.special:amax_compare | unknown (null) |
+| effective_resource_rates.special:compare_max | unknown (null) |
 | effective_resource_rates.special:rsqrt | unknown (null) |
 | effective_resource_rates.special:fp8_encode | unknown (null) |
-| effective_resource_rates.special:clamp_bound_compare | unknown (null) |
-| effective_resource_rates.special:compare_max | unknown (null) |
-| effective_resource_rates.special:relu_compare | unknown (null) |
-| effective_resource_rates.special:exp | unknown (null) |
-| effective_resource_rates.special:topk_candidates | unknown (null) |
-| effective_resource_rates.special:sqrt | unknown (null) |
-| effective_resource_rates.special:scale_floor_compare | unknown (null) |
-| effective_resource_rates.special:clamp_bound_comparisons | unknown (null) |
-| effective_resource_rates.special:abs | unknown (null) |
 | effective_resource_rates.special:softplus | unknown (null) |
-| effective_resource_rates.special:silu | unknown (null) |
-| effective_resource_rates.special:integer_lookup_entries | unknown (null) |
+| effective_resource_rates.special:sigmoid | unknown (null) |
 | effective_resource_rates.special:fp4_encode | unknown (null) |
+| effective_resource_rates.special:abs | unknown (null) |
+| effective_resource_rates.special:sqrt | unknown (null) |
+| effective_resource_rates.special:exp | unknown (null) |
+| effective_resource_rates.special:integer_lookup_entries | unknown (null) |
+| effective_resource_rates.special:power_of_two_scale_bit_round | unknown (null) |
+| effective_resource_rates.special:clamp_bound_comparisons | unknown (null) |
+| effective_resource_rates.special:clamp_bound_compare | unknown (null) |
+| effective_resource_rates.special:topk_candidates | unknown (null) |
+| effective_resource_rates.special:relu_compare | unknown (null) |
 | baseline_work.matrix_flops | 3315656556544 |
 | baseline_work.scalar_flops | 82998708672 |
 | baseline_work.special_ops.rsqrt | 386900 |

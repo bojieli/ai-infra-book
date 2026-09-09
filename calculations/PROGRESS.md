@@ -1721,3 +1721,23 @@ connection-sequence已接统一CLI、可编辑输入、17固定场景和34份JSO
 审查修正默认包长无法容纳TLS开销问题，明确逐包有效request100B/response200B及承载180/280B；root同步重新推导6个精确手算，全部通过。候选17冻结场景与实际CLI一致；52独立场景核287发送、21非法/超范围输入拒绝，作者266断言通过。[候选验收](research/protocol-handshake/acceptance.json)固定同一源码hash。
 
 仅研究候选，未改公共源和正文，不重跑与本候选无关的公共全suite。长0RTT上传跨密钥安装尚需按STREAM offset转换未发送尾部，目前明确拒绝；HRR/Retry/票据回退、真实编码、一般ACK/PTO、拥塞流控、公共接入与媒体截止仍待。C68与全书目标继续，未勾选整项。
+
+## C68 长0RTT上传逐包切换与授权重发候选
+
+新增research/protocol-early-stream，保留旧protocol-handshake冻结。实际开始发送时选0RTT/1RTT，已开始包不抢占，同刻密钥事件优先；0RTT/1RTT每方向共享应用包号空间，重发新PN但原stream offset。接受合并早期前缀与普通尾部，拒绝仅应用授权后重发已发范围与未发尾部；未授权执行0次。双向FIFO与实际UDP接收预算继续参与，含控制/最多重发200000包预算。
+
+30MB输入/5MB输出、20/100Mbps、每向50ms、处理0.3s声明例：早期232100B；接受尾部29767900B以1RTT发送，完整响应13.65867488s；拒绝授权后30000000B以1RTT发送，完整响应13.75792928s；不授权无完整响应。不是实际QUIC吞吐。
+
+54独立场景（含实际30MB逐区间多重性与PN检查）、15非法输入，root3同刻+3中途密钥精确手算通过。13完整冻结场景与实际CLI一致；初次比较位于补总预算/来源根元数据后结果重生前，终版同hash重生后全部通过。[验收](research/protocol-early-stream/acceptance.json)保存证据。仅研究目录变化，未重跑公共全suite或宣称已公共接入。真实编码、HRR/Retry、一般ACK/PTO/拥塞流控、媒体截止和公共接入仍待，原C68不勾选，全书目标继续。
+
+## C68 握手消息图与长0RTT上传公共接入
+
+protocol-handshake和protocol-early-stream已接统一CLI/可编辑输入/Markdown/固定场景/reproduce，第12章扩写和网页同步。17握手+13长early场景共60产物；七份RFC原件公共注册并逐调用校验，数学逻辑与已审查研究候选相同。请求/响应有效bytes、声明线上bytes、授权/执行/重试、密钥与PN/offset分别记账。
+
+30完整公共payload与候选一致，60实际CLI及60冻结结果全部通过；8新增专项tests，全suite878项856通过22可选跳过；verify2152产物26图，正文5158本地链接229引用hash77快照通过。初次sync与chat图重生重叠而拒绝不完整manifest，图生成结束后重新同步与最终验证均通过。[公共验收](research/protocol-integration/acceptance.json)保存hash和日志。
+
+PLAN原C68更新公共成果，HRR/Retry/PSK回退、真实编码、一般ACK/PTO/拥塞流控与媒体截止仍待；[下一范围](research/protocol-integration/next-retry-scope.md)已按固定RFC区分HRR强制early拒绝、Retry不自动拒绝、未知PSK回退与无效binder终止。原项与全书目标继续未完成。
+
+## Qwen3.6 主文与实验入口补齐
+
+本次在第二章 2.5.1 主文直接展开 Qwen3.6-35B-A3B 的三专家矩阵、6×t_e×2048×512 FLOPs、全部常驻/批内读取/逐token工作三个口径，并链接基础文本 decode 和第四章容量结果；说明混合注意力差异不能全部归因于 MoE。实验 2-6 改为先算 Qwen3.6，再推进 V4，K3 为进阶。已有官方来源与计算公式未修改。实际复跑 6 项 Qwen3.6 专项测试通过；重建 skeleton.html 后正文验证通过（5166 本地链接、229 引用哈希、77 快照）。未重跑全套计算验收；C82 的视觉/MTP执行、多卡放置及完整请求/硬件连接仍保留未完成。

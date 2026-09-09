@@ -10028,13 +10028,13 @@ Conditional known-work service bounds; full runtime remains unknown.
 | effective_resource_rates.matrix_fp8 | unknown (null) |
 | effective_resource_rates.vector_fp32 | unknown (null) |
 | effective_resource_rates.interface_bytes | 546000000000 |
-| effective_resource_rates.special:compare_max | unknown (null) |
 | effective_resource_rates.special:sin | unknown (null) |
+| effective_resource_rates.special:compare_max | unknown (null) |
 | effective_resource_rates.special:cos | unknown (null) |
-| effective_resource_rates.special:mask_decisions | unknown (null) |
 | effective_resource_rates.special:exp | unknown (null) |
-| effective_resource_rates.special:negate | unknown (null) |
 | effective_resource_rates.special:rsqrt | unknown (null) |
+| effective_resource_rates.special:mask_decisions | unknown (null) |
+| effective_resource_rates.special:negate | unknown (null) |
 | baseline_work.matrix_flops | 19968622592 |
 | baseline_work.scalar_flops | 42304425 |
 | baseline_work.special_ops.sin | 128 |

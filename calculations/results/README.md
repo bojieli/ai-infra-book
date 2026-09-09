@@ -1207,6 +1207,39 @@ Qwen3.5 基础文本参考路径（非实际运行时间）：
 Qwen3.6-35B-A3B真实混合MoE：逐算子与必要容量，非实际运行时间。
 
 
+TLS/QUIC消息依赖与长早期上传：
+
+- [handshake-tcp_tls13-fresh](handshake-tcp_tls13-fresh.md)
+- [handshake-tcp_tls13-resume](handshake-tcp_tls13-resume.md)
+- [handshake-tcp_tls13-early_accept](handshake-tcp_tls13-early_accept.md)
+- [handshake-tcp_tls13-early_reject](handshake-tcp_tls13-early_reject.md)
+- [handshake-tcp_tls13-reused](handshake-tcp_tls13-reused.md)
+- [handshake-tcp_tls13-wait](handshake-tcp_tls13-wait.md)
+- [handshake-tcp_tls13-reject-no-retry](handshake-tcp_tls13-reject-no-retry.md)
+- [handshake-quic_v1-fresh](handshake-quic_v1-fresh.md)
+- [handshake-quic_v1-resume](handshake-quic_v1-resume.md)
+- [handshake-quic_v1-early_accept](handshake-quic_v1-early_accept.md)
+- [handshake-quic_v1-early_reject](handshake-quic_v1-early_reject.md)
+- [handshake-quic_v1-reused](handshake-quic_v1-reused.md)
+- [handshake-quic_v1-wait](handshake-quic_v1-wait.md)
+- [handshake-quic_v1-reject-no-retry](handshake-quic_v1-reject-no-retry.md)
+- [handshake-quic-budget-3600-ack-False](handshake-quic-budget-3600-ack-False.md)
+- [handshake-quic-budget-4800-ack-False](handshake-quic-budget-4800-ack-False.md)
+- [handshake-quic-budget-4800-ack-True](handshake-quic-budget-4800-ack-True.md)
+- [early-stream-30mb-accept-retry-True](early-stream-30mb-accept-retry-True.md)
+- [early-stream-30mb-reject-retry-True](early-stream-30mb-reject-retry-True.md)
+- [early-stream-30mb-reject-retry-False](early-stream-30mb-reject-retry-False.md)
+- [early-stream-small-accept-retry-True](early-stream-small-accept-retry-True.md)
+- [early-stream-small-reject-retry-True](early-stream-small-reject-retry-True.md)
+- [early-stream-small-reject-retry-False](early-stream-small-reject-retry-False.md)
+- [early-stream-oracle-accept-retry-True](early-stream-oracle-accept-retry-True.md)
+- [early-stream-oracle-reject-retry-True](early-stream-oracle-reject-retry-True.md)
+- [early-stream-oracle-reject-retry-False](early-stream-oracle-reject-retry-False.md)
+- [early-stream-mid-packet-keys-accept](early-stream-mid-packet-keys-accept.md)
+- [early-stream-mid-packet-keys-reject](early-stream-mid-packet-keys-reject.md)
+- [early-stream-4800-server-flight-ack-False](early-stream-4800-server-flight-ack-False.md)
+- [early-stream-4800-server-flight-ack-True](early-stream-4800-server-flight-ack-True.md)
+
 连续请求与连接窗口：
 
 - [sequence-image-quiet-fresh](sequence-image-quiet-fresh.md)

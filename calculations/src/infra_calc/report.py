@@ -6,6 +6,12 @@ from fractions import Fraction
 
 
 def markdown(result: dict) -> str:
+    if result.get("calculation") == "protocol-handshake-declared-packet-graph":
+        from .topics.protocol_handshake import markdown as render
+        return render(result)
+    if result.get("calculation") == "quic-early-stream-declared-packets":
+        from .topics.protocol_early_stream import markdown as render
+        return render(result)
     if result.get("calculation") == "finite-ack-window-sequence":
         from .topics.connection_sequence import markdown as render
         return render(result)
