@@ -77,6 +77,7 @@ files.append(ROOT/'case-studies/training-offload-and-casting.md')
 files.append(ROOT/'references/framework-history/2026-09-08/training-superchip/README.md')
 files.append(ROOT/'references/framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md')
 files.append(ROOT/'references/framework-history/2026-09-09/sequence-and-npu/NOTES.md')
+files.append(ROOT/'references/framework-history/2026-09-09/spindle-wavefront/NOTES.md')
 files.append(ROOT/'case-studies/training-compute.md')
 files.append(ROOT/'research/2026-infra-survey/qwen-request-accounting/README.md')
 files.extend(ROOT/'outlines/extensions'/name for name in ['04-加速器架构.md', '10-训练系统.md', '12-端边云协同.md'])
@@ -790,6 +791,8 @@ from verify_sequence_npu import verify as verify_sequence_npu
 sequence_npu=verify_sequence_npu()
 from verify_qwen_request_accounting import verify as verify_qwen_request_accounting
 qwen_request_accounting=verify_qwen_request_accounting()
+from verify_spindle import verify as verify_spindle
+spindle=verify_spindle()
 from verify_ascend_components import verify as verify_ascend_components
 ascend_components=verify_ascend_components()
 from verify_snapshot_residency import verify as verify_snapshot_residency

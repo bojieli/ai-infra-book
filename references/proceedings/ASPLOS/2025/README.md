@@ -1,6 +1,6 @@
 # ASPLOS 2025：出版目录核对
 
-官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 65 份代表公开 PDF，另存 PipeLLM 一个十五页作者版本；筛读 68 篇原始摘要，其中十四篇有声明范围的正文阅读；其余 116 篇摘要与更多公开正文待补。
+官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 65 份代表公开 PDF，另存 PipeLLM 一个十五页作者版本；筛读 68 篇原始摘要，其中十五篇有声明范围的正文阅读；其余 116 篇摘要与更多公开正文待补。
 
 | 日程对应的正式卷 | 匹配条目 | 出版元数据中的日期 |
 | --- | ---: | --- |
@@ -47,3 +47,5 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 同批选读 [Helix](helix-reading.json) 物理页 1–15 与五页图像，现共十二篇有声明正文范围。其异构请求路径与 vLLM 静态 PP 的差距见[专题笔记](../../../framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md)；只补现有第 6 章实验的变体。llm.npu、FlexSP、Spindle 留作候选待读，未据摘要采用性能结论。
 
 2026-09-09 再选读 [FlexSP](flexsp-reading.json) 物理页 2–13、17 和 [llm.npu](llm-npu-reading.json) 物理页 2–15，合计 27 页及 14 张已查看图页，现共十四篇有声明正文范围，摘要与 PDF 数量不变。原始摘要筛选判断保留为历史，当前取舍按正文更新。固定分支、MLLM v1／2026 AOT 和十二个源码／文档范围见[专题笔记](../../../framework-history/2026-09-09/sequence-and-npu/NOTES.md)。Spindle 仍待本阶段后的独立正文核对；本轮未运行工件。
+
+2026-09-09 并行选读 [Spindle](spindle-reading.json) 物理页 2–13、18–20，八张图页已查看；当前十五篇有声明正文范围，摘要数量不变。固定研究分支的五个读取范围与可手算的分支／重配对照见[专题笔记](../../../framework-history/2026-09-09/spindle-wavefront/NOTES.md)，仅接 10.3.1／实验 10-5 的选做变体。
