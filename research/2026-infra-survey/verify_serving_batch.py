@@ -8,6 +8,7 @@ import subprocess
 import unicodedata
 from bs4 import BeautifulSoup
 from verify_comet_reading import verify as verify_comet
+from verify_tapas_reading import verify as verify_tapas
 
 ROOT = Path(__file__).resolve().parents[2]
 D = ROOT / "references/proceedings/ASPLOS/2025/serving-113-117"
@@ -24,6 +25,7 @@ def check(item):
 
 def verify():
     comet = verify_comet()
+    tapas = verify_tapas()
     sources = json.loads((D / "sources.json").read_text())
     for s in sources:
         check(s)
@@ -73,6 +75,7 @@ def verify():
     assert serial == 200 and concurrent_lower_bound == 110
     result = {"status": "passed", "responses": len(sources), "failed_responses": sum(s["status_code"] != 200 for s in sources), "abstracts": 3, "representative_pdf_pages": 44, "pod_selected_pages": 5, "canonical_merge_pending": True, "arithmetic": {"ctas": ctas, "simplified_waves": waves, "toy_serial_time": serial, "toy_concurrent_resource_lower_bound": concurrent_lower_bound, "not_measured_latency": True}}
     result["comet_selected_pages"] = comet["selected_body_pages"]
+    result["tapas_selected_pages"] = tapas["selected_body_pages"]
     (D / "validation.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     return result
 
