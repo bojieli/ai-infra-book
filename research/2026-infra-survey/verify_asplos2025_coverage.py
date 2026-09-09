@@ -292,6 +292,29 @@ def verify(base=None, serving=None, testing=None):
         'publisher_byte_equivalence_verified': False,
     }
     assert entries[14]['selected_reading'] is None
+    from verify_asplos_fpga_edge import verify as check_fpga_edge
+    fpga = check_fpga_edge()
+    assert fpga['status'] == 'pass' and fpga['sealed_source_files_unchanged']
+    fpga_proof = str((D / 'parallel-fpga-edge/reading-records.json').relative_to(ROOT))
+    for record in fpga['records']:
+        entry = entries[record['program_order']]
+        assert entry['doi'] == record['doi'] and not entry['abstract_read']
+        assert record['selected_reading']['physical_pdf_pages'] == []
+        entry['abstract_read'] = True
+        for key in ('representative_pdf', 'version', 'version_notes', 'identity'):
+            entry[key] = record[key]
+        entry['abstract_identity_reading'] = record['selected_reading']
+        entry['selected_reading'] = None
+        entry['provenance'].append(fpga_proof)
+        entry['adoption'] = {'decision': 'abstract_screening_only', 'reason': record['editorial_decision']}
+        additional.append(record['program_order'])
+    for gap in fpga['gaps']:
+        entry = entries[gap['program_order']]
+        assert entry['doi'] == gap['doi'] and not entry['abstract_read']
+        entry['gap_reason'] = gap['reason']
+        entry['gap_evidence'] = gap
+        entry['provenance'].append(fpga_proof)
+    assert len(additional) == len(set(additional)) == 55
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
         'program_entries': len(entries),
@@ -304,10 +327,10 @@ def verify(base=None, serving=None, testing=None):
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (148, 136, 2281, 29)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (153, 139, 2327, 29)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    assert summary['remaining_abstracts'] == 36
-    assert {1, 2, 5, 163, 166} <= set(summary['remaining_abstract_orders'])
+    assert summary['remaining_abstracts'] == 31
+    assert {1, 2, 5, 32, 163, 166} <= set(summary['remaining_abstract_orders'])
     summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages + 17 + virgo['selected_body_physical_pages']
     assert summary['additional_selected_body_pages'] == 89
     output = {'summary': summary, 'records': [entries[n] for n in sorted(entries)]}
