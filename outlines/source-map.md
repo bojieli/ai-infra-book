@@ -780,3 +780,4 @@
 | `qwen-request-accounting-audit` | [Qwen3 请求计数与跨章衔接](../research/2026-infra-survey/qwen-request-accounting/README.md) | 2、6、8、9、10 | 补充／版本参照 | 区分输出与前向次数；页边界及 PD 主模型复算，保留正确的调用次数算例 |
 | `asplos25-spindle-body` | [Spindle 正文与附录范围](../references/proceedings/ASPLOS/2025/spindle-reading.json) | 10 | 补充／版本参照 | 十五页与八张图页；共享组件、分支扩展曲线、汇合与重配 |
 | `spindle-wavefront-framework` | [共享组件训练与固定研究分支](../references/framework-history/2026-09-09/spindle-wavefront/NOTES.md) | 10 | 扩写 10 | 五个代码读取范围；实验 10-5／图 10-5 选做，完整运行时映射仍待核 |
+| `neusight-calibration` | [预测校准的论文与固定实现](../references/framework-history/2026-09-09/neusight-calibration/NOTES.md) | 13 | 扩写 13 | 实验 13-6 延伸；阶段误差、tile 数据与版本范围，不增加核心实验 |

@@ -793,6 +793,8 @@ from verify_qwen_request_accounting import verify as verify_qwen_request_account
 qwen_request_accounting=verify_qwen_request_accounting()
 from verify_spindle import verify as verify_spindle
 spindle=verify_spindle()
+from verify_neusight import verify as verify_neusight
+neusight=verify_neusight()
 from verify_ascend_components import verify as verify_ascend_components
 ascend_components=verify_ascend_components()
 from verify_snapshot_residency import verify as verify_snapshot_residency
