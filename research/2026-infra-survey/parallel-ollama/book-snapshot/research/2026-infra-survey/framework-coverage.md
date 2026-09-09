@@ -48,5 +48,3 @@
 2026-09-09 补查 [POD 上层调用边界](../../references/framework-history/2026-09-09/pod-callers/README.md)：固定 vLLM／SGLang 的 FlashInfer backend 所读分支分别使用阶段 wrapper；SGLang 的上下文分段与 LSE 合并也不等于跨请求阶段共驻。第 5→8 章沿用已有混合批次实验，区分合批、上下文分解和设备共驻，先记录实际 backend／dtype／DCP，再看完整迭代。当前三份文件的符号搜索不代表全仓库未采用 POD，也未验证实际安装的 FlashInfer 版本。
 
 2026-09-09 补查 [PartIR／Shardy 的证明与搜索边界](../../references/framework-history/2026-09-09/partir-shardy/expanded-reading/NOTES.md)：论文的 MCTS、Core→SPMD 证明、当前优先级传播、外部自动分区回调和贪心通信生成分别取证。沿第 5→6 章既有切分案例核算重分片与 padding，不把接口或 IR 测试当作任意模型硬件的最优搜索。沿用实验 6-2；不采用图注与坐标不符的搜索时间数字，不新增论文计数。
-
-2026-09-09 补查 [Ollama 的后端与思考控制](parallel-ollama/NOTES.md)：2025 年 Vulkan 源码实验支持与 2026 年默认发现分别取证，再检查设备准入和去重。2025 年 thinking 接口与 2026 年原生模板传参分别对照，隐藏显示、effort、总生成上限和 Qwen3 论文的精确预算控制不混用。沿用 5.5.1／8-7 与 11.4.3／11-8，不扩大硬件目录，不从功能开关推断速度或质量。
