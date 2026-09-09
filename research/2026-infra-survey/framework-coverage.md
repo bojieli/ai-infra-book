@@ -54,3 +54,5 @@
 2026-09-09 编译与 KV 管理补读 [Pruner／Relax／vAttention](../../references/proceedings/ASPLOS/2025/parallel-followup/READINGS.md)：分别核对调优开销、形状和 workspace 规划、虚拟映射与细页驱动依赖。Pruner 原型、TVM pass 包装接口、vAttention 的 Sarathi-Serve 工件与论文 vLLM 环境分别说明；第 5／8 章各沿用已有判断，不据旧模型或缩小配置生成当前框架性能排名。
 
 2026-09-09 贯穿案例补齐 [Qwen3-235B 同一分工的容量与通信](parallel-moe-ownership/NOTES.md)：沿 DP1／TP2／EP4 的同 cohort 复制条件，输入已在各 EP 组，专家输出按 TP→EP 汇合；保留重复 attention 与 KV 的代价。第 6→7→9 章使用相同 rank、token 和状态身份，不能拿另一种独立源 token 的 All-to-All 字节拼接。既有实验只加连接步骤；该数学组织不声称是框架默认实现。
+
+2026-09-09 补齐[主机调度代表性演进](parallel-host-timeline/NOTES.md)：选读 4 份文章和 12 份固定源码，校验五个提交的 13 份 Git blob。第 5、8 章共用四次 decode 的教学时间线，区分调度摊销与重叠、当前推测长度和语法依赖；历史性能不移植到新模型。已完成该专题的有界资料补读，实际完整 trace 仍属于后续实验验证。

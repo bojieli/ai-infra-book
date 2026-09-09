@@ -811,6 +811,8 @@ from verify_pod_callers import verify as verify_pod_callers
 pod_callers=verify_pod_callers()
 from verify_ollama_backend_thinking import verify as verify_ollama_backend_thinking
 ollama_backend_thinking=verify_ollama_backend_thinking()
+from verify_host_timeline import verify as verify_host_timeline
+host_timeline=verify_host_timeline()
 from verify_moe_ownership import verify as verify_moe_ownership
 moe_ownership=verify_moe_ownership()
 from verify_asplos2025_coverage import verify as verify_asplos2025_coverage
