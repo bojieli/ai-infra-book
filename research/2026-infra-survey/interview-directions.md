@@ -110,4 +110,4 @@ I17／I18 的训练执行追问继续沿已有长尾案例：早到的微批能�
 - **I12：有生成器就能替换通信库吗？** 沿 [TACOS 的论文与固定公开入口](../../references/proceedings/MICRO/2024/tacos-body-reading/NOTES.md)，分别确认 collective 语义、物理共享端口、生成结果和执行后端。论文描述 All-Reduce 生成，不证明所读公开工具能导出并运行它；能预测 All-Gather 时间也不等于当前 vLLM 已采用该路径。
 - **I14：每个专家独立选择最快设备是否可行？** 沿 [Duplex 的内存放置限制](../../references/proceedings/MICRO/2024/duplex-body-reading/NOTES.md)，检查同一 bank 分区的专家是否必须成组分配、拆 batch 是否重读权重、KV 是否需要迁移。这里借用专用硬件研究解释约束，不能把这些 bank 规则强加给普通 GPU 或 CPU 卸载系统。
 
-[第十一批推理岗位自述](../../references/interviews/2026-09-09/eleventh-pass/README.md)补充 I03／I05／I08 的方向依据：框架实现、KV 加载、PD 分离与部署吞吐。公司和岗位仅为候选人自报，未确认基础模型团队；MGA 及听不清的 MTP／MCP 不擅自订正，不据此新增推测解码原题。已有实验应报告配置与计时口径，但不虚构该面试的标准答案。
+[小米推理岗位自述](../../references/interviews/2026-09-09/xiaomi-spring-self-report/README.md)补充 I03／I05／I08 的方向依据：框架实现、KV 加载、PD 分离与部署吞吐。公司和岗位仅为候选人自报，未确认基础模型团队；MGA 及听不清的 MTP／MCP 不擅自订正，不据此新增推测解码原题。已有实验应报告配置与计时口径，但不虚构该面试的标准答案。
