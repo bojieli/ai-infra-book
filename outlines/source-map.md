@@ -772,3 +772,7 @@
 | `asplos25-helix-body` | [Helix 正文与工件范围](../references/proceedings/ASPLOS/2025/helix-reading.json) | 6、7、9 | 补充／版本参照 | 十五页与五页图像；容量网络、请求路径、KV 预测和模拟条件 |
 | `heterogeneous-pipeline-framework` | [异构流水线与框架接口](../references/framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md) | 6、7、9 | 补充／版本参照 | 历史 vLLM 原型、2025 指南与固定 2026 接口；八个源码读取范围 |
 | `qwen3-heterogeneous-pipeline-case` | [Qwen3 异构 PP 的链路与状态](../case-studies/model-parallelism.md#异构流水线的链路与状态) | 6、7、9 | 补充／版本参照 | 实验 6-2／图 6-2 选做；双张量载荷、最小割与 KV 容量约束 |
+| `asplos25-flexsp-body` | [FlexSP 正文与附录范围](../references/proceedings/ASPLOS/2025/flexsp-reading.json) | 6、10 | 补充／版本参照 | 十三页与六张图页；长度分布、受限分组、GPT／A100 模型与 CP 边界 |
+| `asplos25-llm-npu-body` | [llm.npu 正文与工件范围](../references/proceedings/ASPLOS/2025/llm-npu-reading.json) | 4、5、12 | 补充／版本参照 | 十四页与八张图页；静态块、量化、CPU／NPU 原型与模拟区分 |
+| `sequence-npu-framework-evolution` | [FlexSP 与 MLLM 版本对照](../references/framework-history/2026-09-09/sequence-and-npu/NOTES.md) | 4、6、10、12 | 补充／版本参照 | 十二个读取范围；GQA 扩展载荷、v1 分工与 2026 Qwen3 AOT 条件 |
+| `qwen3-length-distribution-case` | [相同 token 的训练工作](../case-studies/training-compute.md#同一批-token-的长度分布) | 2、6、10 | 扩写 10 | 实验 10-3／图 10-3 选做；有效配对、真实发送量和标签权重 |

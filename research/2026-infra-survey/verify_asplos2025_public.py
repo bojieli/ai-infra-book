@@ -110,11 +110,13 @@ def verify():
         title = re.search(r'^Title:\s*(.+)', info, re.M)
         assert norm(p['title']) in norm(data.decode()) or (title and norm(p['title']) == norm(title[1]))
     selected = [p for p in papers.values() if p['reading_status'] == 'selected_sections_read']
-    assert len(selected) == manifest['selected_sections_read'] == 12
-    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 39, 40, 44, 49, 74, 94}
+    assert len(selected) == manifest['selected_sections_read'] == 14
+    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 39, 40, 44, 49, 73, 74, 75, 94}
     expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 28: range(2, 13), 35: range(1, 14), 39: range(2, 13), 40: range(2, 14), 44: list(range(2, 13)) + [16, 17], 49: range(1, 14), 94: range(1, 14)}
     expected_pages[74] = range(1, 16)
-    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (28, 'picachu-reading.json'), (35, 'darwingame-reading.json'), (39, 'streamgrid-reading.json'), (40, 'arc-reading.json'), (44, 'apophenia-reading.json'), (49, 'pipellm-reading.json'), (74, 'helix-reading.json'), (94, 'fsmoe-reading.json')]:
+    expected_pages[73] = range(2, 16)
+    expected_pages[75] = list(range(2, 14)) + [17]
+    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (28, 'picachu-reading.json'), (35, 'darwingame-reading.json'), (39, 'streamgrid-reading.json'), (40, 'arc-reading.json'), (44, 'apophenia-reading.json'), (49, 'pipellm-reading.json'), (73, 'llm-npu-reading.json'), (74, 'helix-reading.json'), (75, 'flexsp-reading.json'), (94, 'fsmoe-reading.json')]:
         proof = json.loads((D / filename).read_text()); reading = proof['reading']
         assert reading == papers[order]['selected_reading']
         assert reading['physical_pdf_pages'] == list(expected_pages[order])
@@ -178,7 +180,13 @@ def verify():
         assert len(data) == v['bytes'] and hashlib.sha256(data).hexdigest() == v['sha256']
         assert source['sha256'] == v['source_sha256'] and source['program_order'] == v['program_order'] and v['actually_viewed']
     for n in batch['new_abstract_orders']:
-        assert batch['decisions'][str(n)] == {k: papers[n]['screening'][k] for k in ['decision', 'reason']}
+        # Keep the original abstract-screening decision when later body reading changes adoption.
+        if n in {73, 75}:
+            filename = 'llm-npu-reading.json' if n == 73 else 'flexsp-reading.json'
+            historical = json.loads((D / filename).read_text())['prior_abstract_screening']
+        else:
+            historical = papers[n]['screening']
+        assert batch['decisions'][str(n)] == {k: historical[k] for k in ['decision', 'reason']}
         assert batch['version_notes'][str(n)] == papers[n]['public_version_note']
     report = dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed', scope='Public sources and declared reading only; not full proceedings completion.', responses=len(sources), failed_responses=sum(s['status_code'] != 200 for s in sources), location_dois=184, public_pdfs=len(pdfs), public_pdf_pages=sum(s['pdf_pages'] for s in pdfs), primary_abstracts_screened=len(abstracts), remaining_abstracts=184-len(abstracts), selected_sections_read=len(selected), middle_abstract_page_views=4, storage_abstract_page_views=2, storage_transport_errors=1, heterogeneous_abstract_page_views=3, heterogeneous_transport_errors=1)
     (D / 'public-audit.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')

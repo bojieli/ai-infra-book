@@ -76,6 +76,9 @@ files.append(ROOT/'case-studies/kv-quantization-and-execution.md')
 files.append(ROOT/'case-studies/training-offload-and-casting.md')
 files.append(ROOT/'references/framework-history/2026-09-08/training-superchip/README.md')
 files.append(ROOT/'references/framework-history/2026-09-09/heterogeneous-pipelines/NOTES.md')
+files.append(ROOT/'references/framework-history/2026-09-09/sequence-and-npu/NOTES.md')
+files.append(ROOT/'case-studies/training-compute.md')
+files.extend(ROOT/'outlines/extensions'/name for name in ['04-加速器架构.md', '10-训练系统.md', '12-端边云协同.md'])
 files.append(ROOT/'case-studies/model-parallelism.md')
 files.append(ROOT/'outlines/extensions/06-超节点.md')
 links=0
@@ -780,6 +783,8 @@ from verify_asplos2025_public import verify as verify_asplos2025_public
 asplos2025_public=verify_asplos2025_public()
 from verify_heterogeneous_pipelines import verify as verify_heterogeneous_pipelines
 heterogeneous_pipelines=verify_heterogeneous_pipelines()
+from verify_sequence_npu import verify as verify_sequence_npu
+sequence_npu=verify_sequence_npu()
 from verify_ascend_components import verify as verify_ascend_components
 ascend_components=verify_ascend_components()
 from verify_snapshot_residency import verify as verify_snapshot_residency
