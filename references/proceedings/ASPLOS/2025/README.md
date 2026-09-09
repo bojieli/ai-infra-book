@@ -18,9 +18,9 @@
 
 ## 公开稿与读取进度
 
-当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续两批阅读记录，覆盖 **106 篇完整摘要、98 份代表 PDF／1,675 页、21 篇声明正文范围**，仍缺 78 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
+当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续三批阅读记录，覆盖 **108 篇完整摘要、100 份代表 PDF／1,706 页、21 篇声明正文范围**，仍缺 76 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
 
-新增八篇来自 [COMET／POD／TAPAS](serving-113-117/README.md)及[编译器与测试筛选](screening-111-123/README.md)。其中 COMET、POD、TAPAS、Ratte 合计选读 30 页，只补现有量化、混合批处理、资源约束和 Agent 优化实验的判断条件，其余四篇归档备查。MetaMut 属于正式 2024 卷、2025 日程，保留原始年份。维护命令为 `python research/2026-infra-survey/verify_asplos2025_coverage.py`；该检查复核原清单及两批来源、身份与页级证据，再生成统一索引。它不代表全部正文已读。
+新增八篇来自 [COMET／POD／TAPAS](serving-113-117/README.md)及[编译器与测试筛选](screening-111-123/README.md)。其中 COMET、POD、TAPAS、Ratte 合计选读 30 页，只补现有量化、混合批处理、资源约束和 Agent 优化实验的判断条件，其余四篇归档备查。MetaMut 属于正式 2024 卷、2025 日程，保留原始年份。维护命令为 `python research/2026-infra-survey/verify_asplos2025_coverage.py`；该检查复核原清单及后续批次的来源、身份与页级证据，再生成统一索引。它不代表全部正文已读。
 
 [selected-sources.json](selected-sources.json) 另存 177 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。90 份代表 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。十六份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
 
@@ -57,3 +57,5 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 2026-09-09 合并第 77–110 项中的两批交接材料：30 篇完整摘要、25 份代表 PDF／445 页。原始文件继续位于 [原交接目录](pending-077-110/README.md)，不因目录名含 pending 而重复下载或计数。[身份核验](pending-077-110/identity-audit.json)保留题名变体、完整作者和 DOI 的证据；93、96、98 仅以作者版本题名与完整作者关联，未补造原文没有的 DOI。另存一次连接失败，未计入 60 个新增 HTTP 响应。
 
 新增选读范围为 NeuSight 物理页 2–14（沿用已核实并行阅读范围）和 PartIR 物理页 3–5（主任务新读）；分别见[预测校准](../../../framework-history/2026-09-09/neusight-calibration/NOTES.md)与[分片策略](../../../framework-history/2026-09-09/partir-shardy/NOTES.md)。摘要与代表 PDF 的数量不等于全文完成数量，PartIR 剩余方法、评估和证明仍未计入已读。
+
+第 123／128 项的[缺口补查](screening-111-128/README.md)新增两篇完整摘要、两份 PDF／31 页，均归档不采用，不增加正文选读范围。
