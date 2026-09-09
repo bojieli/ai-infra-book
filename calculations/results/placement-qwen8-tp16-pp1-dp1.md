@@ -1,0 +1,58 @@
+# qwen-dense-parallel-placement — qwen3-8b
+
+输入：`{"batch_per_replica": 1, "capacity_bytes": 24000000000, "dp": 1, "history": 8192, "kv_dtype": "BF16", "pp": 1, "tokens": 1, "tp": 16, "weight_dtype": "BF16", "workspace_bytes": 2147483648}`
+
+数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
+
+| 结果 | 值 |
+| --- | ---: |
+| cards | 16 |
+| global_requests | 1 |
+| logical_parameters_per_replica | 8,190,735,360 |
+| physical_weight_bytes | 16,994,697,216 |
+| excess_weight_bytes_over_unsharded_replicas | 613,226,496 |
+| physical_kv_bytes | 2,416,214,016 |
+| maximum_card_resident_bytes | 3,360,665,600 |
+| all_cards_fit_declared_budget | `true` |
+| physical_matrix_flops | 20,572,602,368 |
+| pipeline_network_send_payload_bytes | 0 |
+| predicted_iteration_seconds | `null` |
+
+| DP / PP / TP | 层 | Q heads | KV heads | 权重 bytes | KV bytes | 总预算占用 bytes | 可容纳 |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| 0 / 0 / 0 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [0, 1] | [0] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 1 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [2, 3] | [0] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 2 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [4, 5] | [1] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 3 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [6, 7] | [1] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 4 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [8, 9] | [2] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 5 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [10, 11] | [2] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 6 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [12, 13] | [3] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 7 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [14, 15] | [3] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 8 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [16, 17] | [4] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 9 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [18, 19] | [4] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 10 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [20, 21] | [5] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 11 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [22, 23] | [5] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 12 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [24, 25] | [6] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 13 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [26, 27] | [6] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 14 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [28, 29] | [7] | 1062168576 | 151013376 | 3360665600 | True |
+| 0 / 0 / 15 | [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35] | [30, 31] | [7] | 1062168576 | 151013376 | 3360665600 | True |
+
+逐卡权重矩阵形状、copies、矩阵工作及 TP／PP 消息见 JSON。工作区为显式预算，非实际峰值。
+
+计量条件：
+
+- Basic BF16 Qwen3 Dense inference: TP splits query heads, FFN intermediate width and vocabulary rows. Output/down projections split their input axes. Per-head and hidden norm scales replicate on TP ranks.
+- KV head identities follow each rank query heads and the official GQA grouping. A KV head crossing multiple TP ranks is physically replicated, including its K/V projection weights and work; it is never divided into fractional heads.
+- PP uses contiguous nearly equal layer counts; embedding exists only on the first stage, final norm and untied vocabulary head only on the last. Head runs on the last new position; no tied endpoint handling is inferred.
+- DP means independent inference replicas, each with batch_per_replica requests and its own weights/cache. No training gradient synchronization is added.
+- Capacity is checked per physical card with an explicit workspace reservation. BF16 state is retained through history+tokens. Quantization, allocator peaks, activation lifetimes and real backend feasibility remain separate.
+- Matrix work includes local projections/head and valid causal attention only, not scalar operations. Replicated K/V projection work is counted on every executing rank; DP increases aggregate work with aggregate requests.
+- Two output all-reduces per local layer is the declared basic TP graph; message bytes are full activation, not link traffic. Vocabulary-parallel embedding reduction, logits collection/sampling, norm/cast communication require a fuller execution graph.
+- PP transfers full replicated hidden activation from each TP rank to its matching next-stage rank. Payload totals therefore include TP copies; alternate sharded pipeline interfaces need different placement. No overlap, bubbles, bandwidth or latency prediction is claimed.
+
+固定来源：
+
+- [configs/models/qwen3-8b/config.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json)，SHA256 `f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30`。
+- [sources/qwen3-8b/model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json)，SHA256 `f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc`。
+- [sources/qwen3/modeling_qwen3.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py)，SHA256 `704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2`。
+- [sources/qwen3/modeling_qwen3_moe.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py)，SHA256 `3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8`。

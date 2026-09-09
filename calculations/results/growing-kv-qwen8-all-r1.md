@@ -1,0 +1,3599 @@
+# 增长KV：远端历史、追加副本与提交epoch
+
+## 场景
+
+```json
+{
+  "model": "qwen3-8b",
+  "batch": 1,
+  "prompt": 8192,
+  "steps": 128,
+  "copies": 1,
+  "placement": "remote_all",
+  "bandwidth_bytes_per_second": 40000000000,
+  "startup_ns": 5000,
+  "local_tail_budget_bytes": 1073741824
+}
+```
+
+| 汇总 | 值 |
+|---|---:|
+| full_attention_qk_pv_flops | 623344877568 |
+| initial_copy_network_bytes | 1207959552 |
+| prior_history_logical_read_bytes | 155817345024 |
+| remote_prior_read_bytes | 155817345024 |
+| local_prior_read_bytes | 0 |
+| current_kv_operand_bytes | 18874368 |
+| append_replica_network_bytes | 18874368 |
+| total_network_bytes | 157044178944 |
+| remote_final_bytes_per_replica | 1226833920 |
+| remote_physical_final_bytes | 1226833920 |
+| local_tail_final_bytes | 0 |
+| local_fixed_state_bytes | 0 |
+| local_current_append_buffer_bytes | 147456 |
+| final_unique_history_bytes | 1226833920 |
+| local_tail_budget_fits | True |
+| communication_skeleton_seconds_exact | 2454618421/625000000 |
+| initial_copy_seconds_exact | 18877493/625000000 |
+| token_communication_seconds_exact | 38058452/9765625 |
+| actual_decode_seconds | None |
+| actual_task_feasible | None |
+
+| 步 | 所需远端epoch | 远端旧历史bytes | 本地旧历史bytes | 当前KVbytes | 副本写bytes | 提交秒 | 本地tailbytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 8192 | 1207959552 | 0 | 147456 | 147456 | 0.060416664 | 0 |
+| 1 | 8193 | 1208107008 | 0 | 147456 | 147456 | 0.090633026 | 0 |
+| 2 | 8194 | 1208254464 | 0 | 147456 | 147456 | 0.120853074 | 0 |
+| 3 | 8195 | 1208401920 | 0 | 147456 | 147456 | 0.151076808 | 0 |
+| 4 | 8196 | 1208549376 | 0 | 147456 | 147456 | 0.181304229 | 0 |
+| 5 | 8197 | 1208696832 | 0 | 147456 | 147456 | 0.211535336 | 0 |
+| 6 | 8198 | 1208844288 | 0 | 147456 | 147456 | 0.241770130 | 0 |
+| 7 | 8199 | 1208991744 | 0 | 147456 | 147456 | 0.272008610 | 0 |
+| 8 | 8200 | 1209139200 | 0 | 147456 | 147456 | 0.302250776 | 0 |
+| 9 | 8201 | 1209286656 | 0 | 147456 | 147456 | 0.332496629 | 0 |
+| 10 | 8202 | 1209434112 | 0 | 147456 | 147456 | 0.362746168 | 0 |
+| 11 | 8203 | 1209581568 | 0 | 147456 | 147456 | 0.392999394 | 0 |
+| 12 | 8204 | 1209729024 | 0 | 147456 | 147456 | 0.423256306 | 0 |
+| 13 | 8205 | 1209876480 | 0 | 147456 | 147456 | 0.453516904 | 0 |
+| 14 | 8206 | 1210023936 | 0 | 147456 | 147456 | 0.483781189 | 0 |
+| 15 | 8207 | 1210171392 | 0 | 147456 | 147456 | 0.514049160 | 0 |
+| 16 | 8208 | 1210318848 | 0 | 147456 | 147456 | 0.544320818 | 0 |
+| 17 | 8209 | 1210466304 | 0 | 147456 | 147456 | 0.574596162 | 0 |
+| 18 | 8210 | 1210613760 | 0 | 147456 | 147456 | 0.604875192 | 0 |
+| 19 | 8211 | 1210761216 | 0 | 147456 | 147456 | 0.635157909 | 0 |
+| 20 | 8212 | 1210908672 | 0 | 147456 | 147456 | 0.665444312 | 0 |
+| 21 | 8213 | 1211056128 | 0 | 147456 | 147456 | 0.695734402 | 0 |
+| 22 | 8214 | 1211203584 | 0 | 147456 | 147456 | 0.726028178 | 0 |
+| 23 | 8215 | 1211351040 | 0 | 147456 | 147456 | 0.756325640 | 0 |
+| 24 | 8216 | 1211498496 | 0 | 147456 | 147456 | 0.786626789 | 0 |
+| 25 | 8217 | 1211645952 | 0 | 147456 | 147456 | 0.816931624 | 0 |
+| 26 | 8218 | 1211793408 | 0 | 147456 | 147456 | 0.847240146 | 0 |
+| 27 | 8219 | 1211940864 | 0 | 147456 | 147456 | 0.877552354 | 0 |
+| 28 | 8220 | 1212088320 | 0 | 147456 | 147456 | 0.907868248 | 0 |
+| 29 | 8221 | 1212235776 | 0 | 147456 | 147456 | 0.938187829 | 0 |
+| 30 | 8222 | 1212383232 | 0 | 147456 | 147456 | 0.968511096 | 0 |
+| 31 | 8223 | 1212530688 | 0 | 147456 | 147456 | 0.998838050 | 0 |
+| 32 | 8224 | 1212678144 | 0 | 147456 | 147456 | 1.029168690 | 0 |
+| 33 | 8225 | 1212825600 | 0 | 147456 | 147456 | 1.059503016 | 0 |
+| 34 | 8226 | 1212973056 | 0 | 147456 | 147456 | 1.089841029 | 0 |
+| 35 | 8227 | 1213120512 | 0 | 147456 | 147456 | 1.120182728 | 0 |
+| 36 | 8228 | 1213267968 | 0 | 147456 | 147456 | 1.150528114 | 0 |
+| 37 | 8229 | 1213415424 | 0 | 147456 | 147456 | 1.180877186 | 0 |
+| 38 | 8230 | 1213562880 | 0 | 147456 | 147456 | 1.211229944 | 0 |
+| 39 | 8231 | 1213710336 | 0 | 147456 | 147456 | 1.241586389 | 0 |
+| 40 | 8232 | 1213857792 | 0 | 147456 | 147456 | 1.271946520 | 0 |
+| 41 | 8233 | 1214005248 | 0 | 147456 | 147456 | 1.302310338 | 0 |
+| 42 | 8234 | 1214152704 | 0 | 147456 | 147456 | 1.332677842 | 0 |
+| 43 | 8235 | 1214300160 | 0 | 147456 | 147456 | 1.363049032 | 0 |
+| 44 | 8236 | 1214447616 | 0 | 147456 | 147456 | 1.393423909 | 0 |
+| 45 | 8237 | 1214595072 | 0 | 147456 | 147456 | 1.423802472 | 0 |
+| 46 | 8238 | 1214742528 | 0 | 147456 | 147456 | 1.454184722 | 0 |
+| 47 | 8239 | 1214889984 | 0 | 147456 | 147456 | 1.484570658 | 0 |
+| 48 | 8240 | 1215037440 | 0 | 147456 | 147456 | 1.514960280 | 0 |
+| 49 | 8241 | 1215184896 | 0 | 147456 | 147456 | 1.545353589 | 0 |
+| 50 | 8242 | 1215332352 | 0 | 147456 | 147456 | 1.575750584 | 0 |
+| 51 | 8243 | 1215479808 | 0 | 147456 | 147456 | 1.606151266 | 0 |
+| 52 | 8244 | 1215627264 | 0 | 147456 | 147456 | 1.636555634 | 0 |
+| 53 | 8245 | 1215774720 | 0 | 147456 | 147456 | 1.666963688 | 0 |
+| 54 | 8246 | 1215922176 | 0 | 147456 | 147456 | 1.697375429 | 0 |
+| 55 | 8247 | 1216069632 | 0 | 147456 | 147456 | 1.727790856 | 0 |
+| 56 | 8248 | 1216217088 | 0 | 147456 | 147456 | 1.758209970 | 0 |
+| 57 | 8249 | 1216364544 | 0 | 147456 | 147456 | 1.788632770 | 0 |
+| 58 | 8250 | 1216512000 | 0 | 147456 | 147456 | 1.819059256 | 0 |
+| 59 | 8251 | 1216659456 | 0 | 147456 | 147456 | 1.849489429 | 0 |
+| 60 | 8252 | 1216806912 | 0 | 147456 | 147456 | 1.879923288 | 0 |
+| 61 | 8253 | 1216954368 | 0 | 147456 | 147456 | 1.910360834 | 0 |
+| 62 | 8254 | 1217101824 | 0 | 147456 | 147456 | 1.940802066 | 0 |
+| 63 | 8255 | 1217249280 | 0 | 147456 | 147456 | 1.971246984 | 0 |
+| 64 | 8256 | 1217396736 | 0 | 147456 | 147456 | 2.001695589 | 0 |
+| 65 | 8257 | 1217544192 | 0 | 147456 | 147456 | 2.032147880 | 0 |
+| 66 | 8258 | 1217691648 | 0 | 147456 | 147456 | 2.062603858 | 0 |
+| 67 | 8259 | 1217839104 | 0 | 147456 | 147456 | 2.093063522 | 0 |
+| 68 | 8260 | 1217986560 | 0 | 147456 | 147456 | 2.123526872 | 0 |
+| 69 | 8261 | 1218134016 | 0 | 147456 | 147456 | 2.153993909 | 0 |
+| 70 | 8262 | 1218281472 | 0 | 147456 | 147456 | 2.184464632 | 0 |
+| 71 | 8263 | 1218428928 | 0 | 147456 | 147456 | 2.214939042 | 0 |
+| 72 | 8264 | 1218576384 | 0 | 147456 | 147456 | 2.245417138 | 0 |
+| 73 | 8265 | 1218723840 | 0 | 147456 | 147456 | 2.275898920 | 0 |
+| 74 | 8266 | 1218871296 | 0 | 147456 | 147456 | 2.306384389 | 0 |
+| 75 | 8267 | 1219018752 | 0 | 147456 | 147456 | 2.336873544 | 0 |
+| 76 | 8268 | 1219166208 | 0 | 147456 | 147456 | 2.367366386 | 0 |
+| 77 | 8269 | 1219313664 | 0 | 147456 | 147456 | 2.397862914 | 0 |
+| 78 | 8270 | 1219461120 | 0 | 147456 | 147456 | 2.428363128 | 0 |
+| 79 | 8271 | 1219608576 | 0 | 147456 | 147456 | 2.458867029 | 0 |
+| 80 | 8272 | 1219756032 | 0 | 147456 | 147456 | 2.489374616 | 0 |
+| 81 | 8273 | 1219903488 | 0 | 147456 | 147456 | 2.519885890 | 0 |
+| 82 | 8274 | 1220050944 | 0 | 147456 | 147456 | 2.550400850 | 0 |
+| 83 | 8275 | 1220198400 | 0 | 147456 | 147456 | 2.580919496 | 0 |
+| 84 | 8276 | 1220345856 | 0 | 147456 | 147456 | 2.611441829 | 0 |
+| 85 | 8277 | 1220493312 | 0 | 147456 | 147456 | 2.641967848 | 0 |
+| 86 | 8278 | 1220640768 | 0 | 147456 | 147456 | 2.672497554 | 0 |
+| 87 | 8279 | 1220788224 | 0 | 147456 | 147456 | 2.703030946 | 0 |
+| 88 | 8280 | 1220935680 | 0 | 147456 | 147456 | 2.733568024 | 0 |
+| 89 | 8281 | 1221083136 | 0 | 147456 | 147456 | 2.764108789 | 0 |
+| 90 | 8282 | 1221230592 | 0 | 147456 | 147456 | 2.794653240 | 0 |
+| 91 | 8283 | 1221378048 | 0 | 147456 | 147456 | 2.825201378 | 0 |
+| 92 | 8284 | 1221525504 | 0 | 147456 | 147456 | 2.855753202 | 0 |
+| 93 | 8285 | 1221672960 | 0 | 147456 | 147456 | 2.886308712 | 0 |
+| 94 | 8286 | 1221820416 | 0 | 147456 | 147456 | 2.916867909 | 0 |
+| 95 | 8287 | 1221967872 | 0 | 147456 | 147456 | 2.947430792 | 0 |
+| 96 | 8288 | 1222115328 | 0 | 147456 | 147456 | 2.977997362 | 0 |
+| 97 | 8289 | 1222262784 | 0 | 147456 | 147456 | 3.008567618 | 0 |
+| 98 | 8290 | 1222410240 | 0 | 147456 | 147456 | 3.039141560 | 0 |
+| 99 | 8291 | 1222557696 | 0 | 147456 | 147456 | 3.069719189 | 0 |
+| 100 | 8292 | 1222705152 | 0 | 147456 | 147456 | 3.100300504 | 0 |
+| 101 | 8293 | 1222852608 | 0 | 147456 | 147456 | 3.130885506 | 0 |
+| 102 | 8294 | 1223000064 | 0 | 147456 | 147456 | 3.161474194 | 0 |
+| 103 | 8295 | 1223147520 | 0 | 147456 | 147456 | 3.192066568 | 0 |
+| 104 | 8296 | 1223294976 | 0 | 147456 | 147456 | 3.222662629 | 0 |
+| 105 | 8297 | 1223442432 | 0 | 147456 | 147456 | 3.253262376 | 0 |
+| 106 | 8298 | 1223589888 | 0 | 147456 | 147456 | 3.283865810 | 0 |
+| 107 | 8299 | 1223737344 | 0 | 147456 | 147456 | 3.314472930 | 0 |
+| 108 | 8300 | 1223884800 | 0 | 147456 | 147456 | 3.345083736 | 0 |
+| 109 | 8301 | 1224032256 | 0 | 147456 | 147456 | 3.375698229 | 0 |
+| 110 | 8302 | 1224179712 | 0 | 147456 | 147456 | 3.406316408 | 0 |
+| 111 | 8303 | 1224327168 | 0 | 147456 | 147456 | 3.436938274 | 0 |
+| 112 | 8304 | 1224474624 | 0 | 147456 | 147456 | 3.467563826 | 0 |
+| 113 | 8305 | 1224622080 | 0 | 147456 | 147456 | 3.498193064 | 0 |
+| 114 | 8306 | 1224769536 | 0 | 147456 | 147456 | 3.528825989 | 0 |
+| 115 | 8307 | 1224916992 | 0 | 147456 | 147456 | 3.559462600 | 0 |
+| 116 | 8308 | 1225064448 | 0 | 147456 | 147456 | 3.590102898 | 0 |
+| 117 | 8309 | 1225211904 | 0 | 147456 | 147456 | 3.620746882 | 0 |
+| 118 | 8310 | 1225359360 | 0 | 147456 | 147456 | 3.651394552 | 0 |
+| 119 | 8311 | 1225506816 | 0 | 147456 | 147456 | 3.682045909 | 0 |
+| 120 | 8312 | 1225654272 | 0 | 147456 | 147456 | 3.712700952 | 0 |
+| 121 | 8313 | 1225801728 | 0 | 147456 | 147456 | 3.743359682 | 0 |
+| 122 | 8314 | 1225949184 | 0 | 147456 | 147456 | 3.774022098 | 0 |
+| 123 | 8315 | 1226096640 | 0 | 147456 | 147456 | 3.804688200 | 0 |
+| 124 | 8316 | 1226244096 | 0 | 147456 | 147456 | 3.835357989 | 0 |
+| 125 | 8317 | 1226391552 | 0 | 147456 | 147456 | 3.866031464 | 0 |
+| 126 | 8318 | 1226539008 | 0 | 147456 | 147456 | 3.896708626 | 0 |
+| 127 | 8319 | 1226686464 | 0 | 147456 | 147456 | 3.927389474 | 0 |
+
+所有配置/实现原件校验后使用；BF16完整attention KV按层/头计，Qwen3.6仅10层保存全历史KV，30层FP32递推和BF16卷积槽留在计算节点，不传成历史序列。
+prompt是已产生的KV位置数；steps是追加单token forward次数。输入token/输出token移位明确，当前位置操作数不混入远端旧历史读取。给出的QK/PV仅完整attention子账，不含投影/专家/DeltaNet等全部计算。
+remote_all复制完整prompt，逐步读一个副本的所有旧位置，再将新位置发给每个副本；共享发送接口串行写入，全副本提交屏障保证下一步所有可选副本都达到要求epoch。没有实现真实一致性协议或原子性证明。
+remote_prefix_local_tail保持远端prompt不变，新增位置留本地；每步远端prefix和本地tail各读一次。全部模型层仍需要本地递推/卷积等状态，尾部预算只检查新增完整attention KV，不是整机容量。
+初始化和每消息startup+bytes/B均为声明串行传输模型。当前KV生成完成后才可追加，但计算时长和与网络重叠未知；时间轴只列通信骨架，不能视为真实decode latency或吞吐。
+新KV在本地先产生，current append buffer另列，不和已增长tail盲目相加为内存峰值。远端读缓存/临时buffer/控制消息/ACK/重试/故障检测及恢复未计，不推测厂商能力。
+初始拷贝计从外部已产出的prompt向各副本的发送；原始prompt源是否释放另由上层所有权协议决定，不计成已释放容量。副本只增加存储/写入与静态冗余，不自动增加读带宽。
+
+```json
+{
+  "calculation": "growing-remote-kv",
+  "scenario": {
+    "model": "qwen3-8b",
+    "batch": 1,
+    "prompt": 8192,
+    "steps": 128,
+    "copies": 1,
+    "placement": "remote_all",
+    "bandwidth_bytes_per_second": 40000000000,
+    "startup_ns": 5000,
+    "local_tail_budget_bytes": 1073741824
+  },
+  "sources": [
+    {
+      "file": "configs/models/qwen3-8b/config.json",
+      "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"
+    },
+    {
+      "file": "sources/qwen3-8b/model.safetensors.index.json",
+      "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc"
+    },
+    {
+      "file": "sources/qwen3/modeling_qwen3.py",
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py",
+      "revision": "0720e206c6ba28887e4d60ef60a6a089f6c1cc76",
+      "sha256": "704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2"
+    },
+    {
+      "file": "sources/qwen3/modeling_qwen3_moe.py",
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+      "revision": "0720e206c6ba28887e4d60ef60a6a089f6c1cc76",
+      "sha256": "3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8"
+    }
+  ],
+  "geometry": {
+    "model": "qwen3-8b",
+    "full_attention_layers": 36,
+    "linear_layers": 0,
+    "kv_bytes_per_position": 147456,
+    "qk_pv_flops_per_position_pair": 589824,
+    "local_recurrent_bytes_per_request": 0,
+    "local_convolution_bytes_per_request": 0,
+    "max_positions": 40960
+  },
+  "initial_copy_messages": [
+    {
+      "replica": 0,
+      "bytes": 1207959552
+    }
+  ],
+  "steps": [
+    {
+      "step": 0,
+      "required_remote_epoch": 8192,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1207959552,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4832428032,
+      "read_start_seconds_exact": "18877493/625000000",
+      "read_finish_seconds_exact": "18877493/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8192,
+          "bytes": 147456,
+          "start_seconds_exact": "18877493/312500000",
+          "commit_seconds_exact": "7552083/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "7552083/125000000",
+      "remote_lengths_after": [
+        8193
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208107008
+    },
+    {
+      "step": 1,
+      "required_remote_epoch": 8193,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208107008,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4833017856,
+      "read_start_seconds_exact": "7552083/125000000",
+      "read_finish_seconds_exact": "14160053/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8193,
+          "bytes": 147456,
+          "start_seconds_exact": "14160053/156250000",
+          "commit_seconds_exact": "56645641/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "56645641/625000000",
+      "remote_lengths_after": [
+        8194
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208254464
+    },
+    {
+      "step": 2,
+      "required_remote_epoch": 8194,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208254464,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4833607680,
+      "read_start_seconds_exact": "56645641/625000000",
+      "read_finish_seconds_exact": "37763871/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8194,
+          "bytes": 147456,
+          "start_seconds_exact": "37763871/312500000",
+          "commit_seconds_exact": "75533171/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "75533171/625000000",
+      "remote_lengths_after": [
+        8195
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208401920
+    },
+    {
+      "step": 3,
+      "required_remote_epoch": 8195,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208401920,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4834197504,
+      "read_start_seconds_exact": "75533171/625000000",
+      "read_finish_seconds_exact": "11802197/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8195,
+          "bytes": 147456,
+          "start_seconds_exact": "11802197/78125000",
+          "commit_seconds_exact": "18884601/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "18884601/125000000",
+      "remote_lengths_after": [
+        8196
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208549376
+    },
+    {
+      "step": 4,
+      "required_remote_epoch": 8196,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208549376,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4834787328,
+      "read_start_seconds_exact": "18884601/125000000",
+      "read_finish_seconds_exact": "56654857/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8196,
+          "bytes": 147456,
+          "start_seconds_exact": "56654857/312500000",
+          "commit_seconds_exact": "113315143/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "113315143/625000000",
+      "remote_lengths_after": [
+        8197
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208696832
+    },
+    {
+      "step": 5,
+      "required_remote_epoch": 8197,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208696832,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4835377152,
+      "read_start_seconds_exact": "113315143/625000000",
+      "read_finish_seconds_exact": "33051039/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8197,
+          "bytes": 147456,
+          "start_seconds_exact": "33051039/156250000",
+          "commit_seconds_exact": "26441917/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "26441917/125000000",
+      "remote_lengths_after": [
+        8198
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208844288
+    },
+    {
+      "step": 6,
+      "required_remote_epoch": 8198,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208844288,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4835966976,
+      "read_start_seconds_exact": "26441917/125000000",
+      "read_finish_seconds_exact": "75550451/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8198,
+          "bytes": 147456,
+          "start_seconds_exact": "75550451/312500000",
+          "commit_seconds_exact": "151106331/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "151106331/625000000",
+      "remote_lengths_after": [
+        8199
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1208991744
+    },
+    {
+      "step": 7,
+      "required_remote_epoch": 8199,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1208991744,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4836556800,
+      "read_start_seconds_exact": "151106331/625000000",
+      "read_finish_seconds_exact": "10624997/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8199,
+          "bytes": 147456,
+          "start_seconds_exact": "10624997/39062500",
+          "commit_seconds_exact": "170005381/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "170005381/625000000",
+      "remote_lengths_after": [
+        8200
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1209139200
+    },
+    {
+      "step": 8,
+      "required_remote_epoch": 8200,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1209139200,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4837146624,
+      "read_start_seconds_exact": "170005381/625000000",
+      "read_finish_seconds_exact": "94450653/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8200,
+          "bytes": 147456,
+          "start_seconds_exact": "94450653/312500000",
+          "commit_seconds_exact": "37781347/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "37781347/125000000",
+      "remote_lengths_after": [
+        8201
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1209286656
+    },
+    {
+      "step": 9,
+      "required_remote_epoch": 8201,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1209286656,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4837736448,
+      "read_start_seconds_exact": "37781347/125000000",
+      "read_finish_seconds_exact": "51951241/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8201,
+          "bytes": 147456,
+          "start_seconds_exact": "51951241/156250000",
+          "commit_seconds_exact": "207810393/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "207810393/625000000",
+      "remote_lengths_after": [
+        8202
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1209434112
+    },
+    {
+      "step": 10,
+      "required_remote_epoch": 8202,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1209434112,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4838326272,
+      "read_start_seconds_exact": "207810393/625000000",
+      "read_finish_seconds_exact": "113355463/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8202,
+          "bytes": 147456,
+          "start_seconds_exact": "113355463/312500000",
+          "commit_seconds_exact": "45343271/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "45343271/125000000",
+      "remote_lengths_after": [
+        8203
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1209581568
+    },
+    {
+      "step": 11,
+      "required_remote_epoch": 8203,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1209581568,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4838916096,
+      "read_start_seconds_exact": "45343271/125000000",
+      "read_finish_seconds_exact": "30702399/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8203,
+          "bytes": 147456,
+          "start_seconds_exact": "30702399/78125000",
+          "commit_seconds_exact": "245624621/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "245624621/625000000",
+      "remote_lengths_after": [
+        8204
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1209729024
+    },
+    {
+      "step": 12,
+      "required_remote_epoch": 8204,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1209729024,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4839505920,
+      "read_start_seconds_exact": "245624621/625000000",
+      "read_finish_seconds_exact": "132264881/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8204,
+          "bytes": 147456,
+          "start_seconds_exact": "132264881/312500000",
+          "commit_seconds_exact": "264535191/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "264535191/625000000",
+      "remote_lengths_after": [
+        8205
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1209876480
+    },
+    {
+      "step": 13,
+      "required_remote_epoch": 8205,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1209876480,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4840095744,
+      "read_start_seconds_exact": "264535191/625000000",
+      "read_finish_seconds_exact": "70860659/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8205,
+          "bytes": 147456,
+          "start_seconds_exact": "70860659/156250000",
+          "commit_seconds_exact": "56689613/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "56689613/125000000",
+      "remote_lengths_after": [
+        8206
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210023936
+    },
+    {
+      "step": 14,
+      "required_remote_epoch": 8206,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210023936,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4840685568,
+      "read_start_seconds_exact": "56689613/125000000",
+      "read_finish_seconds_exact": "151178907/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8206,
+          "bytes": 147456,
+          "start_seconds_exact": "151178907/312500000",
+          "commit_seconds_exact": "302363243/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "302363243/625000000",
+      "remote_lengths_after": [
+        8207
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210171392
+    },
+    {
+      "step": 15,
+      "required_remote_epoch": 8207,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210171392,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4841275392,
+      "read_start_seconds_exact": "302363243/625000000",
+      "read_finish_seconds_exact": "10039853/19531250",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8207,
+          "bytes": 147456,
+          "start_seconds_exact": "10039853/19531250",
+          "commit_seconds_exact": "12851229/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "12851229/25000000",
+      "remote_lengths_after": [
+        8208
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210318848
+    },
+    {
+      "step": 16,
+      "required_remote_epoch": 8208,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210318848,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4841865216,
+      "read_start_seconds_exact": "12851229/25000000",
+      "read_finish_seconds_exact": "170097541/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8208,
+          "bytes": 147456,
+          "start_seconds_exact": "170097541/312500000",
+          "commit_seconds_exact": "340200511/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "340200511/625000000",
+      "remote_lengths_after": [
+        8209
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210466304
+    },
+    {
+      "step": 17,
+      "required_remote_epoch": 8209,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210466304,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4842455040,
+      "read_start_seconds_exact": "340200511/625000000",
+      "read_finish_seconds_exact": "89779293/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8209,
+          "bytes": 147456,
+          "start_seconds_exact": "89779293/156250000",
+          "commit_seconds_exact": "359122601/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "359122601/625000000",
+      "remote_lengths_after": [
+        8210
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210613760
+    },
+    {
+      "step": 18,
+      "required_remote_epoch": 8210,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210613760,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4843044864,
+      "read_start_seconds_exact": "359122601/625000000",
+      "read_finish_seconds_exact": "189020783/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8210,
+          "bytes": 147456,
+          "start_seconds_exact": "189020783/312500000",
+          "commit_seconds_exact": "75609399/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "75609399/125000000",
+      "remote_lengths_after": [
+        8211
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210761216
+    },
+    {
+      "step": 19,
+      "required_remote_epoch": 8211,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210761216,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4843634688,
+      "read_start_seconds_exact": "75609399/125000000",
+      "read_finish_seconds_exact": "49621033/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8211,
+          "bytes": 147456,
+          "start_seconds_exact": "49621033/78125000",
+          "commit_seconds_exact": "396973693/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "396973693/625000000",
+      "remote_lengths_after": [
+        8212
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1210908672
+    },
+    {
+      "step": 20,
+      "required_remote_epoch": 8212,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1210908672,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4844224512,
+      "read_start_seconds_exact": "396973693/625000000",
+      "read_finish_seconds_exact": "207948633/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8212,
+          "bytes": 147456,
+          "start_seconds_exact": "207948633/312500000",
+          "commit_seconds_exact": "83180539/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "83180539/125000000",
+      "remote_lengths_after": [
+        8213
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211056128
+    },
+    {
+      "step": 21,
+      "required_remote_epoch": 8213,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211056128,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4844814336,
+      "read_start_seconds_exact": "83180539/125000000",
+      "read_finish_seconds_exact": "108707143/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8213,
+          "bytes": 147456,
+          "start_seconds_exact": "108707143/156250000",
+          "commit_seconds_exact": "434834001/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "434834001/625000000",
+      "remote_lengths_after": [
+        8214
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211203584
+    },
+    {
+      "step": 22,
+      "required_remote_epoch": 8214,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211203584,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4845404160,
+      "read_start_seconds_exact": "434834001/625000000",
+      "read_finish_seconds_exact": "226881091/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8214,
+          "bytes": 147456,
+          "start_seconds_exact": "226881091/312500000",
+          "commit_seconds_exact": "453767611/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "453767611/625000000",
+      "remote_lengths_after": [
+        8215
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211351040
+    },
+    {
+      "step": 23,
+      "required_remote_epoch": 8215,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211351040,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4845993984,
+      "read_start_seconds_exact": "453767611/625000000",
+      "read_finish_seconds_exact": "29543631/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8215,
+          "bytes": 147456,
+          "start_seconds_exact": "29543631/39062500",
+          "commit_seconds_exact": "18908141/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "18908141/25000000",
+      "remote_lengths_after": [
+        8216
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211498496
+    },
+    {
+      "step": 24,
+      "required_remote_epoch": 8216,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211498496,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4846583808,
+      "read_start_seconds_exact": "18908141/25000000",
+      "read_finish_seconds_exact": "245818157/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8216,
+          "bytes": 147456,
+          "start_seconds_exact": "245818157/312500000",
+          "commit_seconds_exact": "491641743/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "491641743/625000000",
+      "remote_lengths_after": [
+        8217
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211645952
+    },
+    {
+      "step": 25,
+      "required_remote_epoch": 8217,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211645952,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4847173632,
+      "read_start_seconds_exact": "491641743/625000000",
+      "read_finish_seconds_exact": "127644209/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8217,
+          "bytes": 147456,
+          "start_seconds_exact": "127644209/156250000",
+          "commit_seconds_exact": "102116453/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "102116453/125000000",
+      "remote_lengths_after": [
+        8218
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211793408
+    },
+    {
+      "step": 26,
+      "required_remote_epoch": 8218,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211793408,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4847763456,
+      "read_start_seconds_exact": "102116453/125000000",
+      "read_finish_seconds_exact": "264759831/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8218,
+          "bytes": 147456,
+          "start_seconds_exact": "264759831/312500000",
+          "commit_seconds_exact": "529525091/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "529525091/625000000",
+      "remote_lengths_after": [
+        8219
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1211940864
+    },
+    {
+      "step": 27,
+      "required_remote_epoch": 8219,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1211940864,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4848353280,
+      "read_start_seconds_exact": "529525091/625000000",
+      "read_finish_seconds_exact": "68558099/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8219,
+          "bytes": 147456,
+          "start_seconds_exact": "68558099/78125000",
+          "commit_seconds_exact": "548470221/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "548470221/625000000",
+      "remote_lengths_after": [
+        8220
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212088320
+    },
+    {
+      "step": 28,
+      "required_remote_epoch": 8220,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212088320,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4848943104,
+      "read_start_seconds_exact": "548470221/625000000",
+      "read_finish_seconds_exact": "283706113/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8220,
+          "bytes": 147456,
+          "start_seconds_exact": "283706113/312500000",
+          "commit_seconds_exact": "113483531/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "113483531/125000000",
+      "remote_lengths_after": [
+        8221
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212235776
+    },
+    {
+      "step": 29,
+      "required_remote_epoch": 8221,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212235776,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4849532928,
+      "read_start_seconds_exact": "113483531/125000000",
+      "read_finish_seconds_exact": "146590491/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8221,
+          "bytes": 147456,
+          "start_seconds_exact": "146590491/156250000",
+          "commit_seconds_exact": "586367393/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "586367393/625000000",
+      "remote_lengths_after": [
+        8222
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212383232
+    },
+    {
+      "step": 30,
+      "required_remote_epoch": 8222,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212383232,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4850122752,
+      "read_start_seconds_exact": "586367393/625000000",
+      "read_finish_seconds_exact": "302657003/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8222,
+          "bytes": 147456,
+          "start_seconds_exact": "302657003/312500000",
+          "commit_seconds_exact": "121063887/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "121063887/125000000",
+      "remote_lengths_after": [
+        8223
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212530688
+    },
+    {
+      "step": 31,
+      "required_remote_epoch": 8223,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212530688,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4850712576,
+      "read_start_seconds_exact": "121063887/125000000",
+      "read_finish_seconds_exact": "9754193/9765625",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8223,
+          "bytes": 147456,
+          "start_seconds_exact": "9754193/9765625",
+          "commit_seconds_exact": "624273781/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "624273781/625000000",
+      "remote_lengths_after": [
+        8224
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212678144
+    },
+    {
+      "step": 32,
+      "required_remote_epoch": 8224,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212678144,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4851302400,
+      "read_start_seconds_exact": "624273781/625000000",
+      "read_finish_seconds_exact": "321612501/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8224,
+          "bytes": 147456,
+          "start_seconds_exact": "321612501/312500000",
+          "commit_seconds_exact": "643230431/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "643230431/625000000",
+      "remote_lengths_after": [
+        8225
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212825600
+    },
+    {
+      "step": 33,
+      "required_remote_epoch": 8225,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212825600,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4851892224,
+      "read_start_seconds_exact": "643230431/625000000",
+      "read_finish_seconds_exact": "165545989/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8225,
+          "bytes": 147456,
+          "start_seconds_exact": "165545989/156250000",
+          "commit_seconds_exact": "132437877/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "132437877/125000000",
+      "remote_lengths_after": [
+        8226
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1212973056
+    },
+    {
+      "step": 34,
+      "required_remote_epoch": 8226,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1212973056,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4852482048,
+      "read_start_seconds_exact": "132437877/125000000",
+      "read_finish_seconds_exact": "340572607/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8226,
+          "bytes": 147456,
+          "start_seconds_exact": "340572607/312500000",
+          "commit_seconds_exact": "681150643/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "681150643/625000000",
+      "remote_lengths_after": [
+        8227
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1213120512
+    },
+    {
+      "step": 35,
+      "required_remote_epoch": 8227,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1213120512,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4853071872,
+      "read_start_seconds_exact": "681150643/625000000",
+      "read_finish_seconds_exact": "87513597/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8227,
+          "bytes": 147456,
+          "start_seconds_exact": "87513597/78125000",
+          "commit_seconds_exact": "140022841/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "140022841/125000000",
+      "remote_lengths_after": [
+        8228
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1213267968
+    },
+    {
+      "step": 36,
+      "required_remote_epoch": 8228,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1213267968,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4853661696,
+      "read_start_seconds_exact": "140022841/125000000",
+      "read_finish_seconds_exact": "359537321/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8228,
+          "bytes": 147456,
+          "start_seconds_exact": "359537321/312500000",
+          "commit_seconds_exact": "719080071/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "719080071/625000000",
+      "remote_lengths_after": [
+        8229
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1213415424
+    },
+    {
+      "step": 37,
+      "required_remote_epoch": 8229,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1213415424,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4854251520,
+      "read_start_seconds_exact": "719080071/625000000",
+      "read_finish_seconds_exact": "184510703/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8229,
+          "bytes": 147456,
+          "start_seconds_exact": "184510703/156250000",
+          "commit_seconds_exact": "738048241/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "738048241/625000000",
+      "remote_lengths_after": [
+        8230
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1213562880
+    },
+    {
+      "step": 38,
+      "required_remote_epoch": 8230,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1213562880,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4854841344,
+      "read_start_seconds_exact": "738048241/625000000",
+      "read_finish_seconds_exact": "378506643/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8230,
+          "bytes": 147456,
+          "start_seconds_exact": "378506643/312500000",
+          "commit_seconds_exact": "151403743/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "151403743/125000000",
+      "remote_lengths_after": [
+        8231
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1213710336
+    },
+    {
+      "step": 39,
+      "required_remote_epoch": 8231,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1213710336,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4855431168,
+      "read_start_seconds_exact": "151403743/125000000",
+      "read_finish_seconds_exact": "48499129/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8231,
+          "bytes": 147456,
+          "start_seconds_exact": "48499129/39062500",
+          "commit_seconds_exact": "775991493/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "775991493/625000000",
+      "remote_lengths_after": [
+        8232
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1213857792
+    },
+    {
+      "step": 40,
+      "required_remote_epoch": 8232,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1213857792,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4856020992,
+      "read_start_seconds_exact": "775991493/625000000",
+      "read_finish_seconds_exact": "397480573/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8232,
+          "bytes": 147456,
+          "start_seconds_exact": "397480573/312500000",
+          "commit_seconds_exact": "31798663/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "31798663/25000000",
+      "remote_lengths_after": [
+        8233
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214005248
+    },
+    {
+      "step": 41,
+      "required_remote_epoch": 8233,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214005248,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4856610816,
+      "read_start_seconds_exact": "31798663/25000000",
+      "read_finish_seconds_exact": "203484633/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8233,
+          "bytes": 147456,
+          "start_seconds_exact": "203484633/156250000",
+          "commit_seconds_exact": "813943961/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "813943961/625000000",
+      "remote_lengths_after": [
+        8234
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214152704
+    },
+    {
+      "step": 42,
+      "required_remote_epoch": 8234,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214152704,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4857200640,
+      "read_start_seconds_exact": "813943961/625000000",
+      "read_finish_seconds_exact": "416459111/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8234,
+          "bytes": 147456,
+          "start_seconds_exact": "416459111/312500000",
+          "commit_seconds_exact": "832923651/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "832923651/625000000",
+      "remote_lengths_after": [
+        8235
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214300160
+    },
+    {
+      "step": 43,
+      "required_remote_epoch": 8235,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214300160,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4857790464,
+      "read_start_seconds_exact": "832923651/625000000",
+      "read_finish_seconds_exact": "106487527/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8235,
+          "bytes": 147456,
+          "start_seconds_exact": "106487527/78125000",
+          "commit_seconds_exact": "170381129/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "170381129/125000000",
+      "remote_lengths_after": [
+        8236
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214447616
+    },
+    {
+      "step": 44,
+      "required_remote_epoch": 8236,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214447616,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4858380288,
+      "read_start_seconds_exact": "170381129/125000000",
+      "read_finish_seconds_exact": "435442257/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8236,
+          "bytes": 147456,
+          "start_seconds_exact": "435442257/312500000",
+          "commit_seconds_exact": "870889943/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "870889943/625000000",
+      "remote_lengths_after": [
+        8237
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214595072
+    },
+    {
+      "step": 45,
+      "required_remote_epoch": 8237,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214595072,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4858970112,
+      "read_start_seconds_exact": "870889943/625000000",
+      "read_finish_seconds_exact": "222467779/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8237,
+          "bytes": 147456,
+          "start_seconds_exact": "222467779/156250000",
+          "commit_seconds_exact": "177975309/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "177975309/125000000",
+      "remote_lengths_after": [
+        8238
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214742528
+    },
+    {
+      "step": 46,
+      "required_remote_epoch": 8238,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214742528,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4859559936,
+      "read_start_seconds_exact": "177975309/125000000",
+      "read_finish_seconds_exact": "454430011/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8238,
+          "bytes": 147456,
+          "start_seconds_exact": "454430011/312500000",
+          "commit_seconds_exact": "908865451/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "908865451/625000000",
+      "remote_lengths_after": [
+        8239
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1214889984
+    },
+    {
+      "step": 47,
+      "required_remote_epoch": 8239,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1214889984,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4860149760,
+      "read_start_seconds_exact": "908865451/625000000",
+      "read_finish_seconds_exact": "28995351/19531250",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8239,
+          "bytes": 147456,
+          "start_seconds_exact": "28995351/19531250",
+          "commit_seconds_exact": "927856661/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "927856661/625000000",
+      "remote_lengths_after": [
+        8240
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215037440
+    },
+    {
+      "step": 48,
+      "required_remote_epoch": 8240,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215037440,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4860739584,
+      "read_start_seconds_exact": "927856661/625000000",
+      "read_finish_seconds_exact": "473422373/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8240,
+          "bytes": 147456,
+          "start_seconds_exact": "473422373/312500000",
+          "commit_seconds_exact": "37874007/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "37874007/25000000",
+      "remote_lengths_after": [
+        8241
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215184896
+    },
+    {
+      "step": 49,
+      "required_remote_epoch": 8241,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215184896,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4861329408,
+      "read_start_seconds_exact": "37874007/25000000",
+      "read_finish_seconds_exact": "241460141/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8241,
+          "bytes": 147456,
+          "start_seconds_exact": "241460141/156250000",
+          "commit_seconds_exact": "965845993/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "965845993/625000000",
+      "remote_lengths_after": [
+        8242
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215332352
+    },
+    {
+      "step": 50,
+      "required_remote_epoch": 8242,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215332352,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4861919232,
+      "read_start_seconds_exact": "965845993/625000000",
+      "read_finish_seconds_exact": "492419343/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8242,
+          "bytes": 147456,
+          "start_seconds_exact": "492419343/312500000",
+          "commit_seconds_exact": "196968823/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "196968823/125000000",
+      "remote_lengths_after": [
+        8243
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215479808
+    },
+    {
+      "step": 51,
+      "required_remote_epoch": 8243,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215479808,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4862509056,
+      "read_start_seconds_exact": "196968823/125000000",
+      "read_finish_seconds_exact": "125479889/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8243,
+          "bytes": 147456,
+          "start_seconds_exact": "125479889/78125000",
+          "commit_seconds_exact": "1003844541/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1003844541/625000000",
+      "remote_lengths_after": [
+        8244
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215627264
+    },
+    {
+      "step": 52,
+      "required_remote_epoch": 8244,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215627264,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4863098880,
+      "read_start_seconds_exact": "1003844541/625000000",
+      "read_finish_seconds_exact": "511420921/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8244,
+          "bytes": 147456,
+          "start_seconds_exact": "511420921/312500000",
+          "commit_seconds_exact": "1022847271/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1022847271/625000000",
+      "remote_lengths_after": [
+        8245
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215774720
+    },
+    {
+      "step": 53,
+      "required_remote_epoch": 8245,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215774720,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4863688704,
+      "read_start_seconds_exact": "1022847271/625000000",
+      "read_finish_seconds_exact": "260461719/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8245,
+          "bytes": 147456,
+          "start_seconds_exact": "260461719/156250000",
+          "commit_seconds_exact": "208370461/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "208370461/125000000",
+      "remote_lengths_after": [
+        8246
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1215922176
+    },
+    {
+      "step": 54,
+      "required_remote_epoch": 8246,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1215922176,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4864278528,
+      "read_start_seconds_exact": "208370461/125000000",
+      "read_finish_seconds_exact": "530427107/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8246,
+          "bytes": 147456,
+          "start_seconds_exact": "530427107/312500000",
+          "commit_seconds_exact": "1060859643/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1060859643/625000000",
+      "remote_lengths_after": [
+        8247
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216069632
+    },
+    {
+      "step": 55,
+      "required_remote_epoch": 8247,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216069632,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4864868352,
+      "read_start_seconds_exact": "1060859643/625000000",
+      "read_finish_seconds_exact": "67491491/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8247,
+          "bytes": 147456,
+          "start_seconds_exact": "67491491/39062500",
+          "commit_seconds_exact": "215973857/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "215973857/125000000",
+      "remote_lengths_after": [
+        8248
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216217088
+    },
+    {
+      "step": 56,
+      "required_remote_epoch": 8248,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216217088,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4865458176,
+      "read_start_seconds_exact": "215973857/125000000",
+      "read_finish_seconds_exact": "549437901/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8248,
+          "bytes": 147456,
+          "start_seconds_exact": "549437901/312500000",
+          "commit_seconds_exact": "1098881231/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1098881231/625000000",
+      "remote_lengths_after": [
+        8249
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216364544
+    },
+    {
+      "step": 57,
+      "required_remote_epoch": 8249,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216364544,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4866048000,
+      "read_start_seconds_exact": "1098881231/625000000",
+      "read_finish_seconds_exact": "279472513/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8249,
+          "bytes": 147456,
+          "start_seconds_exact": "279472513/156250000",
+          "commit_seconds_exact": "1117895481/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1117895481/625000000",
+      "remote_lengths_after": [
+        8250
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216512000
+    },
+    {
+      "step": 58,
+      "required_remote_epoch": 8250,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216512000,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4866637824,
+      "read_start_seconds_exact": "1117895481/625000000",
+      "read_finish_seconds_exact": "568453303/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8250,
+          "bytes": 147456,
+          "start_seconds_exact": "568453303/312500000",
+          "commit_seconds_exact": "227382407/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "227382407/125000000",
+      "remote_lengths_after": [
+        8251
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216659456
+    },
+    {
+      "step": 59,
+      "required_remote_epoch": 8251,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216659456,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4867227648,
+      "read_start_seconds_exact": "227382407/125000000",
+      "read_finish_seconds_exact": "144490683/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8251,
+          "bytes": 147456,
+          "start_seconds_exact": "144490683/78125000",
+          "commit_seconds_exact": "1155930893/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1155930893/625000000",
+      "remote_lengths_after": [
+        8252
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216806912
+    },
+    {
+      "step": 60,
+      "required_remote_epoch": 8252,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216806912,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4867817472,
+      "read_start_seconds_exact": "1155930893/625000000",
+      "read_finish_seconds_exact": "587473313/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8252,
+          "bytes": 147456,
+          "start_seconds_exact": "587473313/312500000",
+          "commit_seconds_exact": "234990411/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "234990411/125000000",
+      "remote_lengths_after": [
+        8253
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1216954368
+    },
+    {
+      "step": 61,
+      "required_remote_epoch": 8253,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1216954368,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4868407296,
+      "read_start_seconds_exact": "234990411/125000000",
+      "read_finish_seconds_exact": "298492523/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8253,
+          "bytes": 147456,
+          "start_seconds_exact": "298492523/156250000",
+          "commit_seconds_exact": "1193975521/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1193975521/625000000",
+      "remote_lengths_after": [
+        8254
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217101824
+    },
+    {
+      "step": 62,
+      "required_remote_epoch": 8254,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217101824,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4868997120,
+      "read_start_seconds_exact": "1193975521/625000000",
+      "read_finish_seconds_exact": "606497931/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8254,
+          "bytes": 147456,
+          "start_seconds_exact": "606497931/312500000",
+          "commit_seconds_exact": "1213001291/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1213001291/625000000",
+      "remote_lengths_after": [
+        8255
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217249280
+    },
+    {
+      "step": 63,
+      "required_remote_epoch": 8255,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217249280,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4869586944,
+      "read_start_seconds_exact": "1213001291/625000000",
+      "read_finish_seconds_exact": "19250374/9765625",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8255,
+          "bytes": 147456,
+          "start_seconds_exact": "19250374/9765625",
+          "commit_seconds_exact": "246405873/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "246405873/125000000",
+      "remote_lengths_after": [
+        8256
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217396736
+    },
+    {
+      "step": 64,
+      "required_remote_epoch": 8256,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217396736,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4870176768,
+      "read_start_seconds_exact": "246405873/125000000",
+      "read_finish_seconds_exact": "625527157/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8256,
+          "bytes": 147456,
+          "start_seconds_exact": "625527157/312500000",
+          "commit_seconds_exact": "1251059743/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1251059743/625000000",
+      "remote_lengths_after": [
+        8257
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217544192
+    },
+    {
+      "step": 65,
+      "required_remote_epoch": 8257,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217544192,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4870766592,
+      "read_start_seconds_exact": "1251059743/625000000",
+      "read_finish_seconds_exact": "317521749/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8257,
+          "bytes": 147456,
+          "start_seconds_exact": "317521749/156250000",
+          "commit_seconds_exact": "50803697/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "50803697/25000000",
+      "remote_lengths_after": [
+        8258
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217691648
+    },
+    {
+      "step": 66,
+      "required_remote_epoch": 8258,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217691648,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4871356416,
+      "read_start_seconds_exact": "50803697/25000000",
+      "read_finish_seconds_exact": "644560991/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8258,
+          "bytes": 147456,
+          "start_seconds_exact": "644560991/312500000",
+          "commit_seconds_exact": "1289127411/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1289127411/625000000",
+      "remote_lengths_after": [
+        8259
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217839104
+    },
+    {
+      "step": 67,
+      "required_remote_epoch": 8259,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217839104,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4871946240,
+      "read_start_seconds_exact": "1289127411/625000000",
+      "read_finish_seconds_exact": "163519909/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8259,
+          "bytes": 147456,
+          "start_seconds_exact": "163519909/78125000",
+          "commit_seconds_exact": "1308164701/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1308164701/625000000",
+      "remote_lengths_after": [
+        8260
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1217986560
+    },
+    {
+      "step": 68,
+      "required_remote_epoch": 8260,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1217986560,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4872536064,
+      "read_start_seconds_exact": "1308164701/625000000",
+      "read_finish_seconds_exact": "663599433/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8260,
+          "bytes": 147456,
+          "start_seconds_exact": "663599433/312500000",
+          "commit_seconds_exact": "265440859/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "265440859/125000000",
+      "remote_lengths_after": [
+        8261
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1218134016
+    },
+    {
+      "step": 69,
+      "required_remote_epoch": 8261,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1218134016,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4873125888,
+      "read_start_seconds_exact": "265440859/125000000",
+      "read_finish_seconds_exact": "336560191/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8261,
+          "bytes": 147456,
+          "start_seconds_exact": "336560191/156250000",
+          "commit_seconds_exact": "1346246193/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1346246193/625000000",
+      "remote_lengths_after": [
+        8262
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1218281472
+    },
+    {
+      "step": 70,
+      "required_remote_epoch": 8262,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1218281472,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4873715712,
+      "read_start_seconds_exact": "1346246193/625000000",
+      "read_finish_seconds_exact": "682642483/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8262,
+          "bytes": 147456,
+          "start_seconds_exact": "682642483/312500000",
+          "commit_seconds_exact": "273058079/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "273058079/125000000",
+      "remote_lengths_after": [
+        8263
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1218428928
+    },
+    {
+      "step": 71,
+      "required_remote_epoch": 8263,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1218428928,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4874305536,
+      "read_start_seconds_exact": "273058079/125000000",
+      "read_finish_seconds_exact": "86520717/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8263,
+          "bytes": 147456,
+          "start_seconds_exact": "86520717/39062500",
+          "commit_seconds_exact": "1384336901/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1384336901/625000000",
+      "remote_lengths_after": [
+        8264
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1218576384
+    },
+    {
+      "step": 72,
+      "required_remote_epoch": 8264,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1218576384,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4874895360,
+      "read_start_seconds_exact": "1384336901/625000000",
+      "read_finish_seconds_exact": "701690141/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8264,
+          "bytes": 147456,
+          "start_seconds_exact": "701690141/312500000",
+          "commit_seconds_exact": "1403385711/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1403385711/625000000",
+      "remote_lengths_after": [
+        8265
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1218723840
+    },
+    {
+      "step": 73,
+      "required_remote_epoch": 8265,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1218723840,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4875485184,
+      "read_start_seconds_exact": "1403385711/625000000",
+      "read_finish_seconds_exact": "355607849/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8265,
+          "bytes": 147456,
+          "start_seconds_exact": "355607849/156250000",
+          "commit_seconds_exact": "56897473/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "56897473/25000000",
+      "remote_lengths_after": [
+        8266
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1218871296
+    },
+    {
+      "step": 74,
+      "required_remote_epoch": 8266,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1218871296,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4876075008,
+      "read_start_seconds_exact": "56897473/25000000",
+      "read_finish_seconds_exact": "720742407/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8266,
+          "bytes": 147456,
+          "start_seconds_exact": "720742407/312500000",
+          "commit_seconds_exact": "1441490243/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1441490243/625000000",
+      "remote_lengths_after": [
+        8267
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219018752
+    },
+    {
+      "step": 75,
+      "required_remote_epoch": 8267,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219018752,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4876664832,
+      "read_start_seconds_exact": "1441490243/625000000",
+      "read_finish_seconds_exact": "182567567/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8267,
+          "bytes": 147456,
+          "start_seconds_exact": "182567567/78125000",
+          "commit_seconds_exact": "292109193/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "292109193/125000000",
+      "remote_lengths_after": [
+        8268
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219166208
+    },
+    {
+      "step": 76,
+      "required_remote_epoch": 8268,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219166208,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4877254656,
+      "read_start_seconds_exact": "292109193/125000000",
+      "read_finish_seconds_exact": "739799281/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8268,
+          "bytes": 147456,
+          "start_seconds_exact": "739799281/312500000",
+          "commit_seconds_exact": "1479603991/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1479603991/625000000",
+      "remote_lengths_after": [
+        8269
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219313664
+    },
+    {
+      "step": 77,
+      "required_remote_epoch": 8269,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219313664,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4877844480,
+      "read_start_seconds_exact": "1479603991/625000000",
+      "read_finish_seconds_exact": "374664723/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8269,
+          "bytes": 147456,
+          "start_seconds_exact": "374664723/156250000",
+          "commit_seconds_exact": "1498664321/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1498664321/625000000",
+      "remote_lengths_after": [
+        8270
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219461120
+    },
+    {
+      "step": 78,
+      "required_remote_epoch": 8270,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219461120,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4878434304,
+      "read_start_seconds_exact": "1498664321/625000000",
+      "read_finish_seconds_exact": "758860763/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8270,
+          "bytes": 147456,
+          "start_seconds_exact": "758860763/312500000",
+          "commit_seconds_exact": "303545391/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "303545391/125000000",
+      "remote_lengths_after": [
+        8271
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219608576
+    },
+    {
+      "step": 79,
+      "required_remote_epoch": 8271,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219608576,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4879024128,
+      "read_start_seconds_exact": "303545391/125000000",
+      "read_finish_seconds_exact": "48024577/19531250",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8271,
+          "bytes": 147456,
+          "start_seconds_exact": "48024577/19531250",
+          "commit_seconds_exact": "1536791893/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1536791893/625000000",
+      "remote_lengths_after": [
+        8272
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219756032
+    },
+    {
+      "step": 80,
+      "required_remote_epoch": 8272,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219756032,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4879613952,
+      "read_start_seconds_exact": "1536791893/625000000",
+      "read_finish_seconds_exact": "777926853/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8272,
+          "bytes": 147456,
+          "start_seconds_exact": "777926853/312500000",
+          "commit_seconds_exact": "311171827/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "311171827/125000000",
+      "remote_lengths_after": [
+        8273
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1219903488
+    },
+    {
+      "step": 81,
+      "required_remote_epoch": 8273,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1219903488,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4880203776,
+      "read_start_seconds_exact": "311171827/125000000",
+      "read_finish_seconds_exact": "393730813/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8273,
+          "bytes": 147456,
+          "start_seconds_exact": "393730813/156250000",
+          "commit_seconds_exact": "1574928681/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1574928681/625000000",
+      "remote_lengths_after": [
+        8274
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220050944
+    },
+    {
+      "step": 82,
+      "required_remote_epoch": 8274,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220050944,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4880793600,
+      "read_start_seconds_exact": "1574928681/625000000",
+      "read_finish_seconds_exact": "796997551/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8274,
+          "bytes": 147456,
+          "start_seconds_exact": "796997551/312500000",
+          "commit_seconds_exact": "1594000531/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1594000531/625000000",
+      "remote_lengths_after": [
+        8275
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220198400
+    },
+    {
+      "step": 83,
+      "required_remote_epoch": 8275,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220198400,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4881383424,
+      "read_start_seconds_exact": "1594000531/625000000",
+      "read_finish_seconds_exact": "201633657/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8275,
+          "bytes": 147456,
+          "start_seconds_exact": "201633657/78125000",
+          "commit_seconds_exact": "322614937/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "322614937/125000000",
+      "remote_lengths_after": [
+        8276
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220345856
+    },
+    {
+      "step": 84,
+      "required_remote_epoch": 8276,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220345856,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4881973248,
+      "read_start_seconds_exact": "322614937/125000000",
+      "read_finish_seconds_exact": "816072857/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8276,
+          "bytes": 147456,
+          "start_seconds_exact": "816072857/312500000",
+          "commit_seconds_exact": "1632151143/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1632151143/625000000",
+      "remote_lengths_after": [
+        8277
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220493312
+    },
+    {
+      "step": 85,
+      "required_remote_epoch": 8277,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220493312,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4882563072,
+      "read_start_seconds_exact": "1632151143/625000000",
+      "read_finish_seconds_exact": "412806119/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8277,
+          "bytes": 147456,
+          "start_seconds_exact": "412806119/156250000",
+          "commit_seconds_exact": "330245981/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "330245981/125000000",
+      "remote_lengths_after": [
+        8278
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220640768
+    },
+    {
+      "step": 86,
+      "required_remote_epoch": 8278,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220640768,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4883152896,
+      "read_start_seconds_exact": "330245981/125000000",
+      "read_finish_seconds_exact": "835152771/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8278,
+          "bytes": 147456,
+          "start_seconds_exact": "835152771/312500000",
+          "commit_seconds_exact": "1670310971/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1670310971/625000000",
+      "remote_lengths_after": [
+        8279
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220788224
+    },
+    {
+      "step": 87,
+      "required_remote_epoch": 8279,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220788224,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4883742720,
+      "read_start_seconds_exact": "1670310971/625000000",
+      "read_finish_seconds_exact": "105586807/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8279,
+          "bytes": 147456,
+          "start_seconds_exact": "105586807/39062500",
+          "commit_seconds_exact": "1689394341/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1689394341/625000000",
+      "remote_lengths_after": [
+        8280
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1220935680
+    },
+    {
+      "step": 88,
+      "required_remote_epoch": 8280,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1220935680,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4884332544,
+      "read_start_seconds_exact": "1689394341/625000000",
+      "read_finish_seconds_exact": "854237293/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8280,
+          "bytes": 147456,
+          "start_seconds_exact": "854237293/312500000",
+          "commit_seconds_exact": "341696003/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "341696003/125000000",
+      "remote_lengths_after": [
+        8281
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221083136
+    },
+    {
+      "step": 89,
+      "required_remote_epoch": 8281,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221083136,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4884922368,
+      "read_start_seconds_exact": "341696003/125000000",
+      "read_finish_seconds_exact": "431890641/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8281,
+          "bytes": 147456,
+          "start_seconds_exact": "431890641/156250000",
+          "commit_seconds_exact": "1727567993/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1727567993/625000000",
+      "remote_lengths_after": [
+        8282
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221230592
+    },
+    {
+      "step": 90,
+      "required_remote_epoch": 8282,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221230592,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4885512192,
+      "read_start_seconds_exact": "1727567993/625000000",
+      "read_finish_seconds_exact": "873326423/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8282,
+          "bytes": 147456,
+          "start_seconds_exact": "873326423/312500000",
+          "commit_seconds_exact": "69866331/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "69866331/25000000",
+      "remote_lengths_after": [
+        8283
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221378048
+    },
+    {
+      "step": 91,
+      "required_remote_epoch": 8283,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221378048,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4886102016,
+      "read_start_seconds_exact": "69866331/25000000",
+      "read_finish_seconds_exact": "220718179/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8283,
+          "bytes": 147456,
+          "start_seconds_exact": "220718179/78125000",
+          "commit_seconds_exact": "1765750861/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1765750861/625000000",
+      "remote_lengths_after": [
+        8284
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221525504
+    },
+    {
+      "step": 92,
+      "required_remote_epoch": 8284,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221525504,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4886691840,
+      "read_start_seconds_exact": "1765750861/625000000",
+      "read_finish_seconds_exact": "892420161/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8284,
+          "bytes": 147456,
+          "start_seconds_exact": "892420161/312500000",
+          "commit_seconds_exact": "1784845751/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1784845751/625000000",
+      "remote_lengths_after": [
+        8285
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221672960
+    },
+    {
+      "step": 93,
+      "required_remote_epoch": 8285,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221672960,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4887281664,
+      "read_start_seconds_exact": "1784845751/625000000",
+      "read_finish_seconds_exact": "450984379/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8285,
+          "bytes": 147456,
+          "start_seconds_exact": "450984379/156250000",
+          "commit_seconds_exact": "360788589/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "360788589/125000000",
+      "remote_lengths_after": [
+        8286
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221820416
+    },
+    {
+      "step": 94,
+      "required_remote_epoch": 8286,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221820416,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4887871488,
+      "read_start_seconds_exact": "360788589/125000000",
+      "read_finish_seconds_exact": "911518507/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8286,
+          "bytes": 147456,
+          "start_seconds_exact": "911518507/312500000",
+          "commit_seconds_exact": "1823042443/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1823042443/625000000",
+      "remote_lengths_after": [
+        8287
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1221967872
+    },
+    {
+      "step": 95,
+      "required_remote_epoch": 8287,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1221967872,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4888461312,
+      "read_start_seconds_exact": "1823042443/625000000",
+      "read_finish_seconds_exact": "28783419/9765625",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8287,
+          "bytes": 147456,
+          "start_seconds_exact": "28783419/9765625",
+          "commit_seconds_exact": "368428849/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "368428849/125000000",
+      "remote_lengths_after": [
+        8288
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1222115328
+    },
+    {
+      "step": 96,
+      "required_remote_epoch": 8288,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1222115328,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4889051136,
+      "read_start_seconds_exact": "368428849/125000000",
+      "read_finish_seconds_exact": "930621461/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8288,
+          "bytes": 147456,
+          "start_seconds_exact": "930621461/312500000",
+          "commit_seconds_exact": "1861248351/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1861248351/625000000",
+      "remote_lengths_after": [
+        8289
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1222262784
+    },
+    {
+      "step": 97,
+      "required_remote_epoch": 8289,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1222262784,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4889640960,
+      "read_start_seconds_exact": "1861248351/625000000",
+      "read_finish_seconds_exact": "470087333/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8289,
+          "bytes": 147456,
+          "start_seconds_exact": "470087333/156250000",
+          "commit_seconds_exact": "1880354761/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1880354761/625000000",
+      "remote_lengths_after": [
+        8290
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1222410240
+    },
+    {
+      "step": 98,
+      "required_remote_epoch": 8290,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1222410240,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4890230784,
+      "read_start_seconds_exact": "1880354761/625000000",
+      "read_finish_seconds_exact": "949729023/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8290,
+          "bytes": 147456,
+          "start_seconds_exact": "949729023/312500000",
+          "commit_seconds_exact": "75978539/25000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "75978539/25000000",
+      "remote_lengths_after": [
+        8291
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1222557696
+    },
+    {
+      "step": 99,
+      "required_remote_epoch": 8291,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1222557696,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4890820608,
+      "read_start_seconds_exact": "75978539/25000000",
+      "read_finish_seconds_exact": "239821133/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8291,
+          "bytes": 147456,
+          "start_seconds_exact": "239821133/78125000",
+          "commit_seconds_exact": "1918574493/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1918574493/625000000",
+      "remote_lengths_after": [
+        8292
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1222705152
+    },
+    {
+      "step": 100,
+      "required_remote_epoch": 8292,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1222705152,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4891410432,
+      "read_start_seconds_exact": "1918574493/625000000",
+      "read_finish_seconds_exact": "968841193/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8292,
+          "bytes": 147456,
+          "start_seconds_exact": "968841193/312500000",
+          "commit_seconds_exact": "387537563/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "387537563/125000000",
+      "remote_lengths_after": [
+        8293
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1222852608
+    },
+    {
+      "step": 101,
+      "required_remote_epoch": 8293,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1222852608,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4892000256,
+      "read_start_seconds_exact": "387537563/125000000",
+      "read_finish_seconds_exact": "489199503/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8293,
+          "bytes": 147456,
+          "start_seconds_exact": "489199503/156250000",
+          "commit_seconds_exact": "1956803441/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1956803441/625000000",
+      "remote_lengths_after": [
+        8294
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223000064
+    },
+    {
+      "step": 102,
+      "required_remote_epoch": 8294,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223000064,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4892590080,
+      "read_start_seconds_exact": "1956803441/625000000",
+      "read_finish_seconds_exact": "987957971/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8294,
+          "bytes": 147456,
+          "start_seconds_exact": "987957971/312500000",
+          "commit_seconds_exact": "1975921371/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "1975921371/625000000",
+      "remote_lengths_after": [
+        8295
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223147520
+    },
+    {
+      "step": 103,
+      "required_remote_epoch": 8295,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223147520,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4893179904,
+      "read_start_seconds_exact": "1975921371/625000000",
+      "read_finish_seconds_exact": "124689761/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8295,
+          "bytes": 147456,
+          "start_seconds_exact": "124689761/39062500",
+          "commit_seconds_exact": "399008321/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "399008321/125000000",
+      "remote_lengths_after": [
+        8296
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223294976
+    },
+    {
+      "step": 104,
+      "required_remote_epoch": 8296,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223294976,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4893769728,
+      "read_start_seconds_exact": "399008321/125000000",
+      "read_finish_seconds_exact": "1007079357/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8296,
+          "bytes": 147456,
+          "start_seconds_exact": "1007079357/312500000",
+          "commit_seconds_exact": "2014164143/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2014164143/625000000",
+      "remote_lengths_after": [
+        8297
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223442432
+    },
+    {
+      "step": 105,
+      "required_remote_epoch": 8297,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223442432,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4894359552,
+      "read_start_seconds_exact": "2014164143/625000000",
+      "read_finish_seconds_exact": "508320889/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8297,
+          "bytes": 147456,
+          "start_seconds_exact": "508320889/156250000",
+          "commit_seconds_exact": "406657797/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "406657797/125000000",
+      "remote_lengths_after": [
+        8298
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223589888
+    },
+    {
+      "step": 106,
+      "required_remote_epoch": 8298,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223589888,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4894949376,
+      "read_start_seconds_exact": "406657797/125000000",
+      "read_finish_seconds_exact": "1026205351/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8298,
+          "bytes": 147456,
+          "start_seconds_exact": "1026205351/312500000",
+          "commit_seconds_exact": "2052416131/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2052416131/625000000",
+      "remote_lengths_after": [
+        8299
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223737344
+    },
+    {
+      "step": 107,
+      "required_remote_epoch": 8299,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223737344,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4895539200,
+      "read_start_seconds_exact": "2052416131/625000000",
+      "read_finish_seconds_exact": "258942519/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8299,
+          "bytes": 147456,
+          "start_seconds_exact": "258942519/78125000",
+          "commit_seconds_exact": "2071545581/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2071545581/625000000",
+      "remote_lengths_after": [
+        8300
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1223884800
+    },
+    {
+      "step": 108,
+      "required_remote_epoch": 8300,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1223884800,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4896129024,
+      "read_start_seconds_exact": "2071545581/625000000",
+      "read_finish_seconds_exact": "1045335953/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8300,
+          "bytes": 147456,
+          "start_seconds_exact": "1045335953/312500000",
+          "commit_seconds_exact": "418135467/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "418135467/125000000",
+      "remote_lengths_after": [
+        8301
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224032256
+    },
+    {
+      "step": 109,
+      "required_remote_epoch": 8301,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224032256,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4896718848,
+      "read_start_seconds_exact": "418135467/125000000",
+      "read_finish_seconds_exact": "527451491/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8301,
+          "bytes": 147456,
+          "start_seconds_exact": "527451491/156250000",
+          "commit_seconds_exact": "2109811393/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2109811393/625000000",
+      "remote_lengths_after": [
+        8302
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224179712
+    },
+    {
+      "step": 110,
+      "required_remote_epoch": 8302,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224179712,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4897308672,
+      "read_start_seconds_exact": "2109811393/625000000",
+      "read_finish_seconds_exact": "1064471163/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8302,
+          "bytes": 147456,
+          "start_seconds_exact": "1064471163/312500000",
+          "commit_seconds_exact": "425789551/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "425789551/125000000",
+      "remote_lengths_after": [
+        8303
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224327168
+    },
+    {
+      "step": 111,
+      "required_remote_epoch": 8303,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224327168,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4897898496,
+      "read_start_seconds_exact": "425789551/125000000",
+      "read_finish_seconds_exact": "67127531/19531250",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8303,
+          "bytes": 147456,
+          "start_seconds_exact": "67127531/19531250",
+          "commit_seconds_exact": "2148086421/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2148086421/625000000",
+      "remote_lengths_after": [
+        8304
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224474624
+    },
+    {
+      "step": 112,
+      "required_remote_epoch": 8304,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224474624,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4898488320,
+      "read_start_seconds_exact": "2148086421/625000000",
+      "read_finish_seconds_exact": "1083610981/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8304,
+          "bytes": 147456,
+          "start_seconds_exact": "1083610981/312500000",
+          "commit_seconds_exact": "2167227391/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2167227391/625000000",
+      "remote_lengths_after": [
+        8305
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224622080
+    },
+    {
+      "step": 113,
+      "required_remote_epoch": 8305,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224622080,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4899078144,
+      "read_start_seconds_exact": "2167227391/625000000",
+      "read_finish_seconds_exact": "546591309/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8305,
+          "bytes": 147456,
+          "start_seconds_exact": "546591309/156250000",
+          "commit_seconds_exact": "437274133/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "437274133/125000000",
+      "remote_lengths_after": [
+        8306
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224769536
+    },
+    {
+      "step": 114,
+      "required_remote_epoch": 8306,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224769536,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4899667968,
+      "read_start_seconds_exact": "437274133/125000000",
+      "read_finish_seconds_exact": "1102755407/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8306,
+          "bytes": 147456,
+          "start_seconds_exact": "1102755407/312500000",
+          "commit_seconds_exact": "2205516243/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2205516243/625000000",
+      "remote_lengths_after": [
+        8307
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1224916992
+    },
+    {
+      "step": 115,
+      "required_remote_epoch": 8307,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1224916992,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4900257792,
+      "read_start_seconds_exact": "2205516243/625000000",
+      "read_finish_seconds_exact": "278082337/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8307,
+          "bytes": 147456,
+          "start_seconds_exact": "278082337/78125000",
+          "commit_seconds_exact": "17797313/5000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "17797313/5000000",
+      "remote_lengths_after": [
+        8308
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225064448
+    },
+    {
+      "step": 116,
+      "required_remote_epoch": 8308,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225064448,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4900847616,
+      "read_start_seconds_exact": "17797313/5000000",
+      "read_finish_seconds_exact": "1121904441/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8308,
+          "bytes": 147456,
+          "start_seconds_exact": "1121904441/312500000",
+          "commit_seconds_exact": "2243814311/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2243814311/625000000",
+      "remote_lengths_after": [
+        8309
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225211904
+    },
+    {
+      "step": 117,
+      "required_remote_epoch": 8309,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225211904,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4901437440,
+      "read_start_seconds_exact": "2243814311/625000000",
+      "read_finish_seconds_exact": "565740343/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8309,
+          "bytes": 147456,
+          "start_seconds_exact": "565740343/156250000",
+          "commit_seconds_exact": "2262966801/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2262966801/625000000",
+      "remote_lengths_after": [
+        8310
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225359360
+    },
+    {
+      "step": 118,
+      "required_remote_epoch": 8310,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225359360,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4902027264,
+      "read_start_seconds_exact": "2262966801/625000000",
+      "read_finish_seconds_exact": "1141058083/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8310,
+          "bytes": 147456,
+          "start_seconds_exact": "1141058083/312500000",
+          "commit_seconds_exact": "456424319/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "456424319/125000000",
+      "remote_lengths_after": [
+        8311
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225506816
+    },
+    {
+      "step": 119,
+      "required_remote_epoch": 8311,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225506816,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4902617088,
+      "read_start_seconds_exact": "456424319/125000000",
+      "read_finish_seconds_exact": "143829579/39062500",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8311,
+          "bytes": 147456,
+          "start_seconds_exact": "143829579/39062500",
+          "commit_seconds_exact": "2301278693/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2301278693/625000000",
+      "remote_lengths_after": [
+        8312
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225654272
+    },
+    {
+      "step": 120,
+      "required_remote_epoch": 8312,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225654272,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4903206912,
+      "read_start_seconds_exact": "2301278693/625000000",
+      "read_finish_seconds_exact": "1160216333/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8312,
+          "bytes": 147456,
+          "start_seconds_exact": "1160216333/312500000",
+          "commit_seconds_exact": "464087619/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "464087619/125000000",
+      "remote_lengths_after": [
+        8313
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225801728
+    },
+    {
+      "step": 121,
+      "required_remote_epoch": 8313,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225801728,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4903796736,
+      "read_start_seconds_exact": "464087619/125000000",
+      "read_finish_seconds_exact": "584898593/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8313,
+          "bytes": 147456,
+          "start_seconds_exact": "584898593/156250000",
+          "commit_seconds_exact": "2339599801/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2339599801/625000000",
+      "remote_lengths_after": [
+        8314
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1225949184
+    },
+    {
+      "step": 122,
+      "required_remote_epoch": 8314,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1225949184,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4904386560,
+      "read_start_seconds_exact": "2339599801/625000000",
+      "read_finish_seconds_exact": "1179379191/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8314,
+          "bytes": 147456,
+          "start_seconds_exact": "1179379191/312500000",
+          "commit_seconds_exact": "2358763811/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2358763811/625000000",
+      "remote_lengths_after": [
+        8315
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1226096640
+    },
+    {
+      "step": 123,
+      "required_remote_epoch": 8315,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1226096640,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4904976384,
+      "read_start_seconds_exact": "2358763811/625000000",
+      "read_finish_seconds_exact": "297240587/78125000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8315,
+          "bytes": 147456,
+          "start_seconds_exact": "297240587/78125000",
+          "commit_seconds_exact": "19023441/5000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "19023441/5000000",
+      "remote_lengths_after": [
+        8316
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1226244096
+    },
+    {
+      "step": 124,
+      "required_remote_epoch": 8316,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1226244096,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4905566208,
+      "read_start_seconds_exact": "19023441/5000000",
+      "read_finish_seconds_exact": "1198546657/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8316,
+          "bytes": 147456,
+          "start_seconds_exact": "1198546657/312500000",
+          "commit_seconds_exact": "2397098743/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2397098743/625000000",
+      "remote_lengths_after": [
+        8317
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1226391552
+    },
+    {
+      "step": 125,
+      "required_remote_epoch": 8317,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1226391552,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4906156032,
+      "read_start_seconds_exact": "2397098743/625000000",
+      "read_finish_seconds_exact": "604066059/156250000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8317,
+          "bytes": 147456,
+          "start_seconds_exact": "604066059/156250000",
+          "commit_seconds_exact": "483253933/125000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "483253933/125000000",
+      "remote_lengths_after": [
+        8318
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1226539008
+    },
+    {
+      "step": 126,
+      "required_remote_epoch": 8318,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1226539008,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4906745856,
+      "read_start_seconds_exact": "483253933/125000000",
+      "read_finish_seconds_exact": "1217718731/312500000",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8318,
+          "bytes": 147456,
+          "start_seconds_exact": "1217718731/312500000",
+          "commit_seconds_exact": "2435442891/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2435442891/625000000",
+      "remote_lengths_after": [
+        8319
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1226686464
+    },
+    {
+      "step": 127,
+      "required_remote_epoch": 8319,
+      "selected_read_replica": 0,
+      "remote_prior_read_bytes": 1226686464,
+      "local_prior_read_bytes": 0,
+      "current_kv_operand_bytes": 147456,
+      "full_attention_qk_pv_flops": 4907335680,
+      "read_start_seconds_exact": "2435442891/625000000",
+      "read_finish_seconds_exact": "38353328/9765625",
+      "replica_writes": [
+        {
+          "replica": 0,
+          "position": 8319,
+          "bytes": 147456,
+          "start_seconds_exact": "38353328/9765625",
+          "commit_seconds_exact": "2454618421/625000000"
+        }
+      ],
+      "all_replica_commit_seconds_exact": "2454618421/625000000",
+      "remote_lengths_after": [
+        8320
+      ],
+      "local_tail_bytes_after": 0,
+      "logical_full_history_bytes_after": 1226833920
+    }
+  ],
+  "summary": {
+    "full_attention_qk_pv_flops": 623344877568,
+    "initial_copy_network_bytes": 1207959552,
+    "prior_history_logical_read_bytes": 155817345024,
+    "remote_prior_read_bytes": 155817345024,
+    "local_prior_read_bytes": 0,
+    "current_kv_operand_bytes": 18874368,
+    "append_replica_network_bytes": 18874368,
+    "total_network_bytes": 157044178944,
+    "remote_final_bytes_per_replica": 1226833920,
+    "remote_physical_final_bytes": 1226833920,
+    "local_tail_final_bytes": 0,
+    "local_fixed_state_bytes": 0,
+    "local_current_append_buffer_bytes": 147456,
+    "final_unique_history_bytes": 1226833920,
+    "local_tail_budget_fits": true,
+    "communication_skeleton_seconds_exact": "2454618421/625000000",
+    "initial_copy_seconds_exact": "18877493/625000000",
+    "token_communication_seconds_exact": "38058452/9765625",
+    "actual_decode_seconds": null,
+    "actual_task_feasible": null
+  },
+  "assumptions": [
+    "所有配置/实现原件校验后使用；BF16完整attention KV按层/头计，Qwen3.6仅10层保存全历史KV，30层FP32递推和BF16卷积槽留在计算节点，不传成历史序列。",
+    "prompt是已产生的KV位置数；steps是追加单token forward次数。输入token/输出token移位明确，当前位置操作数不混入远端旧历史读取。给出的QK/PV仅完整attention子账，不含投影/专家/DeltaNet等全部计算。",
+    "remote_all复制完整prompt，逐步读一个副本的所有旧位置，再将新位置发给每个副本；共享发送接口串行写入，全副本提交屏障保证下一步所有可选副本都达到要求epoch。没有实现真实一致性协议或原子性证明。",
+    "remote_prefix_local_tail保持远端prompt不变，新增位置留本地；每步远端prefix和本地tail各读一次。全部模型层仍需要本地递推/卷积等状态，尾部预算只检查新增完整attention KV，不是整机容量。",
+    "初始化和每消息startup+bytes/B均为声明串行传输模型。当前KV生成完成后才可追加，但计算时长和与网络重叠未知；时间轴只列通信骨架，不能视为真实decode latency或吞吐。",
+    "新KV在本地先产生，current append buffer另列，不和已增长tail盲目相加为内存峰值。远端读缓存/临时buffer/控制消息/ACK/重试/故障检测及恢复未计，不推测厂商能力。",
+    "初始拷贝计从外部已产出的prompt向各副本的发送；原始prompt源是否释放另由上层所有权协议决定，不计成已释放容量。副本只增加存储/写入与静态冗余，不自动增加读带宽。"
+  ]
+}
+```

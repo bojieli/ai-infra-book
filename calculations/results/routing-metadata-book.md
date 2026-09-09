@@ -1,0 +1,53 @@
+# routing-metadata — qwen3-30b-a3b
+
+输入：`{"bandwidth_bytes_per_second": 1000000000, "encoding": "uint16", "header_bytes": 128, "model": "qwen3-30b-a3b", "retained_copies": 1, "token_rate_per_second": 1000000, "tokens": 8192}`
+
+数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
+
+| 结果 | 值 |
+| --- | ---: |
+| moe_layers | 48 |
+| moe_layer_ids | `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]` |
+| routed_experts | 128 |
+| top_k | 8 |
+| dense_layer_count | 0 |
+| shared_experts_per_layer | 0 |
+| hash_routed_layers | 0 |
+| id_entries | 3,145,728 |
+| routed_id_bytes | 6,291,456 |
+| complete_declared_payload_bytes | 6,489,216 |
+| minimum_unsigned_bits_per_id | 7 |
+| retained_payload_bytes | 6,489,216 |
+| average_declared_bytes_per_token_exact | `"50697/64"` |
+| required_transport_bytes_per_second_exact | `"792140625"` |
+| transport_has_strict_slack | `true` |
+| one_payload_transfer_exact_seconds | `"50697/7812500"` |
+
+| 声明载荷组成 | bytes |
+| --- | ---: |
+| routed_ids_bytes | 6291456 |
+| token_identity_bytes | 196608 |
+| validity_bitset_bytes | 1024 |
+| stream_header_bytes | 128 |
+
+| ID编码 | bytes/ID | 最大ID | 能表示全部专家 | ID载荷bytes |
+| --- | ---: | ---: | --- | --- |
+| uint8 | 1 | 255 | True | 3145728 |
+| uint16 | 2 | 65535 | True | 6291456 |
+| int32 | 4 | 2147483647 | True | 12582912 |
+
+计量条件：
+
+- 复用官方专家几何：仅主模型MoE层的逻辑routed专家ID，shared专家无top-k选择所以不另写ID；K3排除首个dense层，V4包含hash路由层的选中ID，MTP/草稿分支不计。只证明元数据几何，不表示框架支持该模型的R3训练。
+- 路由ID张量形状[tokens,MoE层数,top-k]，ID从0开始，uint8上限255恰好支持256专家，不能用于384/896专家；int32为非负有符号整数范围。bit_length仅信息位数参考，实际字节编码不自动位打包。
+- 教学记录每token另存uint64 sequence ID、position和weight version各8bytes；有效位图ceil(tokens/8)，stream header默认128bytes为输入预算，不声称实际NeMo/vLLM格式。固定model revision及layer顺序须由stream header/外部schema绑定，128bytes不证明任意元数据都可装下。
+- tokens为明确记录位置数，包括caller选择保留的前缀；多轮共享、packing重排、缺失路由、不同模型/权重版本需要身份验证，本模块不根据相同文本去重，也不自动把KV命中当路由日志命中。
+- retained_copies是物理保留完整副本数，只乘存储，不自动乘一次传输；每秒供给按同长度记录批次的平均bytes/token乘token_rate，header/bitset尾部随批次重新计量。带宽为有效单向教学输入，不是硬件峰值。
+- 没有路由分数、概率、logprob、梯度或KV载荷，不能据此声称省掉router/专家计算或保证训练质量。供给等于带宽不标有余量；未计通信启动、排队、压缩或持久化协议。
+
+固定来源：
+
+- [configs/models/qwen3-30b-a3b/config.json](https://huggingface.co/Qwen/Qwen3-30B-A3B/resolve/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39/config.json)，SHA256 `2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297`。
+- [sources/qwen3-30b-a3b/model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3-30B-A3B/resolve/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39/model.safetensors.index.json)，SHA256 `df0d481ec595c55a0ba58426d517390c6214a566ec4ff1c8fc4bbce9f57b3c24`。
+- [sources/qwen3/modeling_qwen3.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py)，SHA256 `704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2`。
+- [sources/qwen3/modeling_qwen3_moe.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py)，SHA256 `3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8`。

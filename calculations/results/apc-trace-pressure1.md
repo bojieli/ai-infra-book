@@ -1,0 +1,75 @@
+# apc-trace — 
+
+输入：`{"run": "pressure1"}`
+
+命中与时长来自封存Agent回放；矩阵工作按官方配置复算。
+
+| 结果 | 值 |
+| --- | ---: |
+| agent_requests | 12 |
+| input_tokens | 19,556 |
+| cached_tokens | 0 |
+| requests_with_hit | 0 |
+| request_hit_fraction_exact | `"0"` |
+| token_weighted_hit_fraction_exact | `"0"` |
+| mean_per_request_cached_fraction_exact | `"0"` |
+| full_matrix_flops | 284,309,306,474,496 |
+| hit_matrix_flops | 284,309,306,474,496 |
+| saved_matrix_flops | 0 |
+| matrix_work_saved_fraction_exact | `"0"` |
+| cumulative_reused_kv_logical_bytes | 0 |
+| agent_request_wall_s | 1.3222986480686814 |
+| pressure_request_wall_s | 8.204881876707077 |
+| replay_elapsed_s | 9.595798554131761 |
+| between_requests_s | 0.06861802935600281 |
+| median_delivery_ttft_s | 0.11391563504002988 |
+| all_five_run_output_tokens_match | `true` |
+| pressure_inputs_match | `true` |
+
+| 轮 | 输入token | 命中token | 剩余矩阵 FLOPs | 省下矩阵 FLOPs | 实测TTFT秒 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| agent-0 | 210 | 0 | 2931534528512 | 0 | 0.036115722032263875 |
+| agent-1 | 316 | 0 | 4420511596544 | 0 | 0.022829387104138732 |
+| agent-2 | 670 | 0 | 9441156595712 | 0 | 0.0592210351023823 |
+| agent-3 | 884 | 0 | 12512082919424 | 0 | 0.056241663871333 |
+| agent-4 | 1233 | 0 | 17578222223360 | 0 | 0.14397068694233894 |
+| agent-5 | 1447 | 0 | 20720211722240 | 0 | 0.08509761886671185 |
+| agent-6 | 1796 | 0 | 25902243774464 | 0 | 0.11273201392032206 |
+| agent-7 | 2010 | 0 | 29115296448512 | 0 | 0.1150992561597377 |
+| agent-8 | 2359 | 0 | 34413221249024 | 0 | 0.1418931749649346 |
+| agent-9 | 2573 | 0 | 37697337098240 | 0 | 0.17353316396474838 |
+| agent-10 | 2922 | 0 | 43111154647040 | 0 | 0.1718136379495263 |
+| agent-11 | 3136 | 0 | 46466333671424 | 0 | 0.20359893911518157 |
+
+计量条件：
+
+- 实验8-4固定12轮真实Agent输入，各轮仅生成一个token，不重跑工具或继续真实多token Agent任务。RTX共享GPU／vLLM0.23.0、Qwen3-8B BF16、eager、分块预算512、每条件单次串行回放。
+- 命中数来自引擎记录，核对冻结prompt ID哈希、所有配置输出相同及两组干扰输入相同。请求命中率指cached>0的请求占比；token加权命中与每请求缓存比例平均分列。
+- 矩阵工作为官方full前向减history=cached的suffix前向，保留suffix对命中历史的注意力与末token logits；数学工作不包括chunk额外启动、实际HBM和查找成本。命中工作节省不直接转换为实测加速。
+- 累计复用KV逻辑字节按每轮相加，不是缓存驻留峰值或唯一物理页数。同一历史可能多轮重复命中，缺少块寿命记录不能推出容量占用时间。
+- Agent请求墙钟、干扰请求墙钟和整段回放时间分开；between_requests含显式间隔与主机开销，不能把整段时间都归因于Agent推理。
+- 6GiB与1GiB干扰条件、0.2秒间隔及关闭APC分别对照；单次共享GPU回放不证明通用TTL、显著性能收益或混合排队效果。
+
+固定来源：
+
+- [configs/models/qwen3-8b/config.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json)，SHA256 `f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30`。
+- [sources/qwen3-8b/model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json)，SHA256 `f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc`。
+- [sources/qwen3/modeling_qwen3.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py)，SHA256 `704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2`。
+- [sources/qwen3/modeling_qwen3_moe.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py)，SHA256 `3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8`。
+- [sources/apc-traces/cache6.log](../../experiments/ch08/08-04/cache6.log)，SHA256 `0b56b597f59325f4cb502b124cd8ea7d6e9f073e7b563d7b68d0eb08d05cb9da`。
+- [sources/apc-traces/gap6.log](../../experiments/ch08/08-04/gap6.log)，SHA256 `510faaaa6b8c0889a212795c4da3c8c3039ded76fe1f1e1d3d786c315b8df121`。
+- [sources/apc-traces/inputs/agent-prompts.json](../../experiments/ch08/08-04/inputs/agent-prompts.json)，SHA256 `6819e3779cc050416e0c8dd29f10b8f6c6a38b01670141139e20619011f3f4d5`。
+- [sources/apc-traces/nocache6.log](../../experiments/ch08/08-04/nocache6.log)，SHA256 `77627070d168e4cdb5c3c679298733e64a80b5ebb65cec29ac7f7bfae6e80dc1`。
+- [sources/apc-traces/pressure1.log](../../experiments/ch08/08-04/pressure1.log)，SHA256 `a7da0fe14e98623d016c633fac25b545edeb0a9ee87b4335e091bf51dda98775`。
+- [sources/apc-traces/pressure6.log](../../experiments/ch08/08-04/pressure6.log)，SHA256 `09a181aa4c58f8856542b0f4c327c31b1f8b91e47fa7fb21570bf185bdd9a693`。
+- [sources/apc-traces/results/cache6/environment.json](../../experiments/ch08/08-04/results/cache6/environment.json)，SHA256 `4cc0b306ac4e24891216500da814d75701b7fd3f5974f1551a80f2428a53ef47`。
+- [sources/apc-traces/results/cache6/requests.jsonl](../../experiments/ch08/08-04/results/cache6/requests.jsonl)，SHA256 `fa0afa473c892ee8a7d12e8e4bd3a7218e86c7e2aaeed27b6a4103bf59f6aa16`。
+- [sources/apc-traces/results/gap6/environment.json](../../experiments/ch08/08-04/results/gap6/environment.json)，SHA256 `6f6315d0f03978f00e936c84a5991480291883245d46441f13a21d486dce622c`。
+- [sources/apc-traces/results/gap6/requests.jsonl](../../experiments/ch08/08-04/results/gap6/requests.jsonl)，SHA256 `6cf0c6c0b7ddda31a619e01ba23c7485c4e04a4fa19837b56636ef9d133a0cd4`。
+- [sources/apc-traces/results/nocache6/environment.json](../../experiments/ch08/08-04/results/nocache6/environment.json)，SHA256 `f291a908d5fb096b86419f5a8671196c2cdaa5547835ec78fac9e20fbf3ecefa`。
+- [sources/apc-traces/results/nocache6/requests.jsonl](../../experiments/ch08/08-04/results/nocache6/requests.jsonl)，SHA256 `d8d64f7077ffaba23d8a074850dc7235d6574283bacdf14b958ddb3261119874`。
+- [sources/apc-traces/results/pressure1/environment.json](../../experiments/ch08/08-04/results/pressure1/environment.json)，SHA256 `72dcfb6f7ae0256f08d2fc03f0d5128aca7c7cc3b73f18970d2b619c26701fdc`。
+- [sources/apc-traces/results/pressure1/requests.jsonl](../../experiments/ch08/08-04/results/pressure1/requests.jsonl)，SHA256 `86bec5bdf01aa905ebb888a7cd8bfa4b448d3c78423cf979d5cfd667723214dc`。
+- [sources/apc-traces/results/pressure6/environment.json](../../experiments/ch08/08-04/results/pressure6/environment.json)，SHA256 `a71f489b2dd2d2fab55afbe0562a4794ffc7f21ee1dd3663ccd15c394087f65f`。
+- [sources/apc-traces/results/pressure6/requests.jsonl](../../experiments/ch08/08-04/results/pressure6/requests.jsonl)，SHA256 `32eaa7223a3aa360474f43348cf458a8c68e5e9043a36e54479974cdb9f0019e`。
+- [sources/apc-traces/run.py](../../experiments/ch08/08-04/run.py)，SHA256 `200b1eddf801b24227ddb1579b949c29ebd63963d9423e36f13b63be7ef9ba7d`。

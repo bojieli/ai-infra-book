@@ -1,0 +1,42 @@
+# teacher-cache — qwen3-8b
+
+输入：`{"bandwidth_bytes_per_second": 1000000000, "chunk_tokens": 256, "dtype": "fp32", "head_flops_per_second": 100000000000000, "model": "qwen3-8b", "replays": 4, "tokens": 8192}`
+
+数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
+
+| 结果 | 值 |
+| --- | ---: |
+| hidden_size | 4,096 |
+| vocabulary_size | 151,936 |
+| hidden_cache_bytes | 134,217,728 |
+| full_logits_cache_bytes | 4,978,638,848 |
+| logits_to_hidden_ratio_exact | `"1187/32"` |
+| head_weight_bytes | 2,489,319,424 |
+| one_head_gemm_flops | 10,196,252,360,704 |
+| hidden_total_cache_io_bytes | 671,088,640 |
+| logits_total_cache_io_bytes | 24,893,194,240 |
+| hidden_total_head_flops | 40,785,009,442,816 |
+| logits_total_head_flops | 10,196,252,360,704 |
+| head_chunk_count | 32 |
+| head_tail_tokens | 256 |
+| head_live_tensor_bytes | 2,649,096,192 |
+| hidden_serial_budget_exact_seconds | `"6585319424/6103515625"` |
+| logits_serial_budget_exact_seconds | `"152558329856/6103515625"` |
+| hidden_serial_budget_is_lower | `true` |
+| serial_budget_difference_hidden_minus_logits_exact_seconds | `"-145973010432/6103515625"` |
+
+计量条件：
+
+- 仅保留最终归一化后、输出投影之前的文本hidden [T,H]，不是所有层激活、KV或多模态编码器特征。全logits为[T,V]；二者采用同一声明dtype，shape源自锁定官方config。
+- 教师权重与token身份、位置、mask、tokenizer、模型revision必须固定且另行校验；预算不实现这些校验。改变教师版本必须失效旧cache，不把hidden缓存当可更新教师的前向替代。
+- 两方案共享的教师主干前向不计；hidden在每次replay做一次2THV输出投影，全logits生产时做一次。未计softmax、温度、损失、学生计算、归约、bias和kernel工作区，不证明数值一致或蒸馏质量。
+- IO为同一接口一次写入加每次replay一次完整读取；假设无跨replay常驻复用。有效带宽与矩阵FLOPs/s均为教学输入，无精度或稀疏性不明的硬件峰值。串行时间是声明阶段相加，不能替代重叠执行实测。
+- chunk只切token维，head权重常驻；live tensor量仅为一个chunk输入、完整词表输出与head权重之和，不是系统显存峰值。输出被消费即释放，未包括完整cache驻留、学生状态或双缓冲。
+- 保持全词表输出；top-k logits不能无条件替代完整分布。BF16/FP16/FP32仅元素字节预算，不将低精度重投影自动视为逐位重建。
+
+固定来源：
+
+- [configs/models/qwen3-8b/config.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json)，SHA256 `f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30`。
+- [sources/qwen3-8b/model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json)，SHA256 `f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc`。
+- [sources/qwen3/modeling_qwen3.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py)，SHA256 `704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2`。
+- [sources/qwen3/modeling_qwen3_moe.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py)，SHA256 `3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8`。

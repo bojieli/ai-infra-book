@@ -1,0 +1,2902 @@
+# Fish CLI 代码块到波形导出
+
+1个实际代码块，合计43帧；单次codec产生88064样本。
+
+| 阶段 | D2H bytes | device复制写 bytes | CPU cast写 bytes |
+|---|---:|---:|---:|
+| sample_code_clone_and_cpu_conversation | 3440 | 3440 | 0 |
+| next_concat_codes | 0 | 3440 | 0 |
+| save_merged_codes_numpy_input | 3440 | 0 | 0 |
+| single_codec_decode | 0 | 0 | 0 |
+| wave_cpu_then_float | 352256 | 0 | 0 |
+
+复用codec矩阵FLOPs：290892476416；实际音频时长22016/11025秒。
+
+TTFA、RTF、文件字节与完整runtime峰值未测量，保持unknown。
+
+## 范围
+
+- Pinned CLI with output enabled, one requested sample, GPU-generated code chunks and codec already loaded on that device. CPU path and codec model loading are not zero-cost substitutes.
+- sample events expose codes only; CLI waits for next, concatenates all codes, then decodes once. No waveform is produced per emitted code chunk on this path.
+- Requires actual emitted frame counts after unconditional y[1:, prompt_length:-1] slicing; removed last position need not be terminal. codeframes=returned_y_length-prompt_length-1. Text chunk_length is a text-byte limit, not audio frames or seconds.
+- AR/fast-head work remains in omni_audio and is not duplicated here; codec_operations likewise replaces/reuses the existing codec stage, never add its matrices twice.
+- Code CPU copies for conversation and NPY-save input are separate real copies. Their Python/CUDA overlap, total conversation lifetime and IO timing remain unknown.
+- text2semantic export copies source waveform toCPU then converts toFP32; standalone dac CLI converts toFP32 on device beforeCPU. Their D2H bytes differ underBF16, though both hand float32 data to soundfile.
+- NumPy views do not copy tensor data; soundfile encoding/default subtype/file buffering are not inferred from float32 host-array bytes.
+- No wall-clock measurements supplied: TTFA/RTF are null. Required dependency is all code chunks -> next -> concatenation/save input -> codec -> host conversion -> file writer.
+
+## 完整阶段与复用codec账
+
+阶段接口与codec算子分别列出；codec工作只计一次。
+
+```json
+{
+  "wrapper_stages": [
+    {
+      "stage": "sample_code_clone_and_cpu_conversation",
+      "chunk": 0,
+      "frames": 43,
+      "device_copy_read_bytes": 3440,
+      "device_copy_write_bytes": 3440,
+      "device_to_host_bytes": 3440,
+      "held_code_list_device_bytes": 3440,
+      "code_nonnegative_comparisons": 430,
+      "code_validity_logical_reductions": 429,
+      "code_validity_bool_tensor_bytes": 430,
+      "code_validity_host_scalar_checks": 1,
+      "note": "codes=y[1:,prompt_length:-1].clone(); conversation receives codes.cpu(); yielded codes remain on original device."
+    },
+    {
+      "stage": "next_concat_codes",
+      "executions": 1,
+      "device_copy_read_bytes": 3440,
+      "device_copy_write_bytes": 3440,
+      "code_list_plus_merged_device_bytes": 6880
+    },
+    {
+      "stage": "save_merged_codes_numpy_input",
+      "executions": 1,
+      "device_to_host_bytes": 3440,
+      "host_array_alias_bytes": 3440,
+      "note": "merged_codes.cpu().numpy(); NumPy aliases CPU tensor. NPY serialization/header and file IO excluded."
+    },
+    {
+      "stage": "single_codec_decode",
+      "executions": 1,
+      "frames": 43,
+      "matrix_flops": 290892476416,
+      "note": "Reuse codec operators exactly once after next; no per-sample-chunk codec call."
+    },
+    {
+      "stage": "wave_cpu_then_float",
+      "executions": 1,
+      "device_to_host_bytes": 352256,
+      "host_cast_read_bytes": 0,
+      "host_cast_write_bytes": 0,
+      "cast_elements": 0,
+      "host_numpy_alias_bytes": 352256,
+      "host_input_output_cast_overlap_bytes": 352256,
+      "note": "text2semantic CLI: audio.cpu().float().numpy(); same-dtype float() is a no-op."
+    }
+  ],
+  "codec_operations": {
+    "operators": [
+      {
+        "name": "semantic_index_clamp",
+        "kind": "index",
+        "input_elements": 0,
+        "output_elements": 0,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {
+          "integer_max_compare": 43
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 344
+      },
+      {
+        "name": "semantic_book_0_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "semantic_book_0_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "semantic_book_0_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "semantic_book_0_accumulate",
+        "kind": "reduce",
+        "input_elements": 44032,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 176128,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "semantic_unused_latent_cat",
+        "kind": "copy",
+        "input_elements": 344,
+        "output_elements": 344,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_index_clamp",
+        "kind": "index",
+        "input_elements": 0,
+        "output_elements": 0,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {
+          "integer_max_compare": 387
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 3096,
+        "activation_write_bytes": 3096
+      },
+      {
+        "name": "residual_book_0_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_0_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_0_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_0_accumulate",
+        "kind": "reduce",
+        "input_elements": 44032,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 176128,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_1_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_1_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_1_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_1_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_2_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_2_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_2_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_2_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_3_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_3_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_3_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_3_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_4_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_4_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_4_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_4_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_5_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_5_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_5_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_5_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_6_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_6_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_6_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_6_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_7_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_7_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_7_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_7_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_book_8_lookup",
+        "kind": "embedding",
+        "input_elements": 0,
+        "output_elements": 344,
+        "weight_elements": 344,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 1376,
+        "activation_read_bytes": 344,
+        "activation_write_bytes": 1376
+      },
+      {
+        "name": "residual_book_8_out_proj_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9216,
+        "output_elements": 8192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 24576,
+        "special_ops": {
+          "sqrt": 1024
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 36864,
+        "activation_write_bytes": 32768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "residual_book_8_out_proj",
+        "kind": "conv1d",
+        "input_elements": 344,
+        "output_elements": 44032,
+        "weight_elements": 9216,
+        "matrix_flops": 704512,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 36864,
+        "activation_read_bytes": 1376,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "residual_book_8_accumulate",
+        "kind": "reduce",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128,
+        "note": "Source begins z_q=0.0, including the first scalar-zero add."
+      },
+      {
+        "name": "residual_unused_latent_cat",
+        "kind": "copy",
+        "input_elements": 3096,
+        "output_elements": 3096,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 12384,
+        "activation_write_bytes": 12384
+      },
+      {
+        "name": "semantic_residual_add",
+        "kind": "residual",
+        "input_elements": 88064,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 44032,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 176128
+      },
+      {
+        "name": "rvq_post_transformer",
+        "kind": "transformer",
+        "input_elements": 44032,
+        "output_elements": 44032,
+        "weight_elements": 0,
+        "matrix_flops": 9409462272,
+        "scalar_flops": 9109851,
+        "special_ops": {
+          "rsqrt": 731,
+          "rope_sign_negation": 352256,
+          "attention_exp": 121088,
+          "attention_max_compare": 115584,
+          "sigmoid": 1056768
+        },
+        "weight_interface_bytes": 436207616,
+        "activation_read_bytes": 142094336,
+        "activation_write_bytes": 0,
+        "transformer": {
+          "name": "fish_codec_post",
+          "matrices": [
+            {
+              "name": "q",
+              "input_width": 1024,
+              "output_width": 1024,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 8388608,
+              "matrix_flops": 721420288,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 33554432,
+              "activation_read_bytes": 1409024,
+              "activation_write_bytes": 1409024
+            },
+            {
+              "name": "k",
+              "input_width": 1024,
+              "output_width": 1024,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 8388608,
+              "matrix_flops": 721420288,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 33554432,
+              "activation_read_bytes": 1409024,
+              "activation_write_bytes": 1409024
+            },
+            {
+              "name": "v",
+              "input_width": 1024,
+              "output_width": 1024,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 8388608,
+              "matrix_flops": 721420288,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 33554432,
+              "activation_read_bytes": 1409024,
+              "activation_write_bytes": 1409024
+            },
+            {
+              "name": "o",
+              "input_width": 1024,
+              "output_width": 1024,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 8388608,
+              "matrix_flops": 721420288,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 33554432,
+              "activation_read_bytes": 1409024,
+              "activation_write_bytes": 1409024
+            },
+            {
+              "name": "ffn_gate",
+              "input_width": 1024,
+              "output_width": 3072,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 25165824,
+              "matrix_flops": 2164260864,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 100663296,
+              "activation_read_bytes": 1409024,
+              "activation_write_bytes": 4227072
+            },
+            {
+              "name": "ffn_up",
+              "input_width": 1024,
+              "output_width": 3072,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 25165824,
+              "matrix_flops": 2164260864,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 100663296,
+              "activation_read_bytes": 1409024,
+              "activation_write_bytes": 4227072
+            },
+            {
+              "name": "ffn_down",
+              "input_width": 3072,
+              "output_width": 1024,
+              "rows_per_layer": 43,
+              "repeats": 8,
+              "stored_copies_per_layer": 1,
+              "matrix_parameters": 25165824,
+              "matrix_flops": 2164260864,
+              "weight_read_invocations": 1,
+              "weight_interface_bytes": 100663296,
+              "activation_read_bytes": 4227072,
+              "activation_write_bytes": 1409024
+            }
+          ],
+          "summary": {
+            "projection_and_ffn_matrix_flops": 9378463744,
+            "qk_matrix_flops": 15499264,
+            "pv_matrix_flops": 15499264,
+            "matrix_flops": 9409462272,
+            "matrix_weight_elements": 109051904,
+            "kv_bytes_per_position_per_request": 65536,
+            "kv_retained_logical_bytes": 0,
+            "processed_rows": 43,
+            "valid_attention_pairs_all_invocations": 946,
+            "invocations": 1,
+            "accounted_scalar_flops": 9109851,
+            "special_ops": {
+              "rsqrt": 731,
+              "rope_sign_negation": 352256,
+              "attention_exp": 121088,
+              "attention_max_compare": 115584,
+              "sigmoid": 1056768
+            },
+            "matrix_weight_interface_bytes": 436207616,
+            "matrix_activation_read_bytes": 12681216,
+            "matrix_activation_write_bytes": 15499264,
+            "attention_logical_interface_bytes": 65783808,
+            "accounted_nonmatrix_interface_bytes": 48130048,
+            "accounted_interface_bytes": 578301952
+          },
+          "state_lifecycle": {
+            "scope": "request",
+            "retained_bytes": 0,
+            "release": "after stage/request",
+            "bytes_scope": "logical KV only; weights, eager temporaries, output tokens and allocator not included"
+          },
+          "interface_assumptions": [
+            "Each selected matrix weight read once per invocation, conditional balanced MoE visits min(E,B*top_k); no cross-call caching assumed.",
+            "Attention KV interfaces reuse each KV head across GQA query heads but conservatively account each valid query/history pair; these are not measured HBM bytes.",
+            "Norm/residual/RoPE/softmax/SwiGLU interfaces use declared mathematical primitives; remaining router gather/scatter, sampling, dtype conversion and allocator traffic remain unaccounted."
+          ]
+        }
+      },
+      {
+        "name": "upsample_0",
+        "kind": "conv_transpose1d",
+        "input_elements": 44032,
+        "output_elements": 88064,
+        "weight_elements": 2098176,
+        "matrix_flops": 180355072,
+        "scalar_flops": 88064,
+        "special_ops": {},
+        "weight_interface_bytes": 8392704,
+        "activation_read_bytes": 176128,
+        "activation_write_bytes": 352256,
+        "input_length": 43,
+        "output_length_before_crop": 86,
+        "retained_length": 86,
+        "kernel": 2,
+        "stride": 2,
+        "note": "Full source ConvTranspose before two-sided crop; scattered contribution multiply/add count."
+      },
+      {
+        "name": "upsample_0_crop_contiguous",
+        "kind": "copy",
+        "input_elements": 88064,
+        "output_elements": 88064,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 352256,
+        "crop_each_side": null,
+        "crop_left": 0,
+        "crop_right": 0,
+        "note": "Retained slice materialized by contiguous(); Fish trims only right, Omni both sides."
+      },
+      {
+        "name": "upsample_0_depthwise",
+        "kind": "causal_conv1d",
+        "input_elements": 88064,
+        "output_elements": 88064,
+        "weight_elements": 8192,
+        "matrix_flops": 1232896,
+        "scalar_flops": 88064,
+        "special_ops": {},
+        "weight_interface_bytes": 32768,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 352256,
+        "input_length": 86,
+        "output_length": 86,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1024,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "upsample_0_layernorm",
+        "kind": "normalization",
+        "input_elements": 88064,
+        "output_elements": 88064,
+        "weight_elements": 2048,
+        "matrix_flops": 0,
+        "scalar_flops": 616534,
+        "special_ops": {
+          "rsqrt": 86
+        },
+        "weight_interface_bytes": 8192,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 352256
+      },
+      {
+        "name": "upsample_0_pointwise1",
+        "kind": "linear",
+        "input_elements": 88064,
+        "output_elements": 352256,
+        "weight_elements": 4198400,
+        "matrix_flops": 721420288,
+        "scalar_flops": 352256,
+        "special_ops": {},
+        "weight_interface_bytes": 16793600,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 1409024
+      },
+      {
+        "name": "upsample_0_gelu",
+        "kind": "activation",
+        "input_elements": 352256,
+        "output_elements": 352256,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {
+          "gelu": 352256
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 1409024,
+        "activation_write_bytes": 1409024
+      },
+      {
+        "name": "upsample_0_pointwise2",
+        "kind": "linear",
+        "input_elements": 352256,
+        "output_elements": 88064,
+        "weight_elements": 4195328,
+        "matrix_flops": 721420288,
+        "scalar_flops": 88064,
+        "special_ops": {},
+        "weight_interface_bytes": 16781312,
+        "activation_read_bytes": 1409024,
+        "activation_write_bytes": 352256
+      },
+      {
+        "name": "upsample_0_gamma_residual",
+        "kind": "residual",
+        "input_elements": 176128,
+        "output_elements": 88064,
+        "weight_elements": 1024,
+        "matrix_flops": 0,
+        "scalar_flops": 176128,
+        "special_ops": {},
+        "weight_interface_bytes": 4096,
+        "activation_read_bytes": 704512,
+        "activation_write_bytes": 352256
+      },
+      {
+        "name": "upsample_1",
+        "kind": "conv_transpose1d",
+        "input_elements": 88064,
+        "output_elements": 176128,
+        "weight_elements": 2098176,
+        "matrix_flops": 360710144,
+        "scalar_flops": 176128,
+        "special_ops": {},
+        "weight_interface_bytes": 8392704,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 704512,
+        "input_length": 86,
+        "output_length_before_crop": 172,
+        "retained_length": 172,
+        "kernel": 2,
+        "stride": 2,
+        "note": "Full source ConvTranspose before two-sided crop; scattered contribution multiply/add count."
+      },
+      {
+        "name": "upsample_1_crop_contiguous",
+        "kind": "copy",
+        "input_elements": 176128,
+        "output_elements": 176128,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 704512,
+        "activation_write_bytes": 704512,
+        "crop_each_side": null,
+        "crop_left": 0,
+        "crop_right": 0,
+        "note": "Retained slice materialized by contiguous(); Fish trims only right, Omni both sides."
+      },
+      {
+        "name": "upsample_1_depthwise",
+        "kind": "causal_conv1d",
+        "input_elements": 176128,
+        "output_elements": 176128,
+        "weight_elements": 8192,
+        "matrix_flops": 2465792,
+        "scalar_flops": 176128,
+        "special_ops": {},
+        "weight_interface_bytes": 32768,
+        "activation_read_bytes": 704512,
+        "activation_write_bytes": 704512,
+        "input_length": 172,
+        "output_length": 172,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1024,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "upsample_1_layernorm",
+        "kind": "normalization",
+        "input_elements": 176128,
+        "output_elements": 176128,
+        "weight_elements": 2048,
+        "matrix_flops": 0,
+        "scalar_flops": 1233068,
+        "special_ops": {
+          "rsqrt": 172
+        },
+        "weight_interface_bytes": 8192,
+        "activation_read_bytes": 704512,
+        "activation_write_bytes": 704512
+      },
+      {
+        "name": "upsample_1_pointwise1",
+        "kind": "linear",
+        "input_elements": 176128,
+        "output_elements": 704512,
+        "weight_elements": 4198400,
+        "matrix_flops": 1442840576,
+        "scalar_flops": 704512,
+        "special_ops": {},
+        "weight_interface_bytes": 16793600,
+        "activation_read_bytes": 704512,
+        "activation_write_bytes": 2818048
+      },
+      {
+        "name": "upsample_1_gelu",
+        "kind": "activation",
+        "input_elements": 704512,
+        "output_elements": 704512,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {
+          "gelu": 704512
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 2818048,
+        "activation_write_bytes": 2818048
+      },
+      {
+        "name": "upsample_1_pointwise2",
+        "kind": "linear",
+        "input_elements": 704512,
+        "output_elements": 176128,
+        "weight_elements": 4195328,
+        "matrix_flops": 1442840576,
+        "scalar_flops": 176128,
+        "special_ops": {},
+        "weight_interface_bytes": 16781312,
+        "activation_read_bytes": 2818048,
+        "activation_write_bytes": 704512
+      },
+      {
+        "name": "upsample_1_gamma_residual",
+        "kind": "residual",
+        "input_elements": 352256,
+        "output_elements": 176128,
+        "weight_elements": 1024,
+        "matrix_flops": 0,
+        "scalar_flops": 352256,
+        "special_ops": {},
+        "weight_interface_bytes": 4096,
+        "activation_read_bytes": 1409024,
+        "activation_write_bytes": 704512
+      },
+      {
+        "name": "decoder_input_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 11011584,
+        "output_elements": 11010048,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 33030144,
+        "special_ops": {
+          "sqrt": 1536
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 44046336,
+        "activation_write_bytes": 44040192,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_input",
+        "kind": "causal_conv1d",
+        "input_elements": 176128,
+        "output_elements": 264192,
+        "weight_elements": 11011584,
+        "matrix_flops": 3787456512,
+        "scalar_flops": 264192,
+        "special_ops": {},
+        "weight_interface_bytes": 44046336,
+        "activation_read_bytes": 704512,
+        "activation_write_bytes": 1056768,
+        "input_length": 172,
+        "output_length": 172,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_snake",
+        "kind": "snake1d",
+        "input_elements": 264192,
+        "output_elements": 264192,
+        "weight_elements": 1536,
+        "matrix_flops": 0,
+        "scalar_flops": 1059840,
+        "special_ops": {
+          "sin": 264192
+        },
+        "weight_interface_bytes": 6144,
+        "activation_read_bytes": 1056768,
+        "activation_write_bytes": 1056768,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_upsample_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 18875904,
+        "output_elements": 18874368,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 56623104,
+        "special_ops": {
+          "sqrt": 1536
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 75503616,
+        "activation_write_bytes": 75497472,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_upsample",
+        "kind": "conv_transpose1d",
+        "input_elements": 264192,
+        "output_elements": 1062912,
+        "weight_elements": 18875136,
+        "matrix_flops": 6492782592,
+        "scalar_flops": 1062912,
+        "special_ops": {},
+        "weight_interface_bytes": 75500544,
+        "activation_read_bytes": 1056768,
+        "activation_write_bytes": 4251648,
+        "input_length": 172,
+        "output_length_before_crop": 1384,
+        "retained_length": 1376,
+        "kernel": 16,
+        "stride": 8,
+        "note": "Full source ConvTranspose before two-sided crop; scattered contribution multiply/add count."
+      },
+      {
+        "name": "decoder_0_upsample_crop_contiguous",
+        "kind": "copy",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "crop_each_side": null,
+        "crop_left": 0,
+        "crop_right": 8,
+        "note": "Retained slice materialized by contiguous(); Fish trims only right, Omni both sides."
+      },
+      {
+        "name": "decoder_0_residual_d1_snake1",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_residual_d1_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 4129536,
+        "output_elements": 4128768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 12386304,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 16518144,
+        "activation_write_bytes": 16515072,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_residual_d1_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 4129536,
+        "matrix_flops": 11362369536,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 16518144,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "input_length": 1376,
+        "output_length": 1376,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_residual_d1_snake2",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_residual_d1_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 590592,
+        "output_elements": 589824,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1769472,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 2362368,
+        "activation_write_bytes": 2359296,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_residual_d1_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 590592,
+        "matrix_flops": 1623195648,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 2362368,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "input_length": 1376,
+        "output_length": 1376,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_residual_d1_add",
+        "kind": "residual",
+        "input_elements": 2113536,
+        "output_elements": 1056768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 8454144,
+        "activation_write_bytes": 4227072
+      },
+      {
+        "name": "decoder_0_residual_d3_snake1",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_residual_d3_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 4129536,
+        "output_elements": 4128768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 12386304,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 16518144,
+        "activation_write_bytes": 16515072,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_residual_d3_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 4129536,
+        "matrix_flops": 11362369536,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 16518144,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "input_length": 1376,
+        "output_length": 1376,
+        "kernel": 7,
+        "dilation": 3,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_residual_d3_snake2",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_residual_d3_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 590592,
+        "output_elements": 589824,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1769472,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 2362368,
+        "activation_write_bytes": 2359296,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_residual_d3_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 590592,
+        "matrix_flops": 1623195648,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 2362368,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "input_length": 1376,
+        "output_length": 1376,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_residual_d3_add",
+        "kind": "residual",
+        "input_elements": 2113536,
+        "output_elements": 1056768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 8454144,
+        "activation_write_bytes": 4227072
+      },
+      {
+        "name": "decoder_0_residual_d9_snake1",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_residual_d9_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 4129536,
+        "output_elements": 4128768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 12386304,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 16518144,
+        "activation_write_bytes": 16515072,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_residual_d9_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 4129536,
+        "matrix_flops": 11362369536,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 16518144,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "input_length": 1376,
+        "output_length": 1376,
+        "kernel": 7,
+        "dilation": 9,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_residual_d9_snake2",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_0_residual_d9_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 590592,
+        "output_elements": 589824,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1769472,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 2362368,
+        "activation_write_bytes": 2359296,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_0_residual_d9_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 590592,
+        "matrix_flops": 1623195648,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 2362368,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "input_length": 1376,
+        "output_length": 1376,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_0_residual_d9_add",
+        "kind": "residual",
+        "input_elements": 2113536,
+        "output_elements": 1056768,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1056768,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 8454144,
+        "activation_write_bytes": 4227072
+      },
+      {
+        "name": "decoder_1_snake",
+        "kind": "snake1d",
+        "input_elements": 1056768,
+        "output_elements": 1056768,
+        "weight_elements": 768,
+        "matrix_flops": 0,
+        "scalar_flops": 4228608,
+        "special_ops": {
+          "sin": 1056768
+        },
+        "weight_interface_bytes": 3072,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 4227072,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_upsample_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 4719360,
+        "output_elements": 4718592,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 14155776,
+        "special_ops": {
+          "sqrt": 768
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 18877440,
+        "activation_write_bytes": 18874368,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_upsample",
+        "kind": "conv_transpose1d",
+        "input_elements": 1056768,
+        "output_elements": 4230144,
+        "weight_elements": 4718976,
+        "matrix_flops": 12985565184,
+        "scalar_flops": 4230144,
+        "special_ops": {},
+        "weight_interface_bytes": 18875904,
+        "activation_read_bytes": 4227072,
+        "activation_write_bytes": 16920576,
+        "input_length": 1376,
+        "output_length_before_crop": 11016,
+        "retained_length": 11008,
+        "kernel": 16,
+        "stride": 8,
+        "note": "Full source ConvTranspose before two-sided crop; scattered contribution multiply/add count."
+      },
+      {
+        "name": "decoder_1_upsample_crop_contiguous",
+        "kind": "copy",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "crop_each_side": null,
+        "crop_left": 0,
+        "crop_right": 8,
+        "note": "Retained slice materialized by contiguous(); Fish trims only right, Omni both sides."
+      },
+      {
+        "name": "decoder_1_residual_d1_snake1",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_residual_d1_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 1032576,
+        "output_elements": 1032192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 3096576,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 4130304,
+        "activation_write_bytes": 4128768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_residual_d1_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 1032576,
+        "matrix_flops": 22724739072,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 4130304,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "input_length": 11008,
+        "output_length": 11008,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_1_residual_d1_snake2",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_residual_d1_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 147840,
+        "output_elements": 147456,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 442368,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 591360,
+        "activation_write_bytes": 589824,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_residual_d1_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 147840,
+        "matrix_flops": 3246391296,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 591360,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "input_length": 11008,
+        "output_length": 11008,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_1_residual_d1_add",
+        "kind": "residual",
+        "input_elements": 8454144,
+        "output_elements": 4227072,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 16908288
+      },
+      {
+        "name": "decoder_1_residual_d3_snake1",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_residual_d3_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 1032576,
+        "output_elements": 1032192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 3096576,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 4130304,
+        "activation_write_bytes": 4128768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_residual_d3_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 1032576,
+        "matrix_flops": 22724739072,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 4130304,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "input_length": 11008,
+        "output_length": 11008,
+        "kernel": 7,
+        "dilation": 3,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_1_residual_d3_snake2",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_residual_d3_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 147840,
+        "output_elements": 147456,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 442368,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 591360,
+        "activation_write_bytes": 589824,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_residual_d3_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 147840,
+        "matrix_flops": 3246391296,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 591360,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "input_length": 11008,
+        "output_length": 11008,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_1_residual_d3_add",
+        "kind": "residual",
+        "input_elements": 8454144,
+        "output_elements": 4227072,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 16908288
+      },
+      {
+        "name": "decoder_1_residual_d9_snake1",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_residual_d9_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 1032576,
+        "output_elements": 1032192,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 3096576,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 4130304,
+        "activation_write_bytes": 4128768,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_residual_d9_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 1032576,
+        "matrix_flops": 22724739072,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 4130304,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "input_length": 11008,
+        "output_length": 11008,
+        "kernel": 7,
+        "dilation": 9,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_1_residual_d9_snake2",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_1_residual_d9_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 147840,
+        "output_elements": 147456,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 442368,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 591360,
+        "activation_write_bytes": 589824,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_1_residual_d9_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 147840,
+        "matrix_flops": 3246391296,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 591360,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "input_length": 11008,
+        "output_length": 11008,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_1_residual_d9_add",
+        "kind": "residual",
+        "input_elements": 8454144,
+        "output_elements": 4227072,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 4227072,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 16908288
+      },
+      {
+        "name": "decoder_2_snake",
+        "kind": "snake1d",
+        "input_elements": 4227072,
+        "output_elements": 4227072,
+        "weight_elements": 384,
+        "matrix_flops": 0,
+        "scalar_flops": 16909056,
+        "special_ops": {
+          "sin": 4227072
+        },
+        "weight_interface_bytes": 1536,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 16908288,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_upsample_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 590208,
+        "output_elements": 589824,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 1769472,
+        "special_ops": {
+          "sqrt": 384
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 2360832,
+        "activation_write_bytes": 2359296,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_upsample",
+        "kind": "conv_transpose1d",
+        "input_elements": 4227072,
+        "output_elements": 8454912,
+        "weight_elements": 590016,
+        "matrix_flops": 12985565184,
+        "scalar_flops": 8454912,
+        "special_ops": {},
+        "weight_interface_bytes": 2360064,
+        "activation_read_bytes": 16908288,
+        "activation_write_bytes": 33819648,
+        "input_length": 11008,
+        "output_length_before_crop": 44036,
+        "retained_length": 44032,
+        "kernel": 8,
+        "stride": 4,
+        "note": "Full source ConvTranspose before two-sided crop; scattered contribution multiply/add count."
+      },
+      {
+        "name": "decoder_2_upsample_crop_contiguous",
+        "kind": "copy",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "crop_each_side": null,
+        "crop_left": 0,
+        "crop_right": 4,
+        "note": "Retained slice materialized by contiguous(); Fish trims only right, Omni both sides."
+      },
+      {
+        "name": "decoder_2_residual_d1_snake1",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_residual_d1_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 258240,
+        "output_elements": 258048,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 774144,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 1032960,
+        "activation_write_bytes": 1032192,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_residual_d1_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 258240,
+        "matrix_flops": 22724739072,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 1032960,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 44032,
+        "output_length": 44032,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_2_residual_d1_snake2",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_residual_d1_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 37056,
+        "output_elements": 36864,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 110592,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 148224,
+        "activation_write_bytes": 147456,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_residual_d1_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 37056,
+        "matrix_flops": 3246391296,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 148224,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 44032,
+        "output_length": 44032,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_2_residual_d1_add",
+        "kind": "residual",
+        "input_elements": 16908288,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 67633152,
+        "activation_write_bytes": 33816576
+      },
+      {
+        "name": "decoder_2_residual_d3_snake1",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_residual_d3_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 258240,
+        "output_elements": 258048,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 774144,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 1032960,
+        "activation_write_bytes": 1032192,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_residual_d3_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 258240,
+        "matrix_flops": 22724739072,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 1032960,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 44032,
+        "output_length": 44032,
+        "kernel": 7,
+        "dilation": 3,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_2_residual_d3_snake2",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_residual_d3_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 37056,
+        "output_elements": 36864,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 110592,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 148224,
+        "activation_write_bytes": 147456,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_residual_d3_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 37056,
+        "matrix_flops": 3246391296,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 148224,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 44032,
+        "output_length": 44032,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_2_residual_d3_add",
+        "kind": "residual",
+        "input_elements": 16908288,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 67633152,
+        "activation_write_bytes": 33816576
+      },
+      {
+        "name": "decoder_2_residual_d9_snake1",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_residual_d9_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 258240,
+        "output_elements": 258048,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 774144,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 1032960,
+        "activation_write_bytes": 1032192,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_residual_d9_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 258240,
+        "matrix_flops": 22724739072,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 1032960,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 44032,
+        "output_length": 44032,
+        "kernel": 7,
+        "dilation": 9,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_2_residual_d9_snake2",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_2_residual_d9_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 37056,
+        "output_elements": 36864,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 110592,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 148224,
+        "activation_write_bytes": 147456,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_2_residual_d9_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 37056,
+        "matrix_flops": 3246391296,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 148224,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 44032,
+        "output_length": 44032,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_2_residual_d9_add",
+        "kind": "residual",
+        "input_elements": 16908288,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 67633152,
+        "activation_write_bytes": 33816576
+      },
+      {
+        "name": "decoder_3_snake",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 192,
+        "matrix_flops": 0,
+        "scalar_flops": 33816960,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 768,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_upsample_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 73920,
+        "output_elements": 73728,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 221184,
+        "special_ops": {
+          "sqrt": 192
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 295680,
+        "activation_write_bytes": 294912,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_upsample",
+        "kind": "conv_transpose1d",
+        "input_elements": 8454144,
+        "output_elements": 8454336,
+        "weight_elements": 73824,
+        "matrix_flops": 6492782592,
+        "scalar_flops": 8454336,
+        "special_ops": {},
+        "weight_interface_bytes": 295296,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33817344,
+        "input_length": 44032,
+        "output_length_before_crop": 88066,
+        "retained_length": 88064,
+        "kernel": 4,
+        "stride": 2,
+        "note": "Full source ConvTranspose before two-sided crop; scattered contribution multiply/add count."
+      },
+      {
+        "name": "decoder_3_upsample_crop_contiguous",
+        "kind": "copy",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "crop_each_side": null,
+        "crop_left": 0,
+        "crop_right": 2,
+        "note": "Retained slice materialized by contiguous(); Fish trims only right, Omni both sides."
+      },
+      {
+        "name": "decoder_3_residual_d1_snake1",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_residual_d1_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 64608,
+        "output_elements": 64512,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 193536,
+        "special_ops": {
+          "sqrt": 96
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 258432,
+        "activation_write_bytes": 258048,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_residual_d1_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 64608,
+        "matrix_flops": 11362369536,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 258432,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_3_residual_d1_snake2",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_residual_d1_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9312,
+        "output_elements": 9216,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 27648,
+        "special_ops": {
+          "sqrt": 96
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 37248,
+        "activation_write_bytes": 36864,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_residual_d1_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 9312,
+        "matrix_flops": 1623195648,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 37248,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_3_residual_d1_add",
+        "kind": "residual",
+        "input_elements": 16908288,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 67633152,
+        "activation_write_bytes": 33816576
+      },
+      {
+        "name": "decoder_3_residual_d3_snake1",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_residual_d3_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 64608,
+        "output_elements": 64512,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 193536,
+        "special_ops": {
+          "sqrt": 96
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 258432,
+        "activation_write_bytes": 258048,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_residual_d3_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 64608,
+        "matrix_flops": 11362369536,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 258432,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 7,
+        "dilation": 3,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_3_residual_d3_snake2",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_residual_d3_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9312,
+        "output_elements": 9216,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 27648,
+        "special_ops": {
+          "sqrt": 96
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 37248,
+        "activation_write_bytes": 36864,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_residual_d3_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 9312,
+        "matrix_flops": 1623195648,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 37248,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_3_residual_d3_add",
+        "kind": "residual",
+        "input_elements": 16908288,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 67633152,
+        "activation_write_bytes": 33816576
+      },
+      {
+        "name": "decoder_3_residual_d9_snake1",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_residual_d9_conv1_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 64608,
+        "output_elements": 64512,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 193536,
+        "special_ops": {
+          "sqrt": 96
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 258432,
+        "activation_write_bytes": 258048,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_residual_d9_conv1",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 64608,
+        "matrix_flops": 11362369536,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 258432,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 7,
+        "dilation": 9,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_3_residual_d9_snake2",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "decoder_3_residual_d9_conv2_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 9312,
+        "output_elements": 9216,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 27648,
+        "special_ops": {
+          "sqrt": 96
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 37248,
+        "activation_write_bytes": 36864,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "decoder_3_residual_d9_conv2",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 9312,
+        "matrix_flops": 1623195648,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 37248,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 1,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "decoder_3_residual_d9_add",
+        "kind": "residual",
+        "input_elements": 16908288,
+        "output_elements": 8454144,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 8454144,
+        "special_ops": {},
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 67633152,
+        "activation_write_bytes": 33816576
+      },
+      {
+        "name": "output_snake",
+        "kind": "snake1d",
+        "input_elements": 8454144,
+        "output_elements": 8454144,
+        "weight_elements": 96,
+        "matrix_flops": 0,
+        "scalar_flops": 33816768,
+        "special_ops": {
+          "sin": 8454144
+        },
+        "weight_interface_bytes": 384,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 33816576,
+        "note": "Fish uses alpha directly (no exp); Omni exponentiates alpha/beta. Both apply reciprocal, sin-square, scale and residual add."
+      },
+      {
+        "name": "output_conv_weight_norm",
+        "kind": "weight_normalization",
+        "input_elements": 673,
+        "output_elements": 672,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 2016,
+        "special_ops": {
+          "sqrt": 1
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 2692,
+        "activation_write_bytes": 2688,
+        "note": "Declared g*v/||v|| per dim-0 group; source weight_norm is not removed by the inference loader."
+      },
+      {
+        "name": "output_conv",
+        "kind": "causal_conv1d",
+        "input_elements": 8454144,
+        "output_elements": 88064,
+        "weight_elements": 673,
+        "matrix_flops": 118358016,
+        "scalar_flops": 88064,
+        "special_ops": {},
+        "weight_interface_bytes": 2692,
+        "activation_read_bytes": 33816576,
+        "activation_write_bytes": 352256,
+        "input_length": 88064,
+        "output_length": 88064,
+        "kernel": 7,
+        "dilation": 1,
+        "groups": 1,
+        "note": "Length-preserving causal padding. Matrix work includes padded-zero products; bias counted separately."
+      },
+      {
+        "name": "wave_tanh",
+        "kind": "activation",
+        "input_elements": 88064,
+        "output_elements": 88064,
+        "weight_elements": 0,
+        "matrix_flops": 0,
+        "scalar_flops": 0,
+        "special_ops": {
+          "tanh": 88064
+        },
+        "weight_interface_bytes": 0,
+        "activation_read_bytes": 352256,
+        "activation_write_bytes": 352256
+      }
+    ],
+    "summary": {
+      "matrix_flops": 290892476416,
+      "scalar_flops": 1021454525,
+      "weight_interface_bytes": 736979780,
+      "activation_read_bytes": 2244975844,
+      "activation_write_bytes": 1835815536,
+      "interface_bytes": 4817771160
+    },
+    "output_samples_per_request": 88064,
+    "coverage": "Ordered decoder graph under declared conv arithmetic/operator interfaces; Fish includes RVQ post-transformer, Omni pre-transformer is outside this helper. Special primitives separate; not measured kernel work."
+  }
+}
+```
+
+
+## 固定来源
+
+- [research/generative-audio-analysis/transformers/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py](https://raw.githubusercontent.com/huggingface/transformers/8cb5963cc22174954e7dca2c0a3320b7dc2f4edc/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py)；SHA256 `809eaeb4d40cb0e59965a85b5f85ddc07e9ab7b6cdae84972c711f8cdadec296`。
+- [research/generative-audio-analysis/transformers/src/transformers/models/qwen3_omni_moe/configuration_qwen3_omni_moe.py](https://raw.githubusercontent.com/huggingface/transformers/8cb5963cc22174954e7dca2c0a3320b7dc2f4edc/src/transformers/models/qwen3_omni_moe/configuration_qwen3_omni_moe.py)；SHA256 `779bf4b816425448d5d3a2ffa57928d1c7b7c10e2d66b09371fceaee62bcbf89`。
+- [research/generative-audio-analysis/fish/fish_speech/models/text2semantic/llama.py](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/fish_speech/models/text2semantic/llama.py)；SHA256 `b7dc3c039ddcbc05e445293e5d4babb1e80340b8a2944747fab0cf44c0919852`。
+- [research/generative-audio-analysis/fish/fish_speech/models/text2semantic/inference.py](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/fish_speech/models/text2semantic/inference.py)；SHA256 `9c85ce70e93dd990ac53a0831bf6d909d74eb434de5608f54fe00bfc129d4cae`。
+- [research/generative-audio-analysis/fish/fish_speech/models/dac/modded_dac.py](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/fish_speech/models/dac/modded_dac.py)；SHA256 `a08407421ee85d8af28377d6a14d989b5a17a985c9719f8b5701cd0a845840c0`。
+- [research/generative-audio-analysis/fish/fish_speech/models/dac/inference.py](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/fish_speech/models/dac/inference.py)；SHA256 `a34210e04904a2be93eb09c46878e740837661318a40ee0e9070148ce1401e60`。
+- [research/generative-audio-analysis/fish/fish_speech/models/dac/rvq.py](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/fish_speech/models/dac/rvq.py)；SHA256 `a4d38e529846473c712dd1b2f5eaa889eb0233fd56228799c168060f335c0246`。
+- [research/generative-audio-analysis/fish/fish_speech/configs/modded_dac_vq.yaml](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/fish_speech/configs/modded_dac_vq.yaml)；SHA256 `73321408579c372149620d877f0dfb841cf70465758a535f7243e1cb6553d56a`。
+- [research/generative-audio-analysis/transformers-current/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py](https://raw.githubusercontent.com/huggingface/transformers/cbc1651a032b923da7f4b44b3d0e6f68e6ba6b55/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py)；SHA256 `0ec28dd7714f09de8749edc958c25c0ebcc0628c9c2a0dca3abd905e7cddab04`。
+- [research/generative-audio-analysis/fish/pyproject.toml](https://raw.githubusercontent.com/fishaudio/fish-speech/befe4001745417f8c42131739d862b8a6fdbd15a/pyproject.toml)；SHA256 `7fdd2e4f01746b884b368b7003c315d285cf86a36031035b3f28d7aafe68ea15`。
+- [research/generative-audio-analysis/descript/dac/nn/quantize.py](https://raw.githubusercontent.com/descriptinc/descript-audio-codec/c7cfc5d2647e26471dc394f95846a0830e7bec34/dac/nn/quantize.py)；SHA256 `e2dc61f32f6123aa48a0aeb934a0d9a41ea29a5eae8db28119c791885c9f1b07`。
+- [research/generative-audio-analysis/descript/dac/nn/layers.py](https://raw.githubusercontent.com/descriptinc/descript-audio-codec/c7cfc5d2647e26471dc394f95846a0830e7bec34/dac/nn/layers.py)；SHA256 `ec2649649d787b166a138d5ad9dcd585aeabbcd93670771b30cbbbab731c4b63`。

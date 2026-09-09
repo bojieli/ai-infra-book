@@ -1,0 +1,46 @@
+# periodic-fluid-queue — 
+
+输入：`{"buffer_bytes": null, "capacity_bytes_per_second": 50000000000, "initial_queue_bytes": 0, "jobs": [{"offset_ns": 0, "on_ns": 20000000, "period_ns": 100000000, "rate_bytes_per_second": 40000000000}, {"offset_ns": 20000000, "on_ns": 20000000, "period_ns": 100000000, "rate_bytes_per_second": 40000000000}], "window_ns": 100000000}`
+
+数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
+
+| 结果 | 值 |
+| --- | ---: |
+| average_offered_bytes_per_second | 16,000,000,000.0 |
+| peak_offered_bytes_per_second | 40,000,000,000 |
+| arrived_exact_bytes | `"1600000000"` |
+| served_exact_bytes | `"1600000000"` |
+| excess_demand_exact_bytes | `"0"` |
+| dropped_exact_bytes | `"0"` |
+| dropped_bytes | 0.0 |
+| peak_queue_exact_bytes | `"0"` |
+| peak_queue_bytes | 0.0 |
+| final_queue_exact_bytes | `"0"` |
+| final_queue_bytes | 0.0 |
+| queue_area_exact_byte_ns | `"0"` |
+| mean_queue_bytes | 0.0 |
+| compatibility_exact | `"1"` |
+| compatibility | 1.0 |
+| last_drain_exact_ns | `null` |
+| stop_arrivals_final_drain_exact_ns | `"0"` |
+| peak_queue_virtual_wait_exact_ns | `"0"` |
+| actual_switch_queue_bytes | `null` |
+| actual_job_completion_ns | `null` |
+
+| 开始 ms | 结束 ms | 到达 GB/s | 初始队列 MB | 末尾队列 MB | 丢弃 bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.000000 | 20.000000 | 40.000000 | 0.000000 | 0.000000 | 0 |
+| 20.000000 | 40.000000 | 40.000000 | 0.000000 | 0.000000 | 0 |
+| 40.000000 | 100.000000 | 0.000000 | 0.000000 | 0.000000 | 0 |
+
+计量条件：
+
+- 默认两作业周期100ms、持续20ms、各40GB/s，共用50GB/s；均为外生教学到达速率，不是官方网卡规格或CASSINI实测。默认观察窗口为周期最小公倍数。
+- 每个周期的on区间按半开区间处理，offset按周期取模，跨窗口起点的脉冲尾部会纳入；观察起点队列由initial_queue_bytes明确给定，默认零，不冒称周期稳态。
+- 流体队列q=max(0,q+(arrival-capacity)*dt)，有积压时满速服务，无积压时不凭空发送。有限buffer_bytes将队列截断，多余流体字节记为丢弃；精确有理数在区间内部插入排空／填满时刻，再积分队列面积。该丢弃是流体近似，不是包级队列或拥塞控制实现。
+- excess_demand是正超额速率积分，peak_queue是带排空过程的实际分析积压，二者一般不同。compatibility=1-excess/(capacity*window)，可为负，不是概率。
+- 末尾排空时间假设观察结束后停止所有新输入；周期流继续时不能直接使用。peak_queue/capacity只是流体FIFO虚拟等待上界口径，不是实际请求或训练步耗时。
+- 不模拟DCQCN/PFC、通信依赖或GPU反馈改变发送时刻，不将600MB教学积压写成真实交换机队列；稳定错峰还需实际漂移与反馈校准。
+
+固定来源：
+

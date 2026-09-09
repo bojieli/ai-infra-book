@@ -1,0 +1,659 @@
+# Architecture tile work
+
+Declared tile arithmetic, not measured hardware utilization.
+
+| Variant / operator | M,N,K | Count | Valid FLOPs | Rectangular FLOPs | Padded FLOPs |
+|---|---|---:|---:|---:|---:|
+| deeper_same_width / q_proj | [129, 4096, 4096] | 48 | 207769042944 | 207769042944 | 309237645312 |
+| deeper_same_width / k_proj | [129, 1024, 4096] | 48 | 51942260736 | 51942260736 | 77309411328 |
+| deeper_same_width / v_proj | [129, 1024, 4096] | 48 | 51942260736 | 51942260736 | 77309411328 |
+| deeper_same_width / qk | [129, 129, 128] | 1536 | 3297116160 | 6543507456 | 19327352832 |
+| deeper_same_width / pv | [129, 128, 129] | 1536 | 3297116160 | 6543507456 | 14495514624 |
+| deeper_same_width / o_proj | [129, 4096, 4096] | 48 | 207769042944 | 207769042944 | 309237645312 |
+| deeper_same_width / gate_proj | [129, 8320, 4096] | 48 | 422030868480 | 422030868480 | 628138967040 |
+| deeper_same_width / up_proj | [129, 8320, 4096] | 48 | 422030868480 | 422030868480 | 628138967040 |
+| deeper_same_width / down_proj | [129, 4096, 8320] | 48 | 422030868480 | 422030868480 | 628138967040 |
+| deeper_same_width / lm_head | [1, 151936, 4096] | 1 | 1244659712 | 1244659712 | 79658221568 |
+| shallower_wider / q_proj | [129, 5120, 5120] | 24 | 162319564800 | 162319564800 | 241591910400 |
+| shallower_wider / k_proj | [129, 1024, 5120] | 24 | 32463912960 | 32463912960 | 48318382080 |
+| shallower_wider / v_proj | [129, 1024, 5120] | 24 | 32463912960 | 32463912960 | 48318382080 |
+| shallower_wider / qk | [129, 129, 128] | 960 | 2060697600 | 4089692160 | 12079595520 |
+| shallower_wider / pv | [129, 128, 129] | 960 | 2060697600 | 4089692160 | 9059696640 |
+| shallower_wider / o_proj | [129, 5120, 5120] | 24 | 162319564800 | 162319564800 | 241591910400 |
+| shallower_wider / gate_proj | [129, 13952, 5120] | 24 | 442320814080 | 442320814080 | 658337955840 |
+| shallower_wider / up_proj | [129, 13952, 5120] | 24 | 442320814080 | 442320814080 | 658337955840 |
+| shallower_wider / down_proj | [129, 5120, 13952] | 24 | 442320814080 | 442320814080 | 658337955840 |
+| shallower_wider / lm_head | [1, 151936, 5120] | 1 | 1555824640 | 1555824640 | 99572776960 |
+
+```json
+{
+  "schema": "architecture-tile-work-v1",
+  "scenario": {
+    "batch": 1,
+    "tokens": 129,
+    "history": 0,
+    "tile_m": 64,
+    "tile_n": 128,
+    "tile_k": 64,
+    "ffn_alignment": 128,
+    "matrix_rate_flops_per_second": 100000000000000.0,
+    "variant_rates": null
+  },
+  "sources": [
+    {
+      "file": "configs/models/qwen3-8b/config.json",
+      "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"
+    },
+    {
+      "file": "sources/qwen3-8b/model.safetensors.index.json",
+      "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc"
+    },
+    {
+      "file": "sources/qwen3/modeling_qwen3.py",
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py",
+      "revision": "0720e206c6ba28887e4d60ef60a6a089f6c1cc76",
+      "sha256": "704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2"
+    },
+    {
+      "file": "sources/qwen3/modeling_qwen3_moe.py",
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+      "revision": "0720e206c6ba28887e4d60ef60a6a089f6c1cc76",
+      "sha256": "3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8"
+    }
+  ],
+  "variants": [
+    {
+      "name": "deeper_same_width",
+      "architecture": {
+        "layers": 48,
+        "hidden": 4096,
+        "ffn": 8320,
+        "heads": 32,
+        "head_dim": 128
+      },
+      "parameters": 8165670912,
+      "parameter_delta": -25064448,
+      "matrices": [
+        {
+          "name": "q_proj",
+          "mnk": [
+            129,
+            4096,
+            4096
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 4328521728,
+          "rectangular_per_instance_flops": 4328521728,
+          "padded_per_instance_flops": 6442450944,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 64,
+            "n_blocks": 32,
+            "output_tiles": 96,
+            "valid_matrix_flops": 4328521728,
+            "fully_padded_matrix_flops": 6442450944
+          },
+          "valid_flops": 207769042944,
+          "rectangular_flops": 207769042944,
+          "padded_flops": 309237645312,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 101468602368,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "k_proj",
+          "mnk": [
+            129,
+            1024,
+            4096
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 1082130432,
+          "rectangular_per_instance_flops": 1082130432,
+          "padded_per_instance_flops": 1610612736,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 64,
+            "n_blocks": 8,
+            "output_tiles": 24,
+            "valid_matrix_flops": 1082130432,
+            "fully_padded_matrix_flops": 1610612736
+          },
+          "valid_flops": 51942260736,
+          "rectangular_flops": 51942260736,
+          "padded_flops": 77309411328,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 25367150592,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "v_proj",
+          "mnk": [
+            129,
+            1024,
+            4096
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 1082130432,
+          "rectangular_per_instance_flops": 1082130432,
+          "padded_per_instance_flops": 1610612736,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 64,
+            "n_blocks": 8,
+            "output_tiles": 24,
+            "valid_matrix_flops": 1082130432,
+            "fully_padded_matrix_flops": 1610612736
+          },
+          "valid_flops": 51942260736,
+          "rectangular_flops": 51942260736,
+          "padded_flops": 77309411328,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 25367150592,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "qk",
+          "mnk": [
+            129,
+            129,
+            128
+          ],
+          "multiplicity": 1536,
+          "valid_per_instance_flops": 2146560,
+          "rectangular_per_instance_flops": 4260096,
+          "padded_per_instance_flops": 12582912,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 2,
+            "n_blocks": 2,
+            "output_tiles": 6,
+            "valid_matrix_flops": 4260096,
+            "fully_padded_matrix_flops": 12582912
+          },
+          "valid_flops": 3297116160,
+          "rectangular_flops": 6543507456,
+          "padded_flops": 19327352832,
+          "causal_rectangle_extra_flops": 3246391296,
+          "tile_padding_extra_flops": 12783845376,
+          "valid_fraction_of_padded_exact": "2795/16384"
+        },
+        {
+          "name": "pv",
+          "mnk": [
+            129,
+            128,
+            129
+          ],
+          "multiplicity": 1536,
+          "valid_per_instance_flops": 2146560,
+          "rectangular_per_instance_flops": 4260096,
+          "padded_per_instance_flops": 9437184,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 3,
+            "n_blocks": 1,
+            "output_tiles": 3,
+            "valid_matrix_flops": 4260096,
+            "fully_padded_matrix_flops": 9437184
+          },
+          "valid_flops": 3297116160,
+          "rectangular_flops": 6543507456,
+          "padded_flops": 14495514624,
+          "causal_rectangle_extra_flops": 3246391296,
+          "tile_padding_extra_flops": 7952007168,
+          "valid_fraction_of_padded_exact": "2795/12288"
+        },
+        {
+          "name": "o_proj",
+          "mnk": [
+            129,
+            4096,
+            4096
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 4328521728,
+          "rectangular_per_instance_flops": 4328521728,
+          "padded_per_instance_flops": 6442450944,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 64,
+            "n_blocks": 32,
+            "output_tiles": 96,
+            "valid_matrix_flops": 4328521728,
+            "fully_padded_matrix_flops": 6442450944
+          },
+          "valid_flops": 207769042944,
+          "rectangular_flops": 207769042944,
+          "padded_flops": 309237645312,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 101468602368,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "gate_proj",
+          "mnk": [
+            129,
+            8320,
+            4096
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 8792309760,
+          "rectangular_per_instance_flops": 8792309760,
+          "padded_per_instance_flops": 13086228480,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 64,
+            "n_blocks": 65,
+            "output_tiles": 195,
+            "valid_matrix_flops": 8792309760,
+            "fully_padded_matrix_flops": 13086228480
+          },
+          "valid_flops": 422030868480,
+          "rectangular_flops": 422030868480,
+          "padded_flops": 628138967040,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 206108098560,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "up_proj",
+          "mnk": [
+            129,
+            8320,
+            4096
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 8792309760,
+          "rectangular_per_instance_flops": 8792309760,
+          "padded_per_instance_flops": 13086228480,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 64,
+            "n_blocks": 65,
+            "output_tiles": 195,
+            "valid_matrix_flops": 8792309760,
+            "fully_padded_matrix_flops": 13086228480
+          },
+          "valid_flops": 422030868480,
+          "rectangular_flops": 422030868480,
+          "padded_flops": 628138967040,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 206108098560,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "down_proj",
+          "mnk": [
+            129,
+            4096,
+            8320
+          ],
+          "multiplicity": 48,
+          "valid_per_instance_flops": 8792309760,
+          "rectangular_per_instance_flops": 8792309760,
+          "padded_per_instance_flops": 13086228480,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 130,
+            "n_blocks": 32,
+            "output_tiles": 96,
+            "valid_matrix_flops": 8792309760,
+            "fully_padded_matrix_flops": 13086228480
+          },
+          "valid_flops": 422030868480,
+          "rectangular_flops": 422030868480,
+          "padded_flops": 628138967040,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 206108098560,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "lm_head",
+          "mnk": [
+            1,
+            151936,
+            4096
+          ],
+          "multiplicity": 1,
+          "valid_per_instance_flops": 1244659712,
+          "rectangular_per_instance_flops": 1244659712,
+          "padded_per_instance_flops": 79658221568,
+          "tile_blocks": {
+            "m_blocks": 1,
+            "k_blocks": 64,
+            "n_blocks": 1187,
+            "output_tiles": 1187,
+            "valid_matrix_flops": 1244659712,
+            "fully_padded_matrix_flops": 79658221568
+          },
+          "valid_flops": 1244659712,
+          "rectangular_flops": 1244659712,
+          "padded_flops": 79658221568,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 78413561856,
+          "valid_fraction_of_padded_exact": "1/64"
+        }
+      ],
+      "valid_flops": 1793354104832,
+      "rectangular_flops": 1799846887424,
+      "padded_flops": 2770992103424,
+      "causal_rectangle_extra_flops": 6492782592,
+      "tile_padding_extra_flops": 971145216000,
+      "valid_fraction_of_padded_exact": "6841103/10570496",
+      "padded_over_valid_exact": "10570496/6841103",
+      "declared_padded_matrix_flops_per_second": 100000000000000.0,
+      "conditional_matrix_service_seconds": 0.02770992103424,
+      "effective_valid_matrix_flops_per_second": 64718845738175.38,
+      "full_forward_runtime_seconds": null,
+      "actual_tensor_core_utilization": null
+    },
+    {
+      "name": "shallower_wider",
+      "architecture": {
+        "layers": 24,
+        "hidden": 5120,
+        "ffn": 13952,
+        "heads": 40,
+        "head_dim": 128
+      },
+      "parameters": 8209296384,
+      "parameter_delta": 18561024,
+      "matrices": [
+        {
+          "name": "q_proj",
+          "mnk": [
+            129,
+            5120,
+            5120
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 6763315200,
+          "rectangular_per_instance_flops": 6763315200,
+          "padded_per_instance_flops": 10066329600,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 80,
+            "n_blocks": 40,
+            "output_tiles": 120,
+            "valid_matrix_flops": 6763315200,
+            "fully_padded_matrix_flops": 10066329600
+          },
+          "valid_flops": 162319564800,
+          "rectangular_flops": 162319564800,
+          "padded_flops": 241591910400,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 79272345600,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "k_proj",
+          "mnk": [
+            129,
+            1024,
+            5120
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 1352663040,
+          "rectangular_per_instance_flops": 1352663040,
+          "padded_per_instance_flops": 2013265920,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 80,
+            "n_blocks": 8,
+            "output_tiles": 24,
+            "valid_matrix_flops": 1352663040,
+            "fully_padded_matrix_flops": 2013265920
+          },
+          "valid_flops": 32463912960,
+          "rectangular_flops": 32463912960,
+          "padded_flops": 48318382080,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 15854469120,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "v_proj",
+          "mnk": [
+            129,
+            1024,
+            5120
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 1352663040,
+          "rectangular_per_instance_flops": 1352663040,
+          "padded_per_instance_flops": 2013265920,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 80,
+            "n_blocks": 8,
+            "output_tiles": 24,
+            "valid_matrix_flops": 1352663040,
+            "fully_padded_matrix_flops": 2013265920
+          },
+          "valid_flops": 32463912960,
+          "rectangular_flops": 32463912960,
+          "padded_flops": 48318382080,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 15854469120,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "qk",
+          "mnk": [
+            129,
+            129,
+            128
+          ],
+          "multiplicity": 960,
+          "valid_per_instance_flops": 2146560,
+          "rectangular_per_instance_flops": 4260096,
+          "padded_per_instance_flops": 12582912,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 2,
+            "n_blocks": 2,
+            "output_tiles": 6,
+            "valid_matrix_flops": 4260096,
+            "fully_padded_matrix_flops": 12582912
+          },
+          "valid_flops": 2060697600,
+          "rectangular_flops": 4089692160,
+          "padded_flops": 12079595520,
+          "causal_rectangle_extra_flops": 2028994560,
+          "tile_padding_extra_flops": 7989903360,
+          "valid_fraction_of_padded_exact": "2795/16384"
+        },
+        {
+          "name": "pv",
+          "mnk": [
+            129,
+            128,
+            129
+          ],
+          "multiplicity": 960,
+          "valid_per_instance_flops": 2146560,
+          "rectangular_per_instance_flops": 4260096,
+          "padded_per_instance_flops": 9437184,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 3,
+            "n_blocks": 1,
+            "output_tiles": 3,
+            "valid_matrix_flops": 4260096,
+            "fully_padded_matrix_flops": 9437184
+          },
+          "valid_flops": 2060697600,
+          "rectangular_flops": 4089692160,
+          "padded_flops": 9059696640,
+          "causal_rectangle_extra_flops": 2028994560,
+          "tile_padding_extra_flops": 4970004480,
+          "valid_fraction_of_padded_exact": "2795/12288"
+        },
+        {
+          "name": "o_proj",
+          "mnk": [
+            129,
+            5120,
+            5120
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 6763315200,
+          "rectangular_per_instance_flops": 6763315200,
+          "padded_per_instance_flops": 10066329600,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 80,
+            "n_blocks": 40,
+            "output_tiles": 120,
+            "valid_matrix_flops": 6763315200,
+            "fully_padded_matrix_flops": 10066329600
+          },
+          "valid_flops": 162319564800,
+          "rectangular_flops": 162319564800,
+          "padded_flops": 241591910400,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 79272345600,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "gate_proj",
+          "mnk": [
+            129,
+            13952,
+            5120
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 18430033920,
+          "rectangular_per_instance_flops": 18430033920,
+          "padded_per_instance_flops": 27430748160,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 80,
+            "n_blocks": 109,
+            "output_tiles": 327,
+            "valid_matrix_flops": 18430033920,
+            "fully_padded_matrix_flops": 27430748160
+          },
+          "valid_flops": 442320814080,
+          "rectangular_flops": 442320814080,
+          "padded_flops": 658337955840,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 216017141760,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "up_proj",
+          "mnk": [
+            129,
+            13952,
+            5120
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 18430033920,
+          "rectangular_per_instance_flops": 18430033920,
+          "padded_per_instance_flops": 27430748160,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 80,
+            "n_blocks": 109,
+            "output_tiles": 327,
+            "valid_matrix_flops": 18430033920,
+            "fully_padded_matrix_flops": 27430748160
+          },
+          "valid_flops": 442320814080,
+          "rectangular_flops": 442320814080,
+          "padded_flops": 658337955840,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 216017141760,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "down_proj",
+          "mnk": [
+            129,
+            5120,
+            13952
+          ],
+          "multiplicity": 24,
+          "valid_per_instance_flops": 18430033920,
+          "rectangular_per_instance_flops": 18430033920,
+          "padded_per_instance_flops": 27430748160,
+          "tile_blocks": {
+            "m_blocks": 3,
+            "k_blocks": 218,
+            "n_blocks": 40,
+            "output_tiles": 120,
+            "valid_matrix_flops": 18430033920,
+            "fully_padded_matrix_flops": 27430748160
+          },
+          "valid_flops": 442320814080,
+          "rectangular_flops": 442320814080,
+          "padded_flops": 658337955840,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 216017141760,
+          "valid_fraction_of_padded_exact": "43/64"
+        },
+        {
+          "name": "lm_head",
+          "mnk": [
+            1,
+            151936,
+            5120
+          ],
+          "multiplicity": 1,
+          "valid_per_instance_flops": 1555824640,
+          "rectangular_per_instance_flops": 1555824640,
+          "padded_per_instance_flops": 99572776960,
+          "tile_blocks": {
+            "m_blocks": 1,
+            "k_blocks": 80,
+            "n_blocks": 1187,
+            "output_tiles": 1187,
+            "valid_matrix_flops": 1555824640,
+            "fully_padded_matrix_flops": 99572776960
+          },
+          "valid_flops": 1555824640,
+          "rectangular_flops": 1555824640,
+          "padded_flops": 99572776960,
+          "causal_rectangle_extra_flops": 0,
+          "tile_padding_extra_flops": 98016952320,
+          "valid_fraction_of_padded_exact": "1/64"
+        }
+      ],
+      "valid_flops": 1722206617600,
+      "rectangular_flops": 1726264606720,
+      "padded_flops": 2675546521600,
+      "causal_rectangle_extra_flops": 4057989120,
+      "tile_padding_extra_flops": 949281914880,
+      "valid_fraction_of_padded_exact": "2102303/3266048",
+      "padded_over_valid_exact": "3266048/2102303",
+      "declared_padded_matrix_flops_per_second": 100000000000000.0,
+      "conditional_matrix_service_seconds": 0.026755465216,
+      "effective_valid_matrix_flops_per_second": 64368404873412.76,
+      "full_forward_runtime_seconds": null,
+      "actual_tensor_core_utilization": null
+    }
+  ],
+  "comparison": {
+    "shallow_to_deep_valid_flop_ratio_exact": "52557575/54728824",
+    "shallow_to_deep_padded_flop_ratio_exact": "159475/165164",
+    "shallow_faster_iff": "rate_shallow / rate_deep > padded_shallow / padded_deep under the declared aggregate matrix-service model",
+    "actual_declared_rate_ratio_exact": "1",
+    "shallow_has_lower_conditional_matrix_service": true
+  },
+  "scope": [
+    "Reuse existing Qwen8 parameter-budget variants: deeper_same_width is relatively deeper/narrower (48x4096) versus shallower_wider (24x5120). Both are untrained; released Qwen8 supplies the baseline parameter budget only.",
+    "One logical unsharded model, tp=1; all matrix operators including Q/K/V/O, gate/up/down, QK/PV and last-position vocabulary head per sequence are counted. Nonmatrix arithmetic, KV copies and communication remain external.",
+    "Caller tile M/N/K is a declared fully padded GEMM rule, matching gemm_tiles.account and quantized_gemm ceil geometry, not a fixed official backend kernel. No quantization or hardware peak is inferred.",
+    "Attention executes a declared full rectangular GEMM per batch/query-head, then causal masking. Public valid causal FLOPs, extra rectangle work and tile tail padding are distinct; they must not be added twice. GQA sharing can reduce bytes but does not reduce per-query-head attention products.",
+    "Only arithmetic fields are reused from gemm_tiles; its BF16 interface assumptions are not applied to FP32 attention probabilities. No HBM or working-buffer feasibility is claimed by this adapter.",
+    "Padded work divided by caller padded-arithmetic service rate defines conditional matrix service. Effective valid FLOPs/s and valid/padded fractions are arithmetic quantities, not measured Tensor Core utilization or whole-model latency. Scalar/special kernels, launch dependencies and residency can change observed ordering.",
+    "Variant-specific positive rates are optional explicit assumptions; the exact rate-ratio threshold exposes where the ordering changes. Parameter-budget error remains visible; neither equal quality nor a hardware recommendation is inferred."
+  ]
+}
+```

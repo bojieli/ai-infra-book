@@ -1,0 +1,729 @@
+# 内存池：容量、周期访问与副本依赖
+
+| 节点 | 原容量GiB | 任务需求GiB | 借用后物理占用GiB | 剩余GiB |
+|---|---:|---:|---:|---:|
+| 0 | 64 | 80 | 64 | 0 |
+| 1 | 64 | 48 | 64 | 0 |
+| 2 | 64 | 32 | 32 | 32 |
+| 3 | 64 | 32 | 32 | 32 |
+
+完整80GiB任务无法迁到任一64GiB节点；允许拆分并迁走16GiB才是另一种容量可行方案，其执行成本未知。
+
+| 带宽GB/s | 延迟us | 在途事务 | 读/秒 | 条件服务秒 | 负载 | 周期模型不积压 |
+|---|---:|---:|---:|---:|---:|---|
+| 10 | 2 | 128 | 1/60 | 1.717991918 | 0.028633 | True |
+| 10 | 2 | 128 | 1 | 1.717991918 | 1.717992 | False |
+| 10 | 2 | 128 | 20 | 1.717991918 | 34.359838 | False |
+| 10 | 2 | 4096 | 1/60 | 1.717991918 | 0.028633 | True |
+| 10 | 2 | 4096 | 1 | 1.717991918 | 1.717992 | False |
+| 10 | 2 | 4096 | 20 | 1.717991918 | 34.359838 | False |
+| 10 | 20 | 128 | 1/60 | 10.485765000 | 0.174763 | True |
+| 10 | 20 | 128 | 1 | 10.485765000 | 10.485765 | False |
+| 10 | 20 | 128 | 20 | 10.485765000 | 209.715300 | False |
+| 10 | 20 | 4096 | 1/60 | 1.717991918 | 0.028633 | True |
+| 10 | 20 | 4096 | 1 | 1.717991918 | 1.717992 | False |
+| 10 | 20 | 4096 | 20 | 1.717991918 | 34.359838 | False |
+| 40 | 2 | 128 | 1/60 | 1.048581000 | 0.017476 | True |
+| 40 | 2 | 128 | 1 | 1.048581000 | 1.048581 | False |
+| 40 | 2 | 128 | 20 | 1.048581000 | 20.971620 | False |
+| 40 | 2 | 4096 | 1/60 | 0.429501730 | 0.007158 | True |
+| 40 | 2 | 4096 | 1 | 0.429501730 | 0.429502 | True |
+| 40 | 2 | 4096 | 20 | 0.429501730 | 8.590035 | False |
+| 40 | 20 | 128 | 1/60 | 10.485765000 | 0.174763 | True |
+| 40 | 20 | 128 | 1 | 10.485765000 | 10.485765 | False |
+| 40 | 20 | 128 | 20 | 10.485765000 | 209.715300 | False |
+| 40 | 20 | 4096 | 1/60 | 0.429501730 | 0.007158 | True |
+| 40 | 20 | 4096 | 1 | 0.429501730 | 0.429502 | True |
+| 40 | 20 | 4096 | 20 | 0.429501730 | 8.590035 | False |
+
+| 故障节点 | 不可用任务所有者 |
+|---|---|
+| [0] | [0] |
+| [1] | [0, 1] |
+| [2] | [2] |
+| [3] | [3] |
+| [0, 1] | [0, 1] |
+| [0, 2] | [0, 2] |
+| [0, 3] | [0, 3] |
+| [1, 2] | [0, 1, 2] |
+| [1, 3] | [0, 1, 3] |
+| [2, 3] | [2, 3] |
+| [0, 1, 2] | [0, 1, 2] |
+| [0, 1, 3] | [0, 1, 3] |
+| [0, 2, 3] | [0, 2, 3] |
+| [1, 2, 3] | [0, 1, 2, 3] |
+| [0, 1, 2, 3] | [0, 1, 2, 3] |
+
+四个64GiB、80/48/32/32GiB工作集来自实验6-9教学例，不对应任何硬件远程访问能力。副本在不同节点、读请求只选一个活副本；副本数不会自动倍增带宽。
+完整80GiB任务迁到另一台64GiB仍放不下。若允许拆分计算/数据并迁走16GiB，则容量可行，但拆分、依赖和执行收益必须另算。
+只借容量时借用者保留计算任务、本地64GiB，远端16GiB在所列供体持有。借用不制造额外唯一数据；额外完整副本另计容量，初始填充/复制流量与创建时间未计。
+访问场景反复读取同一16GiB快照，冷/热体现为1/60、1、20次每秒。动态KV追加、版本同步、写入和计算不在本快照账；不能称完整decode时间。
+接口/窗口参数与频率均是新增教学假设，不是原文给出的测量。以min(B,Nq/L)上界计算乐观服务，再显式假定它就是本串行模型的固定服务时长startup+max(L,payload/rate)。严格周期到达下service<=period才不增长积压，等号无余量；这只是声明模型的条件，不保证真实系统稳定，突发/随机到达/其他竞争另算。
+故障表是指定节点集合永久不可用时的静态依赖可用性，无概率、检测/恢复时长或可靠性排名。失去本地计算节点的任务不可用，即使某个远端副本仍在。
+
+```json
+{
+  "calculation": "memory-pool-access",
+  "scenario": {
+    "copies": 1
+  },
+  "sources": [
+    {
+      "file": "sources/memory-pool/outline-6-6.md",
+      "origin": "outlines/06-超节点.md §6.6 before generated integration",
+      "sha256": "27e87a68c472cca4e73c0489b40f74aac915f9a8194449055e6e66d7114c1624",
+      "bytes": 2868,
+      "scope": "outline teaching capacities; interface/frequency scenarios are explicitly introduced assumptions"
+    }
+  ],
+  "capacity": {
+    "node_capacity_bytes": [
+      68719476736,
+      68719476736,
+      68719476736,
+      68719476736
+    ],
+    "job_demand_bytes": [
+      85899345920,
+      51539607552,
+      34359738368,
+      34359738368
+    ],
+    "total_capacity_bytes": 274877906944,
+    "total_demand_bytes": 206158430208,
+    "local_deficit_bytes": [
+      17179869184,
+      0,
+      0,
+      0
+    ],
+    "unusable_local_slack_before_pool_bytes": 85899345920,
+    "added_local_capacity_bytes": 17179869184,
+    "whole_job_migration_feasible_assignments": [],
+    "whole_job_migration_infeasibility": "80GiB job exceeds every64GiB node",
+    "splittable_compute_migration_bytes": 17179869184,
+    "splittable_compute_migration_feasible_if_supported": true,
+    "splittable_compute_migration_runtime_cost": null,
+    "borrowed_unique_bytes": 17179869184,
+    "donor_nodes": [
+      1
+    ],
+    "physical_used_after_pool_bytes": [
+      68719476736,
+      68719476736,
+      34359738368,
+      34359738368
+    ],
+    "physical_free_after_pool_bytes": [
+      0,
+      0,
+      34359738368,
+      34359738368
+    ],
+    "extra_replica_storage_bytes": 0,
+    "total_physical_used_bytes": 206158430208
+  },
+  "failure_sets": [
+    {
+      "failed_nodes": [
+        0
+      ],
+      "unavailable_job_owners": [
+        0
+      ]
+    },
+    {
+      "failed_nodes": [
+        1
+      ],
+      "unavailable_job_owners": [
+        0,
+        1
+      ]
+    },
+    {
+      "failed_nodes": [
+        2
+      ],
+      "unavailable_job_owners": [
+        2
+      ]
+    },
+    {
+      "failed_nodes": [
+        3
+      ],
+      "unavailable_job_owners": [
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        1
+      ],
+      "unavailable_job_owners": [
+        0,
+        1
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        2
+      ],
+      "unavailable_job_owners": [
+        0,
+        2
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        3
+      ],
+      "unavailable_job_owners": [
+        0,
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        1,
+        2
+      ],
+      "unavailable_job_owners": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "failed_nodes": [
+        1,
+        3
+      ],
+      "unavailable_job_owners": [
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        2,
+        3
+      ],
+      "unavailable_job_owners": [
+        2,
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        1,
+        2
+      ],
+      "unavailable_job_owners": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        1,
+        3
+      ],
+      "unavailable_job_owners": [
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        2,
+        3
+      ],
+      "unavailable_job_owners": [
+        0,
+        2,
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        1,
+        2,
+        3
+      ],
+      "unavailable_job_owners": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "failed_nodes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "unavailable_job_owners": [
+        0,
+        1,
+        2,
+        3
+      ]
+    }
+  ],
+  "access_scenarios": [
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 2000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "60",
+      "load_exact": "357914983/12500000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "36426255051/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 2000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "1",
+      "load_exact": "1073744949/625000000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-448744949/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 2000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "1073744949/31250000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-1042494949/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 2000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "60",
+      "load_exact": "357914983/12500000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "36426255051/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 2000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "1",
+      "load_exact": "1073744949/625000000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-448744949/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 2000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "1073744949/31250000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-1042494949/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 20000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "1638400000",
+      "serialized_read_service_seconds_exact": "2097153/200000",
+      "period_seconds_exact": "60",
+      "load_exact": "699051/4000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "9902847/200000",
+      "max_read_frequency_exact": "200000/2097153",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 20000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "1638400000",
+      "serialized_read_service_seconds_exact": "2097153/200000",
+      "period_seconds_exact": "1",
+      "load_exact": "2097153/200000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-1897153/200000",
+      "max_read_frequency_exact": "200000/2097153",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 20000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "1638400000",
+      "serialized_read_service_seconds_exact": "2097153/200000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "2097153/10000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-2087153/200000",
+      "max_read_frequency_exact": "200000/2097153",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 20000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "60",
+      "load_exact": "357914983/12500000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "36426255051/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 20000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "1",
+      "load_exact": "1073744949/625000000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-448744949/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 10000000000,
+      "latency_ns": 20000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "10000000000",
+      "serialized_read_service_seconds_exact": "1073744949/625000000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "1073744949/31250000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-1042494949/625000000",
+      "max_read_frequency_exact": "625000000/1073744949",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 2000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "16384000000",
+      "serialized_read_service_seconds_exact": "1048581/1000000",
+      "period_seconds_exact": "60",
+      "load_exact": "349527/20000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "58951419/1000000",
+      "max_read_frequency_exact": "1000000/1048581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 2000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "16384000000",
+      "serialized_read_service_seconds_exact": "1048581/1000000",
+      "period_seconds_exact": "1",
+      "load_exact": "1048581/1000000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-48581/1000000",
+      "max_read_frequency_exact": "1000000/1048581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 2000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "16384000000",
+      "serialized_read_service_seconds_exact": "1048581/1000000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "1048581/50000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-998581/1000000",
+      "max_read_frequency_exact": "1000000/1048581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 2000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "40000000000",
+      "serialized_read_service_seconds_exact": "268438581/625000000",
+      "period_seconds_exact": "60",
+      "load_exact": "89479527/12500000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "37231561419/625000000",
+      "max_read_frequency_exact": "625000000/268438581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 2000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "40000000000",
+      "serialized_read_service_seconds_exact": "268438581/625000000",
+      "period_seconds_exact": "1",
+      "load_exact": "268438581/625000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "356561419/625000000",
+      "max_read_frequency_exact": "625000000/268438581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 2000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "40000000000",
+      "serialized_read_service_seconds_exact": "268438581/625000000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "268438581/31250000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-237188581/625000000",
+      "max_read_frequency_exact": "625000000/268438581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 20000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "1638400000",
+      "serialized_read_service_seconds_exact": "2097153/200000",
+      "period_seconds_exact": "60",
+      "load_exact": "699051/4000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "9902847/200000",
+      "max_read_frequency_exact": "200000/2097153",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 20000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "1638400000",
+      "serialized_read_service_seconds_exact": "2097153/200000",
+      "period_seconds_exact": "1",
+      "load_exact": "2097153/200000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-1897153/200000",
+      "max_read_frequency_exact": "200000/2097153",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 20000,
+      "active_transactions": 128,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "1638400000",
+      "serialized_read_service_seconds_exact": "2097153/200000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "2097153/10000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-2087153/200000",
+      "max_read_frequency_exact": "200000/2097153",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 20000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1/60",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "4294967296/15",
+      "effective_upper_bytes_per_second_exact": "40000000000",
+      "serialized_read_service_seconds_exact": "268438581/625000000",
+      "period_seconds_exact": "60",
+      "load_exact": "89479527/12500000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "37231561419/625000000",
+      "max_read_frequency_exact": "625000000/268438581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 20000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "1",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "17179869184",
+      "effective_upper_bytes_per_second_exact": "40000000000",
+      "serialized_read_service_seconds_exact": "268438581/625000000",
+      "period_seconds_exact": "1",
+      "load_exact": "268438581/625000000",
+      "deterministic_serial_queue_bounded": true,
+      "spare_time_per_period_seconds_exact": "356561419/625000000",
+      "max_read_frequency_exact": "625000000/268438581",
+      "measured_decode_seconds": null
+    },
+    {
+      "interface_bandwidth_bytes_per_second": 40000000000,
+      "latency_ns": 20000,
+      "active_transactions": 4096,
+      "transaction_bytes": 256,
+      "startup_ns": 5000,
+      "reads_per_second_exact": "20",
+      "read_payload_bytes": 17179869184,
+      "offered_payload_bytes_per_second_exact": "343597383680",
+      "effective_upper_bytes_per_second_exact": "40000000000",
+      "serialized_read_service_seconds_exact": "268438581/625000000",
+      "period_seconds_exact": "1/20",
+      "load_exact": "268438581/31250000",
+      "deterministic_serial_queue_bounded": false,
+      "spare_time_per_period_seconds_exact": "-237188581/625000000",
+      "max_read_frequency_exact": "625000000/268438581",
+      "measured_decode_seconds": null
+    }
+  ],
+  "assumptions": [
+    "四个64GiB、80/48/32/32GiB工作集来自实验6-9教学例，不对应任何硬件远程访问能力。副本在不同节点、读请求只选一个活副本；副本数不会自动倍增带宽。",
+    "完整80GiB任务迁到另一台64GiB仍放不下。若允许拆分计算/数据并迁走16GiB，则容量可行，但拆分、依赖和执行收益必须另算。",
+    "只借容量时借用者保留计算任务、本地64GiB，远端16GiB在所列供体持有。借用不制造额外唯一数据；额外完整副本另计容量，初始填充/复制流量与创建时间未计。",
+    "访问场景反复读取同一16GiB快照，冷/热体现为1/60、1、20次每秒。动态KV追加、版本同步、写入和计算不在本快照账；不能称完整decode时间。",
+    "接口/窗口参数与频率均是新增教学假设，不是原文给出的测量。以min(B,Nq/L)上界计算乐观服务，再显式假定它就是本串行模型的固定服务时长startup+max(L,payload/rate)。严格周期到达下service<=period才不增长积压，等号无余量；这只是声明模型的条件，不保证真实系统稳定，突发/随机到达/其他竞争另算。",
+    "故障表是指定节点集合永久不可用时的静态依赖可用性，无概率、检测/恢复时长或可靠性排名。失去本地计算节点的任务不可用，即使某个远端副本仍在。"
+  ]
+}
+```

@@ -1,0 +1,57 @@
+# rl-conditional-resource-supply — qwen3-8b
+
+输入：`{"cycle": {"accepted_samples": 16, "head_strategy": "dense", "output_tokens": 256, "prompt_tokens": 1024, "prompts": 8, "reference_passes": 1, "rollout_replicas": 1, "samples_per_prompt": 4, "teacher_passes": 0, "update_epochs": 1}, "pool_speedups": {"learner": 2}, "supply": {"matrix": {"policy_update": {"flops_per_second": 200000000000000.0, "pool": "learner"}, "reference_scoring": {"flops_per_second": 200000000000000.0, "pool": "reference"}, "rollout_decode": {"flops_per_second": 20000000000000.0, "pool": "actor"}, "rollout_prefill": {"flops_per_second": 200000000000000.0, "pool": "actor"}, "teacher_scoring": {"flops_per_second": 200000000000000.0, "pool": "teacher"}}, "synchronization": {"bytes_per_second": 50000000000.0, "pool": "weight_link"}, "verifier": {"pool": "verifier", "seconds_per_candidate": 0.05, "workers": 8}}, "supply_kind": "teaching_assumption"}`
+
+数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
+
+| 结果 | 值 |
+| --- | ---: |
+| generated_samples | 32 |
+| accepted_samples | 16 |
+| serial_component_batch_seconds | 14.86189783793664 |
+| ideal_pipeline_interval_lower_seconds | 8.77850865434624 |
+| limiting_pools | `["actor"]` |
+| conditional_serial_accepted_samples_per_second | 1.076578521429358 |
+| ideal_pipeline_accepted_samples_per_second_upper | 1.8226330496443037 |
+| actual_cycle_seconds | `null` |
+
+| 阶段 | 资源池 | 稳态服务需求 s | 孤立批次 s |
+| --- | --- | ---: | ---: |
+| rollout_prefill | actor | 2.325714557 | 2.325714557 |
+| rollout_decode | actor | 6.452794098 | 6.452794098 |
+| reference_scoring | reference | 3.174719868 | 3.174719868 |
+| teacher_scoring | teacher | 0.000000000 | 0.000000000 |
+| policy_update | learner | 2.381039901 | 2.381039901 |
+| verification | verifier | 0.200000000 | 0.200000000 |
+| weight_sync | weight_link | 0.327629414 | 0.327629414 |
+
+| 池 | 累积服务需求 s |
+| --- | ---: |
+| actor | 8.778508654 |
+| reference | 3.174719868 |
+| teacher | 0.000000000 |
+| learner | 2.381039901 |
+| verifier | 0.200000000 |
+| weight_link | 0.327629414 |
+
+计量条件：
+
+- 教学 RL 批次：所有 prompt 和 response 等长，无 EOS 提前停止、重试、跨样本前缀共享或 speculative decoding。先生成全部候选再评分／筛选；拒收样本仍消耗 rollout 和评分。accepted_samples 是已声明的本批整数结果，不用概率倒推一个确定的成功数。
+- prefill 最后位置产生第一个输出，随后 G-1 次 decode；不再把最后一个已生成 token 喂回模型。Qwen 有效因果注意力随历史呈仿射，首尾等差求和严格复现逐步矩阵计量；专家路由采用已有 balanced 情景，无容量 padding。
+- 训练／评分输入长度 P+G-1，标签是 G 个输出，位置从 P-1 至 P+G-2。普通 dense head 计算全部位置；compact 假设只对这 G 个位置计算 head，backbone 仍完整执行。
+- reference 和 teacher 是与 policy 相同配置的独立快照，每 pass 对全部候选做 teacher-forced 前向；次数可为零。仅报告矩阵工作，不含 log-softmax、KL、优势估计、奖励／规则验证或辅助损失，也不冒充实际奖励模型配置。
+- update_epochs 次完整遍历已接受样本，计前向与反向矩阵；批次均为分析聚合规模，不代表能同时放入某张卡。优化器更新、激活、重计算、微批调度、通信及等待另算，未用 FLOPs 直接预测周期时间。
+- 周期末同步一次完整 BF16 policy 权重到每个 rollout 副本，独立 unicast 发送量为副本数乘快照大小；不含优化器状态，不假定广播树、增量更新或参数转换。policy 状态与 rollout/reference/teacher 常驻内存不混加成设备峰值。
+- 有效样本归一化包含拒收候选开销；质量、真实吞吐和各阶段有效供给未知，不能仅按工作量大小决定增配哪类设备。本例不声称复现 V4/K3 的 RL 系统。
+- 本表为显式供给情景：默认矩阵速率、验证服务时间及链路带宽均为教学输入，不是官方 GPU 峰值或实测。输入速率必须与本账有效矩阵 FLOPs 口径相同；不能把含 padding 的硬件执行量或稀疏宣传值直接作为分母。
+- 矩阵阶段时间为工作量除该阶段占用整个 pool 时的聚合有效速率，不再额外乘除 GPU 数。相同 pool 的阶段占用相加；不同 pool 仅在理想无限缓冲、多批流水条件下可重叠。
+- 验证对全部候选执行，workers 个同速独立服务槽。孤立批次按 ceil(候选/workers) 轮计；稳态服务需求按总候选服务量/workers 计。尾轮空槽不能误当持续资源需求。
+- serial_component_batch_seconds 是所列组件依次执行的条件模型；max(pool 累积需求) 是多批流水间隔下界。同步 on-policy 下一批依赖新权重时不能直接使用流水吞吐上界，且真实损失／优化器／排队等缺项未补齐。
+- pool_speedups 是假设整个 pool 的服务能力按比例提升，包括同池全部阶段；不保证加倍设备就达到加倍服务率，也不改变样本质量、接受数或工作量。验证池倍率解释为每个 worker 服务变快，不改变有限批次轮数。
+
+固定来源：
+
+- [configs/models/qwen3-8b/config.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json)，SHA256 `f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30`。
+- [sources/qwen3-8b/model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json)，SHA256 `f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc`。
+- [sources/qwen3/modeling_qwen3.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py)，SHA256 `704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2`。
+- [sources/qwen3/modeling_qwen3_moe.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py)，SHA256 `3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8`。

@@ -1,0 +1,64 @@
+# training-state — qwen3-8b
+
+输入：`{"capacity_bytes": 25769803776, "extra_live_bytes": 0, "gradient_bytes": 2, "model": "qwen3-8b", "participants": 7, "partition": "flat"}`
+
+数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
+
+| 结果 | 值 |
+| --- | ---: |
+| parameters | 8,190,735,360 |
+| tensor_instances | 399 |
+| bytes_per_parameter_unsharded | 16 |
+| unsharded_persistent_bytes | 131,051,765,760 |
+| padded_shard_elements_per_rank | 1,170,105,052 |
+| padding_elements_per_sharded_component | 4 |
+| minimum_persistent_bytes_per_rank | 18,721,680,832 |
+| stages_fitting_specified_allocations | `[3]` |
+
+持久状态与输入的额外同时驻留量；通过容量比较不证明实际训练峰值可行。
+
+| ZeRO stage | 每rank持久 bytes | 全组持久 bytes | 所列同时驻留 bytes | 剩余净预算 bytes | 所列分配能容纳 |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 131051765760 | 917362360320 | 131051765760 | -105281961984 | False |
+| 1 | 46804202064 | 327629414448 | 46804202064 | -21034398288 | False |
+| 2 | 32762941448 | 229340590136 | 32762941448 | -6993137672 | False |
+| 3 | 18721680832 | 131051765824 | 18721680832 | 7048122944 | True |
+
+| stage | 状态 | bytes/element | 分片 | 每rank bytes | 全组padding bytes | 额外复制 bytes |
+| ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 0 | weights_bf16 | 2 | False | 16381470720 | 0 | 98288824320 |
+| 0 | gradients | 2 | False | 16381470720 | 0 | 98288824320 |
+| 0 | master_weights_fp32 | 4 | False | 32762941440 | 0 | 196577648640 |
+| 0 | adam_m_fp32 | 4 | False | 32762941440 | 0 | 196577648640 |
+| 0 | adam_v_fp32 | 4 | False | 32762941440 | 0 | 196577648640 |
+| 1 | weights_bf16 | 2 | False | 16381470720 | 0 | 98288824320 |
+| 1 | gradients | 2 | False | 16381470720 | 0 | 98288824320 |
+| 1 | master_weights_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 1 | adam_m_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 1 | adam_v_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 2 | weights_bf16 | 2 | False | 16381470720 | 0 | 98288824320 |
+| 2 | gradients | 2 | True | 2340210104 | 8 | 0 |
+| 2 | master_weights_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 2 | adam_m_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 2 | adam_v_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 3 | weights_bf16 | 2 | True | 2340210104 | 8 | 0 |
+| 3 | gradients | 2 | True | 2340210104 | 8 | 0 |
+| 3 | master_weights_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 3 | adam_m_fp32 | 4 | True | 4680420208 | 16 | 0 |
+| 3 | adam_v_fp32 | 4 | True | 4680420208 | 16 | 0 |
+
+计量条件：
+
+- 全参数Adam教学配置：BF16参数2bytes，梯度显式BF16/FP32，FP32 master及两个moment各4bytes。16/18bytes由此得到，不代表所有BF16优化器实现的默认值。
+- ZeRO stage1分片optimizer（含master），stage2再分片梯度，stage3再分片参数；无TP/PP/EP、offload或冻结参数。MoE总持久状态包含所有专家，不按top-k缩小。
+- flat把完整参数展平后补齐到DP整数倍；per_tensor逐物理张量补齐后每rank等长。两者是声明的布局模型，具体框架bucket、对齐、持久化阈值需另核验。
+- 这里只计已物化的持久状态：初始化懒分配、完整梯度临时值、all-gather、prefetch、casting、激活、通信bucket和allocator另计。extra_live_bytes须是同一峰值时刻额外分配且不重复计算的输入，默认0不等于实际额外开销0。
+- 容量为输入的净预算，不是某设备的官方容量。specified_allocations_fit仅表示所列分配能放下，不能证明训练峰值、拓扑或吞吐可行；张量清单存JSON供独立核算。
+
+固定来源：
+
+- [configs/models/qwen3-8b/config.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json)，SHA256 `f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30`。
+- [sources/qwen3-8b/model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json)，SHA256 `f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc`。
+- [sources/qwen3/modeling_qwen3.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py)，SHA256 `704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2`。
+- [sources/qwen3/modeling_qwen3_moe.py](https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py)，SHA256 `3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8`。
+- [sources/training-state/zero3.rst](https://raw.githubusercontent.com/deepspeedai/DeepSpeed/0e741714f5a708b75a4db0a8140f9016f3aa5fd3/docs/code-docs/source/zero3.rst)，SHA256 `e8eeb0ccfd067c371e522b494d70e0a233e7aeda4d5ccf6dd1a200d01a4b6847`。

@@ -1,0 +1,207 @@
+# QK—Softmax—PV：矩阵与向量交接
+
+时间为教学tick，路径与供给为声明条件，非厂商专用通路实测。每行组完成整个QK收缩后才交Softmax；槽位到PV结束才释放。
+
+完成时间：4350；首次向量开工：1024；声明交接容量：98304 bytes（通过：True）。
+
+跨单元载荷：98304 bytes；所选路径服务字节：98304。
+
+| 任务 | 资源 | 开始 | 结束 | 服务时间 |
+|---|---|---:|---:|---:|
+| g0.qk | matrix | 0 | 512 | 512 |
+| g0.scores | handoff | 512 | 1024 | 512 |
+| g0.softmax | vector | 1024 | 3582 | 2558 |
+| g0.probabilities | handoff | 3582 | 3838 | 256 |
+| g0.pv | matrix | 3838 | 4350 | 512 |
+
+## 槽位占用
+
+| 行组 | 槽 | 取得 | 释放 |
+|---|---:|---:|---:|
+| 0 | 0 | 0 | 4350 |
+
+## 适用范围
+
+- One head, full causal score matrix materialized. Dense GEMMs include masked upper-triangle entries; softmax scale/subtract/exp/divide runs on the full rectangle, with masked values set to -infinity.
+- Each row group includes the complete key extent and head-dimension contraction. A K-partial accumulator is never published to softmax; row splitting alone permits earlier vector work.
+- Mask predicate creation and score-mask writes, final output store, operand loading, layout conversion and control instructions are excluded; this is a compute/handoff subaccount, not a complete attention forward.
+- FP32 scores and BF16 probabilities are separately reserved within each slot; the slot is acquired before QK and released only after PV. Other accumulators/inputs/workspaces are outside this declared capacity.
+- Staged path serves a write and a read for each crossing payload through one shared handoff server; direct path serves one transfer on that server. These are abstract path assumptions, not asserted NVIDIA/Ascend/Apple implementations.
+- All rates are declared work per teaching tick, not official hardware peak or measured effective service. Vector classes execute serially on one resource; QK and PV share one matrix server.
+- Scheduler uses earliest-ready nonpreemptive tasks with stable list order, including finite-slot release dependencies; reported ordering is one declared schedule, not a globally optimal scheduler.
+- Output probabilities are cast to BF16 as a declared representation; cast work and quality impact are not claimed absent or measured.
+
+## 完整形状、工作量与输入
+
+```json
+{
+  "calculation": "qwen-matrix-vector-handoff",
+  "model": "qwen3-8b",
+  "scenario": {
+    "length": 128,
+    "group_rows": 128,
+    "slots": 1,
+    "path": "direct",
+    "matrix_flops_per_tick": 8192,
+    "scalar_ops_per_tick": 128,
+    "exp_ops_per_tick": 16,
+    "div_ops_per_tick": 16,
+    "comparison_ops_per_tick": 128,
+    "link_bytes_per_tick": 128,
+    "capacity_bytes": 98304
+  },
+  "sources": [
+    {
+      "file": "configs/models/qwen3-8b/config.json",
+      "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/config.json",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"
+    },
+    {
+      "file": "sources/qwen3-8b/model.safetensors.index.json",
+      "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/b968826d9c46dd6066d109eabc6255188de91218/model.safetensors.index.json",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc"
+    },
+    {
+      "file": "sources/qwen3/modeling_qwen3.py",
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3/modeling_qwen3.py",
+      "revision": "0720e206c6ba28887e4d60ef60a6a089f6c1cc76",
+      "sha256": "704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2"
+    },
+    {
+      "file": "sources/qwen3/modeling_qwen3_moe.py",
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/0720e206c6ba28887e4d60ef60a6a089f6c1cc76/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+      "revision": "0720e206c6ba28887e4d60ef60a6a089f6c1cc76",
+      "sha256": "3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8"
+    }
+  ],
+  "work": [
+    {
+      "group": 0,
+      "row_start": 0,
+      "row_count": 128,
+      "QK_shapes": [
+        [
+          128,
+          128
+        ],
+        [
+          128,
+          128
+        ]
+      ],
+      "PV_shapes": [
+        [
+          128,
+          128
+        ],
+        [
+          128,
+          128
+        ]
+      ],
+      "qk_flops": 4194304,
+      "pv_flops": 4194304,
+      "basic_scalar_ops": 49024,
+      "maximum_comparisons": 16256,
+      "exponential_ops": 16384,
+      "division_ops": 16384,
+      "masked_score_elements": 8128,
+      "score_handoff_bytes": 65536,
+      "probability_handoff_bytes": 32768,
+      "served_handoff_bytes": 98304
+    }
+  ],
+  "timeline": [
+    {
+      "id": "g0.qk",
+      "resource": "matrix",
+      "start_tick": 0,
+      "end_tick": 512,
+      "duration_ticks": 512,
+      "critical_predecessor": null,
+      "scheduled_predecessors": []
+    },
+    {
+      "id": "g0.scores",
+      "resource": "handoff",
+      "start_tick": 512,
+      "end_tick": 1024,
+      "duration_ticks": 512,
+      "critical_predecessor": "g0.qk",
+      "scheduled_predecessors": [
+        "g0.qk"
+      ]
+    },
+    {
+      "id": "g0.softmax",
+      "resource": "vector",
+      "start_tick": 1024,
+      "end_tick": 3582,
+      "duration_ticks": 2558,
+      "critical_predecessor": "g0.scores",
+      "scheduled_predecessors": [
+        "g0.scores"
+      ]
+    },
+    {
+      "id": "g0.probabilities",
+      "resource": "handoff",
+      "start_tick": 3582,
+      "end_tick": 3838,
+      "duration_ticks": 256,
+      "critical_predecessor": "g0.softmax",
+      "scheduled_predecessors": [
+        "g0.softmax",
+        "g0.scores"
+      ]
+    },
+    {
+      "id": "g0.pv",
+      "resource": "matrix",
+      "start_tick": 3838,
+      "end_tick": 4350,
+      "duration_ticks": 512,
+      "critical_predecessor": "g0.probabilities",
+      "scheduled_predecessors": [
+        "g0.probabilities",
+        "g0.qk"
+      ]
+    }
+  ],
+  "slot_ownership": [
+    {
+      "group": 0,
+      "slot": 0,
+      "start_tick": 0,
+      "release_tick": 4350
+    }
+  ],
+  "summary": {
+    "groups": 1,
+    "fp32_score_bytes_per_slot": 65536,
+    "bf16_probability_bytes_per_slot": 32768,
+    "reserved_handoff_bytes": 98304,
+    "passes_declared_handoff_capacity": true,
+    "total_matrix_flops": 8388608,
+    "crossing_payload_bytes": 98304,
+    "served_handoff_bytes": 98304,
+    "finish_tick": 4350,
+    "capacity_qualified_finish_tick": 4350,
+    "first_vector_start_tick": 1024,
+    "measured_kernel_seconds": null,
+    "actual_instruction_count": null
+  },
+  "assumptions": [
+    "One head, full causal score matrix materialized. Dense GEMMs include masked upper-triangle entries; softmax scale/subtract/exp/divide runs on the full rectangle, with masked values set to -infinity.",
+    "Each row group includes the complete key extent and head-dimension contraction. A K-partial accumulator is never published to softmax; row splitting alone permits earlier vector work.",
+    "Mask predicate creation and score-mask writes, final output store, operand loading, layout conversion and control instructions are excluded; this is a compute/handoff subaccount, not a complete attention forward.",
+    "FP32 scores and BF16 probabilities are separately reserved within each slot; the slot is acquired before QK and released only after PV. Other accumulators/inputs/workspaces are outside this declared capacity.",
+    "Staged path serves a write and a read for each crossing payload through one shared handoff server; direct path serves one transfer on that server. These are abstract path assumptions, not asserted NVIDIA/Ascend/Apple implementations.",
+    "All rates are declared work per teaching tick, not official hardware peak or measured effective service. Vector classes execute serially on one resource; QK and PV share one matrix server.",
+    "Scheduler uses earliest-ready nonpreemptive tasks with stable list order, including finite-slot release dependencies; reported ordering is one declared schedule, not a globally optimal scheduler.",
+    "Output probabilities are cast to BF16 as a declared representation; cast work and quality impact are not claimed absent or measured."
+  ]
+}
+```
