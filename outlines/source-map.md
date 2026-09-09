@@ -783,3 +783,7 @@
 | `neusight-calibration` | [预测校准的论文与固定实现](../references/framework-history/2026-09-09/neusight-calibration/NOTES.md) | 13 | 扩写 13 | 实验 13-6 延伸；阶段误差、tile 数据与版本范围，不增加核心实验 |
 | `partir-shardy-partitioning` | [分片策略与公开编译器路径](../references/framework-history/2026-09-09/partir-shardy/NOTES.md) | 6 | 扩写 6 | 三页方法正文、固定分支与局部形状复算；仅补现有 TP 案例的编译结果核对 |
 | `pod-attention-serving-method` | [POD 共驻方法与同批服务摘要](../references/proceedings/ASPLOS/2025/serving-113-117/README.md) | 5、8、11 | 扩写 5 | 只采用物理页4–8的共享资源判断；COMET／TAPAS候选，113仍缺摘要，正式清单合并待做 |
+
+## 作者材料采用（2026-09-09）
+
+[七份来源快照与 SHA-256](../references/author-materials/2026-09-09/sources.json)补充本地作者材料：[上下文与技术判断](../case-studies/author-context-and-design.md)对应 3.1.4、4.6.4、5.3.4、8.2.4–8.2.5、12.1.3、12.2.3、13.4.1；[单 Agent、24×7 serving 成本](../case-studies/single-agent-serving-cost.md)对应 11.4.1、13.5.1 和实验 13-6。前缀复用以 AI Agent 书第 2 章及实验台账为主；两朵云短例的论文版本入口与阅读范围在案例笔记中登记。FastWake 未采用，原五篇作者文章不重复登记。

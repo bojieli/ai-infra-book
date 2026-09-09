@@ -41,3 +41,13 @@ config.finalize_model_grads_func 绑定外部 Megatron 的 finalize_model_grads�
 三返回值 loss 路径中，非 per-token 模式会除返回的 normalizer（至少一）及微批数。slime 该模式返回 normalizer=1，因此它前面乘微批数与这里的除法配对；DP/CP 的其余缩放仍需结合具体 DDP 配置。per-token 模式跳过这段局部除法，finalize_model_grads 在传入 token 计数时先沿 PP 广播，再在 DP/CP 组求和，以总计数倒数缩放梯度。
 
 这一证据已足以说明教学重点：局部 loss、后端累积和最终梯度是连续路径。分母与缩放必须在这条路径上对齐，不能根据日志平均或单函数的一次乘除给出正确性结论。实际 DDP 通信操作、配置传播、全零掩码与特殊分支未全部验证；不能把本次源文件阅读写成真实安装或全算法验收。
+
+## CP1 普通 DP 的缩放闭合
+
+补读默认 Megatron 的 DDP 缩放配置：非 per-token 目标可由归约取平均实现，也可由预乘 1/DP 后求和实现；per-token 模式禁止 collective average，预缩放为一。补丁对应 DDP/buffer 段落改变备份与分配参数，不改上述缩放配置。未构建或应用补丁验证全部兼容性。
+
+取 CP1、普通 dense DP、每个样本一条 rollout、每样本有有效 mask 的条件，slime 的局部样本均值之和乘 M×DP/N，schedule 除 M，DDP 完成预期平均，得到全局样本均值。用两 rank 的四个标量 1、3／3、3，在每 rank 一或两个微批时均得 2.5；独立分数运算见 normalization-arithmetic.json，没有导入下载实现。
+
+样本等权与 token 等权本身也是不同目标：两样本长度1／3、样本内均值1／3，前者为2、后者为2.5。不能因为后端支持两种归一化，就认为切换开关只改变执行效率。rollout 分成多个片段时要采用前文的共享分母，而不是本段每样本一条 rollout 的简化。
+
+这条普通配置的缩放说明已足够用于原有梯度累积练习，不继续把任意配置正确性当作阅读前提。CP/EP 特殊组织、全零 mask、实际数据分派、优化器裁剪及运行正确性仍不在本次验收范围。
