@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import unicodedata
+from verify_ratte_reading import verify as verify_ratte
 
 ROOT = Path(__file__).resolve().parents[2]
 D = ROOT / 'references/proceedings/ASPLOS/2025/screening-111-123'
@@ -23,6 +24,7 @@ def check(record):
 
 
 def verify():
+    ratte = verify_ratte()
     sources = json.loads((D / 'sources.json').read_text())
     for source in sources:
         check(source)
@@ -52,13 +54,14 @@ def verify():
             reverse = norm(author['family']+' '+author.get('given', ''))
             assert norm(pdf_name) in (forward, reverse)
         assert record['view']['actually_viewed'] is True
-        assert record['body_reading_status'] == 'not_read'
+        assert record['body_reading_status'] == ('selected_pages_read' if record['program_order'] == 120 else 'not_read')
         if record['program_order'] == 118:
             assert 'ASPLOS ’24' in text and '2024' in text
     result = dict(status='passed', source_responses=len(sources), complete_abstracts=5,
                   representative_pdfs=5, archived_pdf_pages=sum(r['pdf']['pages'] for r in records),
-                  first_pages_viewed=5, selected_body_scopes=0, canonical_merge_pending=True,
-                  outline_additions=0, version_year_exceptions=[118], author_metadata_variants=[121])
+                  first_pages_viewed=5, selected_body_scopes=1, canonical_merge_pending=True,
+                  selected_body_pages=ratte['selected_body_pages'],
+                  new_outline_sections=0, version_year_exceptions=[118], author_metadata_variants=[121])
     (D/'validation.json').write_text(json.dumps(result, indent=2)+'\n')
     return result
 
