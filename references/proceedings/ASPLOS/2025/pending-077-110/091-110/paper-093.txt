@@ -1,0 +1,2544 @@
+arXiv:2411.11217v1 [cs.DC] 18 Nov 2024
+
+MoE-Lightning: High-Throughput MoE Inference on
+Memory-constrained GPUs
+Shiyi Cao
+
+Shu Liu
+
+Tyler Griggs
+
+shicao@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+lshu@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+tgriggs@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+Peter Schafhalter
+
+Xiaoxuan Liu
+
+Ying Sheng
+
+pschafhalter@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+xiaoxuan_liu@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+ying1123@stanford.edu
+Stanford
+Palo Alto, CA, USA
+
+Joseph E. Gonzalez
+
+Matei Zaharia
+
+Ion Stoica
+
+jegonzal@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+matei@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+istoica@berkeley.edu
+UC Berkeley
+Berkeley, CA, USA
+
+Abstract
+
+each input, MoE models activate only a subset of experts,
+thereby improving computational efficiency.
+While the MoE models achieve strong performance in
+many tasks [10, 22], unfortunately, their deployment is challenging due to the significantly increased memory demand
+for the same number of active parameters. For example, the
+Mixtral 8x22B model [32] requires over 256 GB of memory
+for the parameters of the expert feed-forward network (FFN),
+which is 4 − 5× higher than the memory requirements of
+dense models that require similar FLOPs for inference.
+In this paper, we study how to achieve high-throughput
+MoE inference with limited GPU memory. We are focusing on off-line, batch-processing workloads such as model
+evaluation [29], synthetic data generation [14], data wrangling [33], form processing [7], and LLM for relational analytics [31] where higher inference throughput translates
+into lower total completion time.
+The common approach for memory-constrained batch
+inference is to offload model weights [4, 19] and key-value
+tensors of earlier tokens (KV cache) [42] — which are needed
+for generating the next token – to CPU memory or disk. Then,
+they are loaded layer-by-layer to the GPU for computation.
+Unfortunately, existing solutions fall short of effectively
+overlapping computations with data transfers between CPU
+and GPU. For instance, the GPU may remain idle as it awaits
+a small yet crucial piece of data such as intermediate results
+for the upcoming batch. At the same time, transferring the
+weights for subsequent layers may take a long time and
+potentially block both the GPU and CPU from processing
+further tasks, leading to under-utilization of all the resources.
+As a result, efficient MoE inference for throughput-oriented
+workloads using limited GPU memory remains challenging.
+We find that increasing I/O utilization and other resource utilization is critical in achieving high throughput. For example,
+
+Efficient deployment of large language models, particularly
+Mixture of Experts (MoE) models, on resource-constrained
+platforms presents significant challenges in terms of computational efficiency and memory utilization. The MoE architecture, renowned for its ability to increase model capacity
+without a proportional increase in inference cost, greatly
+reduces the token generation latency compared with dense
+models. However, the large model size makes MoE models inaccessible to individuals without high-end GPUs. In
+this paper, we propose a high-throughput MoE batch inference system, MoE-Lightning, that significantly outperforms
+past work. MoE-Lightning introduces a novel CPU-GPU-I/O
+pipelining schedule, CGOPipe, with paged weights to achieve
+high resource utilization, and a performance model, HRM,
+based on a Hierarchical Roofline Model we introduce to help
+find policies with higher throughput than existing systems.
+MoE-Lightning can achieve up to 10.3× higher throughput
+than state-of-the-art offloading-enabled LLM inference systems for Mixtral 8x7B on a single T4 GPU (16GB). When
+the theoretical system throughput is bounded by the GPU
+memory, MoE-Lightning can reach the throughput upper
+bound with 2–3× less CPU memory, significantly increasing
+resource utilization. MoE-Lightning also supports efficient
+batch inference for much larger MoEs (e.g., Mixtral 8x22B
+and DBRX) on multiple low-cost GPUs (e.g., 2–4 T4s).
+
+1
+
+Introduction
+
+Mixture of Experts (MoE) [10, 22, 41, 46] is a paradigm shift
+in the architecture of Large Language Models (LLMs) that
+leverages sparsely-activated expert sub-networks to enhance
+model performance without significantly increasing the number of operations required for inference. Unlike dense models [40, 47, 53], where all model parameters are activated for
+1
+
+Throughput
+
+MoE-Lightning
+
+In summary, this paper makes the following contributions:
+• CGOPipe, a pipeline scheduling strategy that efficiently schedules various I/O events and overlaps CPU
+and GPU computation with I/O events. By deploying
+weights paging, CGOPipe reduces pipeline bubbles,
+significantly enhancing throughput and I/O efficiency
+compared with existing systems (§4.1).
+• HRM, a general performance model for LLM inference
+which extends the Roofline Model [48]. HRM can easily support different models, hardware, and workloads,
+and has near-zero overhead in real deployments, without the need for extensive data fitting (might take
+hours or days) as needed in FlexGen (§4.2).
+• An in-depth performance analysis for MoE models
+based on our extended HRM which identifies various
+performance regions where specific resource becomes
+the bottleneck (§3).
+
+Existing System
+w/ our policy
+Existing System
+w/ their policy
+
+Batch Size
+(CPU Memory)
+
+Figure 1. MoE-Lightning achieves higher throughput with
+far less CPU memory, enabled by CGOPipe and HRM.
+
+Fig. 1 illustrates the relationship between CPU memory and
+achievable token generation throughput for different systems with fixed GPU memory (less than the model size) and
+CPU-to-GPU memory bandwidth. When a layer’s weights
+are loaded onto the GPU, a common strategy to increase
+throughput is to process as many requests as possible to
+amortize the I/O overhead of weights’ transfer [42]. However, this increases CPU memory usage as additional space
+is required to store the KV cache for all requests. Consequently, lower I/O utilization means higher I/O overhead of
+weights’ transfer, requiring greater CPU memory to reach
+peak generation performance; otherwise, the GPU will be
+under-utilized as suggested by the blue line in Fig. 1.
+While improving resource utilization is crucial for achieving high-throughput inference with limited GPU memory,
+achieving this raises several challenges. First, we need to
+effectively schedule the computation tasks running on CPU
+and GPU, together with the transfers of various inputs (e.g.,
+experts weights, hidden states, and KV cache), such that to
+avoid computation tasks waiting for transfers or the other
+way around. Second, as indicated by the orange line in Fig. 1,
+the existing solutions [42] tend to generate sub-optimal
+policies with smaller GPU batch sizes which lead to resource under-utilization. Fundamentally, these solutions fail
+to take into account that changes in the workload can lead
+to changes in the bottleneck resource.
+To address these two challenges, we developed a new inference system, MoE-Lightning, which consists of two new
+components. The first component is CGOPipe, a pipeline
+scheduling strategy that overlaps GPU computation, CPU
+computation and various I/O events efficiently so that computation is not blocked by I/O events and different I/O events
+won’t block each other. This way, CGOPipe can significantly
+improve the system utilization. The second component is
+Hierarchical Roofline Model (HRM) which accurately
+models how different components in an inference system
+interact and affect application performance under various
+operational conditions.
+
+We evaluate MoE-Lightning on various recent popular
+MoE models (e.g., Mixtral 8x7b, Mixtral 8x22B, and DBRX)
+on different hardware settings (e.g., L4, T4, 2xT4, and 4xT4
+GPUs) using three real workloads. When compared to the
+best of the existing systems, MoE-Lightning can improve
+the generation throughput by up to 10.3× (without request
+padding) and 3.5× (with request padding) on a single GPU.
+When Tensor-parallelism is enabled, MoE-Lightning demonstrates super-linear scaling in generation throughput (§5).
+
+2
+
+Background
+
+2.1
+
+Mixture of Experts
+
+Large Language Models (LLMs) have significantly improved
+in performance due to the advancements in architecture
+and scalable training methods. In particular, Mixture of Experts (MoE) models have shown remarkable improvements
+in model capacity, training time, and model quality [10, 13,
+22, 27, 41, 46], revitalizing an idea that dates back to the early
+1990s [21, 23] where ensembles of specialized models are
+used in conjunction with a gating mechanism to dynamically
+select the appropriate “expert” for a given task.
+The key idea behind MoE is a gating function that routes
+inputs to specific experts within a larger neural network.
+Each expert is specialized in handling particular types of
+inputs. The gating function selects only a subset of experts
+to process an input, which allows LLMs to scale the number
+of parameters without increasing inference operations.
+MoE models adopt a conventional LLM architecture, which
+uses learned embeddings for tokens and stacked transformer
+layers. MoE LLMs typically modify the Feed-Forward Network (FFN) within a transformer layer by adding a gating
+network that selects expert FFNs, usually implemented as
+multi-layer perceptrons, to process the input token [6, 13, 57].
+These designs can surpass traditional dense models [8, 10, 22]
+in effectiveness while being more parameter-efficient and
+cost-effective during training and inference.
+2
+
+Output Token
+
+amounts of data between the GPU and CPU for various computational tasks with distinct characteristics. Naive scheduling of the computation task and data transfer can result
+in poor resource utilization. This paper explores how each
+resource in a heterogeneous system affects LLM inference
+performance and proposes efficient scheduling strategies
+and system optimizations to enhance resource utilization.
+
+Linear + Softmax
+Add + Layer Norm
+FFN 1
+
+FFN 2
+
+…
+
+FFN N
+
+Router Mixture of Experts
+Feed-Forward Network
+Add + Layer Norm
+Self Attention
+
+Transformer
+
+3
+
+Positional Encoding
+
+In this section, we introduce a Hierarchical Roofline Model
+(HRM) (§3.2) extended from the classical Roofline Model [48],
+which we use to conduct a theoretical performance analysis for MoE inference (§3.3). It also serves as the basics of
+our performance model used in scheduling policy search,
+which will be discussed in §4.2. The Hierarchical Roofline
+Model extends the original Roofline Model for multicore
+architectures [48] to provide a stronger model of heterogeneous computing devices and memory bandwidth. We
+further identify two additional turning points that define
+settings where the computation is best done on CPU instead
+of GPU and where the application is GPU memory-bound
+or CPU memory-bound, providing explicit explanations for
+how LLM inference performance will be affected by different
+resource limits in the system.
+
+Token Embedding
+Input Token
+
+Figure 2. Architecture of a Mixture of Experts in Large
+Language Models.
+Despite their advantages, the widespread use of MoE models faces challenges due to the difficulties in managing and
+deploying models with extremely high parameter counts
+that demand substantial memory. Thus, our work aims to
+make MoE models more accessible to those lacking extensive
+high-end GPU resources.
+2.2
+
+Performance Analysis
+
+LLM Inference
+
+LLMs are trained to predict the conditional probability distribution for the next token, 𝑃 (𝑥𝑛+1 | 𝑥 1, . . . , 𝑥𝑛 ), given a list
+of input tokens (𝑥 1, . . . , 𝑥𝑛 ). When deployed as a service, the
+LLM takes in a list of tokens from a user request and generates an output sequence (𝑥𝑛+1, . . . , 𝑥𝑛+𝑇 ). The generation
+process involves sequentially evaluating the probability and
+sampling the token at each position for 𝑇 iterations. The
+stage where the model generates the first token 𝑥𝑛+1 given
+the initial list of tokens (𝑥 1, . . . , 𝑥𝑛 ), is defined as the prefill
+stage. In the prefill stage, at each layer, the input hidden
+states to the attention block will be projected into the query,
+key, and value vectors. The key and value vectors will be
+stored in the KV cache. Following the prefill stage is the decode stage, where the model generates the remaining tokens
+(𝑥𝑛+2, . . . , 𝑥𝑛+𝑇 ) sequentially. When generating token 𝑥𝑛+2 ,
+all the KV cache of the previous tokens (𝑥 1, . . . , 𝑥𝑛+1 ) will
+be needed, and the token 𝑥𝑛+2 ’s key and value at each layer
+will be appended to the KV cache.
+The auto-regressive nature of LLM generation, where tokens are generated sequentially, can lead to sub-optimal
+device utilization and decreased serving throughput [37].
+Batching is a critical strategy for improving GPU utilization:
+[51] proposed continuous batching which increases the serving throughput by orders of magnitude. Numerous studies
+have developed methods to tackle associated challenges such
+as memory fragmentation [26] and the heavy memory pressure imposed by the KV cache [17, 24, 42]. The scenario of
+limited GPU memory introduces further challenges, especially for large MoE models, as it requires transferring large
+
+3.1
+
+Roofline Model
+
+We will start with the original Roofline Model [48], which
+provides a visual performance model to estimate the performance of a given application by showing inherent hardware
+limitations and potential opportunities for optimizations. It
+correlates a system’s peak performance and memory bandwidth with the operational intensity of a given computation, where Operational Intensity (𝐼 ) denotes the ratio of the
+number of operations in FLOPs performed to the number
+of bytes accessed from memory, expressed in FLOPs/Bytes.
+The fundamental repPerformance (FLOPs/s)
+resentation in the Roofline
+Model is a performance
+graph, where the xaxis represents operational intensity 𝐼 in
+Operational Intensity
+FLOPs/byte and the y(FLOPs/Bytes)
+axis represents performance 𝑃 in FLOPs/sec. The model is graphically depicted by
+two main components:
+Memory Roof: It serves as the upper-performance limit
+indicated by memory bandwidth. It is determined by the
+product of the peak memory bandwidth (𝐵 peak in Bytes/sec)
+and the operational intensity (𝐼 ). Intuitively, if the data needed
+for the computation is supplied slower than the computation
+itself, the processor will idly wait for data, making memory bandwidth the primary bottleneck. The memory-bound
+3
+
+region (in blue) of the roofline is then represented by:
+𝑃 ≤ 𝐵 peak × 𝐼
+
+This represents the maximum computational capability at level 𝑖, independent of the operational intensity.
+• Memory Roof at level 𝑖:
+
+(1)
+
+where 𝑃 is the achievable performance.
+Compute Roof: This represents the maximum performance achievable limited by the machine’s peak computational capability (𝑃 peak ). It is a horizontal line on the graph
+(top edge of the yellow region), independent of the operational intensity, indicating that when data transfer is not
+the bottleneck, the maximum achievable performance is determined by the processor’s computation capability. The
+compute-bound part (yellow region) is then defined by:
+𝑃 ≤ 𝑃peak
+
+𝑃𝑥𝑖 ≤ 𝐵𝑖peak × 𝐼𝑥𝑖
+
+More importantly, in HRM, there is also the memory band𝑗,𝑖
+width from level 𝑗 to level 𝑖, denoted as 𝐵 peak
+, which will
+define another memory roof for computation 𝑥 that is executed on level 𝑖 and transfers data from level 𝑗:
+• Memory Roof from level 𝑗 to 𝑖:
+𝑗,𝑖
+𝑃𝑥𝑖 ≤ 𝐵 peak
+× 𝐼𝑥𝑗
+
+Therefore, if computation 𝑥 is executed on level 𝑖, data
+from level 𝑗 needs to be fetched, and the peak performance
+will be bounded by the three roofs listed above (Eqs. (4)–(6)):
+𝑗,𝑖
+𝑖
+𝑃𝑥𝑖 = min(𝑃peak
+, 𝐵𝑖peak × 𝐼𝑥𝑖 , 𝐵 peak
+× 𝐼𝑥𝑗 )
+
+(7)
+
+If operator 𝑥 is executed on level 𝑖 without fetching data
+from other levels, it reduces to the traditional roofline model
+and can achieve:
+𝑖
+𝑃𝑥𝑖 = min(𝑃peak
+, 𝐵𝑖peak × 𝐼𝑥𝑖 )
+
+(8)
+
+Turning Points. Intuitively, our HRM introduces more
+memory roofs that consider cross-level memory bandwidth
+and compute roofs for diverse processors. This results in
+more “turning points” than in the original Roofline Model,
+which define various performance regions where different
+resources are the bottleneck. Analyzing these turning points
+is crucial for understanding the performance upper bound
+of an application under different hardware setups and computational characteristics.
+For example, consider a computation task 𝑥 that has data
+stored on level 𝑗, according to Eq. (6) and Eq. (8), when
+𝑗
+𝑗
+𝑗,𝑖
+𝑃𝑥𝑗 = min(𝑃peak
+, 𝐵 peak
+× 𝐼𝑥𝑗 ) ≥ 𝐵 peak
+× 𝐼𝑥𝑗 , we have 𝑃𝑥𝑖 ≤
+
+Hierarchical Roofline Model
+
+While the original Roofline Model demonstrates great power
+for application performance analysis, it is not enough for
+analyzing applications such as LLM inference that utilize
+diverse computing resources (e.g., CPU and GPU) and move
+data across multiple memory hierarchies (e.g., GPU HBM,
+CPU DRAM, and Disk storage).
+Consider a system with 𝑛 levels of memory hierarchies.
+Each level 𝑖 in this hierarchy is coupled with a computing
+processor. The peak bandwidth at which the processor at
+level 𝑖 can access the memory at the same level is denoted by
+𝐵𝑖peak . Additionally, the peak performance of the processor
+𝑖
+1.
+is denoted by 𝑃peak
+
+𝑗,𝑖
+𝐵 peak
+× 𝐼𝑥𝑗 ≤ 𝑃𝑥𝑗 . Therefore, the first turning point 𝑃 1 is at:
+
+𝐼¯𝑥𝑗 =
+
+𝑗
+𝑗
+min(𝑃peak
+, 𝐵 peak
+× 𝐼𝑥𝑗 )
+
+(9)
+𝑗,𝑖
+𝐵 peak
+
+This gives the critical operational intensity 𝐼¯𝑥𝑗 , indicating the
+threshold below which it is not beneficial to transfer data
+from level 𝑗 to 𝑖 for computation for 𝑥.
+𝑗,𝑖
+Now if we continue increasing 𝐼𝑥𝑗 such that 𝑃𝑥𝑗 < 𝐵 peak
+×
+
+Definition 3.1 (General Operational Intensity). To consider
+different memory hierarchies, we define the general operational intensity 𝐼𝑥𝑖 of the computation task 𝑥 as the ratio of
+the number of operations in FLOPs performed by 𝑥 to the
+number of bytes accessed from memory at level 𝑖.
+
+𝑖
+𝐼𝑥𝑗 ≤ min(𝑃peak
+, 𝐵𝑖peak × 𝐼𝑥𝑖 ), then we obtain another turning
+point 𝑃2 :
+𝑖
+min(𝑃peak
+, 𝐵𝑖peak × 𝐼𝑥𝑖 )
+𝐼¯𝑥𝑗 =
+(10)
+𝑗,𝑖
+𝐵 peak
+
+For computation 𝑥 executed at level 𝑖 in the HRM, we
+can define its compute and memory roofs similarly as in the
+original Roofline Model:
+• Compute Roof at level 𝑖:
+𝑖
+𝑃𝑥𝑖 ≤ 𝑃peak
+
+(6)
+
+(2)
+
+The turning point is the intersection of the compute and
+memory roofs, given by the equation:
+𝑃peak
+𝐼¯ =
+(3)
+𝐵 peak
+defines the critical operational intensity 𝐼¯. Applications with
+𝐼 ≥ 𝐼¯ are typically compute-bound, while those with 𝐼 < 𝐼¯
+are memory-bound.
+In practice, analyzing an application’s placement on the
+roofline model helps identify the critical bottleneck for performance improvements. Recent works [52] analyze different
+computations (e.g., softmax and linear projection) in LLM
+using the Roofline Model.
+3.2
+
+(5)
+
+which denotes the critical operational intensity 𝐼¯𝑥𝑗 below
+which computation 𝑥 is bounded by the memory bandwidth
+from memory at level 𝑗 to memory at level 𝑖.
+
+(4)
+
+𝑗
+𝑗
+1 In this paper we assume when 𝑖 < 𝑗, 𝑃 𝑖
+≥ 𝑃 peak and 𝐵𝑖peak ≥ 𝐵 peak .
+peak
+
+4
+
+𝑗,𝑖
+𝑖
+Balance Point. Further, if 𝐵𝑖peak × 𝐼𝑥𝑖 < 𝐵 peak
+× 𝐼𝑥𝑗 < 𝑃peak
+,
+indicating that the computation 𝑥 on level 𝑖 is memory-bound
+(refer to Eq. (3)). In this situation, further increasing 𝐼𝑥𝑗 cannot improve the system’s performance. Instead, we need to
+increase 𝐼𝑥𝑖 , and a balance point will be reached if:
+𝑗,𝑖
+𝐵𝑖peak × 𝐼𝑥𝑖 = 𝐵 peak
+× 𝐼𝑥𝑗
+
+Attention Block. Fig. 4 demonstrates the HRM plot for
+Mixtral 8x7B’s attention computation3 assuming all the KV
+cache are stored on CPU4 . On the plot, we have horizontal lines as the compute roofs defined by CPU and GPU
+peak performance. There are also the memory roofs defined
+by CPU memory bandwidth, GPU memory bandwidth, and
+CPU to GPU memory bandwidth, respectively. We then draw
+vertical lines representing different operational intensities
+for the attention computation with different KV cache data
+types. Theoretically, attention’s operational intensity is independent of the batch size since its flops and bytes are
+proportional to batch size. To increase the attention computation’s operational intensity, we need methods such as
+quantization [30, 38], Grouped Query Attention (GQA) [2],
+or sparse attention [9]. All these methods try to reduce the
+memory access needed by performing the attention computation, and GQA is used by most of the existing MoE models;
+however, as denoted in the plot, for both float16 and int45
+the operational intensity is quite low and is smaller than 𝑃1 ’s
+corresponding operational intensity, which suggests it may
+be better to perform attention on CPU.
+
+(11)
+
+Our performance model and policy optimizer (see §4.2) are
+designed to find the maximum balance point under the device
+memory constraints.
+300GB/s
+
+GPU Mem
+(24GB)
+
+GPU
+
+242TFlops/s
+
+CPU
+
+1.3TFlops/s
+
+32GB/s
+CPU Mem (192GB)
+
+100GB/s
+
+Figure 3. Hardware Configurations for the L4 Instance.
+3.3 Case Study
+To visualize the turning points and balance points discussed
+in the preceding sections, we conduct a case study with real
+HRM plots for computations2 in a single layer of the Mixtral
+8x7B model on a Google Cloud Platform L4 instance. The
+hardware setting is as detailed in Fig. 3. Specifically, we let
+levels 𝑖 and 𝑗 represent GPU and CPU, respectively. Then,
+we define the following:
+
+MoE Feed-Forward Network (FFN). Fig. 5 is an HRM
+plot for Mixtral 8x7B’s MoE Feed-Forward module on the
+L4 instance. The orange line represents the MoE FFN kernel
+performance achieved at a micro-batch size of 128. Vertical
+lines intersecting with CPU roofs and CPU-GPU memory
+roofs represent different batch sizes. FFN’s operational intensity will increase as batch size or micro-batch size increases
+since, intuitively, a larger batch size means more computation per weight access. As shown in the plot, suppose the
+computation kernel for the MoE FFN can run at a maximum
+𝜇 = 128, we can identify the turning point in Eq. (10) to be
+𝑃2 and the turning point in Eq. (9) to be 𝑃1 .
+When 𝐼 is less than 𝑃 1 ’s corresponding 𝐼 , there is no benefit in swapping the data to GPU for computation since it
+will be bounded by the memory roof from CPU to GPU. This
+is normally the case for many latency-oriented applications
+where users may only have one or two prompts to be processed. In such scenarios, it is more beneficial to have a static
+weights placement strategy (e.g., putting 𝑚 out of 𝑛 layers
+on GPU) and perform the computation where the data is
+located instead of swapping the weights back and forth.
+Next, we show the peak performance will be finally reached
+at a balance point (Eq. (11)). When 𝐼 is less than 𝑃2 ’s corresponding 𝐼 , the computation is bounded by the CPU to GPU
+memory bandwidth, and it cannot achieve the performance
+at 𝑃2 . Depending on whether there is enough CPU memory
+to hold a larger batch, we can either increase the batch size
+or put some of the weights on the GPU statically since both
+
+Definition 3.2 (Batch Size 𝑁 ). Batch size is the total number
+of tokens processed by one pass of the whole model.
+Definition 3.3 (Micro-Batch Size 𝜇). Since GPU memory is
+limited, a batch of size 𝑁 often needs to be split into several
+micro-batches of size 𝜇 to be processed by a single kernel
+execution on GPU.
+CPU Mem Bdw
+GPU Mem Bdw
+
+CPU-GPU Mem Bdw
+CPU Peak FLOPS
+
+GPU Peak FLOPS
+Attention x DataType
+
+Performance (GFLOPS/s)
+
+106
+
+105
+
+104
+
+P1
+
+103
+
+int4
+102
+
+101
+
+f16
+
+10−1
+
+100
+
+101
+
+102
+
+103
+
+104
+
+Operational Intensity (FLOPs/Byte)
+
+Figure 4. Hierarchical Roofline Model for Mixtral 8x7B’s
+Grouped Query Attention Block in Decode Stage on L4 Instance. (Context Length = 512)
+
+3 Not including QKVO projection.
+2We only discuss the attention and feed-forward blocks since they account
+
+4 For analysis purposes, we use the calculated theoretical operational inten-
+
+for the majority of computation time and represent quite different computation characteristics.
+
+sity instead of numbers from real profiling
+5 The computation is still done in float32.
+5
+
+CPU Mem Bdw
+GPU Mem Bdw
+CPU-GPU Mem Bdw
+
+CPU Peak FLOPS
+GPU Peak FLOPS
+
+Kernel Perf. at μ=128
+MoE FFN x N
+
+paper, CPU attention is consistently better than GPU attention, according to our performance model. We also conduct
+an ablation study in §6.3 to show how best policy changes
+under different hardware configurations.
+
+Performance (GFLOPS/s)
+
+106
+
+105
+
+μ=128
+
+104
+
+P1
+
+103
+
+102
+
+101
+
+4.1
+
+P2
+
+N=32N=128 N=1024
+
+10−1
+
+100
+
+101
+
+102
+
+Algorithm 1 CGOPipe
+1: for 𝑑 = 1, 2, . . . 𝑔𝑒𝑛_𝑙𝑒𝑛 do
+2:
+// Prologue
+3:
+for 𝑗 = 1, 2 do
+4:
+PreAttn(1, 𝑗)
+5:
+OffloadQKV(1, 𝑗)
+6:
+CPUAttn(1, 𝑗)
+7:
+W_CtoPin(2, 𝑗)
+8:
+for 𝑖 = 1, 2, . . . 𝑛𝑢𝑚_𝑙𝑎𝑦𝑒𝑟𝑠 do
+9:
+for 𝑗 = 1, 2, . . . 𝑛𝑢𝑚_𝑢𝑏𝑠 do
+10:
+LoadH(𝑖, 𝑗)
+11:
+W_PintoG(𝑖 + 1, 𝑗)
+12:
+PostAttn(𝑖, 𝑗)
+13:
+// Launch CPUAttn two batches ahead
+14:
+PreAttn(𝑖, 𝑗 + 2)
+15:
+OffloadQKV(𝑖, 𝑗 + 2)
+16:
+CPUAttn(𝑖, 𝑗 + 2)
+17:
+W_CtoPin(𝑖 + 1, 𝑗 + 2)
+
+N=16384
+
+103
+
+104
+
+Operational Intensity (FLOPs/Byte)
+
+Figure 5. Hierarchical Roofline Model for Mixtral 8x7B’s
+MoE Feed-Forward Block in Decode Stage on L4 Instance.
+
+strategies can increase the operational intensity for the MoE
+FFN computation regarding the data on the CPU.
+If the batch size can be continually increased, then when 𝐼
+equals 𝑃 2 ’s corresponding 𝐼 , the maximum performance that
+can be achieved is bounded by the operator’s operational
+intensity on GPU, which is dependent on the 𝜇 for the MoE
+FFN kernels. Then, there is no need to increase 𝑁 anymore,
+and the maximum performance reached at a balance point
+equals 𝑃2 . On the other hand, if we put more weights onto
+GPU, 𝜇 will decrease since larger 𝜇 will result in higher peak
+memory consumption. The maximum performance will be
+achieved at a balance point smaller than 𝑃 2 .
+In conclusion, to achieve high throughput for batched
+MoE inference, we hope to place computations on proper
+computing devices and find the best combination of 𝑁 and
+𝜇 so that we can fully utilize all the system’s components.
+
+4
+
+GPU-CPU-I/O Pipeline Schedule
+
+Pipeline scheduling is a common approach to maximize
+compute and I/O resource utilization. Yet, the pipeline concerning GPU, CPU, and I/O is not trivial. In traditional pipeline
+parallelism for deep learning training [16, 18, 34], models are
+divided into stages which are assigned to different devices.
+Therefore, only output activations are transferred between
+stages, resulting in a single type of data transfer in each direction at a time. In our scenario, both weights and intermediate
+results need to be transferred between GPU and CPU. Intermediate results are required immediately after computation
+to avoid blocking subsequent operations, whereas weights
+for the next layer are needed only after all micro-batches for
+the current layer are processed. Additionally, weight transfers typically take significantly longer than intermediate
+results. Consequently, naive scheduling of I/O events can
+lead to low I/O utilization, which also hinders computation.
+CGOPipe. Fig. 6 demonstrates our proposed CGOPipe and
+the other three scheduling strategies adopted in existing systems. CGOPipe employs CPU attention as analyzed in §3.3,
+alongside a weight paging scheme that interleaves the transfer of intermediate results for upcoming micro-batches with
+paged weight transfers to optimize computation and communication overlap. The GPU sequentially processes the postattention tasks (primarily O projection and MoE FFN) for
+the current micro-batch, followed by the pre-attention tasks
+(mainly layer norm and QKV projection) for the next microbatch. Concurrently, the CPU handles attention (specifically
+the softmax part) for the next batch, and a page of weights
+for the subsequent layer are transferred to the GPU.
+
+Method
+
+In general, we adopt the zigzag computation order proposed
+in FlexGen [42]: loading the weights from CPU6 and performing the computation layer by layer. For the prefill stage, we
+perform all the computation on GPU and offload KV cache to
+CPU for all the micro-batches7 . For the decode stage, within
+each layer, we propose a fine-grained GPU-CPU-I/O pipeline
+schedule (§4.1) to increase the utilization of GPU, CPU, and
+I/O in decode stage. We also build a performance model (§4.2)
+based on the HRM we extended from the Roofline Model to
+help search for the best hyper-parameters for the pipeline
+schedule, including the assignment of devices to perform
+different computations, the batch size, the micro-batch size
+and the ratio of weights to be placed on GPU statically. Note
+that for the memory-constrained scenarios we target in this
+6We do not consider disk offloading in this work.
+7 Since the prefill stage is normally compute-bound, and the computation
+
+can be easily overlapped with I/O, we do not perform further optimization
+for prefill stage.
+6
+
+Time
+
+CGOPipe
+MoE-Lightning
+
+GPU
+
+A1 A2
+
+C1
+B1
+
+CPU
+
+A3
+
+B2
+
+C2
+B3
+
+A1'
+
+C3
+B1'
+
+A2'
+
+C1'
+B2'
+
+A3'
+Ax
+
+DtoH
+
+W
+
+HtoD
+
+W
+
+W
+
+W'
+
+Paged Weights
+
+Pipeline
+w/o
+Paged
+Weights
+FastDecode*
+
+w/o
+Pipeline
+w/o
+Paged
+Weights
+
+GPU
+CPU
+
+A1 A2
+
+C1
+B1
+
+DtoH
+
+B2
+
+C2
+B3
+
+A1'
+
+C3
+B1'
+
+A2'
+
+...
+
+FlexGen
+
+W
+
+KV cache Transfer
+Ax' denotes pre-attention for micro-batch
+x in next layer, similar for others
+
+C1
+
+A2
+
+B1
+
+C2
+
+A3
+
+B2
+
+C3
+
+A1'
+
+C1'
+
+B3
+
+B1'
+
+DtoH
+
+W
+
+HtoD
+
+FlexGen(c)
+
+w/o CPU
+Attention
+w/o
+Paged
+Weights
+
+QKV DtoH
+Weights Transfer
+
+Un-Paged Weights
+A1
+
+Post-Attention for micro-batch x
+
+C1'
+
+B2'
+W
+
+CPU
+
+Attention for micro-batch x
+
+Cx
+
+Hidden HtoD
+
+A3
+
+HtoD
+
+GPU
+
+Pre-Attention for micro-batch x
+
+Bx
+
+...
+
+W
+
+Un-Paged Weights
+GPU
+CPU
+
+A1
+
+C1
+
+A2
+
+C2
+
+A3
+
+C3
+
+A1'
+
+C1'
+
+DtoH
+HtoD
+
+KV cache 2
+
+KV cache 3
+
+KV cache 1'
+
+W
+
+...
+
+W
+
+Un-Paged Weights
+
+Figure 6. Different Scheduling Strategies: Square sizes vary with workloads and policies. For example, larger 𝜇 or longer
+sequences lengthen the orange (attention) and the green (KV cache transfer from CPU to GPU) squares. Squares with red
+zigzag lines indicate the unnecessary GPU idle times. *FastDecode [17] dose not consider weights offloading.
+then mainly lies in the scheduling of D2 , D3 and D4 , which
+are all from CPU to GPU. For the case without CPU attention (S4 ), while D4 usually takes a similar or longer time
+compared with a layer’s computation, the I/O bandwidth is
+almost fully utilized, leaving little room for more efficient
+scheduling for data transfer. As we can see from the diagram of S2 and S3 , conducting the weights transfer as a
+whole will block the next layer’s first D2 for a long time,
+resulting in poor overall system efficiency. Instead, we can
+chunk the weights to be transferred into 𝑛 pages where 𝑛
+equals the number of micro-batches in the pipeline, and the
+performance model and optimizer (§4.2) select the proper
+micro-batch size, batch size and the proportion of weights
+to be transferred from CPU to GPU.
+Algorithm 1 provides the order in which the main CPU
+task launcher thread launches the tasks to enable CGOPipe.
+All the tasks are executed asynchronously, and necessary
+synchronization primitives are added to each task to enforce
+the correct data dependency.
+
+FlexGen [42] primarily employs the fourth schedule (S4 ),
+where attention is performed on GPU and the KV cache for
+the next micro-batch is prefetched during the current computation. This approach results in higher KV cache transfer
+latency than performing attention directly on the CPU (§3.3)
+and consumes I/O bandwidth that could otherwise be used
+for weight transfers, reducing resource utilization compared
+to CGOPipe. FlexGen also supports CPU attention and adopts
+the third schedule (S3 ), which is the least optimized and may
+even perform worse than S4 if KV cache transfer latency is
+less than the sum of pre-attention, post-attention, and CPU
+attention latencies, as later shown by our evaluation results
+(§5). FastDecode [17] suggests overlapping CPU attention
+with GPU computation, similar to the second schedule (S2 ).
+However, it does not target memory-constrained settings, so
+weight transfer scheduling is not considered.
+Weights Paging and Data Transfer Scheduling. To fully
+utilize the I/O, we propose a weights paging scheme to interleave the data transfer for different tasks, reducing bubbles
+in the I/O. There are mainly four kinds of data transfer:
+• D1 (QKV DtoH): the intermediate results to be transferred from GPU to CPU after QKV projection.
+• D2 (Hidden HtoD): the hidden states to be transferred
+from CPU to GPU after the CPU attention.
+• D3 (Weights Transfer): the weights for the next layer
+to be transferred from CPU to GPU.
+• D4 (KV cache Transfer): the KV cache for the next
+micro-batch to be transferred from CPU to GPU.
+
+4.2
+
+Search Space and Performance Model
+
+Given a hardware configuration H , a model configuration
+M, and a workload configuration W, we search for the optimal policy P that minimizes per-layer latency𝑇 (M, H, W, P)
+for the pipeline schedule in §4.1, without violating the CPU
+and GPU memory constraints, in order to reach the optimal
+balance point (Eq. (11)). Compared with FlexGen, we exclude
+disk-related variables from the search space and add two
+binaries to indicate whether to perform attention or MoE
+FFN on GPU.
+
+Due to independent data paths, data transfers in opposite
+directions can happen simultaneously. Data transfer will be
+performed sequentially in the same direction. The challenge
+7
+
+Table 1. Notations for the Performance Model Configuration
+Notation
+𝑚𝑔 , 𝑚𝑐
+𝑏𝑔 , 𝑏𝑐 , 𝑏𝑐𝑔
+𝑝𝑔 , 𝑝 𝑐
+𝑙
+ℎ1, ℎ2
+𝑛𝑞 , 𝑛𝑘𝑣
+𝑛𝑒 , 𝑘
+𝑑𝑡
+𝑠
+𝑛
+𝑁, 𝜇
+𝐹𝑔 , 𝐴𝑔
+𝑟 𝑤 , 𝑟𝑐
+
+such modeling can provide a reasonable estimation of the
+relative effectiveness of any two policies. In this paper, all
+the evaluation results of MoE-Lightning follow policies generated by a performance model with theoretically calculated
+computation flops and bytes with profiled peak performance
+and memory bandwidth for the hardware.
+
+Description
+Hardware Configurations, H
+GPU, CPU memory
+GPU, CPU, CPU-GPU bandwidth
+GPU, CPU FLOPS
+Model Configurations, M
+Number of layers
+Model, Intermediate hidden dimensions
+Query, Key/Value heads in attention
+Number of experts, Top-k routing
+Data type (e.g., float32)
+Workload Configurations, W
+Average Prompt Length
+Generation Length
+Policy, P
+Batch, Micro Batch Size
+GPU Attention/MoE FFN Indicator
+Ratio of Weights/KV Cache Stored on GPU
+
+4.3
+
+In existing works [42], pipeline parallelism is used for scaling beyond a single GPU, which requires the number of
+devices to scale with the model depth instead of the layer
+size. However, according to our analysis for MoE models
+in §3.3, Total GPU memory capacity can decide the upper
+bound throughput the system can achieve. Therefore, MoELightning implements tensor parallelism [35] within a single
+node to get a higher throughput upper bound. In this case,
+we have 𝑡𝑝_𝑠𝑖𝑧𝑒 times more GPU memory capacity and GPU
+memory bandwidth, we can then search for the policy similarly as for single GPU.
+
+The search space (Tab. 1) covers 2 integer values: the microbatch size (𝜇) and batch size (𝑁 ), 2 binary indicators 𝐴𝑔 to
+indicate whether to perform the attention on GPU and 𝐹𝑔 to
+indicate whether to perform the MoE FFN on GPU. When
+𝐹𝑔 = 1, we also need to decide the percent of weights 𝑟 𝑤 that
+can be statically stored on GPU and the percent of weights
+1 − 𝑟 𝑤 that need to be transferred to GPU. Similarly, for
+𝐴𝑔 = 1, we need to decide 𝑟𝑐 . The generated policy will be a
+6-tuple (𝑁 , 𝜇, 𝐴𝑔 , 𝐹𝑔 , 𝑟 𝑤 , 𝑟𝑐 ). For our major setting, we always
+get 𝐴𝑔 = 0 and 𝐹𝑔 = 1. However, we discuss in §6.3 different
+policies for various hardware settings. Notably, CGOPipe
+is primarily designed for 𝐴𝑔 = 0 and when 𝐴𝑔 = 1, MoELightning adopt S4 .
+We then build the performance model based on Eq. (7) and
+Eq. (8) in HRM to estimate per-layer decode latency 𝑇 by:
+𝑇 (M, H, W, P) = max(𝑐𝑜𝑚𝑚𝑐𝑝𝑢_𝑡𝑜_𝑔𝑝𝑢 ,𝑇𝑐𝑝𝑢 ,𝑇𝑔𝑝𝑢 )
+
+Evaluation
+
+5.1
+
+Setup
+
+Setting
+
+Model
+
+GPU
+
+CPU (Intel Xeon)
+
+S1
+S2
+
+Mixtral 8x7B
+Mixtral 8x7B
+
+1xT4 (16G)
+1xL4 (24G)
+
+2.30GHz, 24-core, 192GB
+2.20GHz, 24-core, 192GB
+
+S6
+S7
+
+Mixtral 8x22B
+Mixtral 8x22B
+
+2xT4 (32G)
+4xT4 (64G)
+
+2.30GHz, 32-core, 416GB
+2.30GHz, 32-core, 416GB
+
+S8
+S9
+
+DBRX
+DBRX
+
+2xT4 (32G)
+4xT4 (64G)
+
+2.30GHz, 32-core, 416GB
+2.30GHz, 32-core, 416GB
+
+(12)
+Table 3. Workload Configurations.
+
+of bytes needed to be transferred from CPU to GPU for a
+layer’s computation divided by the CPU to GPU memory
+bandwidth 𝑏𝑐𝑔 . Here, for simplicity, we only consider the
+attention computation and the MoE FFN computation in a
+transformer block, and therefore we have:
+
+Dataset
+
+𝑠 avg
+
+𝑠 max
+
+𝑙
+
+MTBench [55]
+Synthetic Reasoning [29]
+Summarization [29]
+
+77
+242
+1693
+
+418
+256
+1984
+
+32, 64, 128, 256
+50
+64
+
+𝑔
+
+𝑐
+𝑇𝑔𝑝𝑢 = 𝑇𝑎𝑡𝑡𝑛 + 𝑇𝑓 𝑓 𝑛 , 𝑇𝑐𝑝𝑢 = 𝑇𝑎𝑡𝑡𝑛
++ 𝑇𝑓𝑐 𝑓 𝑛
+
+(13)
+Implementation. We build MoE-Lightning on top of PyTorch [36], vLLM [26] and SGLang [56], written in Python
+and C++. We implement customized CPU Grouped Query
+Attention (GQA) kernels based on Intel’s MKL library [20].
+Models. We evaluate three popular MoE models: Mixtral
+8x7B [22], Mixtral 8x22B [32], and DBRX (132B, 16 Experts) [46].
+Although not evaluated, MoE-Lightning also supports other
+models compatible with vLLM [26]’s model classes.
+Hardware. We conduct tests on various hardware settings,
+including a single NVIDIA T4 GPU (16GB), a single NVIDIA
+L4 GPU (24GB) and multiple T4 GPUs. We evaluate 6 different model and hardware settings as shown in Tab. 2.
+
+To estimate the time to perform a computation 𝑥 on GPU
+or CPU, we can use 𝑇𝑥 = max(𝑐𝑜𝑚𝑚𝑥 , 𝑐𝑜𝑚𝑝𝑥 ) according to
+Eq. (8) in HRM, resulting in:
+𝑔
+
+5
+
+Table 2. Model and Hardware Configurations.
+
+where 𝑐𝑜𝑚𝑚𝑐𝑝𝑢_𝑡𝑜_𝑔𝑝𝑢 can be computed as the number
+
+𝑔
+
+Tensor Parallelism
+
+𝑔
+
+𝑔
+
+𝑇𝑓 𝑓 𝑛 = max(𝑐𝑜𝑚𝑚 𝑓 𝑓 𝑛 , 𝑐𝑜𝑚𝑝 𝑓 𝑓 𝑛 )
+
+(14)
+
+𝑔
+
+𝑐
+and similarly for 𝑇𝑎𝑡𝑡𝑛 , 𝑇𝑎𝑡𝑡𝑛
+and 𝑇𝑓𝑐 𝑓 𝑛 .
+For a given computation 𝑥, we can calculate their theoretical FLOPS and data transfer based on M and then we
+𝑔
+𝑔
+have 𝑐𝑜𝑚𝑚𝑥 = 𝑏𝑦𝑡𝑒𝑠𝑥 /𝑏𝑔 and 𝑐𝑜𝑚𝑝𝑥 = 𝑓 𝑙𝑜𝑝𝑠𝑥 /𝑝𝑔 (same for
+CPU). While there are discrepancies between the theoretical
+performance estimation and the kernel’s real performance,
+8
+
+FlexGen(c)
+
+DeepSpeed-Zero
+
+MoE-Lightning(p)
+
+MoE-Lightning
+
+MTBench @ S1
+
+75
+
+97.73
+
+1.3x
+15.6
+12.19.8
+7.1
+
+294.5
+
+300
+
+96.7
+
+3.5x
+33.9
+
+3.2x
+30.1
+
+2.0x
+24.0
+12.39.4
+7.6
+
+167.9
+
+100
+
+1.8x
+53.7
+29.2
+17.512.7
+
+9.6 6.8 6.7
+
+9.5 7.2 7.8
+
+0
+
+217.5
+
+203.0
+
+200
+
+63.0
+
+50
+25
+
+MTBench @ S2
+
+101.3
+
+100
+
+Throughput (tokens/s)
+
+Throughput (tokens/s)
+
+FlexGen
+
+MTBench @ S6
+
+1.3x
+5.38
+
+20
+
+3.66
+
+3.44
+
+2.86
+
+2.7
+
+10
+
+3.09
+
+0
+
+5.31
+
+4.97
+
+2
+0.56
+
+32
+
+0.61
+
+0.59
+
+64
+
+128
+
+Generation Length
+
+8.7x
+25.8
+
+3.0x
+14.9
+
+4.77
+
+4.4
+
+4.25
+
+6.0x
+26.2
+4.2x
+22.4
+
+1.6x
+7.75
+
+1.7x
+7.33
+
+6
+
+28.8
+15.911.8
+
+MTBench @ S7
+30
+
+2.5x
+9.13
+
+8
+
+2.7x
+78.6
+
+37.2
+20.012.1
+
+0
+
+10
+
+4
+
+2.1x
+79.0
+
+1.9x
+67.4
+34.9
+18.913.3
+
+0.62
+
+0
+
+256
+
+4.36
+
+1.78 0.9
+
+0.97 1.0
+
+1.02 1.2
+
+32
+
+64
+
+128
+
+2.96
+
+0.67 1.3
+
+256
+
+Generation Length
+
+Figure 7. End-to-end Results for MTBench on Different Model-Hardware Configurations. Normally, MoE-Lightning’s performance will be much higher than MoE-Lightning (p) since padding will lead to higher memory consumption and attention
+computation overhead8 . Here MoE-Lightning achieves up to 10.3× higher throughput than FlexGen under S1 and S2.
+Table 4. Performance for HELM tasks under S1 & S2
+Synthetic Reasoning
+Settings
+
+S1
+
+Summarization
+S2
+
+S1
+
+S2
+
+Throughput
+
+𝜇
+
+𝑁 /𝜇
+
+Throughput
+
+𝜇
+
+𝑁 /𝜇
+
+Throughput
+
+𝜇
+
+𝑁 /𝜇
+
+Throughput
+
+𝜇
+
+𝑁 /𝜇
+
+FlexGen(c)
+FlexGen
+DeepSpeed
+
+16.903
+22.691
+11.832
+
+32
+32
+102
+
+61
+61
+1
+
+20.015
+50.138
+18.589
+
+64
+64
+156
+
+33
+33
+1
+
+2.614
+3.868
+0.965
+
+3
+3
+8
+
+92
+92
+1
+
+4.307
+7.14
+1.447
+
+8
+8
+12
+
+36
+36
+1
+
+MoE-Lightning(p)
+
+26.349
+
+36
+
+26
+
+105.29
+
+100
+
+15
+
+4.52
+
+4
+
+19
+
+12.393
+
+8
+
+36
+
+Workloads. We use popular LLM benchmarks with different
+prompt length distributions to evaluate our system, as shown
+in Tab. 3. MTBench [55] includes 80 high-quality multi-turn
+questions across various categories like writing and reasoning. We replicate it into thousands of questions for our batch
+inference use case. We test various output token lengths for
+MTBench, from 32, 64, 128, to 256 tokens. We also pick two
+tasks (i.e., synthetic reasoning and summarization), from
+the HELM benchmarks [29] to test our system with longer
+prompt lengths.
+Baselines. We evaluate MoE-Lightning and MoE-Lightning’s
+variant, comparing them against two baseline systems that
+support running LLMs without enough GPU memory: FlexGen [42] and DeepSpeed Zero-Inference [4].
+
+Metrics. We measure the generation throughput for each
+workload, which is calculated as the number of tokens generated divided by total generation time (i.e., prefill time +
+decode time).
+
+• FlexGen [42] is the state-of-the-art offloading system that targets high-throughput batch inference for
+OPT [53] models. It does not support variable prompt
+length in a batch and needs to pad all the requests to
+the maximum prompt length in the batch.
+• FlexGen(c) is FlexGen enabling CPU attention.
+
+We evaluate the maximum generation throughput for all
+baseline systems on three workloads under S1, S2, S6, and S7
+settings. As shown in Fig. 7 and Tab. 4, MoE-Lightning (p)
+outperforms all baselines in all settings, and MoE-Lightning
+achieves up to 10.3× better throughput compared with the
+
+• DeepSpeed Zero-Inference [4] is an offloading system
+that pins model weights to CPU memory and streams
+them layer-by-layer to GPU for computation. We use
+version 0.14.3 in the evaluation.
+• MoE-Lightning represents our system with all the
+optimizations enabled.
+• MoE-Lightning (p) represents our system running
+with requests padded to the maximum prompt length
+in the batch to compare with FlexGen.
+
+5.2
+
+9
+
+End-to-end Results on Real Workloads
+
+best of the baselines for MTBench and HELM benchmark. In
+the following sections, we analyze how MoE-Lightning (p)
+outperforms our baselines by integrating the key methods
+from §4.2.
+Generation Length. While longer lengths allow for better
+amortization of the prefill time which increases throughput,
+they also lead to higher CPU memory usage and additional
+attention computation or KV cache transfer overheads. This
+increased memory demand can limit the maximum batch
+size, reducing throughput. Moreover, the increase in computation or KV cache transfers can make attention the main
+bottleneck. Typically, throughput first increases with longer
+generation length and then decreases.
+We observe this pattern for FlexGen and FlexGen(c) in all
+settings. However, MoE-Lightning (p) avoids a decrease in
+throughput under S1 and S6, which feature similar ratios
+of GPU to CPU memory. We attribute this performance improvement to CGOPipe, which significantly improves the
+resource utilization and renders the system GPU memory
+capacity bound in these settings.
+On a single GPU (S1 and S2), MoE-Lightning (p) achieves
+up to 3.5×, 5×, and 6.7× improvement over FlexGen, FlexGen(c), and DeepSpeed, respectively.
+Prompt Length. In the HELM tasks, we examine the impact of varying prompt lengths on generation throughput.
+Increasing the prompt length not only raises CPU memory consumption and attention overhead, but also leads to
+greater GPU peak memory usage during the prefill stage.
+Consequently, systems handling the summarization task
+with a 2k prompt length are bottlenecked by either GPU
+memory capacity or attention processes (see the ablation
+study in §6.3 for a detailed discussion on bottlenecks). Under
+S1, MoE-Lightning (p) achieves a 1.16× and 1.73× higher
+throughput than FlexGen and FlexGen(c), respectively, despite using a batch size that is 3.63× smaller, enabled by
+CGOPipe. DeepSpeed, utilizing a larger micro-batch size
+but the smallest batch size, is primarily constrained by the
+overhead of weight transfers. Under S2, with increased GPU
+memory, MoE-Lightning (p) adjusts to use a larger 𝜇 and 𝑁 ,
+reaching a new balance point (Eq. (11)), while FlexGen and
+FlexGen(c) are unable to increase 𝑁 from their S1 settings
+due to CPU memory limitations. As a result, MoE-Lightning
+(p) now achieves an even higher throughput improvement:
+1.74× and 2.88× higher than FlexGen and FlexGen(c), respectively. This superior performance is attributed to MoELightning (p)’s efficient resource utilization.
+The synthetic reasoning task enables all systems to have
+a larger micro-batch size due to the shorter prompt length.
+Under S1, MoE-Lightning (p) achieves a 1.16×, 1.56×, 2.22×
+higher throughput than FlexGen, FlexGen(c) and DeepSpeed
+
+respectively. Under S2, MoE-Lightning (p) finds a better balance point and uses less batch size than FlexGen, achieving
+2.1× and 5.26× higher throughput compared to FlexGen and
+FlexGen(c), demonstrating the efficiency of CGOPipe and
+HRM.
+5.3
+
+Tensor Parallelism
+
+Throughput (tokens/s)
+
+This section evaluates MoE-Lightning’s ability to run on
+multiple GPUs with tensor parallelism. As shown in S1 and
+S2, due to our efficient resource utilization, MoE-Lightning’s
+throughput is predominantly bounded by GPU memory capacity. This shows that increasing GPU memory can raise
+the system’s throughput upper bound.
+100
+83.58
+
+80
+
+2xT4
+4xT4
+
+82.98
+
+71.54
+59.45
+
+60
+40
+
+34.04
+
+36.24
+29.67
+
+25.86
+
+20
+0
+
+32
+
+64
+
+128
+
+Generation Length
+
+256
+
+Figure 8. MoE-Lightning with Tensor-Parallelism for MTBench @ S8 & S9.
+
+S6 and S7 in Fig. 7 show the end-to-end throughput results on Mixtral 8x22B of MoE-Lightning (p), FlexGen, and
+DeepSpeed on MTBench for multiple T4 GPUs. Notably,
+MoE-Lightning (p) achieves 2.77-3.38× higher throughput
+with 4xT4 GPUs than with 2xT4 GPUs, demonstrating superlinear scaling performance. DeepSpeed demonstrates a linearscaling performance but uses a small batch size of 32, resulting in low throughput. FlexGen fails to scale under settings
+S6 and S7, largely due to the pipeline parallelism approach
+it employs. In this method, when using 4 GPUs, during the
+saturated phase, four layers are simultaneously active across
+four GPUs, increasing CPU peak memory consumption. As a
+result, FlexGen is bottlenecked by the CPU to GPU memory
+bandwidth and fails to take advantage of the added GPUs.
+Note that pipeline parallelism is more effective across multiple GPU nodes. In such configurations, doubling the number
+of GPUs also doubles the CPU to GPU bandwidth, the CPU
+memory capacity, and the CPU memory bandwidth9 .
+Fig. 8 demonstrates MoE-Lightning’s generation throughput results on DBRX to showcase the performance when
+all optimizations are enabled (CGOPipe, HRM and variable
+length prompts). For the DBRX model and without request
+padding (i.e., shorter prompt length), the system becomes
+less GPU memory capacity bound. We can see 2.1-2.8× improvement when scaling from 2 GPUs to 4 GPUs.
+
+8We only show MoE-Lightning’s results for S1 and S2 and omit them for S6
+
+and S7 to focus on the comparison of the main optimizations we proposed
+in this paper.
+
+9 In this paper, we focus on the cases within one node.
+
+10
+
+MoE FFN
+
+𝜇
+
+𝑁
+
+Throughput (token/s)
+
+FlexGen w/ their policy
+FlexGen w/ our policy
+FlexGen w/ our policy + larger 𝑁
+
+8
+36
+36
+
+1112
+504
+1116
+
+9.5
+16.816 (1.77×)
+20.654 (2.17×)
+
+MoE-Lightning (p)
+
+36
+
+504
+
+30.12 (3.17×)
+
+0.015
+
+0.010
+
+0.005
+
+0.000
+
+128
+
+256
+
+512
+
+1024
+
+0.04
+
+0.03
+
+0.02
+
+0.01
+
+0.00
+
+2048
+
+128
+
+256
+
+512
+
+1024
+
+2048
+
+Context Length
+
+Context Length
+
+Micro Batch Size: 128
+
+Micro Batch Size: 256
+
+0.08
+
+Latency (seconds)
+
+Latency (seconds)
+
+0.175
+
+0.06
+
+0.04
+
+0.02
+
+0.00
+
+128
+
+256
+
+512
+
+1024
+
+0.150
+0.125
+0.100
+0.075
+0.050
+0.025
+0.000
+
+2048
+
+128
+
+256
+
+Context Length
+
+512
+
+1024
+
+2048
+
+Context Length
+
+Figure 9. Latency Comparison for a single layer’s KV cache
+transfer, CPU Attention Kernel and the MoE FFN Kernel wrt.
+𝜇 and Context Length in Decode Stage.
+
+Table 5. Generation throughput for MoE-Lightning and
+different variants of FlexGen. (MTBench@S1, Generation
+length=128)
+
+CPU to GPU memory bandwidth, the trade-offs will also
+change. Then the question becomes: when we have enough
+GPU memory (e.g., 2xA100-80G) to hold the model weights
+(e.g., Mixtral 8x7B), is it still beneficial to perform CPU computation or to offload weights/KV cache to the CPU? To
+conduct the analysis, we use 2xA100-80G for the GPU specification and vary the CPU to GPU memory bandwidth from
+100 to 500 GB/s alongside different CPU capabilities. We set
+base CPU specifications at 𝑚𝑐 = 200GB/s, 𝑏𝑐 = 100GB, and
+𝑝𝑐 = 1.6TFLOPS/s, scaling these values by multiplying with
+the CPU scaling ratio for various configurations10 .
+
+CPU Attention vs. Experts FFN vs. KV Transfer
+
+In this section, we study when CPU attention will become
+the bottleneck in the decode stage. For different batch sizes
+(from 32 to 256), we test the latency of the MoE FFN kernel
+on L4 GPU and compare it with the latency of the CPU attention kernel on a 24-core Intel(R) Xeon(R) CPU @ 2.20GHz
+with various context lengths (from 128 to 2048). Additionally, we also measure the latency for swapping the KV cache
+needed for the attention from CPU pinned memory to GPU
+to validate the efficiency of our CPU GQA kernel.
+As shown in Fig. 9, our CPU attention kernel is 3 − 4×
+faster than KV cache transfer, which is close to the ratio
+of CPU memory bandwidth and the CPU to GPU memory
+bandwidth. The MoE FFN’s latency doesn’t change so much
+across different micro batch sizes, which is as expected since
+the kernel is memory-bound for the decode stage. As the
+micro-batch size and context length increase, the CPU attention will eventually become the bottleneck, which calls for
+higher CPU memory bandwidth.
+6.3
+
+CPU Attention
+Micro Batch Size: 64
+
+0.020
+
+Latency (seconds)
+
+Optimizer Policy
+
+In this section, we compare MoE-Lightning (p), FlexGen with
+its policy and FlexGen with our policy. For this experiment,
+we do not turn on the CPU attention for FlexGen as it is
+consistently worse than FlexGen w/o CPU attention. We
+use the workload from MTBench on the S1 setting with a
+generation length of 128. The results are displayed in Tab. 5.
+By deploying our policy, we can see a 1.77× improvement in
+FlexGen. We also increase the batch size to better amortize
+the weights transfer overhead and it gives a 2.17× speedup.
+However, it still cannot match MoE-Lightning’s throughput
+under the same policy, as KV cache swapping becomes the
+bottleneck for FlexGen in this case.
+
+6.2
+
+KV Transfer
+
+Micro Batch Size: 32
+
+500
+
+Ratio of Weights on CPU
+0.90
+
+450
+
+CPU-GPU Bandwidth
+
+500
+
+400
+
+0.75
+
+350
+
+0.60
+
+300
+0.45
+250
+0.30
+200
+0.15
+
+150
+100
+
+2
+
+4
+
+6
+
+8
+
+CPU Scaling Ratio
+
+10
+
+0.00
+
+Ratio of KV Cache on CPU
+0.90
+
+450
+
+CPU-GPU Bandwidth
+
+6.1
+
+Ablation Study
+Latency (seconds)
+
+6
+
+400
+
+0.75
+
+350
+
+0.60
+
+300
+0.45
+250
+0.30
+200
+0.15
+
+150
+100
+
+2
+
+4
+
+6
+
+8
+
+10
+
+0.00
+
+CPU Scaling Ratio
+
+Figure 10. Policy changes with different hardware configurations (prompt length=512, generation length=32). Red
+points denote performing attention on the CPU.
+
+Case Study on Different Hardware Settings
+
+We can see that when running Mixtral 8x7B on two A100
+GPUs, as CPU-to-GPU memory bandwidth increases, more
+weight will be offloaded to the CPU. KV cache offloading is
+highly related to the CPU scaling ratio in this setup: when the
+
+In this section, we study how the best policy changes under different hardware settings. As we have shown in the
+previous ablation study, CPU attention can actually become
+the bottleneck for large batch size and context length, which
+means if we have more powerful GPUs, at some point, CPU
+attention may not be worth it. Moreover, if we have higher
+
+10 Note that this setup doesn’t reflect real-world hardware scaling; rather,
+
+it simplifies the number of variables to offer a rough idea of how these
+hardware configurations might impact performance.
+11
+
+CPU scaling ratio is low (i.e., low CPU memory bandwidth),
+even with the highest CPU to GPU memory bandwidth tested
+here, it is not beneficial to offload KV cache.
+
+7
+
+resource utilization, and HRM is a performance model based
+on a Hierarchical Roofline Model that we extend from the
+classical Roofline Model to find policies with higher throughput upper bound.
+
+Related Work
+
+A
+
+Memory-constriant LLM Inference LLM inference requires substantial memory to store model parameters and
+computation outputs, making it typically memory capacitybound. There is a line of research dedicated to memoryconstraint LLM inference. This is particularly crucial for
+inference hardware such as desktop computers, or low-end
+cloud instances with limited computational power and memory capacity. To facilitate inference on such constrained systems, some work leverages sparsity or neuro activation patterns to intelligent offloading between CPU and GPU [15,
+42, 43, 50]. Some approaches utilize not only DRAM but also
+flash memory to expand the available memory resources [3].
+Additionally, since the CPU often remains underutilized during inference, it can be harnessed to perform complementary
+computations [25, 43, 49].
+LLM Inference Throughput Optimization To enhance
+inference throughput, some research focuses on maximizing
+the sharing of computations between sequences to minimize
+redundant processing of identical tokens [24, 56]. Another
+approach involves batching requests [51] to optimize hardware utilization. Additionally, some studies develop paged
+memory methods for managing the key-value (KV) cache
+to reduce memory waste, thereby increasing the effective
+batch size and further improving throughput [26]. FastDecode [17] proposes aggregating memory and computing
+power of CPUs across multiple nodes to process the attention
+part to boost GPU throughput. Compared with FastDecode,
+we are targeting the memory-constrained case where the
+model weights also need to be transferred between CPU and
+GPU, making the optimization and scheduling problem far
+more challenging.
+LLM Inference Latency Optimization To reduce LLM inference latency, some work addresses the inherent slowness
+caused by the autoregressive nature of LLM inference by
+developing fast decoding methods, such as speculative decoding [5, 28, 44] and parallel decoding [39], which generate
+multiple tokens simultaneously. Another approach aims to
+decrease inference latency by implementing efficient computational kernels [1, 11, 12] designed to minimize memory
+access and maximize GPU utilization.
+
+8
+
+System Implementation Details
+
+In this section, we explain two system-level designs and
+their implementation details: 1. Appendix A.1 introduces
+how GPU and CPU memory are used and weights paging
+is implemented in MoE-Lightning, and 2. Appendix A.2
+presents the batching algorithm employed in MoE-Lightning
+to support dynamic-length requests in a batch.
+A.1
+
+Memory Management
+
+Since attention is performed on CPU, the KV cache for all
+micro-batches will be transferred to and stored on CPU after the corresponding computation completes. To enable
+CGOPipe, we allocate a weight buffer with a size of 2 ×
+𝑠𝑖𝑧𝑒𝑜 𝑓 (𝑊𝐿 ), where 𝑊𝐿 denotes the size of the portion of
+a layer’s weights stored in CPU memory. This buffer enables overlapping weight prefetching: as the current layer’s
+weights are being used, the next layer’s weights are simultaneously transferred to GPU memory.
+Weights are transferred in a paged manner. For example in Fig. 11, each expert in the MoE FFN kernel requires
+two pages, and the kernel accesses the appropriate pages
+using a page table. To accelerate transfers from CPU to GPU,
+weights are first moved from CPU memory to pinned memory, and then from pinned memory to GPU. These transfers
+are overlapped to hide latency. As illustrated in Fig. 11, while
+transferring Weights 2 for Layer 2 from pinned memory
+to GPU, Weights 4 for the same layer can be transferred
+concurrently from CPU to pinned memory.
+
+MoE FFN Kernel
+
+Experts idx Page idx
+1
+4,5
+2
+6,7
+
+Read
+
+GPU Memory
+
+Layer 0
+
+CPU Memory
+Layer 1
+
+Layer 2
+
+Weights 1
+
+1
+
+1
+
+Weights 2
+
+2
+
+2
+
+Weights 3
+
+3
+
+3
+
+Weights 4
+
+4
+
+4
+
+1
+
+1
+
+KV 1
+
+KV 1
+
+KV 1
+
+Weights 2
+
+2
+
+KV 2
+
+KV 2
+
+KV 2
+
+Weights 3
+
+3
+
+KV 3
+
+KV 3
+
+KV 3
+
+Weights 4
+
+4
+
+KV 4
+
+KV 4
+
+KV 4
+
+Intermediate Tensors
+1
+
+3
+
+2
+
+4
+
+Pinned
+Memory
+
+Conclusion
+
+We present MoE-Lightning, a high-throughput MoE inference system for GPU-constrained scenarios. MoE-Lightning
+can achieve up to 10.3× (without request padding) and 3.5×
+(with request padding) higher throughput over state-of-theart systems on a single GPU and demonstrate super-linear
+scaling on multiple GPUs, enabled by CGOPipe and HRM.
+CGOPipe is a novel pipeline scheduling strategy to improve
+
+Figure 11. Simplified Demonstration of MoE-Lightning’s
+Memory Management.
+A.2
+
+Request Batching
+
+For a given workload, the optimizer introduced in §4.2 takes
+the average prompt length to search for an optimal policy.
+12
+
+However, maintaining a consistent micro-batch size becomes
+challenging due to varying input lengths across requests. To
+address this, we employ the strategy outlined in Algorithm 2
+to achieve balanced token distribution. In essence, requests
+are sorted by input length in descending order and assigned
+to micro-batches by iteratively placing the longest request
+into the micro-batch with the fewest tokens. This approach
+ensures that all micro-batches have a size close to the 𝑢𝑏𝑠
+specified by the generated policy.
+
+bandwidth during attention (depending on sequence length),
+where methods like sparse attention[9, 45, 54] and quantized
+KV cache may offer more gains.
+B.2 Optimizer Overhead
+In §4.2, we introduced the optimization target Eq. (12) and
+the search space. For a given workload, model and hardware
+specification, the optimal policy can be generated offline
+through mixed integer linear programming (MILP), which
+takes less than a minute.
+
+Algorithm 2 Request Batching
+
+C
+
+Input: 𝑟𝑒𝑞_𝑞𝑢𝑒𝑢𝑒: Queue of requests
+Input: 𝑛_𝑢𝑏: Number of micro-batches
+Input: 𝑢𝑏𝑠: Maximum number of requests per microbatches
+Input: 𝑔𝑒𝑛_𝑙𝑒𝑛: Generation length per request
+Input: 𝑐𝑎𝑐ℎ𝑒_𝑠𝑖𝑧𝑒: Maximum cache size per micro-batches
+Output: 𝑚𝑖𝑐𝑟𝑜_𝑏𝑎𝑡𝑐ℎ𝑒𝑠: List of micro-batches
+Output: 𝑎𝑏𝑜𝑟𝑡𝑒𝑑_𝑟𝑒𝑞𝑢𝑒𝑠𝑡𝑠: List of aborted requests to be
+added to the next batch
+1: for 𝑖 ← 1 to 𝑛_𝑢𝑏 do
+2:
+𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠 [𝑖] ← ∅
+3:
+𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠_𝑠𝑢𝑚𝑠 [𝑖] ← 0
+4: Sort(𝑟𝑒𝑞_𝑞𝑢𝑒𝑢𝑒, 𝑘𝑒𝑦 = 𝜆𝑥 . 𝑥 .𝑖𝑛𝑝𝑢𝑡_𝑙𝑒𝑛, 𝑟𝑒𝑣𝑒𝑟𝑠𝑒 = 𝑇 𝑟𝑢𝑒)
+5: for all 𝑟𝑒𝑞 ∈ 𝑟𝑒𝑞_𝑞𝑢𝑒𝑢𝑒 do
+6:
+if 𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠 == ∅ then
+7:
+𝑎𝑏𝑜𝑟𝑡𝑒𝑑_𝑟𝑒𝑞𝑢𝑒𝑠𝑡𝑠 += 𝑟𝑒𝑞
+8:
+𝑖𝑑𝑥 ← arg min(𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠_𝑠𝑢𝑚𝑠)
+if (𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠_𝑠𝑢𝑚𝑠 [𝑖𝑑𝑥] + 𝑟𝑒𝑞.𝑖𝑛𝑝𝑢𝑡_𝑙𝑒𝑛) + (1 +
+9:
+|𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠 [𝑖𝑑𝑥] |) × 𝑔𝑒𝑛_𝑙𝑒𝑛 > 𝑐𝑎𝑐ℎ𝑒_𝑠𝑖𝑧𝑒 then
+10:
+𝑎𝑏𝑜𝑟𝑡𝑒𝑑_𝑟𝑒𝑞𝑢𝑒𝑠𝑡𝑠 += 𝑟𝑒𝑞
+11:
+else
+12:
+𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠 [𝑖𝑑𝑥] += 𝑟𝑒𝑞
+13:
+𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠_𝑠𝑢𝑚𝑠 [𝑖𝑑𝑥] += 𝑟𝑒𝑞.𝑖𝑛𝑝𝑢𝑡_𝑙𝑒𝑛
+14:
+if |𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠 [𝑖𝑑𝑥] | == 𝑢𝑏𝑠 then
+15:
+𝑛𝑒𝑤_𝑏𝑎𝑡𝑐ℎ ← NewBatch(𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠 [𝑖𝑑𝑥])
+16:
+𝑚𝑖𝑐𝑟𝑜_𝑏𝑎𝑡𝑐ℎ𝑒𝑠 += 𝑛𝑒𝑤_𝑏𝑎𝑡𝑐ℎ
+17:
+𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠.𝑝𝑜𝑝 (𝑖𝑑𝑥)
+18:
+𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛𝑠_𝑠𝑢𝑚𝑠.𝑝𝑜𝑝 (𝑖𝑑𝑥)
+19: return 𝑚𝑖𝑐𝑟𝑜_𝑏𝑎𝑡𝑐ℎ𝑒𝑠, 𝑎𝑏𝑜𝑟𝑡_𝑟𝑒𝑞𝑢𝑒𝑠𝑡𝑠
+
+B
+
+Further Discussion
+
+B.1
+
+MoE v.s. Dense Models
+
+Future Work
+
+Advanced performance model. HRM presented in this
+work is limited to hardware within a single node and does
+not account for GPU-GPU communication or multi-node
+communication, both of which are critical for more comprehensive distributed performance modeling. Additionally,
+with recent advances in leveraging KV cache sparsity for
+long-context inference [45], it becomes essential to incorporate these optimizations into the performance model. For
+example, when CPU attention emerges as the bottleneck, the
+KV cache budget can be adjusted to better balance CPU and
+GPU computation, enhancing overall system efficiency.
+Disk and other hardware support. MoE-Lightning currently focuses on scenarios where GPU memory is limited
+but sufficient CPU memory is available to hold the model,
+highlighting the effectiveness of both CGOPipe and HRM.
+However, when CPU memory is insufficient to hold the entire model, disk offloading becomes essential. Moreover, supporting hardware such as TPUs and other accelerators is
+essential for extending the versatility of MoE-Lightning to
+diverse computing environments.
+
+References
+[1] Flashinfer AI. Flashinfer: Kernel library for llm serving. https://github.
+com/flashinfer-ai/flashinfer, 2024. Accessed: 2024-05-20.
+[2] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy,
+Federico Lebrón, and Sumit Sanghai. Gqa: Training generalized multiquery transformer models from multi-head checkpoints. arXiv preprint
+arXiv:2305.13245, 2023.
+[3] Keivan Alizadeh, Iman Mirzadeh, Dmitry Belenko, Karen Khatamifard,
+Minsik Cho, Carlo C Del Mundo, Mohammad Rastegari, and Mehrdad
+Farajtabar. Llm in a flash: Efficient large language model inference
+with limited memory, 2024.
+[4] Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan,
+Cheng Li, Du Li, Elton Zheng, Olatunji Ruwase, Shaden Smith, Minjia
+Zhang, Jeff Rasley, et al. Deepspeed-inference: enabling efficient
+inference of transformer models at unprecedented scale. In SC22:
+International Conference for High Performance Computing, Networking,
+Storage and Analysis, pages 1–15. IEEE, 2022.
+[5] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste
+Lespiau, Laurent Sifre, and John Jumper. Accelerating large language
+model decoding with speculative sampling, 2023.
+[6] Wuyang Chen, Yanqi Zhou, Nan Du, Yanping Huang, James Laudon,
+Zhifeng Chen, and Claire Cui. Lifelong language pretraining with
+distribution-specialized experts. In International Conference on Machine Learning, pages 5383–5395. PMLR, 2023.
+
+The performance model and system optimizations proposed
+in this work are fully applicable to dense models. As discussed in §3.3, MoE models present greater challenges with
+their higher memory-to-FLOPS ratio. This benefits them
+more from the system optimizations, which specifically aim
+to improve I/O efficiency and reduce pipeline bubbles. Dense
+models can benefit from these optimizations as well; however,
+they are more likely to be bottle-necked by CPU memory
+13
+
+[24] Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y. Fu, Christopher Ré, and Azalia Mirhoseini. Hydragen: High-throughput llm
+inference with shared prefixes, 2024.
+[25] Keisuke Kamahori, Yile Gu, Kan Zhu, and Baris Kasikci. Fiddler: Cpugpu orchestration for fast inference of mixture-of-experts models,
+2024.
+[26] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+Efficient memory management for large language model serving with
+pagedattention. In Proceedings of the 29th Symposium on Operating
+Systems Principles, pages 611–626, 2023.
+[27] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen,
+Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, and
+Zhifeng Chen. Gshard: Scaling giant models with conditional computation and automatic sharding. arXiv preprint arXiv:2006.16668,
+2020.
+[28] Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from
+transformers via speculative decoding, 2023.
+[29] Percy Liang, Rishi Bommasani, Tony Lee, Dimitris Tsipras, Dilara
+Soylu, Michihiro Yasunaga, Yian Zhang, Deepak Narayanan, Yuhuai
+Wu, Ananya Kumar, et al. Holistic evaluation of language models.
+arXiv preprint arXiv:2211.09110, 2022.
+[30] Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang, Guangxuan
+Xiao, Chuang Gan, and Song Han. Qserve: W4a8kv4 quantization and
+system co-design for efficient llm serving, 2024.
+[31] Shu Liu, Asim Biswal, Audrey Cheng, Xiangxi Mo, Shiyi Cao, Joseph E.
+Gonzalez, Ion Stoica, and Matei Zaharia. Optimizing llm queries in
+relational workloads, 2024.
+[32] MistralAI. https://mistral.ai/news/mixtral-8x22b/, April 2024.
+[33] Avanika Narayan, Ines Chami, Laurel Orr, and Christopher Ré. Can
+foundation models wrangle your data? arXiv preprint arXiv:2205.09911,
+2022.
+[34] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri,
+Nikhil R Devanur, Gregory R Ganger, Phillip B Gibbons, and Matei
+Zaharia. Pipedream: generalized pipeline parallelism for dnn training. In Proceedings of the 27th ACM symposium on operating systems
+principles, pages 1–15, 2019.
+[35] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi
+Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efficient largescale language model training on gpu clusters using megatron-lm.
+In Proceedings of the International Conference for High Performance
+Computing, Networking, Storage and Analysis, pages 1–15, 2021.
+[36] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James
+Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia
+Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, highperformance deep learning library. Advances in neural information
+processing systems, 32, 2019.
+[37] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin,
+James Bradbury, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and
+Jeff Dean. Efficiently scaling transformer inference. Proceedings of
+Machine Learning and Systems, 5, 2023.
+[38] Sarunya Pumma, Jongsoo Park, Jianyu Huang, Amy Yang, Jaewon Lee,
+Daniel Haziza, Grigory Sizov, Jeremy Reizenstein, Jeff Johnson, and
+Ying Zhang. Int4 decoding gqa cuda optimizations for llm inference.
+https://pytorch.org/blog/int4-decoding/, 2024.
+[39] Andrea Santilli, Silvio Severino, Emilian Postolache, Valentino
+Maiorca, Michele Mancusi, Riccardo Marin, and Emanuele Rodola.
+Accelerating transformer inference for translation via parallel decoding. In Proceedings of the 61st Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers). Association for
+Computational Linguistics, 2023.
+[40] Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana
+Ilić, Daniel Hesslow, Roman Castagné, Alexandra Sasha Luccioni,
+
+[7] Xinyun Chen, Petros Maniatis, Rishabh Singh, Charles Sutton, Hanjun
+Dai, Max Lin, and Denny Zhou. Spreadsheetcoder: Formula prediction
+from semi-structured context. In International Conference on Machine
+Learning, pages 1661–1672. PMLR, 2021.
+[8] Wei-Lin Chiang, Lianmin Zheng, Ying Sheng, Anastasios Nikolas Angelopoulos, Tianle Li, Dacheng Li, Hao Zhang, Banghua Zhu, Michael
+Jordan, Joseph E Gonzalez, et al. Chatbot arena: An open platform for
+evaluating llms by human preference. arXiv preprint arXiv:2403.04132,
+2024.
+[9] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating
+long sequences with sparse transformers, 2019.
+[10] Damai Dai, Chengqi Deng, Chenggang Zhao, R. X. Xu, Huazuo Gao,
+Deli Chen, Jiashi Li, Wangding Zeng, Xingkai Yu, Y. Wu, Zhenda
+Xie, Y. K. Li, Panpan Huang, Fuli Luo, Chong Ruan, Zhifang Sui, and
+Wenfeng Liang. Deepseekmoe: Towards ultimate expert specialization
+in mixture-of-experts language models. CoRR, abs/2401.06066, 2024.
+[11] Tri Dao. FlashAttention-2: Faster attention with better parallelism
+and work partitioning. In International Conference on Learning Representations (ICLR), 2024.
+[12] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher
+Ré. FlashAttention: Fast and memory-efficient exact attention with
+IO-awareness. In Advances in Neural Information Processing Systems
+(NeurIPS), 2022.
+[13] Nan Du, Yanping Huang, Andrew M Dai, Simon Tong, Dmitry Lepikhin, Yuanzhong Xu, Maxim Krikun, Yanqi Zhou, Adams Wei Yu,
+Orhan Firat, et al. Glam: Efficient scaling of language models with
+mixture-of-experts. In International Conference on Machine Learning,
+pages 5547–5569. PMLR, 2022.
+[14] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten,
+Amy Yang, Angela Fan, et al. The llama 3 herd of models. arXiv
+preprint arXiv:2407.21783, 2024.
+[15] Artyom Eliseev and Denis Mazur. Fast inference of mixture-of-experts
+language models with offloading, 2023.
+[16] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu Wang, Zhen
+Zheng, Chuan Wu, Guoping Long, Jun Yang, Lixue Xia, et al. Dapple: A pipelined data parallel approach for training large models. In
+Proceedings of the 26th ACM SIGPLAN Symposium on Principles and
+Practice of Parallel Programming, pages 431–445, 2021.
+[17] Jiaao He and Jidong Zhai. Fastdecode: High-throughput gpu-efficient
+llm serving using heterogeneous pipelines, 2024.
+[18] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao
+Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui
+Wu, et al. Gpipe: Efficient training of giant neural networks using
+pipeline parallelism. Advances in neural information processing systems,
+32, 2019.
+[19] HuggingFace. Hugging face accelerate. https://huggingface.co/docs/
+accelerate/index, 2022.
+[20] Intel. Intel(r) oneapi math kernel library (onemkl). https://www.intel.
+com/content/www/us/en/developer/tools/oneapi/onemkl.html, 2024.
+[21] Robert A. Jacobs, Michael I. Jordan, Steven J. Nowlan, and Geoffrey E.
+Hinton. Adaptive mixtures of local experts. Neural Comput., 3(1):79–
+87, 1991.
+[22] Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris Bamford, Devendra Singh Chaplot, Diego
+de Las Casas, Emma Bou Hanna, Florian Bressand, Gianna Lengyel,
+Guillaume Bour, Guillaume Lample, Lélio Renard Lavaud, Lucile
+Saulnier, Marie-Anne Lachaux, Pierre Stock, Sandeep Subramanian,
+Sophia Yang, Szymon Antoniak, Teven Le Scao, Théophile Gervet,
+Thibaut Lavril, Thomas Wang, Timothée Lacroix, and William El
+Sayed. Mixtral of experts. CoRR, abs/2401.04088, 2024.
+[23] Michael I Jordan and Robert A Jacobs. Hierarchical mixtures of experts
+and the em algorithm. Neural computation, 6(2):181–214, 1994.
+
+14
+
+[57] Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang, Vincent
+Zhao, Andrew M Dai, Quoc V Le, James Laudon, et al. Mixture-ofexperts with expert choice routing. Advances in Neural Information
+Processing Systems, 35:7103–7114, 2022.
+
+François Yvon, Matthias Gallé, et al. Bloom: A 176b-parameter openaccess multilingual language model. arXiv preprint arXiv:2211.05100,
+2022.
+[41] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis,
+Quoc Le, Geoffrey Hinton, and Jeff Dean. Outrageously large neural
+networks: The sparsely-gated mixture-of-experts layer. arXiv preprint
+arXiv:1701.06538, 2017.
+[42] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max
+Ryabinin, Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and
+Ce Zhang. Flexgen: High-throughput generative inference of large
+language models with a single gpu. In International Conference on
+Machine Learning, pages 31094–31116. PMLR, 2023.
+[43] Yixin Song, Zeyu Mi, Haotong Xie, and Haibo Chen. Powerinfer: Fast
+large language model serving with a consumer-grade gpu, 2023.
+[44] Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Blockwise parallel
+decoding for deep autoregressive models, 2018.
+[45] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci,
+and Song Han. Quest: Query-aware sparsity for efficient long-context
+llm inference. arXiv preprint arXiv:2406.10774, 2024.
+[46] Mosaic Research Team. Introducing dbrx: A new state-of-the-art open
+llm, 2024. https://www.databricks.com/blog/introducing-dbrx-newstate-art-open-llm, March 2024. Accessed 2024-06-20.
+[47] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, MarieAnne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric
+Hambro, Faisal Azhar, et al. Llama: Open and efficient foundation
+language models. arXiv preprint arXiv:2302.13971, 2023.
+[48] Samuel Williams, Andrew Waterman, and David A. Patterson.
+Roofline: an insightful visual performance model for multicore architectures. Commun. ACM, 52(4):65–76, 2009.
+[49] ZHAO XUANLEI, Bin Jia, Haotian Zhou, Ziming Liu, Shenggan Cheng,
+and Yang You. Hetegen: Efficient heterogeneous parallel inference for
+large language models on resource-constrained devices. Proceedings
+of Machine Learning and Systems, 6:162–172, 2024.
+[50] Leyang Xue, Yao Fu, Zhan Lu, Luo Mai, and Mahesh Marina. Moeinfinity: Activation-aware expert offloading for efficient moe serving,
+2024.
+[51] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim,
+and Byung-Gon Chun. Orca: A distributed serving system for
+{Transformer-Based} generative models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 22), pages
+521–538, 2022.
+[52] Zhihang Yuan, Yuzhang Shang, Yang Zhou, Zhen Dong, Chenhao Xue,
+Bingzhe Wu, Zhikai Li, Qingyi Gu, Yong Jae Lee, Yan Yan, Beidi Chen,
+Guangyu Sun, and Kurt Keutzer. Llm inference unveiled: Survey and
+roofline model insights, 2024.
+[53] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya
+Chen, Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained transformer language models.
+arXiv preprint arXiv:2205.01068, 2022.
+[54] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin
+Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark
+Barrett, et al. H2o: Heavy-hitter oracle for efficient generative inference of large language models. Advances in Neural Information
+Processing Systems, 36, 2024.
+[55] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing,
+et al. Judging llm-as-a-judge with mt-bench and chatbot arena. Advances in Neural Information Processing Systems, 36, 2024.
+[56] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica,
+Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. Sglang: Efficient
+execution of structured language model programs, 2024.
+
+15
+
+
