@@ -18,7 +18,7 @@
 | 64 TACOS | 已选读物理页 4–10，视读第 8 页 | [正文与固定 README](../../references/proceedings/MICRO/2024/tacos-body-reading/NOTES.md)：拓扑时序生成与实际部署分开；公开入口只声明 All-Gather／预计时间，接现有 6.4 通信调优。 |
 | 74 StarNUMA | 备查 | CPU 多 socket 共享页放置不直接代表 GPU KV 内存池；保留通信与放置的背景。 |
 | 99 SN40L | 正文候选 | 已有 4.6 引用继续保留；待读三层存储和模型切换，区分 Composition of Experts 系统组合与逐层 MoE。 |
-| 105 Duplex | 正文候选 | 连续批处理改变每个 expert 的 Op/B，进而改变 xPU／Logic-PIM 分工；须核质量和硬件假设，历史模型不替换 V4／K3。 |
+| 105 Duplex | 已选读物理页 4–9，视读第 9 页 | [专家工作量与共享内存约束](../../references/proceedings/MICRO/2024/duplex-body-reading/NOTES.md)补现有专家案例；Logic-PIM 专用硬件和仿真条件保留，不当作现成 GPU 功能。 |
 | 107 FuseMax | 正文候选 | attention 的数据遍数、片上容量与不同算子的供给比例；须读等面积基线及仿真条件，近 100% 利用率不是通用 MFU。 |
 | 112 NeoMem | 备查 | CXL 物理页热度和 OS 分层管理与语义 KV 复用不同，不因 cache 名称相近再扩展一套推理缓存内容。 |
 
@@ -30,7 +30,7 @@
 
 原稿 H100 的板卡／存储频率组合尚未核清；正文与表 I 还互换了 Graviton3／A64FX 的两项延迟。图 3 的抽取文本含不可见的重复图标文字，核对图像后未采用这些数值。本文不把设备表移作当前规格，也不把当时的模拟器误差移作当前版本结论。完整模拟实现、CXL 曲线、应用 stress score 和 artifact 未计入本次选读。
 
-首批其余候选优先比较 Duplex 的逐专家工作量，只在它们增加既有章节未解释的设计判断时采用。SN40L 的已有引用不自动证明本阶段已读全文；14 份 PDF 的页数也不等于已读页数。
+vTrain、TACOS、Duplex 已按声明范围选读；其余候选继续按能否增加既有章节未解释的设计判断取舍。SN40L 的已有引用不自动证明本阶段已读全文；14 份 PDF 的页数也不等于已读页数。
 
 ## 扩展批次：26 篇完整摘要
 

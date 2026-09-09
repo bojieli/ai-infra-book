@@ -1,6 +1,6 @@
 # MICRO 2024 归档与阅读
 
-2026-09-09 更新：按 DOI 去重后的[统一覆盖](reading-coverage.json)现为 **84 篇完整摘要、72 份代表 PDF／1,106 个物理页、5 篇声明正文选读范围**，还有 29 篇摘要缺口。[第九批](parallel-abstracts-ninth/NOTES.md)新增 4 篇摘要、2 份 PDF／31 页，正文新增 0；本批首页视读由阅读代理完成，主代理复核摘要文本与归档证据。另有 [vTrain](vtrain-body-reading/NOTES.md) 新增物理页 4–7 的正文选读与第 7 页视读，摘要和 PDF 不重复计数。[TACOS](tacos-body-reading/NOTES.md) 另选读物理页 4–10 并核对固定 README 的公开工具限制。以下 2026-09-08 数字保留为原始归档快照，不代表当前累计。
+2026-09-09 更新：按 DOI 去重后的[统一覆盖](reading-coverage.json)现为 **86 篇完整摘要、74 份代表 PDF／1,137 个物理页、6 篇声明正文选读范围**，还有 27 篇摘要缺口。[第十批](parallel-abstracts-tenth/NOTES.md)新增 2 篇摘要、2 份 PDF／31 页，正文新增 0；首页视读由阅读代理完成，主代理复核完整摘要文本与来源。[vTrain](vtrain-body-reading/NOTES.md)、[TACOS](tacos-body-reading/NOTES.md)、[Duplex](duplex-body-reading/NOTES.md)分别按已声明范围选读并接入既有案例，不重复增加摘要或 PDF。以下 2026-09-08 数字为原始归档快照。
 
 2026-09-08：原始日程提取的 123 项已分成 **113 篇正式论文与 10 个海报／博士生论坛活动**。113 篇均匹配出版 DOI：101 项标题规范化匹配，12 项题名和作者差异逐项复核；另分出出版元数据中的 11 项前后附页。原日程序号保留，不重新编号。
 

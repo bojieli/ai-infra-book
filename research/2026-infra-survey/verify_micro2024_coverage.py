@@ -29,7 +29,7 @@ def verify(base=None):
         if r.get('pdf_pages'):
             e['representative_pdf'] = {'file': r['pdf_file'], 'sha256': r['pdf_sha256'], 'pages': r['pdf_pages']}
     assert sum(e['abstract_read'] for e in entries.values()) == base['primary_abstracts_screened']
-    for folder in ('parallel-abstracts', 'parallel-abstracts-next', 'parallel-abstracts-third', 'parallel-abstracts-fourth', 'parallel-abstracts-fifth', 'parallel-abstracts-sixth', 'parallel-abstracts-seventh', 'parallel-abstracts-eighth', 'parallel-abstracts-ninth'):
+    for folder in ('parallel-abstracts', 'parallel-abstracts-next', 'parallel-abstracts-third', 'parallel-abstracts-fourth', 'parallel-abstracts-fifth', 'parallel-abstracts-sixth', 'parallel-abstracts-seventh', 'parallel-abstracts-eighth', 'parallel-abstracts-ninth', 'parallel-abstracts-tenth'):
         packet = D / folder
         subprocess.run([sys.executable, str(packet / 'verify.py')], check=True, capture_output=True)
         handoff = json.loads((packet / 'verification.json').read_text())
@@ -94,6 +94,17 @@ def verify(base=None):
     entry['provenance'].append(str(tacos_path.relative_to(ROOT)))
     entry['adoption'] = {'decision': 'existing_experiment_optional_variant',
         'reason': '6.4 / experiment6-5: route synthesis, shared-port accounting, and documented artifact limitations; no NCCL replacement claim.'}
+    from verify_duplex_body import verify as check_duplex_body
+    duplex = check_duplex_body()
+    entry = entries[105]
+    assert entry['abstract_read'] and entry['selected_reading'] is None
+    duplex_path = D / 'duplex-body-reading/reading.json'
+    entry['selected_reading'] = {'proof_file': str(duplex_path.relative_to(ROOT)),
+        'physical_pdf_pages': duplex['full_text_pages_read'],
+        'scope': 'Root read full text p4–9 and visually checked p9 memory placement and evaluation; not whole paper.'}
+    entry['provenance'].append(str(duplex_path.relative_to(ROOT)))
+    entry['adoption'] = {'decision': 'existing_case_clarification',
+        'reason': 'Existing expert-work accounting: memory placement constrains heterogeneous scheduling; Logic-PIM simulation is not current GPU functionality.'}
     summary = {
         'status': 'passed', 'scope': 'Unique MICRO2024 DOIs; original archive preserved; abstract batches add no body scope; separately verified body readings are counted once.',
         'matched_papers': len(entries),
@@ -102,10 +113,10 @@ def verify(base=None):
         'pdf_pages': sum(e['representative_pdf']['pages'] for e in entries.values() if e['representative_pdf']),
         'selected_sections_read': sum(e['selected_reading'] is not None for e in entries.values()),
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
-        'additional_full_primary_abstracts': 43, 'errors': [],
+        'additional_full_primary_abstracts': 45, 'errors': [],
     }
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (84, 72, 1106, 5)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (86, 74, 1137, 6)
     (D / 'reading-coverage.json').write_text(json.dumps({'summary': summary, 'records': list(entries.values())}, ensure_ascii=False, indent=2) + '\n')
     return summary
 
