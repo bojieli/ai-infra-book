@@ -1,6 +1,6 @@
 # ASPLOS 2025：出版目录核对
 
-官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 65 份代表公开 PDF，另存 PipeLLM 一个十五页作者版本；筛读 68 篇原始摘要，其中十五篇有声明范围的正文阅读；其余 116 篇摘要与更多公开正文待补。
+官方主日程的 **184 个条目**均已按原页面 DOI 匹配出版方提交给 Crossref 的元数据，见 [manifest.json](manifest.json)。这批出版元数据没有摘要。后续已另行归档 90 份代表公开 PDF／1555 页，另存 PipeLLM 作者版本及批次内的替代／相关版本；筛读 98 篇原始摘要，其中十七篇有声明范围的正文阅读；其余 86 篇摘要与更多公开正文待补。
 
 | 日程对应的正式卷 | 匹配条目 | 出版元数据中的日期 |
 | --- | ---: | --- |
@@ -18,9 +18,9 @@
 
 ## 公开稿与读取进度
 
-[selected-sources.json](selected-sources.json) 另存 117 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。65 份有效 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。十份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
+[selected-sources.json](selected-sources.json) 另存 177 份响应：4 次 OpenAlex 批量查询覆盖 184 个日程 DOI，其他为公开稿、作者页、单条元数据、查找失败响应及 Faiss 官方文档。OpenAlex 仅作位置发现，不将其聚合摘要或可用位置当作完整原始资料。90 份代表 PDF 均有页数、原件哈希、可搜索文本和首页身份核对；[public-location-map.json](public-location-map.json) 保存回到位置查询的路径。十六份非 200 响应，以及返回实验室首页／非论文页面的响应均未计入 PDF。
 
-[68 篇摘要](public-abstracts.json)直接来自作者 arXiv 页面、作者／机构论文 PDF 或作者摘要页，逐项保存来源及提取范围。作者稿可能晚于正式出版，HAL 的封面页与正文页也分开计；不混用卷页码。具体取舍见[阅读记录](../../../../research/2026-infra-survey/reading-asplos-2025.md)，其中 IKS、FSMoE 作者 v1 的物理页 1–13 各已读，相关图已查看；其余 PDF 主要完成身份与摘要核对。页级范围见 [IKS](iks-reading.json) 与 [FSMoE](fsmoe-reading.json)，历史模型和数值疑点留在阅读记录。
+[98 篇摘要](public-abstracts.json)直接来自作者 arXiv 页面、作者／机构论文 PDF 或作者摘要页，逐项保存来源及提取范围。作者稿可能晚于正式出版，HAL 的封面页与正文页也分开计；不混用卷页码。具体取舍见[阅读记录](../../../../research/2026-infra-survey/reading-asplos-2025.md)，其中 IKS、FSMoE 作者 v1 的物理页 1–13 各已读，相关图已查看；其余 PDF 主要完成身份与摘要核对。页级范围见 [IKS](iks-reading.json) 与 [FSMoE](fsmoe-reading.json)，历史模型和数值疑点留在阅读记录。
 
 核验：`python research/2026-infra-survey/verify_asplos2025_public.py`。它核对已有来源、摘要提取、页级阅读和取舍记录，不证明全部论文集已归档或全文已读。
 
@@ -49,3 +49,7 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 2026-09-09 再选读 [FlexSP](flexsp-reading.json) 物理页 2–13、17 和 [llm.npu](llm-npu-reading.json) 物理页 2–15，合计 27 页及 14 张已查看图页，现共十四篇有声明正文范围，摘要与 PDF 数量不变。原始摘要筛选判断保留为历史，当前取舍按正文更新。固定分支、MLLM v1／2026 AOT 和十二个源码／文档范围见[专题笔记](../../../framework-history/2026-09-09/sequence-and-npu/NOTES.md)。Spindle 仍待本阶段后的独立正文核对；本轮未运行工件。
 
 2026-09-09 并行选读 [Spindle](spindle-reading.json) 物理页 2–13、18–20，八张图页已查看；当前十五篇有声明正文范围，摘要数量不变。固定研究分支的五个读取范围与可手算的分支／重配对照见[专题笔记](../../../framework-history/2026-09-09/spindle-wavefront/NOTES.md)，仅接 10.3.1／实验 10-5 的选做变体。
+
+2026-09-09 合并第 77–110 项中的两批交接材料：30 篇完整摘要、25 份代表 PDF／445 页。原始文件继续位于 [原交接目录](pending-077-110/README.md)，不因目录名含 pending 而重复下载或计数。[身份核验](pending-077-110/identity-audit.json)保留题名变体、完整作者和 DOI 的证据；93、96、98 仅以作者版本题名与完整作者关联，未补造原文没有的 DOI。另存一次连接失败，未计入 60 个新增 HTTP 响应。
+
+新增选读范围为 NeuSight 物理页 2–14（沿用已核实并行阅读范围）和 PartIR 物理页 3–5（主任务新读）；分别见[预测校准](../../../framework-history/2026-09-09/neusight-calibration/NOTES.md)与[分片策略](../../../framework-history/2026-09-09/partir-shardy/NOTES.md)。摘要与代表 PDF 的数量不等于全文完成数量，PartIR 剩余方法、评估和证明仍未计入已读。

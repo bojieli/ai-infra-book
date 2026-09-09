@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 65 份代表 PDF／1110 页、完成 68 篇原始完整摘要筛选，十五篇有声明范围的正文阅读；其余 116 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 90 份代表 PDF／1555 页、完成 98 篇原始完整摘要筛选，十七篇有声明范围的正文阅读；其余 86 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -140,3 +140,7 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 FlexSP 的物理页 2–13、17 与 llm.npu 的物理页 2–15 已读，14 张图页已查看。前者接训练长度分布与真实通信表示，后者接固定图、量化和端侧分工；只增加现有实验变体。26 份框架响应中有三份失败响应，十二个明确读取范围及独立计算见[专题记录](../../references/framework-history/2026-09-09/sequence-and-npu/NOTES.md)。没有以局部 prefill 加速代替完整请求收益，也没有以历史原型代替当前框架支持。
 
 Spindle 的十五页正文／附录范围与八张图页已读；共享分支的扩展曲线、汇合和完整重配成本接 10.3.1，64 卡实测与 256 卡模拟分开。固定分支没有完成论文全运行时的调用对应，不承诺完整训练复现；[源码范围与教学反例](../../references/framework-history/2026-09-09/spindle-wavefront/NOTES.md)保留在扩写层。
+
+## 第 77–110 项交接合并
+
+30 篇原始摘要经过重提取和完整题名／作者核验后加入正式清单；逐篇取舍见[筛选表](screening-asplos-2025.tsv)和[批次复核](../../references/proceedings/ASPLOS/2025/pending-077-110/review.md)。替代稿、HTTP 错误和连接失败分别保留。NeuSight 的物理页 2–14 与 PartIR 的 3–5 接入选读计数；各自实际查看与源码范围见[预测校准记录](../../references/framework-history/2026-09-09/neusight-calibration/ROOT-REVIEW.md)和[分片记录](../../references/framework-history/2026-09-09/partir-shardy/reading.json)。其余新候选仍需正文，不把摘要中的最高加速比当作框架或当前硬件结论。

@@ -20,7 +20,7 @@ def norm(text):
 
 def verify():
     sources = json.loads((D / 'selected-sources.json').read_text())
-    assert len(sources) == len({s['id'] for s in sources}) == 117
+    assert len(sources) == len({s['id'] for s in sources}) == 177
     byid = {s['id']: s for s in sources}
     for s in sources:
         b = (ROOT / s['file']).read_bytes()
@@ -43,14 +43,30 @@ def verify():
     abstracts = json.loads((D / 'public-abstracts.json').read_text())['records']
     screens = list(csv.DictReader((ROOT / 'research/2026-infra-survey/screening-asplos-2025.tsv').open(), delimiter='\t'))
     orders = [a['program_order'] for a in abstracts]
+    from verify_asplos_parallel_identity import verify as verify_parallel_identity
+    parallel_identities = {r['program_order']: r for r in verify_parallel_identity()['records']}
+    parallel_records = {}
+    parallel_transport_errors = []
+    for batch in ('077-090', '091-110'):
+        bundle = json.loads((D / 'pending-077-110' / batch / 'bundle.json').read_text())
+        parallel_records.update({r['program_order']: r for r in bundle['records']})
+        parallel_transport_errors.extend(s for s in bundle['sources'] if not isinstance(s.get('status_code'), int))
+    assert json.loads((D / 'pending-077-110/transport-errors.json').read_text()) == parallel_transport_errors
+    assert len(parallel_transport_errors) == 1
     assert orders == sorted(set(orders)) == [int(s['number']) for s in screens]
-    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 68
+    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 98
     for a, sc in zip(abstracts, screens):
         p = papers[a['program_order']]; s = byid[a['source_id']]
         assert a['source_file'] == s['file'] and a['source_sha256'] == s['sha256']
         assert a['identity']['official_program_doi'] == p['doi'] and norm(a['title']) == norm(p['title'])
         assert a['reading_status'] == 'full_abstract_read'
-        if 'page_text' in a:
+        if 'parallel_bundle' in a:
+            original = parallel_records[a['program_order']]
+            assert a['qualified_identity'] == parallel_identities[a['program_order']]
+            assert a['source_title'] == original['title']
+            assert a['source_file'] == original['source_file'] and a['authors'] == original['authors']
+            text = original['abstract']  # Fresh primary re-extraction performed by verify_parallel_identity.
+        elif 'page_text' in a:
             t = a['page_text']; page = str(t['physical_page'])
             data = subprocess.check_output(['pdftotext', '-f', page, '-l', page, str(ROOT / s['file']), '-'])
             assert data == (ROOT / t['file']).read_bytes() and hashlib.sha256(data).hexdigest() == t['sha256']
@@ -98,20 +114,21 @@ def verify():
         assert p['public_abstract']['sha256'] == a['abstract_sha256']
         assert p['screening'] == {'basis': 'title_and_full_primary_public_abstract', 'decision': sc['decision'], 'reason': sc['reason']}
     pdfs = [s for s in sources if 'pdf_pages' in s]
-    assert len(pdfs) == manifest['public_pdfs_archived'] == 65
+    assert len(pdfs) == manifest['public_pdfs_archived'] == 90
     for s in pdfs:
         p = papers[s['program_order']]; pdf = ROOT / s['file']
         assert pdf.read_bytes().startswith(b'%PDF-') and p['pdf']['sha256'] == s['sha256']
         info = subprocess.check_output(['pdfinfo', str(pdf)], text=True, stderr=subprocess.PIPE)
         assert int(re.search(r'^Pages:\s+(\d+)', info, re.M)[1]) == s['pdf_pages'] == p['pages']
-        data = subprocess.check_output(['pdftotext', '-f', '1', '-l', '1', str(pdf), '-'])
+        flags = ['-raw'] if s.get('first_page_raw') else []
+        data = subprocess.check_output(['pdftotext', '-f', '1', '-l', '1', *flags, str(pdf), '-'])
         assert data == (ROOT / s['first_page_text']['file']).read_bytes()
         assert hashlib.sha256(data).hexdigest() == s['first_page_text']['sha256']
         title = re.search(r'^Title:\s*(.+)', info, re.M)
         assert norm(p['title']) in norm(data.decode()) or (title and norm(p['title']) == norm(title[1]))
     selected = [p for p in papers.values() if p['reading_status'] == 'selected_sections_read']
-    assert len(selected) == manifest['selected_sections_read'] == 15
-    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 39, 40, 44, 49, 73, 74, 75, 76, 94}
+    assert len(selected) == manifest['selected_sections_read'] == 17
+    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 39, 40, 44, 49, 73, 74, 75, 76, 78, 80, 94}
     expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 28: range(2, 13), 35: range(1, 14), 39: range(2, 13), 40: range(2, 14), 44: list(range(2, 13)) + [16, 17], 49: range(1, 14), 94: range(1, 14)}
     expected_pages[74] = range(1, 16)
     expected_pages[73] = range(2, 16)
@@ -132,6 +149,16 @@ def verify():
             assert hashlib.sha256(data).hexdigest() == expected
         for f in proof['figures']:
             assert f['actually_viewed'] and hashlib.sha256((ROOT / f['file']).read_bytes()).hexdigest() == f['sha256']
+    from verify_neusight import verify as verify_neusight
+    from verify_partir_shardy import verify as verify_partir_shardy
+    verify_neusight(); verify_partir_shardy()
+    proof78 = json.loads((ROOT / 'references/framework-history/2026-09-09/neusight-calibration/neusight-reading.json').read_text())
+    assert papers[78]['selected_reading'] == proof78['reading']
+    r80 = papers[80]['selected_reading']
+    proof80 = json.loads((ROOT / r80['proof_file']).read_text())
+    assert r80['physical_pdf_pages'] == [p['physical_page'] for p in proof80['pages']] == [3, 4, 5]
+    assert r80['page_text_sha256'] == {str(p['physical_page']): p['sha256'] for p in proof80['pages']}
+    assert r80['individual_pdf'] == papers[80]['pdf']['file']
     middle = json.loads((D / 'middle-screening-notes.json').read_text())
     assert len(middle['new_source_ids']) == 16
     assert middle['new_abstract_orders'] == [36, 37, 38, 39, 40, 41, 43, 44, 46, 48, 49, 55, 60]
