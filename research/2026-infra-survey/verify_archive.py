@@ -875,4 +875,6 @@ report['serving_batch']=serving_batch
 report['asplos_testing_batch']=asplos_testing_batch
 report['pod_implementation']=pod_implementation
 report['pod_callers']=pod_callers
+from verify_speculation_followups import verify as verify_speculation_followups
+report['speculation_followups']=verify_speculation_followups()
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors
