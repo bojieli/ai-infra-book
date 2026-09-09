@@ -1,0 +1,269 @@
+# 第 4 章 加速器架构
+
+> 写作大纲 · 数据搬移主线与章节依赖修订 · 草案 22 · 2026-09-08
+
+第 3 章的需求进入芯片后，必须由真实的计算、存储和通路持续供给。本章围绕同一注意力与专家矩阵比较 NVIDIA、昇腾和 Apple：改变资源配比怎样减少重复读写、缩短供数路径或缓解等待。
+
+**本章判断：** 增加计算单元的收益取决于供数和非矩阵工作；局部容量、带宽、面积与功率必须一起满足目标。
+
+**前置与交付：** 依赖第 2、3 章；交付各阶段的资源上界和最值得验证的通路，第 5 章用实现和 trace 检查。
+
+**阅读安排：** 核心练习为实验 4-1、实验 4-4、实验 4-5；其余练习为延伸。每节的完整参数、实现版本与实验变体见对应[扩写资料](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md)。章末更新[跨章设计决定](decision-record.md)。
+
+## 4.1 从需求到芯片资源
+
+把同一工作映射到计算、保存、搬运与等待，再讨论面积和功率应该分给哪里。
+
+### 4.1.1 矩阵乘与芯片资源
+
+先把第 3 章的工作放到芯片上，读者才能知道接下来的结构图为什么这样画。
+
+用 Qwen3-8B 的投影、Softmax、FFN 与 V4-Flash 的专家矩阵作可复算主例；历史背景选当时的 CNN、BERT／GPT 类任务，不将后来的模型倒写成早期芯片的设计目标。先算训练、prefill 与 decode 的形状、字节和复用，再解释计算、保存、搬运和等待各占多少。
+
+### 4.1.2 面积与功耗的分配
+
+给定面积、功耗与封装预算，比较增加矩阵吞吐、向量能力、片上存储、外部带宽或控制逻辑分别能缩短哪段任务。用 TPU v1 作历史引例；后续每次代际比较都先问原先最贵的等待是否被消除，以及新增资源在另一种 workload 下会不会闲置。
+
+> **图 4-1：从应用到计算单元的观察顺序（配图计划）**
+>
+> 自绘 SVG；一组贯穿算子加芯片层次，作为后续图的索引。
+
+**扩写资料：** [本节完整计算、版本与实验变体](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md#detail-4.1)。
+
+## 4.2 计算能力与持续供数
+
+三种架构围绕同一注意力和专家矩阵比较。每次只选会改变结论的单元或精度变化。
+
+### 4.2.1 NVIDIA：SM 与 Tensor Core
+
+先看计算单元；三种架构都回答“工作由谁发起、谁计算、怎样保持忙碌”。
+
+以 Volta 引入矩阵单元为起点，带着混合精度训练的矩阵与非矩阵工作看 Ampere 的执行组织，再进入大 Transformer 对 Hopper 异步矩阵执行的需求。Blackwell SM100 用新的矩阵指令与单／双 SM 协作扩大计算组织；与 RTX Blackwell SM120 分开描述。
+
+### 4.2.2 昇腾：Cube、Vector 与 Scalar
+
+从早期 DaVinci 和 CNN 任务中的矩阵、向量与控制分工出发，再把 Transformer 的归一化、激活和注意力放进同一张执行图。910C 的 AIC／AIV 分工与 950 的 SIMD／SIMT 混合执行，分别用非矩阵工作和动态专家路径说明适用条件。
+
+先算只增加 Cube 吞吐后的完成时间，再讨论向量资源、调度与通路是否必须一起改。产品事实按原件核对，910 各代未披露的内部变化保留未知，不能把负载分析写成未经证实的设计历史。
+
+### 4.2.3 Apple：GPU 与 Neural Engine
+
+以作者 M2 Max 的 Metal 执行为基线，区分 GPU 上的矩阵计算和独立 ANE。沿本地语言、语音与图像生成的需求，解释为什么既要高效矩阵单元，又要保留灵活控制及与其他应用共享的资源。
+
+用 M5 在每个 GPU 核心内增加 Neural Accelerator 的官方说明，与此前 GPU 路径比较；将 Metal Tensor API 能调用的硬件和独立 ANE 分开。代际收益要检查实际后端是否用到新单元，不能把新一代能力或峰值加到 M2 的实验结果上。
+
+### 4.2.4 注意力中的矩阵与非矩阵工作
+
+并排标出三种架构上 QK、Softmax 和 AV 的执行者。用前文头数与序列长度计算矩阵 FLOPs、指数及归约工作，比较仅把矩阵能力翻倍与同时增强非矩阵能力的结果。Blackwell 到 Rubin 的指数吞吐变化用于说明长上下文为何需要重新分配单元；昇腾用 Cube／Vector 配比检验相同问题。
+
+先用 FlashAttention-4 对 B200 的分析，把 Qwen3 的 head dimension 128 代入一个 128×128 tile：矩阵、共享内存读取、指数的资源下界分别为 1,024、768、1,024 周期。假想只将矩阵吞吐再翻倍，指数仍限制速度，由此引出第 5 章的交错执行与资源分担。数字是论文条件下的推算，共享内存与 HBM 分开，不能当作整核实测。[输入与复算](../case-studies/kernel-and-fleet-efficiency.md)。
+
+> **实验 4-1 ★〔核心〕：注意力计算与单元配比**
+>
+> 将 Qwen3-8B 的同一注意力计算映射到 NVIDIA、昇腾和 Apple，再固定访存条件，分别只提高矩阵或向量能力。算完成时间而非峰值总和；增大上下文后重做，判断哪项资源更值得增加。
+>
+> 条件：基础·形状、资源与依赖计算。
+
+> **图 4-2：同一注意力的执行分工与瓶颈变化（配图计划）**
+>
+> 三栏自绘 SVG；各栏用前后两种资源配比标出限制，矩阵单元、向量单元和独立 ANE 不混合计量。
+
+### 4.2.5 低精度格式与执行路径
+
+同一个低精度格式可能同时改变字节数、矩阵能力和转换工作。将格式元数据、解码路径与质量条件放回资源表，再比较真正省下的时间。 依据：[成本下降调研](../research/token-cost-2023-2026/report.md#quantization)。
+
+从面积与数据量回到模型质量，说明它怎样同时改变计算单元和存储压力。
+
+> **实验 4-2 ★〔延伸〕：低精度执行成本**
+>
+> 降低权重精度后，哪项成本没有一起下降？ 固定同一专家矩阵及质量要求，比较 Hopper／Blackwell 或 Apple 后端中可用的两条低比特路径；逐项计权重、scale、转换与矩阵工作。再改为小 batch decode，解释新低精度算力何时不能转化为相同倍数的速度。
+>
+> 条件：基础·计算。
+
+**局部实测：** [M2 Max的4-bit矩阵路径](../experiments/ch04/04-02/apple/README.md)中，batch 1直接计算约0.218 ms、反量化后计算约0.274 ms，batch 512两者几乎相同。算子一致性检查通过，但相对原FP32夹具仍有约9%–10%误差，不能当作模型质量通过。 [RTX INT8补测](../experiments/ch04/04-02/README.md)中，直算完整路径较低，但整数矩阵本体调用并未更快；转换与填充仍须计入。
+
+> **图 4-3：低比特数据从存储到运算的过程（配图计划）**
+>
+> 自绘格式与执行示意，配实验 4-2；不使用厂商峰值倍率作速度图。
+
+**扩写资料：** [本节完整计算、版本与实验变体](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md#detail-4.2)。
+
+## 4.3 存储容量、复用与带宽
+
+先判工作集，再判访问频率；容量增长与供数增长可以产生不同收益。
+
+### 4.3.1 片上存储与数据复用
+
+算得快的前提是既放得下，也能及时取到。用同一工作集比较存储层次，而不是逐家记术语。
+
+用同一个分块的输入、累加器和中间结果计算片上容量。Ampere 到 Hopper 的 shared memory 扩大可容纳什么；Hopper 到 Blackwell SM100 的 shared memory 并未同步翻倍，因此引入 Tensor Memory 的累加器路径要与寄存器压力、读取和同步一起分析。
+
+### 4.3.2 HBM、GDDR 与统一内存
+
+先算 Qwen 的权重和 KV，再用 V4 的大规模专家与长上下文改变工作集。沿 A100、H100／H200、B200、Rubin 的具体形态，分开比较容量、带宽、封装功耗与成本；H200 尤其用于观察存储增长与矩阵吞吐增长可以不同步。
+
+Rubin 的 HBM4 放在这条供数问题中解释，采用已归档官方版本的规格，不把全平台宣传加速比当作内存带宽倍数。再对照昇腾与 Apple 的存储组织，解释本地大容量、数据中心高吞吐和多处理器共享分别需要付出什么。
+
+### 4.3.3 容量限制与带宽限制
+
+沿 A100 到 Blackwell 的固定规格分列容量、带宽和计算的变化，检查哪项变化能改善本章负载；价格与能耗的作用另算，不能将成本变化全归给制程。 依据：[成本下降调研](../research/token-cost-2023-2026/report.md#hardware)。
+
+让同一个模型依次触及显存容量、工作集和带宽限制；说明 MacBook 可以容纳的模型为何未必有相同速度。CPU 与 GPU 共用内存时，容量和带宽也会被其他工作占用。
+
+承接第 1 章的[访存并发算例](../case-studies/memory-bandwidth-and-concurrency.md)，用同一 KV 工作集说明接口带宽增长还需要足够的独立请求。对照读写组成和负载下的延迟，解释增加执行单元、改善数据复用与升级内存分别能解决什么限制；Mess 只提供测量方法，设备数字仍以本章固定规格与实际记录为准。
+
+> **实验 4-3 ★〔延伸〕：存储容量与解码带宽**
+>
+> 相同容量为什么有不同的解码速度？ 用 Qwen3-8B／235B 的真实权重和 KV 工作集，在 A100、H100／H200、B200 与 M2 Max 条件下计算驻留与读取时间。先只替换容量，再只替换带宽，最后代入真实产品；改变并发与上下文后解释各代设计的收益范围。
+>
+> 条件：基础·计算。
+
+> **图 4-4：三种架构的存储层次与主机关系（配图计划）**
+>
+> 按相同层次自绘 SVG，在相关存储位置标出代际变化及新增工作集；配实验 4-3 的容量和带宽曲线。
+
+**扩写资料：** [本节完整计算、版本与实验变体](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md#detail-4.3)。
+
+## 4.4 布局、缓冲与数据通路
+
+跟踪一个中间张量经过哪些接口，判断减少中转、改变布局或增加缓冲各省下什么。
+
+### 4.4.1 数据布局与地址生成
+
+再沿实际数据通路看“如何取到”，把前两节连接起来。
+
+从 Qwen 的规则投影矩阵走到 V4 的多专家矩阵：形状相近但基址、stride 与 token 分组不断变化。先算有效搬运和地址／描述符准备，再比较手工组织与硬件搬运。Rubin 的 TMA inline descriptor update 在此作为减少专家元数据处理的具体变化，和昇腾 NDDMA 的多维搬运分别说明；接口能力不画等号。
+
+### 4.4.2 异步搬运与流水供数
+
+先画经寄存器中转的同步加载，再看 Ampere 异步拷贝如何减少中转，Hopper TMA 如何承担多维 tile 搬运与地址处理。把 Blackwell 的异步矩阵执行和 TMEM 累加器接入同一流水，计算每轮供数、计算、缓冲与等待；新增指令不自动等于形成有效重叠。
+
+昇腾按 MTE／NDDMA，Apple 按 Metal 缓冲与任务依赖分析同一条路径。给定供数率与计算率，先求最少缓冲和仍然暴露的时间，再讨论生产者／消费者分工；寄存器、同步及软件复杂度也要计入取舍。
+
+### 4.4.3 矩阵与向量单元的协作
+
+用 950 的 CV 通路与此前经存储交换的路径，和选定 NVIDIA／Apple 路径对照；先算中间张量和跨单元交接。对于逐 token 执行，把 Rubin 更细的 tile 级生产者／消费者触发放进时序，分析何时能提前开工、何时仍受真正的数据依赖限制；不将其表述为首次出现异步启动。
+
+> **实验 4-4 ★〔核心〕：片上缓冲与数据复用**
+>
+> 增加一块片上缓冲值不值得？ 沿同一 Qwen 注意力或 V4 专家矩阵，比较同步加载、异步搬运与专用交接路径。扫描分块和缓冲，算省下的中转字节、指令与等待，再增加矩阵吞吐，观察旧缓冲为何可能不够；提交收益开始变小的位置。
+>
+> 条件：基础·Python。
+
+> **图 4-5：同一中间张量走过哪些接口（配图计划）**
+>
+> 三栏自绘路径 SVG，标出直接交接、缓冲、缓存和片外访问，配实验 4-4。
+
+**扩写资料：** [本节完整计算、版本与实验变体](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md#detail-4.4)。
+
+## 4.5 从资源下界到实际性能
+
+用形状与共享资源建立上界，测量只校准会改变候选选择的差距；同时保留计算受限的情形。
+
+### 4.5.1 Roofline 与性能上界
+
+用 Roofline 汇合前面各层的资源分析，比较哪些代际变化真正改变了本例的性能上界。
+
+按阶段计算算术强度，画出三种架构的计算与带宽上界。改变 batch 和上下文，看原先有利的芯片在哪些位置失去优势。
+
+**已复算（H01-H06）：** [官方硬件基础表](../calculations/results/hardware.md)已分开输入精度、累加精度、执行单元与 dense／structured sparsity。以官方白皮书为例，4090 的 dense FP16 Tensor 峰值在 FP16 累加时为 330.3 TFLOPs/s、FP32 累加时为 165.2 TFLOPs/s；BF16＋FP32 累加采用后者。RTX PRO 6000 Blackwell Workstation 的同口径 BF16＋FP32 为 503.8 TFLOPs/s。Roofline CLI 拒绝用整数 TOPS、未知累加／稀疏条件或另一产品的峰值替代；Apple 未公开的 GPU FLOPs 保持未知。当前约定的代际／型号与官方规格差异审查已按[硬件清单](../calculations/PLAN.md)验收；未披露字段和来源版本边界继续显式保留，新增官方证据再更新受影响记录。
+
+**已复算（H06-projection）：** [硬件来源审查](../calculations/HARDWARE-AUDIT.md)当前收录151个配置、471条峰值记录，分别保存H100的SXM／PCIe／NVL、H200两种形态、GB系统范围、RTX PRO三种版本及Apple M1至最新M6的选定配置。[Qwen3-8B真实Q投影](../calculations/results/projection-qwen3-8b-rtx4090-b256.md)按BF16输入／输出、FP32累加、dense、冷内存各读写一次，在B=1与256时AI分别为0.999512与227.555556 FLOPs/byte；4090上对应资源下界为33.304381与51.997183μs，主导约束由内存转到计算。运行 `python3 calculations/calc.py projection-bound --device rtx4090 --batch 256` 复现；这是单层GEMM的条件式下界。Apple或昇腾缺少精度证据的场景只给内存服务时间，完整Roofline留空；全模型放置、真实HBM与持续性能另算。
+
+**已复算（H05-field-audit）：** [逐字段登记审查](../calculations/results/hardware-audit.md)由 `python3 calculations/calc.py hardware --audit --format md` 复现。缺值、缺字段来源与峰值不符合计算口径分别呈现，不从空值推断设备不支持。功率区分TDP/TGP、配置上限和达到规格算力时的芯片功耗；互联保留方向与拓扑，不把双向合计当单向有效带宽。Mac的GPU档位和内存按官方允许组合列出，已公布但未来供应的配置明确记录日期；来源冲突及尚未查完的型号仍按硬件清单保留。累加寄存器／结果类型还须与内部累加有效精度分开：官方PTX对部分Hopper FP8 wgmma指令明确给出低于完整单精度的内部累加限制，不能仅凭FP32类型或相同峰值认定数值等价；逐行证据保留具体适用范围。
+
+**已复算（C22-stage-resources）：** [真实逐阶段资源界](../calculations/results/stage-resources-qwen8-b1-prefill128.md)将Qwen8与V4-Flash的实际算子按层汇总，分别计算各层资源最大值之和及合并全部工作后的全局最大值；这两者对应不同串行屏障假设。矩阵精度/累加/dense条件逐项准入，V4 routed权重虽存FP4，固定内核转换为FP8后执行GEMM，不能套FP4峰值。[显式特殊函数速率假设](../calculations/results/stage-resources-qwen8-assumed-special-baseline.md)下，Qwen128输入逐层串行界约7.216ms，全局合并界约6.842ms；矩阵、向量、接口带宽和exp供给各翻倍的场景分别比较。默认官方表缺少特殊函数速率时完整已计资源界留空，Apple/Huawei不匹配精度也不猜值。运行 `python3 calculations/calc.py stage-resource-bounds --format md`。25场景覆盖两模型B1/8、prefill128/512、decode8K/32K与三类硬件。未知容量不能取得容量资格；Qwen权重+KV仅必要容量，V4 checkpoint大小不能证明运行容量。接口bytes不是实测HBM，缺失工作/资源不会被调用者速率补齐，完整请求延迟仍未知。
+
+> **实验 4-5 ★〔核心〕：batch 与架构性能**
+>
+> 把 batch 变大，会改变芯片比较的结果吗？ 使用 Qwen3-8B 和 V4-Flash 的形状，生成三家架构及选定代际的 Roofline。分别只改变矩阵吞吐、存储带宽和非矩阵能力，再代入真实组合；用 prefill、decode 与不同 batch 说明哪项演进解决了当前瓶颈。
+>
+> 条件：基础·Python。
+
+### 4.5.2 算子效率与实际性能
+
+用形状利用率、片上容量、向量工作和提交解释达不到上界的原因。这里给预测和公开证据，第 5 章检查实现，第 8 章完成服务测量。
+
+> **实验 4-6 ★★〔延伸〕：Mac 与 RTX 的预测和测量**
+>
+> Mac 和 RTX 的差别能由架构解释多少？ 采集小矩阵、带宽和注意力测量，对照预测；昇腾用指定论文记录，数据分析替代硬件。
+>
+> 条件：进阶·单设备／公开记录。
+
+> **实测**：相同FP32矩阵在M2 Max与RTX上均通过参考检查；256 MiB复制的载荷速率分别约192与734 GB/s，但热缓存与运行库路径不同，不能直接视为外存带宽。注意力两端也通过数值检查，但默认SDPA进入不同后端路径；昇腾论文记录另列，匹配投影的RTX计数器显示：单行GEMV两种访问前史读取量相同，batch 256的GEMM才呈现明显缓存差异，不能仅凭耗时归因。[记录与图](../experiments/ch04/04-06/README.md)。
+
+> **图 4-6：同一算子在不同芯片上的预测与测量（配图计划）**
+>
+> 实验 4-5、实验 4-6 绘图脚本生成 SVG／PDF，按阶段并列。
+
+### 4.5.3 性能与使用成本
+
+回到 H100／4090 历史问题和 M2 Max／RTX PRO 6000 的本书配对。区分按卡、按整机、按功耗和按任务比较；不把不同年代或负载的结果拼成排名。
+
+**扩写资料：** [本节完整计算、版本与实验变体](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md#detail-4.5)。
+
+## 4.6 封装与专用化的边界
+
+把模型的数据需求放回制造、功率和可变性预算。专用路线按固定了什么、省下什么来比较。
+
+### 4.6.1 单芯片资源与封装选择
+
+在前述片上优化后，将总权重、KV 与持续吞吐放回封装预算。比较更多内存堆栈、双 die、芯片间接口与单芯片方案的容量、互联和功耗；以 Blackwell／Rubin 的具体产品与昇腾／Apple 的已披露设计为例，解释为什么扩展计算单元必须同时考虑供数和制造约束。
+
+### 4.6.2 主机访问与卡间协作
+
+沿 TP 的激活交接、MoE 专家流量和 CPU／GPU 协同说明互联需求。NVLink 代际、Rubin 的 counted writes 与 Vera—Rubin CPU／GPU 连接分别对应吞吐、完成同步和主机访问问题；与 Unified Bus、Apple 统一内存比较具体路径。Vera 是 CPU，Rubin 是 GPU，平台、封装和单芯片能力分别引用。
+
+本节只算一条实际交接的字节与往返，完整 TP／PP／DP／EP 放置在第 6 章展开。NVIDIA、昇腾和 Apple 每项代际变化都已在对应计算、存储和通路小节说明，此处接向系统规模。
+
+> **图 4-7：从芯片供数到封装与主机接口（配图计划）**
+>
+> 自绘数据路径 SVG，将权重、激活和 KV 标到对应接口；用局部前后结构说明变化。少量原始架构图注明版本、图号和出版使用状态。
+
+### 4.6.3 矩阵阵列与系统供数
+
+选几条能改变前面判断的路线，给每条路线一个具体负载和取舍。
+
+回到第 1 章的 TPU，比较 v1 与后续训练系统的存储、专用单元及互联需求；近期 8t／8i 作训推分工实例，和本章的共同分析方法连接。
+
+### 4.6.4 片上容量与扩展通信
+
+对照 Graphcore、Cerebras 的片上数据组织与扩展办法：省下什么访问，怎样容纳大模型，软件怎样分配工作。设计适用性由工作集与通信决定，不用企业成败替代架构分析。
+
+### 4.6.5 固定数据流与可变性
+
+比较 Groq、SambaNova、FPGA 和 OpenTallas／固定模型芯片，说明可预测负载怎样支持更专用的执行。AMD、Trainium、Gaudi、寒武纪的资料作为相应结构的补充比较，不逐项铺开产品目录。
+
+> **实验 4-7 ★★〔延伸〕：负载变化与芯片资源分配**
+>
+> 选 Ampere→Hopper、Hopper→Blackwell、Blackwell→Rubin 或一条昇腾／Apple 演进线。先用前代代表负载提出资源分配，再换成大 Transformer、长上下文或稀疏专家，重新计算瓶颈并选择一次硬件改动。与公开设计对照，说明动机依据、预期收益、代价及最需要的验证；不要求复述所有新特性。
+>
+> 条件：进阶·历史与反事实推演。
+
+> **图 4-8：片上容量与专用化程度的几种选择（配图计划）**
+>
+> 自绘结构小图与实验 4-7 的条件式曲线；不以同面积暗示真实比例。
+
+**扩写资料：** [本节完整计算、版本与实验变体](extensions/04-%E5%8A%A0%E9%80%9F%E5%99%A8%E6%9E%B6%E6%9E%84.md#detail-4.6)。
+
+## 本章的设计决定
+
+针对同一 prefill、decode 和专家矩阵选出两种可行资源配比，分别标容量与时间下界、可能未覆盖的非矩阵工作，以及最值得测的通路。第 5 章用真实实现解释下界与执行的差距。 将预测、证据和修改分别填入[跨章设计决定](decision-record.md)。
+
+## 写作资料
+
+- 访存测量与校准：[Mess 作者接受稿，选读物理页 3–6](../references/proceedings/MICRO/2024/paper-011.pdf)；[推算及采用范围](../case-studies/memory-bandwidth-and-concurrency.md)。
+
+- 注意力与代际资源配比：[FlashAttention-4，MLSys 2026](../references/proceedings/MLSys/2026/papers/mlsys2026-ae8b0b5838ba510daff1198474e7b984.pdf)，结合[单 SM 复算与采用边界](../case-studies/kernel-and-fleet-efficiency.md)。
+
+- 开篇问题与历史动机：[A100/H100 太贵，何不用 4090？](../references/files/documents/h100-vs-4090.html)；[In-Datacenter Performance Analysis of a Tensor Processing Unit](../references/files/papers/tpu-v1.pdf)。
+- 代际因果与定量落点：[芯片演进的分析笔记](../case-studies/architecture-evolution.md)。
+- 4.2–4.6 的近期机制：[NVIDIA Blackwell Technical Brief](../references/files/specs/nvidia-blackwell-brief.pdf)；[CUTLASS Blackwell 功能](../references/outline-checks/2026-09-07/systems-cases/cutlass-blackwell.html)；[Rubin 官方架构说明](../references/outline-checks/2026-09-07/systems-cases/rubin-rechecked.html)；[Vera Rubin 平台规格](../references/files/specs/nvidia-rubin-system.html)。
+- Apple 代际依据：[M3 Dynamic Caching](../references/outline-checks/2026-09-07/systems-cases/apple-m3-evolution.html)；[M5 GPU Neural Accelerators](../references/outline-checks/2026-09-07/systems-cases/apple-m5-evolution.html)。
+- 4.2–4.6 的 NVIDIA 比较：[NVIDIA Tesla V100 GPU Architecture](../references/files/specs/nvidia-v100.pdf)；[NVIDIA A100 Tensor Core GPU Architecture](../references/files/specs/nvidia-a100.pdf)；[NVIDIA H100 Tensor Core GPU Architecture](../references/files/specs/nvidia-h100.pdf)；[NVIDIA RTX Blackwell PRO GPU Architecture v1.0](../references/files/specs/nvidia-rtx-blackwell-pro.pdf)；[RTX PRO 6000 Blackwell Workstation Edition Datasheet](../references/files/specs/nvidia-rtx-pro6000-spec.pdf)。
+- 4.2–4.6 的昇腾比较：[Communications of HUAWEI RESEARCH：昇腾架构论文所在期](../references/files/specs/ascend-davinci.pdf)；[Serving Large Language Models on Huawei CloudMatrix384, v2](../references/files/papers/cloudmatrix384-v2.pdf)；[昇腾 950 NPU 架构白皮书（官方下载原件）](../references/files/specs/ascend-950-official.pdf)。
+- 4.2–4.5 的 Apple 比较：[Explore the architecture of Apple GPUs — WWDC20](../references/files/documents/apple-gpu-architecture.html)；[Choosing a resource storage mode for Apple GPUs — DocC JSON](../references/files/documents/apple-metal-memory.json)；[Apple M2 Pro and M2 Max launch specifications](../references/files/specs/apple-m2-pro-max.html)；[Ollama v0.20.7 bundled ggml Metal kernels](../references/files/documents/ollama-ggml-metal-kernels.txt)。
+- 4.4–4.5 的机制与性能模型：[Roofline: An Insightful Visual Performance Model for Floating-Point Programs and Multicore Architectures](../references/files/papers/roofline.pdf)；[NVIDIA Hopper Tuning Guide](../references/files/documents/nvidia-hopper-tuning.html)；[CANN 8.1.RC1.alpha002 Ascend C 算子开发指南](../references/files/specs/ascend-c-guide.pdf)。
+- 4.6 的不同设计选择：[Google's Training Supercomputers from TPU v2 to Ironwood: Architectural Stability, Scale, Resilience, Power Efficiency, and Sustainability Across Five Generations](../references/files/papers/google-tpu-generations.pdf)；[Inside the Eighth-Generation TPU: An Architecture Deep Dive](../references/files/specs/google-tpu8.html)；[IPU Programming Model](../references/files/documents/graphcore-programming.html)；[Cerebras Wafer-Scale Engine 3 Datasheet](../references/files/specs/cerebras-wse3-spec.pdf)；[Think Fast: A Tensor Streaming Processor (TSP) for Accelerating Deep Learning Workloads](../references/files/papers/groq-tsp.pdf)；[SambaNova SN40L: Scaling the AI Memory Wall with Dataflow and Composition of Experts](../references/files/papers/sambanova-sn40l-paper.pdf)；[OpenTallas architecture and analysis](../references/files/documents/opentallas-readme.md)。
+
+原文版本、参数差异与扩写时需补的材料见[编辑笔记](editorial-notes.md#ch-04)。

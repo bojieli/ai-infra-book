@@ -187,6 +187,71 @@ def verify(base=None, serving=None, testing=None):
         entry['adoption'] = {'decision': 'existing_experiment_extension', 'reason': 'Existing11.3.1/11-3 compares resource-share adjustment with loading critical path and capacity invalidation.'}
     assert len(serverless['records']) == 2 and sum(len(r['physical_pdf_pages']) for r in serverless['records']) == 17
     assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134, 145, 146, 147, 148, 149, 151, 152, 153, 154, 156, 158, 170, 171, 172, 175, 182]
+    from verify_asplos_late_batches import verify as check_late_batches
+    late = check_late_batches()
+    assert late['status'] == 'passed_with_explicit_version_limits'
+    assert late['sealed_packets_unchanged']
+    assert (late['counts']['new_full_abstracts'], late['counts']['representative_pdfs'],
+            late['counts']['representative_pdf_pages'], late['counts']['selected_body_physical_pages']) == (16, 15, 243, 0)
+    assert late['counts']['selected_body_reading_records'] == 0
+    assert {r['program_order'] for r in late['records']} == {157, 159, 160, 161, 162, 165, 167, 168, 173, 174, 176, 177, 178, 179, 183, 184}
+    # This adapter already deduplicates its packets by formal DOI. Still require
+    # an unread entry here so a later canonical integration cannot double count.
+    for record in late['records']:
+        n = record['program_order']
+        entry = entries[n]
+        assert record['doi'] == record['formal_doi'] == entry['doi'] and not entry['abstract_read']
+        assert record['abstract_read'] and record['selected_reading'] is None
+        assert record['abstract_identity_reading']['physical_pdf_pages'] == []
+        entry['abstract_read'] = True
+        for key in ('representative_pdf', 'selected_reading', 'version', 'version_notes',
+                    'identity', 'adoption', 'abstract_identity_reading',
+                    'formal_container_metadata', 'formal_page_range',
+                    'pdf_relationship', 'identity_conditions'):
+            if key in record:
+                entry[key] = record[key]
+        entry['abstract_source'] = {
+            'file': record['source_file'], 'sha256': record['source_sha256'],
+            'url': record['source_url'], 'extraction_kind': record['extraction_kind'],
+            'abstract_sha256': record['abstract_sha256'],
+        }
+        entry['provenance'].extend(record['provenance'])
+        additional.append(n)
+    assert {r['program_order'] for r in late['gaps']} == {163, 166}
+    for gap in late['gaps']:
+        entry = entries[gap['program_order']]
+        assert gap['doi'] == entry['doi'] and not entry['abstract_read']
+        assert not gap['abstract_read'] and gap['representative_pdf'] is None and gap['selected_reading'] is None
+        entry['provenance'].extend(gap['provenance'])
+        entry['gap_reason'] = gap['gap_reason']
+        entry['gap_evidence'] = {
+            key: value for key, value in gap.items()
+            if key not in ('program_order', 'doi', 'formal_doi', 'title', 'authors',
+                           'abstract_read', 'representative_pdf', 'selected_reading',
+                           'provenance', 'gap_reason')
+        }
+    assert len(additional) == len(set(additional)) == 47
+    # The anonymous author-artifact manuscript remains a conditional association,
+    # and its first-page abstract never becomes a selected-body-reading scope.
+    assert entries[179]['identity_conditions']['anonymous_author_artifact_manuscript']
+    assert not entries[179]['identity_conditions']['publisher_abstract_equivalence_verified']
+    assert entries[179]['identity_conditions']['public_manuscript_pages'] == 14
+    assert entries[179]['identity_conditions']['formal_publication_pages'] == 15
+    assert entries[179]['selected_reading'] is None
+    from verify_virgo_body import verify as check_virgo_body
+    virgo = check_virgo_body()
+    assert virgo['status'] == 'pass' and virgo['same_pdf_bytes_as_prior_abstract_packet']
+    assert virgo['new_abstracts'] == virgo['new_pdfs'] == virgo['new_pdf_pages'] == 0
+    assert virgo['new_body_reading_records'] == 1 and virgo['selected_body_physical_pages'] == 15
+    entry = entries[virgo['program_order']]
+    assert entry['doi'] == virgo['doi'] and entry['abstract_read'] and entry['selected_reading'] is None
+    assert entry['representative_pdf']['sha256'] == virgo['existing_pdf']['sha256']
+    entry['selected_reading'] = virgo['selected_reading']
+    entry['provenance'].append(virgo['selected_reading']['proof_file'])
+    entry['adoption'] = {
+        'decision': 'existing_experiment_extension',
+        'reason': 'Existing 4.3.1/4.4.3 uses a conditional capacity/operand-supply budget; the reading agent’s 15-page scope and root p10 Table 2 spot check remain distinct. No product-performance or reproduced-energy claim.',
+    }
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
         'program_entries': len(entries),
@@ -195,14 +260,16 @@ def verify(base=None, serving=None, testing=None):
         'public_pdf_pages': sum(e['representative_pdf']['pages'] for e in entries.values() if e['representative_pdf']),
         'selected_sections_read': sum(e['selected_reading'] is not None for e in entries.values()),
         'additional_abstracts_over_canonical': len(additional),
-        'additional_selected_scopes_over_canonical': len(proof_names) + len(followups) + memory_selected + len(serverless['records']),
+        'additional_selected_scopes_over_canonical': len(proof_names) + len(followups) + memory_selected + len(serverless['records']) + virgo['new_body_reading_records'],
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (129, 119, 2005, 28)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (145, 134, 2248, 29)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages + 17
-    assert summary['additional_selected_body_pages'] == 74
+    assert summary['remaining_abstracts'] == 39
+    assert {163, 166} <= set(summary['remaining_abstract_orders'])
+    summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages + 17 + virgo['selected_body_physical_pages']
+    assert summary['additional_selected_body_pages'] == 89
     output = {'summary': summary, 'records': [entries[n] for n in sorted(entries)]}
     (D / 'reading-coverage.json').write_text(json.dumps(output, ensure_ascii=False, indent=2) + '\n')
     return summary
