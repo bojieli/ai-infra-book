@@ -252,6 +252,46 @@ def verify(base=None, serving=None, testing=None):
         'decision': 'existing_experiment_extension',
         'reason': 'Existing 4.3.1/4.4.3 uses a conditional capacity/operand-supply budget; the reading agent’s 15-page scope and root p10 Table 2 spot check remain distinct. No product-performance or reproduced-energy claim.',
     }
+    from verify_asplos_final_next import verify as check_final_next
+    final_next = check_final_next()
+    assert final_next['status'] == 'passed_with_explicit_version_limits'
+    assert final_next['sealed_packet_unchanged']
+    assert (final_next['counts']['new_full_abstracts'], final_next['counts']['representative_pdfs'],
+            final_next['counts']['representative_pdf_pages'], final_next['counts']['selected_body_physical_pages']) == (3, 2, 33, 0)
+    for record in final_next['records']:
+        n = record['program_order']; entry = entries[n]
+        assert record['doi'] == record['formal_doi'] == entry['doi'] and not entry['abstract_read']
+        assert record['abstract_read'] and record['selected_reading'] is None
+        entry['abstract_read'] = True
+        for key in ('representative_pdf', 'selected_reading', 'version', 'version_notes',
+                    'identity', 'adoption', 'abstract_identity_reading', 'formal_page_range',
+                    'pdf_relationship', 'identity_conditions'):
+            if key in record:
+                entry[key] = record[key]
+        entry['abstract_source'] = {
+            'file': record['source_file'], 'sha256': record['source_sha256'],
+            'url': record['source_url'], 'extraction_kind': record['extraction_kind'],
+            'abstract_sha256': record['abstract_sha256'],
+        }
+        entry['provenance'].extend(record['provenance'])
+        additional.append(n)
+    assert {r['program_order'] for r in final_next['gaps']} == {1, 2, 5}
+    for gap in final_next['gaps']:
+        entry = entries[gap['program_order']]
+        assert gap['doi'] == entry['doi'] and not entry['abstract_read']
+        assert not gap['abstract_read'] and gap['representative_pdf'] is None and gap['selected_reading'] is None
+        entry['provenance'].extend(gap['provenance'])
+        entry['gap_reason'] = gap['gap_reason']
+        entry['gap_evidence'] = {key: value for key, value in gap.items()
+                                 if key not in ('program_order', 'doi', 'formal_doi', 'title', 'authors',
+                                                'abstract_read', 'representative_pdf', 'selected_reading',
+                                                'provenance', 'gap_reason')}
+    assert len(additional) == len(set(additional)) == 50
+    assert entries[14]['identity_conditions'] == {
+        'public_manuscript_pages': 17, 'formal_publication_pages': 16,
+        'publisher_byte_equivalence_verified': False,
+    }
+    assert entries[14]['selected_reading'] is None
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
         'program_entries': len(entries),
@@ -264,10 +304,10 @@ def verify(base=None, serving=None, testing=None):
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (145, 134, 2248, 29)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (148, 136, 2281, 29)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    assert summary['remaining_abstracts'] == 39
-    assert {163, 166} <= set(summary['remaining_abstract_orders'])
+    assert summary['remaining_abstracts'] == 36
+    assert {1, 2, 5, 163, 166} <= set(summary['remaining_abstract_orders'])
     summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages + 17 + virgo['selected_body_physical_pages']
     assert summary['additional_selected_body_pages'] == 89
     output = {'summary': summary, 'records': [entries[n] for n in sorted(entries)]}
