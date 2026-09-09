@@ -29,6 +29,8 @@ SGLang 的 [EAGLE 自适应步数](../references/framework-history/2026-09-08/sp
 
 vLLM 所读[日志实现](../references/framework-history/2026-09-08/speculative-execution/vllm-spec-metrics.py)中，mean acceptance length 是 `1 + accepted / drafts`，draft acceptance rate 则是接受草稿数除以提议数。[逐请求指标](../references/framework-history/2026-09-08/speculative-execution/vllm-acceptance_metrics.md)还提供逐步计数，默认不收集，流式输出的统计在相应最终 usage 块中。实验保存定义和终止条件；数字超过 k 时，先检查是否包含额外 token，不能马上归因于算法错误或更强预测能力。
 
+所读日志的 per-position acceptance rate 以全部 draft 轮数为分母，记为 `q_j`，已经是接受长度至少达到 j 的累计比例。固定每轮提议 k 个 token 时，`q_j=Π(i=1…j)p_i`，期望产出用 `1+Σq_j`，不能再将这些日志比例连乘。例如条件概率为 0.5、0.5，对应累计比例 0.5、0.25，期望为 1.75，而不是误连乘得到的 1.625。可变提议长度时，全轮数分母的 q 仍计实际接受贡献，却不能据未提议的位置推断更长草稿的接受概率；请求结束裁剪与额外 token 仍按前述条件单列。
+
 ## 四个请求的验证预算
 
 以 Qwen3-8B 的一个 batch 为教学输入，四个请求每位置的条件接受概率分别假设为 0.9、0.5、0.3、0.3。先都提议 6 个 token，再比较将验证上限改为 6、2、1、1。这里的概率、图档位及时间均为教学假设，并非 DSpark 或 Qwen3 的测量。
