@@ -20,7 +20,7 @@ def norm(text):
 
 def verify():
     sources = json.loads((D / 'selected-sources.json').read_text())
-    assert len(sources) == len({s['id'] for s in sources}) == 87
+    assert len(sources) == len({s['id'] for s in sources}) == 101
     byid = {s['id']: s for s in sources}
     for s in sources:
         b = (ROOT / s['file']).read_bytes()
@@ -44,7 +44,7 @@ def verify():
     screens = list(csv.DictReader((ROOT / 'research/2026-infra-survey/screening-asplos-2025.tsv').open(), delimiter='\t'))
     orders = [a['program_order'] for a in abstracts]
     assert orders == sorted(set(orders)) == [int(s['number']) for s in screens]
-    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 48
+    assert len(orders) == manifest['public_abstracts_available'] == manifest['abstracts_screened'] == 58
     for a, sc in zip(abstracts, screens):
         p = papers[a['program_order']]; s = byid[a['source_id']]
         assert a['source_file'] == s['file'] and a['source_sha256'] == s['sha256']
@@ -57,6 +57,19 @@ def verify():
             raw = data.decode(); spans = t['character_spans']
             assert all(0 <= lo < hi <= len(raw) for lo, hi in spans)
             text = ' '.join(' '.join(raw[lo:hi] for lo, hi in spans).split())
+            if a['identity'].get('publisher_author_names_in_pdf_page'):
+                assert norm(p['doi']) in norm(raw)
+                assert all(norm(name) in norm(raw) for name in a['authors'])
+                assert list(map(norm, a['authors'])) == [norm(' '.join([x.get('given', ''), x['family']])) for x in p['author_metadata']]
+        elif 'html_abstract' in a:
+            soup = BeautifulSoup((ROOT / s['file']).read_text(), 'html.parser')
+            h = a['html_abstract']; blocks = soup.select(h['css_selector'])
+            assert len(blocks) == h['expected_matches'] == 1
+            text = ' '.join(blocks[0].get_text(' ', strip=True).split())
+            assert norm(soup.select_one(h['citation_title_selector'])['content']) == norm(a['title'])
+            assert [x['content'] for x in soup.select(h['citation_author_selector'])] == a['authors']
+            assert list(map(norm, a['authors'])) == [norm(' '.join([x.get('given', ''), x['family']])) for x in p['author_metadata']]
+            assert soup.select_one(h['citation_doi_selector'])['content'].lower() == p['doi']
         else:
             soup = BeautifulSoup((ROOT / s['file']).read_text(), 'html.parser')
             block = soup.select_one('blockquote.abstract')
@@ -74,7 +87,7 @@ def verify():
         assert p['public_abstract']['sha256'] == a['abstract_sha256']
         assert p['screening'] == {'basis': 'title_and_full_primary_public_abstract', 'decision': sc['decision'], 'reason': sc['reason']}
     pdfs = [s for s in sources if 'pdf_pages' in s]
-    assert len(pdfs) == manifest['public_pdfs_archived'] == 47
+    assert len(pdfs) == manifest['public_pdfs_archived'] == 55
     for s in pdfs:
         p = papers[s['program_order']]; pdf = ROOT / s['file']
         assert pdf.read_bytes().startswith(b'%PDF-') and p['pdf']['sha256'] == s['sha256']
@@ -86,10 +99,10 @@ def verify():
         title = re.search(r'^Title:\s*(.+)', info, re.M)
         assert norm(p['title']) in norm(data.decode()) or (title and norm(p['title']) == norm(title[1]))
     selected = [p for p in papers.values() if p['reading_status'] == 'selected_sections_read']
-    assert len(selected) == manifest['selected_sections_read'] == 9
-    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 44, 49, 94}
-    expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 28: range(2, 13), 35: range(1, 14), 44: list(range(2, 13)) + [16, 17], 49: range(1, 14), 94: range(1, 14)}
-    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (28, 'picachu-reading.json'), (35, 'darwingame-reading.json'), (44, 'apophenia-reading.json'), (49, 'pipellm-reading.json'), (94, 'fsmoe-reading.json')]:
+    assert len(selected) == manifest['selected_sections_read'] == 11
+    assert {p['program_order'] for p in selected} == {3, 21, 22, 27, 28, 35, 39, 40, 44, 49, 94}
+    expected_pages = {3: range(1, 14), 21: range(2, 14), 22: range(2, 15), 27: range(2, 15), 28: range(2, 13), 35: range(1, 14), 39: range(2, 13), 40: range(2, 14), 44: list(range(2, 13)) + [16, 17], 49: range(1, 14), 94: range(1, 14)}
+    for order, filename in [(3, 'iks-reading.json'), (21, 'diffuse-reading.json'), (22, 'cxlfork-reading.json'), (27, 'ascend-components-reading.json'), (28, 'picachu-reading.json'), (35, 'darwingame-reading.json'), (39, 'streamgrid-reading.json'), (40, 'arc-reading.json'), (44, 'apophenia-reading.json'), (49, 'pipellm-reading.json'), (94, 'fsmoe-reading.json')]:
         proof = json.loads((D / filename).read_text()); reading = proof['reading']
         assert reading == papers[order]['selected_reading']
         assert reading['physical_pdf_pages'] == list(expected_pages[order])
@@ -116,7 +129,28 @@ def verify():
         source = byid[view['source_id']]
         assert source['sha256'] == view['source_sha256'] and source['program_order'] == view['program_order']
         assert view['actually_viewed'] and view['physical_page'] == 1
-    report = dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed', scope='Public sources and declared reading only; not full proceedings completion.', responses=len(sources), failed_responses=sum(s['status_code'] != 200 for s in sources), location_dois=184, public_pdfs=len(pdfs), public_pdf_pages=sum(s['pdf_pages'] for s in pdfs), primary_abstracts_screened=len(abstracts), remaining_abstracts=184-len(abstracts), selected_sections_read=len(selected), middle_abstract_page_views=4)
+    storage = json.loads((D / 'storage-screening-notes.json').read_text())
+    assert len(storage['new_source_ids']) == 14
+    assert storage['new_abstract_orders'] == [50, 51, 52, 53, 54, 56, 58, 61, 63, 64]
+    assert set(storage['new_abstract_orders']).issubset(orders)
+    assert sum(byid[i].get('pdf_pages', 0) for i in storage['new_source_ids']) == storage['new_pdf_pages'] == 130
+    assert sum('pdf_pages' in byid[i] for i in storage['new_source_ids']) == storage['new_pdfs'] == 8
+    assert {x['program_order'] for x in storage['unresolved']} == {57, 59, 62}
+    assert not {57, 59, 62} & set(orders)
+    assert len(storage['transport_errors']) == 1
+    assert storage['selected_body_orders'] == [39, 40]
+    assert sum(len(papers[n]['selected_reading']['physical_pdf_pages']) for n in [39, 40]) == storage['selected_body_pages'] == 23
+    assert {v['program_order'] for v in storage['abstract_page_views']} == {54, 64}
+    for view in storage['abstract_page_views']:
+        data = (ROOT / view['file']).read_bytes()
+        assert len(data) == view['bytes'] and hashlib.sha256(data).hexdigest() == view['sha256']
+        source = byid[view['source_id']]
+        assert source['sha256'] == view['source_sha256'] and source['program_order'] == view['program_order']
+        assert view['actually_viewed'] and view['physical_page'] == 1
+    for n in storage['new_abstract_orders']:
+        assert storage['decisions'][str(n)] == {k: papers[n]['screening'][k] for k in ['decision', 'reason']}
+        assert storage['version_notes'][str(n)] == papers[n]['public_version_note']
+    report = dict(verified_at=datetime.now(timezone.utc).isoformat(), status='passed', scope='Public sources and declared reading only; not full proceedings completion.', responses=len(sources), failed_responses=sum(s['status_code'] != 200 for s in sources), location_dois=184, public_pdfs=len(pdfs), public_pdf_pages=sum(s['pdf_pages'] for s in pdfs), primary_abstracts_screened=len(abstracts), remaining_abstracts=184-len(abstracts), selected_sections_read=len(selected), middle_abstract_page_views=4, storage_abstract_page_views=2, storage_transport_errors=1)
     (D / 'public-audit.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     return report
 

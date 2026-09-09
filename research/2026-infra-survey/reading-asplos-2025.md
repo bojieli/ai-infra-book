@@ -1,6 +1,6 @@
 # ASPLOS 2025：公开稿、摘要筛选与专题正文
 
-截至 2026-09-09，官方主日程 184 个 DOI 中已归档 47 份代表 PDF／811 页、完成 48 篇原始完整摘要筛选，九篇有声明范围的正文阅读；其余 136 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
+截至 2026-09-09，官方主日程 184 个 DOI 中已归档 55 份代表 PDF／941 页、完成 58 篇原始完整摘要筛选，十一篇有声明范围的正文阅读；其余 126 篇摘要未读。另存 PipeLLM 十五页正式格式作者稿，物理页 1–13 已读、六页图像已查看；代表 PDF 与原始摘要数量保持，新增副本不重复计算论文。
 
 出版卷、演讲年份、作者版本与实际读取范围分开。QRCC 作者稿写 Volume 1，但正式 DOI 的出版元数据为 Volume 4；DarwinGame 2025-09 上传稿晚于正式出版，且留有 Conference17／占位 DOI，身份由完整题名和作者核对。见[归档说明](../../references/proceedings/ASPLOS/2025/README.md)。
 
@@ -29,16 +29,26 @@
 | 36. [Copper and Wire: Bridging Expressiveness and Performance for Service Mesh Policies](../../references/proceedings/ASPLOS/2025/public/paper-036.pdf) | 备查 | L7 策略表达与 sidecar 放置，供 11 的控制路径备查；不是 TP／EP 集合通信或模型路由的直接实现。 |
 | 37. [MetaSapiens: Real-Time Neural Rendering with Efficiency-Aware Pruning and Accelerated Foveated Rendering](../../references/proceedings/ASPLOS/2025/public/paper-037.pdf) | 备查 | 点式神经渲染按计算成本剪枝及注视点质量取舍；可补 12／13 的质量约束，暂不展开新的渲染主线。 |
 | 38. [D-VSync: Decoupled Rendering and Displaying for Smartphone Graphics](../../references/proceedings/ASPLOS/2025/public/paper-038.pdf) | 备查 | 显示前预执行缓解长帧，保留真实交互边界；图形合成机制不直接迁移为实时 AI 请求的吞吐保证。 |
-| 39. [StreamGrid: Streaming Point Cloud Analytics via Compulsory Splitting and Deterministic Termination](../../references/proceedings/ASPLOS/2025/public/paper-039.pdf) | 候选待读 | 点云切分、终止条件与行缓冲共同降低片外访问；候选对照 4／5 的依赖和质量，需读正文后再采用。 |
-| 40. [ARC: Warp-level Adaptive Atomic Reduction in GPUs to Accelerate Differentiable Rendering](../../references/proceedings/ASPLOS/2025/public/paper-040.pdf) | 候选待读 | 可微渲染梯度的原子归约在 SM 与 L2 间分工；可检验只看总 FLOPs／HBM 的遗漏，需分清软件路径和硬件模拟。 |
+| 39. [StreamGrid: Streaming Point Cloud Analytics via Compulsory Splitting and Deterministic Termination](../../references/proceedings/ASPLOS/2025/public/paper-039.pdf) | 备查 | 物理页 2–12 已读；点云切分与提前终止改变算法工作及质量，缓冲模型需要给定数据流；作为 5／13 方法参照，不增加渲染专题。 |
+| 40. [ARC: Warp-level Adaptive Atomic Reduction in GPUs to Accelerate Differentiable Rendering](../../references/proceedings/ASPLOS/2025/public/paper-040.pdf) | 备查 | 物理页 2–13 已读；高 L2 命中仍可能受原子队列限制，warp 内归约另有指令和寄存器代价；软件实测与新增硬件模拟分开，暂不扩展正文。 |
 | 41. [Treelet Accelerated Ray Tracing on GPUs](../../references/proceedings/ASPLOS/2025/public/paper-041.pdf) | 备查 | RT 遍历用队列和 warp 重组改善局部性；不是当前 LLM 注意力路径，暂不增加光追案例。 |
 | 43. [Mint: Cost-Efficient Tracing with All Requests Collection via Commonality and Variability Analysis](../../references/proceedings/ASPLOS/2025/public/paper-043.pdf) | 备查 | trace 模式聚合与参数过滤降低采集成本；全请求覆盖不等于保留全部信息，供实验记录取舍备查。 |
 | 44. [Automatic Tracing in Task-Based Runtime Systems](../../references/proceedings/ASPLOS/2025/public/paper-044.pdf) | 重点阅读并整合 | 物理页 2–12、16–17 已读；身份、匹配等待与准备成本接 5.4.4／实验 5-8。Legion 工件与固定 vLLM 图封装分开；历史 DP 训练结果不外推当前模型。 |
 | 46. [Rethinking Java Performance Analysis](../../references/proceedings/ASPLOS/2025/public/paper-046.pdf) | 备查 | DaCapo 负载更新和用户延迟方法支持测量取舍；已有 AI 调优案例，保留方法参照而不添加 Java 专节。 |
 | 48. [Cinnamon: A Framework for Scale-Out Encrypted AI](../../references/proceedings/ASPLOS/2025/public/paper-048.pdf) | 备查 | FHE 的多层并行与芯片资源配比，任务语义与普通推理不同；不能将加密 CPU 基线倍数并入常规 GPU 比较。 |
 | 49. [PipeLLM: Fast and Confidential Large Language Model Services with Speculative Pipelined Encryption](../../references/proceedings/ASPLOS/2025/pipellm/author-final.pdf) | 重点阅读并整合 | 正式格式作者稿物理页 1–13 已读；提前准备、额外复制与有用工作接 5.2.3。历史换出、工件限制与 V1 抢占／connector 分开。 |
+| 50. [Practical Federated Recommendation Model Learning Using ORAM with Controlled Privacy](../../references/proceedings/ASPLOS/2025/public/paper-050.pdf) | 备查 | FEDORA 为联邦推荐的嵌入子集访问引入 ORAM、隐私预算和 SSD 布局；可作约束参照，不扩展本书的 LLM 训练主线。 |
+| 51. [Tackling ML-based Dynamic Mispredictions using Statically Computed Invariants for Attack Surface Reduction](../../references/proceedings/ASPLOS/2025/public/paper-051-landing.html) | 排除 | ML 预测程序调用集后用静态关系区分失配与攻击，属于 CPU 程序去膨胀和安全分析；不是模型服务的推测解码。 |
+| 52. [Control Logic Synthesis: Drawing the Rest of the OWL](../../references/proceedings/ASPLOS/2025/public/paper-052.pdf) | 排除 | 根据 ISA／架构规格合成 SoC 控制逻辑，主要验证 RISC-V 与密码加速器；不同于第 5 章以 profiling 反馈优化张量内核。 |
+| 53. [CRUSH: A Credit-Based Approach for Functional Unit Sharing in Dynamically Scheduled HLS](../../references/proceedings/ASPLOS/2025/public/paper-053.pdf) | 备查 | CRUSH 以 credit 和依赖约束共享 HLS 功能单元；保留资源共享方法参照，不将 Dynamatic 集成声明写成推理框架特性。 |
+| 54. [AMuLeT: Automated Design-Time Testing of Secure Speculation Countermeasures](../../references/proceedings/ASPLOS/2025/public/paper-054.pdf) | 排除 | AMuLeT 在微架构模拟器内测试安全投机防护；这里的 speculation 不是 LLM 推测解码，不增加 CPU 攻击专题。 |
 | 55. [Don't Repeat Yourself! Coarse-Grained Circuit Deduplication to Accelerate RTL Simulation](../../references/proceedings/ASPLOS/2025/public/paper-055-author.pdf) | 排除 | RTL 仿真的共享指令代码与 LLC 瓶颈；本书已有 AI 复用和争用例子，不展开 EDA 仿真系统。 |
+| 56. [Parendi: Thousand-Way Parallel RTL Simulation](../../references/proceedings/ASPLOS/2025/public/paper-056.pdf) | 备查 | Parendi 为 Graphcore IPU 上的 RTL 仿真平衡同步、通信和计算；有切分方法价值，已有 AI 贯穿案例，不另开 EDA 仿真内容。 |
+| 58. [Embracing Imbalance: Dynamic Load Shifting among Microservice Containers in Shared Clusters](../../references/proceedings/ASPLOS/2025/public/paper-058.pdf) | 备查 | Imbres 联合调整微服务容器的负载、连接和资源；可作 11 的争用背景，不能直接等同 MoE 专家调度或模型 goodput。 |
 | 60. [FleetIO: Managing Multi-Tenant Cloud Storage with Multi-Agent Reinforcement Learning](../../references/proceedings/ASPLOS/2025/public/paper-060.pdf) | 备查 | 虚拟 SSD 的隔离、利用率与 RL 奖励取舍；不是模型 RL 训练调度，暂不扩展存储控制器专题。 |
+| 61. [ZRAID: Leveraging Zone Random Write Area (ZRWA) for Alleviating Partial Parity Tax in ZNS RAID](../../references/proceedings/ASPLOS/2025/public/paper-061-landing.html) | 备查 | ZRAID 借 ZRWA 改变 ZNS RAID 部分校验的写入与回收；仅作存储写放大背景，不直接移植为 KV 缓存性能。 |
+| 63. [MOAT: Securely Mitigating Rowhammer with Per-Row Activation Counters](../../references/proceedings/ASPLOS/2025/public/paper-063.pdf) | 排除 | MOAT 研究 DRAM 行激活计数与 Rowhammer 防护，超出 AI 资源配置和模型运行环境主线。 |
+| 64. [HyperHammer: Breaking Free from KVM-Enforced Isolation](../../references/proceedings/ASPLOS/2025/public/paper-064.pdf) | 排除 | HyperHammer 是特定配置下的虚拟化隔离概念验证；摘要明确限定系统条件，不用它替代 Agent 沙箱设计或泛化现行服务风险。 |
 | 79. [MVQ: Towards Efficient DNN Compression and Acceleration with Masked Vector Quantization](../../references/proceedings/ASPLOS/2025/public/paper-079.pdf) | 备查 | N:M 剪枝、向量码本和阵列协同，实验主要是视觉 CNN；已有模型量化主线，暂不增算法小节。 |
 | 87. [Bounding Speculative Execution of Atomic Regions to a Single Retry](../../references/proceedings/ASPLOS/2025/public/paper-087.pdf) | 排除 | 共享内存原子区域的事务重试与 cacheline 锁，区别于 LLM 的推测解码和 rollout 重试。 |
 | 94. [FSMoE: A Flexible and Scalable Training System for Sparse Mixture-of-Experts Models](../../references/proceedings/ASPLOS/2025/public/paper-094.pdf) | 重点阅读并整合 | 已读物理页 1–13；采用梯度就绪、共享跨机链路与分桶空隙的判断，接 10.3 和实验 10-5；历史改型模型与当前预算分开。 |
@@ -97,16 +107,26 @@ Faiss 官方索引表与选择指南补充真实实验入口；普通 Flat 的 F
 
 其单 H100-SXM 评估并未启用 CPU TDX，旧 vLLM 测的是 OPT 模型的并行采样。公开工件需要修改 CUDA／OpenSSL 集成，所读失配分支进入断言；源码与论文的保护、回退设计尚未逐项对应，不能宣称完整复现。[三期 vLLM 对照](../../references/framework-history/2026-09-09/pipellm-swap/README.md)区分旧单／多序列抢占、V1 重计算与 connector 缓存，未发现直接集成该研究的证据。图注与 52.8% 指标歧义留在记录，正文不移植性能倍数；只补 5.2.3／实验 5-2／图 5-2 的选做变体，接回第 8→9 章已有缓存计算。
 
+**StreamGrid**：作者 v1 物理页 2–12 的十一页正文范围已读，五页图像已查看，见[页级记录](../../references/proceedings/ASPLOS/2025/streamgrid-reading.json)。强制切分和搜索提前终止会改变算法工作量与任务质量，需要配合训练；不能当作保持原计算不变的 GPU 融合。固定吞吐下的缓冲模型还需要给定数据流、时序和复用信息，给快阶段留空隙有时可以节省缓冲。
+
+硬件部分采用 RTL 综合／布局与周期、带宽模型；PointNet++、分割与 3DGS 所用机制不同，训练适应的成本也单独存在。图 20(b) 的图注与任务指标有差异，原稿保留。本书已有质量、资源与生命周期的分析，故由候选改为备查：不增加点云专题、不迁移总加速比，也没有验证当前推理框架直接采用该设计。
+
+**ARC**：物理页 2–13 的十二页正文范围已读，四页图像已查看，见[页级记录](../../references/proceedings/ASPLOS/2025/arc-reading.json)。高 L2 命中不消除原子请求排队；先在 warp 内归约可以减少请求，也会增加指令、寄存器和控制流开销。收益受地址局部性、活跃 lane 数与调优阈值影响，不能只用 HBM 字节数判断。
+
+ARC-HW 的新增指令与单元依靠模拟评估，ARC-SW 是 GPU 上的软件实现；梯度内核、完整训练与模拟硬件参数分别看待。适用条件涉及归约顺序、原子操作语义和返回值；论文比较中的历史库限制不代表当前 CCCL。所引软件工件本批未读，不能声称已核实框架接入。现有第五章的分单元分析已经覆盖这一判断，暂留备查，不新增章节或实验。
+
 ## 尚缺的材料
 
 - 首个 session 中 Mosaic、DynaX、RASSM 的原始摘要／正文仍有缺口；DynaX 的作者 README 不能代替论文。TFHE 作者页面的 PDF 按钮仍指向 ACM。
 - 184 条 OpenAlex 查询结果只用于定位公开稿，不能替代原始摘要；其中可用位置也不完整，已知 GUST／IKS 等须另行查找。公开副本归属再由标题、作者和正式 DOI 核对。
 - 初次下载的一份机构副本返回 403，ACM 条目返回 403，探测的官方 abstracts 路径为 404。保留响应，继续寻找作者稿；其余工作正常推进。
 - 本轮 NCSU 作者链接以 HTTP 200 重定向到 Purdue 实验室首页，Yale PULSE 链接为 404；均保存响应，不计论文。第 17／24 项仍缺公开稿，其余未筛条目按 manifest 保留。
-- 其余 136 篇继续查摘要和全文。已读候选先与本书现有图执行、资源共享、调度和分层存储案例比较，只有新的约束或选择边界才进入提纲。
+- 其余 126 篇继续查摘要和全文。已读候选先与本书现有图执行、资源共享、调度和分层存储案例比较，只有新的约束或选择边界才进入提纲。
 
 机器记录：[摘要与来源](../../references/proceedings/ASPLOS/2025/public-abstracts.json)、[筛选表](screening-asplos-2025.tsv)、[逐篇 manifest](../../references/proceedings/ASPLOS/2025/manifest.json)。
 
 Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正式 DOI 的 Crossref 记录列五位，未列该名字。题名与其余五位作者一致，按较早作者版本归档；此处仅记录元数据差异，不推断正式 PDF 的作者名单已经变更。
 
-前一批十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。首轮将 StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，Apophenia、PipeLLM 随后完成上述选读，其余两篇仍为正文候选；该批其他论文备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。
+前一批十三篇新摘要的逐项判断和版本备注见[筛选记录](../../references/proceedings/ASPLOS/2025/middle-screening-notes.json)。首轮将 StreamGrid、ARC、Apophenia、PipeLLM 留为正文候选，四篇随后均完成声明范围的正文阅读；StreamGrid／ARC 留作备查；该批其他论文备查或排除，不根据摘要加速比向主大纲追加内容。Mint 作者稿仍有占位 DOI；Java 方法论文的 72 页包含附录；第 55 项按正式 2024 卷与 2025 演讲分别记录。MPI 路径返回非 PDF 页面、EXIST 作者链接返回 404、eScholarship 返回空 202，原响应保留；ARC 与 RTL 去重论文随后取得另一作者路径的有效 PDF。旧第 55 项失败响应仍保留原件，不覆盖它。
+
+本批[存储与系统摘要记录](../../references/proceedings/ASPLOS/2025/storage-screening-notes.json)新增十篇完整摘要、八份代表 PDF／130 页，以及六份其他原始响应。OWL 属于正式 2024 卷；CRUSH 采用实验室链接的十五页 ASPLOS 版，保留先前错误路径的 404，不混用同名 IWLS 版。IBM／SNU 两条采用机构完整摘要元素，明确没有 PDF 正文阅读。AMuLeT／HyperHammer 的跨栏摘要经首页图像复核，作者脚注与版权文字不进入提取范围。Necro-reaper、Tela、Marionette 仍未取得本地可核的完整摘要，保留作者页、403 和传输失败，不用搜索片段补足阅读计数。

@@ -765,3 +765,6 @@
 | `asplos25-pipellm-body` | [PipeLLM 正文与作者版本](../references/proceedings/ASPLOS/2025/pipellm-reading.json) | 5、8、9 | 补充／版本参照 | 十三页声明正文与六张图页；提前准备、保护条件及预测工作 |
 | `pipellm-preemption-framework` | [工件与三期 vLLM 抢占路径](../references/framework-history/2026-09-09/pipellm-swap/README.md) | 5、8、9 | 补充／版本参照 | 九份新响应、十六个读取范围；旧式换出、重计算与 connector 缓存 |
 | `pipellm-preparation-case` | [主机准备、复制与有效工作](../case-studies/host-transfer-and-buffer-lifetime.md#提前准备的工作是否有用) | 5、8、9 | 扩写 5,8,9 | 实验 5-2／图 5-2 选做；同一张量的等待、三类双槽与无用准备预算 |
+| `asplos25-streamgrid-body` | [StreamGrid 正文范围](../references/proceedings/ASPLOS/2025/streamgrid-reading.json) | 5、13 | 补充／版本参照 | 十一页与五张图页；算法质量、数据流建模及缓冲，备查不新增正文 |
+| `asplos25-arc-body` | [ARC 正文范围](../references/proceedings/ASPLOS/2025/arc-reading.json) | 5、13 | 补充／版本参照 | 十二页与四张图页；原子排队、warp 归约代价与硬件模拟边界 |
+| `asplos25-storage-screen` | [存储与系统摘要筛选](../references/proceedings/ASPLOS/2025/storage-screening-notes.json) | 5、11、13 | 补充／版本参照 | 十篇完整摘要、八份 PDF；机构原文与跨栏范围核对，三项缺口保留 |
