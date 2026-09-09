@@ -135,7 +135,30 @@ def verify(base=None, serving=None, testing=None):
         entry['provenance'].append(str(memory_path.relative_to(ROOT)))
         entry['gap_reason'] = gap['gap_reason']
     assert memory_selected == 1 and memory_pages == 4
-    assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134, 145, 151, 152, 175, 182]
+    from verify_asplos_adjacent_abstracts import verify as check_adjacent
+    assert check_adjacent()['status'] == 'pass'
+    adjacent_path = D / 'parallel-abstracts-next/reading-records.json'
+    adjacent = json.loads(adjacent_path.read_text())
+    assert {r['program_order'] for r in adjacent['records']} == {146, 147, 148, 149, 153}
+    for record in adjacent['records']:
+        n = record['program_order']
+        entry = entries[n]
+        assert record['doi'] == entry['doi'] and not entry['abstract_read']
+        assert record['selected_reading']['physical_pdf_pages'] == []
+        entry['abstract_read'] = True
+        entry['representative_pdf'] = record['representative_pdf']
+        entry['version_notes'] = record['version_notes']
+        entry['provenance'].append(str(adjacent_path.relative_to(ROOT)))
+        entry['adoption'] = {'decision': 'abstract_screening_only', 'reason': record['editorial_decision']}
+        if n == 153:
+            entry['pdf_relationship'] = 'Author-linked Teola v3 related preprint; formal Ayo abstract remains the institutional source. Not asserted identical to version of record.'
+        additional.append(n)
+    for gap in adjacent['gaps']:
+        entry = entries[gap['program_order']]
+        assert entry['doi'] == gap['doi'] and not entry['abstract_read']
+        entry['provenance'].append(str(adjacent_path.relative_to(ROOT)))
+        entry['gap_reason'] = gap['gap_reason']
+    assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134, 145, 146, 147, 148, 149, 151, 152, 153, 175, 182]
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
         'program_entries': len(entries),
@@ -148,7 +171,7 @@ def verify(base=None, serving=None, testing=None):
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (118, 109, 1849, 26)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (123, 113, 1914, 26)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
     summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages
     assert summary['additional_selected_body_pages'] == 57

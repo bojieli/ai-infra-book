@@ -18,7 +18,9 @@
 
 本轮并行成果已按实际范围整合：[PartIR／Shardy](../../references/framework-history/2026-09-09/partir-shardy/expanded-reading/NOTES.md)补证明、搜索与生成通信的边界；[Ollama](parallel-ollama/NOTES.md)补后端准入／去重及思考控制。沿[第 6–10 章复核](parallel-case-audit.md)统一了 decode 需求与训练效率定义，修正见[记录](qa/parallel-case-resolutions.json)。这些都是已有小节和实验的增补。
 
-[Pruner／Relax／vAttention](../../references/proceedings/ASPLOS/2025/parallel-followup/READINGS.md)之后，新增 [EDM／Aqua](../../references/proceedings/ASPLOS/2025/parallel-next/READINGS.md)两篇完整摘要与 Aqua 四页正文范围。ASPLOS 2025 唯一 DOI 覆盖已核为 **118 篇摘要、109 份代表 PDF、26 篇声明正文范围，66 篇摘要待补**。全局最近一次完整核验为 **1,428 篇摘要／79 篇正文范围、无错误**，时间为 2026-09-09 06:22 UTC；未接入的新交付不计入这个快照。
+[相邻 ASPLOS 摘要批](../../references/proceedings/ASPLOS/2025/parallel-abstracts-next/READINGS.md)新增五篇完整摘要，[MICRO 摘要批](../../references/proceedings/MICRO/2024/parallel-abstracts/NOTES.md)新增六篇。各归档四份公开 PDF，共 129 页；仅读摘要和身份，未增加正文范围。ASPLOS 2025 的唯一 DOI 覆盖为 **123 篇摘要、113 份代表 PDF、26 篇声明正文范围，61 篇摘要待补**；MICRO 2024 为 **47 篇摘要、43 份 PDF、1 篇声明正文范围，66 篇摘要待补**。Ayo 的正式机构摘要与作者链接的 Teola 相关预印本分别标记；Block Dependency 的一手摘要仍缺失。原始分批记录保持不变，新增来源通过独立覆盖索引合并。
+
+全局完整核验为 **1,439 篇摘要／79 篇正文范围、无错误**，时间为 2026-09-09T06:32:38.287575+00:00。这是已纳入索引的快照；PIM／Serverless 和下一 MICRO 批次的交付另待验收，正文候选不直接变成大纲内容。
 
 [主机调度时间线](parallel-host-timeline/NOTES.md)和[同一 MoE 放置](parallel-moe-ownership/NOTES.md)已完成有界补读与推算，分别接入现有第 5／8 章及第 6／7／9 章。案例审计补清 I01 的串行计时分母和 I09 的累计接受率定义；I19／I20 的积压和双缓冲算式经[独立复算](qa/answers-19-20-audit.json)未发现错误。实际引擎 trace 的验收与后续实验保持独立，不把教学时间代入实测。更多会议摘要、正文候选及全书逐例复查继续并行推进。
 

@@ -840,7 +840,9 @@ kv_quantization=verify_kv_quantization()
 from verify_hybrid_state import verify as verify_hybrid_state
 hybrid_state=verify_hybrid_state()
 from verify_micro2024 import verify as verify_micro2024
-micro2024=verify_micro2024()
+micro2024_base=verify_micro2024()
+from verify_micro2024_coverage import verify as verify_micro2024_coverage
+micro2024=verify_micro2024_coverage(micro2024_base)
 from verify_micro2025 import verify as verify_micro2025
 micro2025=verify_micro2025()
 from verify_asplos2026 import verify as verify_asplos2026
