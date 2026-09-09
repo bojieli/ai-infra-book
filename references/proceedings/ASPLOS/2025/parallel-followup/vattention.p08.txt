@@ -1,0 +1,106 @@
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+(this is similar to vLLM’s default behavior). We leave more
+sophisticated policies such as swapping out KV cache to CPU
+memory as future work.
+Depending on whether a request is in the prefill phase
+or decode phase, different amount of physical memory may
+need to be mapped for a given iteration. The prefill phase
+processes the input tokens of a given prompt in parallel.
+Therefore, the amount of physical memory needed to be
+mapped depends on the number of prompt tokens being
+scheduled. If the total K cache size of all prompt tokens at
+one layer of the model is 𝑠 and page-group size is 𝑡, then each
+worker needs to ensure that at least (𝑠 + 𝑡 − 1)/𝑡 page-groups
+are mapped in each of the 2 × 𝑁 KV cache sub-tensors of the
+given reqId.
+For a request in the decode phase, the number of new
+page-groups required is at most one per virtual tensor. This
+is because each iteration produces only one output token for
+a request. vAttention internally tracks the number of pagegroups mapped for each request and maps new page-groups
+only when prior page-groups are about to be exhausted.
+5.3.4 Request completion. A request terminates when
+it reaches user specified or the maximum context length
+supported by the model, or when the model produces a special end-of-sequence token. The framework notifies vAttention of a request’s completion with free_reqid (line 19).
+Internally, vAttention may unmap the physical pages of a
+completed request or defer them to be freed later (§6.1.2).
+Supporting continuous batching: Continuous batching
+poses one challenge in computing attention in our design.
+When a request from somewhere in the middle of a batch
+exits, it creates an unused hole in the virtual tensors of
+KV cache. This layout is not supported by implementations
+that expect the query (Q) and KV cache to be of the same
+size in batch (𝐵) dimension. However, FlashAttention provides rich API support to address this issue; its argument
+cache_batch_idx allows Q and KV cache to have different
+batch sizes and also be arranged in arbitrary order (i.e., batch
+index 0 in Q can be mapped to batch index 1 in KV cache). vAttention benefits from this API support in terms of both performance and ease of programming; when the request composition of a batch changes, we update cache_batch_idx
+of running requests such that their Q tensors map to their
+respective KV cache based on their reqId.
+
+6
+
+Optimizations
+
+There are two challenges in using CUDA virtual memory
+support for serving LLMs. First, invoking CUDA VMM APIs
+at runtime incurs high latency. Second, cuMemCreate currently allocates memory only at the granularity of large
+pages, i.e., multiples of 2MB. Use of large pages can waste
+physical memory due to internal fragmentation. This section
+details a set of simple-yet-effective optimizations that we
+introduce to overcome these challenges.
+
+6.1
+
+Hiding Latency of Memory Allocation
+
+The serving framework invokes the step API in every iteration. The latency of step depends on the number of pagegroups that need to be mapped into KV cache. Consider,
+for example, that the KV cache of one request needs to be
+extended for Yi-34B which has 60 layers. This requires 120
+calls to cuMemMap + cuMemSetAccess each of which takes
+about 40 microseconds. Therefore, growing the KV cache of
+one request by new page-groups (two per layer) adds about
+5 millisecond latency to the corresponding iteration. The
+latency overhead grows proportional to the number of requests that need new page-groups in a given iteration. We
+propose the following optimizations to hide this latency:
+6.1.1 Overlapping memory allocation with compute
+(decode phase). We leverage the predictability of memory
+demand to overlap memory allocation with computation. In
+particular, note that each iteration produces a single output
+token for every decode request. Therefore, memory demand
+for a decode iteration is known ahead-of-time. Further, in the
+decode phase, a request requires at most one new page-group
+for each of its virtual tensors. vAttention keeps track of the
+current context length and how much physical memory is
+already mapped for each request. Using this information, it
+determines when a request would need more memory and
+uses a background thread to allocate new page-groups when
+the preceding iteration is executing. For example, consider
+that a request R1 would require more physical memory in
+iteration i. When the serving framework invokes step API
+in iteration i-1, vAttention launches a background thread
+that maps page-groups for iteration i. Since per-iteration
+latency is typically in the range of 10s-100s of milliseconds,
+the background thread has enough time to prepare physical
+memory mappings for an iteration before it starts executing.
+This way, vAttention hides the latency of CUDA APIs by
+performing memory allocations out of the critical path.
+6.1.2 Deferred reclamation + eager allocation (prefill
+phase). We observe that allocating physical memory for the
+prefill phase can be avoided in many cases. Consider that
+a request R1 completed in iteration i and a new request R2
+joins the running batch in iteration i+1. To avoid allocating
+page-groups to R2 from scratch, vAttention simply defers the
+reclamation of R1’s page-groups (Figure 5(d)) and assigns
+R1’s reqId to R2. This way, R2 uses the same tensors for its
+KV cache that R1 was using – which are already backed by
+physical pages (Figure 5(e)). Therefore, new allocations are
+required only if R2’s context length is higher than R1.
+We further optimize the prefill phase by proactively allocating a small number of page-groups ahead of time. For this
+purpose, we try to keep a certain number of page-groups
+mapped into the virtual tensors of one of the inactive reqId.
+When a new request arrives, we allocate this reqId. At the
+same time, we identify a new reqId to be allocated next and
+
+

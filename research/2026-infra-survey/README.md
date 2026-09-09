@@ -16,6 +16,12 @@
 
 ## 当前入口
 
+本轮并行成果已按实际范围整合：[PartIR／Shardy](../../references/framework-history/2026-09-09/partir-shardy/expanded-reading/NOTES.md)补证明、搜索与生成通信的边界；[Ollama](parallel-ollama/NOTES.md)补后端准入／去重及思考控制。沿[第 6–10 章复核](parallel-case-audit.md)统一了 decode 需求与训练效率定义，修正见[记录](qa/parallel-case-resolutions.json)。这些都是已有小节和实验的增补。
+
+[Pruner／Relax／vAttention](../../references/proceedings/ASPLOS/2025/parallel-followup/READINGS.md)新增三篇完整摘要、三份代表 PDF／51 页与 16 页正文选读；ASPLOS 2025 唯一 DOI 覆盖已核为 **116 篇摘要、107 份代表 PDF、25 篇声明正文范围，68 篇摘要待补**。下方 113／104／22 等是此前快照。全局最近一次完整核验为 1,423 篇摘要／75 篇正文范围、无错误，发生在这三篇接入之前；新批次通过独立来源、重提取、算术与覆盖核验，不把局部验证写成全库重验。
+
+后续优先补[主机调度的同一请求时间线](parallel-history-gaps.md)和同一 MoE 放置的容量／通信交接；完整引擎 trace 属于后续实验准备，不以继续堆功能资料替代实验，也不将实验未运行当成已完成。
+
 [Frugal 寻源](../../references/proceedings/ASPLOS/2025/frugal-discovery/README.md)确认作者主页都指向本轮返回 403 的出版入口，保留原文缺口；另从 PNNL 补齐 HetEC 原始完整摘要。ASPLOS 2025 当前覆盖 113 篇摘要、104 份代表 PDF、22 篇声明正文范围，71 篇摘要待补；未把工件 README 算成论文正文。
 
 GraphPipe 已选读物理页 3–9，见[依赖与激活驻留](../../references/proceedings/ASPLOS/2025/screening-129-135/GRAPHPIPE-READING.md)。实验 10-5 只补在途样本计数和默认调度边界；独立教学激活项为 768→640 MiB，不是论文实测。ASPLOS 2025 的声明正文范围现为 22 篇，摘要和 PDF 数量不变。

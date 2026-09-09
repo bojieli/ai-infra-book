@@ -1,0 +1,1458 @@
+                                                  vAttention: Dynamic Memory Management for
+                                                      Serving LLMs without PagedAttention
+                                                         Ramya Prabhu                                           Ajay Nayak∗                           Jayashree Mohan
+                                                        Microsoft Research                             Indian Institute of Science                     Microsoft Research
+                                                         Bengaluru, India                                   Bengaluru, India                            Bengaluru, India
+
+                                                                             Ramchandran Ramjee                                  Ashish Panwar
+                                                                                  Microsoft Research                             Microsoft Research
+                                                                                   Bengaluru, India                               Bengaluru, India
+arXiv:2405.04437v3 [cs.LG] 29 Jan 2025
+
+
+
+
+                                         Abstract                                                                          System/library and issues related to PagedAttention
+                                         PagedAttention is a popular approach for dynamic memory                           vLLM [51]: Pioneered PagedAttention. Despite being in an
+                                         allocation in LLM serving systems. It enables on-demand allo-                     actively maintained code repository, vLLM’s PagedAttention
+                                         cation of GPU memory to mitigate KV cache fragmentation                           kernel is up to 2.8× slower than FlashAttention-2 (Table 7).
+                                         — a phenomenon that crippled the batch size (and conse-                           Furthermore, changing block size changes the execution time
+                                         quently throughput) in prior systems. However, in trying to                       of the kernel by as much as 1.9× (Figure 3).
+                                                                                                                           FlashAttention-2 [42]: PagedAttention-based prefill kernel
+                                         allocate physical memory at runtime, PagedAttention ends
+                                                                                                                           is up to 37% slower than the non-paged kernel (Figure 2)
+                                         up changing the virtual memory layout of the KV cache
+                                                                                                                           while the decode kernel is up to 12% slower. Initial attempts
+                                         from contiguous to non-contiguous. Such a design leads to
+                                                                                                                           to add paging support failed unit tests [7].
+                                         non-trivial programming and performance overheads.
+                                                                                                                           FlashAttention-3 [67] / SDPA in cuDNN-9 [59]: State-of-
+                                            We present vAttention — an approach that mitigates frag-                       the-art attention kernels for NVIDIA Hopper architecture
+                                         mentation in physical memory while retaining the virtual                          did not support PagedAttention when released.
+                                         memory contiguity of the KV cache. We achieve this by                             TensorRT-LLM [6]: Serving throughput dropped by more
+                                         decoupling the allocation of virtual and physical memory                          than 10% in a Python front-end [5]. Recommends using the
+                                         using CUDA virtual memory management APIs. We also                                C++ front-end. Even with C++, we observe up to 5% higher
+                                         introduce various LLM-specific optimizations to address the                       latency in some cases with PagedAttention.
+                                         limitations of CUDA virtual memory support. Overall, vAt-                         FlashInfer [77]: PagedAttention-based prefill kernel is up
+                                         tention is a simpler, portable, and performant alternative to                     to 42% slower than the non-paged kernel (Figure 2).
+                                         PagedAttention: it supports various attention kernels out-                    Table 1. The PagedAttention approach requires an appli-
+                                         of-the-box and improves LLM serving throughput by up to                       cation to explicitly manage dynamically allocated physical
+                                         1.23× compared to the use of PagedAttention-based kernels                     memory, including re-writing of attention kernels. These
+                                         of FlashAttention-2 and FlashInfer.                                           examples highlight the complexity, performance and main-
+                                         CCS Concepts: • Software and its engineering → Main-                          tenance challenges associated with this approach.
+                                         taining software; Virtual memory; Software design tech-
+                                         niques; • General and reference → Performance; • Com-
+                                         puting methodologies → Neural networks.
+                                                                                                                       of the 30th ACM International Conference on Architectural Support
+                                         Keywords: Large language models; KV cache; fragmenta-                         for Programming Languages and Operating Systems, Volume 1 (ASP-
+                                         tion; memory management                                                       LOS ’25), March 30–April 3, 2025, Rotterdam, Netherlands. ACM, New
+                                                                                                                       York, NY, USA, 18 pages. https://doi.org/10.1145/3669940.3707256
+                                         ACM Reference Format:
+                                         Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ram-
+                                         jee, and Ashish Panwar. 2025. vAttention: Dynamic Memory Man-                 1      Introduction
+                                         agement for Serving LLMs without PagedAttention. In Proceedings               Large Language Models (LLMs) are being deployed in a wide
+                                         ∗ Contributed to this work as an intern at Microsoft Research India.          range of applications e.g., chat bots, search engines and cod-
+                                                                                                                       ing assistants [9, 10, 18, 19, 25, 41, 61]. Given the size and
+                                         This work is licensed under a Creative Commons Attribution Interna-           scale of modern LLM deployments, optimizing inference has
+                                         tional 4.0 License.                                                           become extremely important [36, 46, 48, 49, 51, 63, 78, 82].
+                                         ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+                                                                                                                          Batching is a powerful technique to boost LLM serving
+                                         © 2025 Copyright held by the owner/author(s).                                 throughput [35, 51, 63, 78]. However, achieving a large batch
+                                         ACM ISBN 979-8-4007-0698-1/25/03                                              size requires careful allocation of GPU memory. For each
+                                         https://doi.org/10.1145/3669940.3707256                                       request, the serving framework stores the activations of all
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands   Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+the tokens processed so far in GPU memory and reuses                      memory ahead-of-time. vAttention decouples the allocation
+them for generating subsequent tokens. This is called the                 of virtual and physical memory using the CUDA virtual
+KV cache [36, 63, 78] which accounts for a majority of GPU                memory management (VMM) APIs [12].
+memory usage during inference. Efficiently allocating GPU                    In building vAttention, we find that using CUDA VMM
+memory for the KV cache is challenging for two reasons.                   support for KV cache management poses two key efficiency
+First, the per-request KV cache grows slowly (one token per               challenges for an LLM serving system (§6). First, memory
+iteration), and second, a request’s decode length (or its total           allocation using CUDA VMM APIs incurs high latency be-
+KV cache size) is not known ahead of time.                                cause each allocation involves a round-trip to the OS kernel.
+   Prior systems like Orca [78] and FasterTransformer [15]                We tackle latency issues with several LLM-specific optimiza-
+allocate memory for each request based on the maximum                     tions such as overlapping memory allocation with compute,
+context length supported by the model (e.g., Yi-34B model                 opportunistically allocating pages ahead of time, and defer-
+supports context length of up to 200K [32]). However, the                 ring memory reclamation. Second, CUDA supports mem-
+number of decode tokens generated are far less in practice,               ory allocation only at the granularity of large pages, i.e., in
+e.g., the average decode length for the chat-based sharegpt               multiples of 2MB. Use of large pages can create significant
+dataset is 415 tokens [35]. Therefore, static memory allo-                fragmentation. We address this challenge by modifying the
+cation could create severe internal fragmentation, limiting               open-source CUDA unified virtual memory driver, adding
+batch size and serving throughput.                                        support for smaller 64KB pages. Our evaluation shows that
+   Inspired by demand paging in OS-based virtual memory                   use of 64KB pages has no negative impact on the perfor-
+systems, vLLM introduced PagedAttention [51] that allo-                   mance of attention kernels, i.e., we do not find any evidence
+cates small blocks of GPU memory on demand i.e., when                     of TLB thrashing. Together, these optimizations mitigate
+previously allocated blocks are fully utilized and the model              fragmentation while hiding the latency cost of on demand
+continues to generate more tokens. This approach provides                 memory allocation, making vAttention a simpler, portable
+a near-perfect solution for mitigating fragmentation and                  and performant alternative to PagedAttention.
+hence, PagedAttention has become the de facto standard for                   Overall, we make the following contributions:
+dynamic memory allocation in LLM serving systems, e.g.,
+TensorRT-LLM, HuggingFace TGI, LightLLM [4, 6, 28] etc.                         • We present vAttention – a memory management ap-
+   However, we show that PagedAttention faces a funda-                            proach that retains the virtual contiguity of KV cache
+mental consequence of dynamic memory allocation: dynam-                           while enabling dynamic allocation of physical memory.
+ically allocated objects are not guaranteed to be contiguous.                     Our implementation of vAttention in vLLM seamlessly
+Note that user-level objects are allocated in virtual mem-                        adds dynamic memory allocation support to various
+ory. Therefore, in trying to enable dynamic allocation of                         unmodified attention kernels.
+physical memory, PagedAttention ends up changing the                            • We compare vAttention against PagedAttention-based
+virtual memory layout of KV cache from contiguous to                              alternatives of vLLM, FlashAttention-2 and FlashIn-
+non-contiguous. We argue that this approach has several                           fer on Yi-6B, Llama-3-8B and Yi-34B with 1-2 A100
+pitfalls (§3). First, it requires rewriting attention kernels, i.e.,              GPUs. Using FlashAttention-2’s non-paged attention
+to enable de-referencing all tokens of the non-contiguous KV                      kernel, vAttention outperforms vLLM by up to 1.99×
+cache. Second, it forces developers to implement a memory                         in decode throughput. In long-context scenarios, it
+manager in the serving framework, i.e., to stitch together dy-                    also improves the end-to-end LLM serving throughput
+namically allocated virtual memory blocks. Third, it adds run-                    by up to 1.18× and 1.23× over PagedAttention based
+time overhead in the critical path of both CPU and GPU exe-                       kernels of FlashAttention-2 and FlashInfer
+cution. Table 1 provides empirical evidence and real-world                      • We demonstrate the portability benefit of vAttention
+experiences to support these arguments.                                           with the recently launched FlashAttention-3 kernel
+   The fundamental issue with PagedAttention and prior sys-                       (FA3 [67]). FA3 is optimized for the NVIDIA Hopper
+tems is that they rely on the reservation-based memory allo-                      architecture and was not released with PagedAtten-
+cation method exposed by the GPU runtime. In this method                          tion support. vAttention supports FA3 out-of-the-box,
+(used by cudaMalloc), the runtime allocates both virtual and                      leading to 1.26 − 1.5× higher throughout over Page-
+physical memory on the GPU meaning that physical mem-                             dAttention based FlashAttention-2.
+ory is allocated even if the corresponding virtual memory is
+not accessed. This is in stark contrast to OS-based demand
+                                                                          2     Background
+paging [52, 62]. We show that separating the allocation of
+virtual and physical memory allows for more effective KV                  2.1    Large Language Models
+cache memory management. To support our claim, we in-                     Given an input sequence, an LLM predicts the probability of
+troduce vAttention (§5) — an approach that stores KV cache                an output sequence: a sequence is a set of tokens [51]. Each
+in contiguous virtual memory without committing physical                  inference request begins with a prefill phase that processes
+vAttention: Dynamic Memory Management for Serving LLMs                        ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+     Symbol     Definition                                          2.2   Fragmentation and PagedAttention
+     𝑁          Number of layers on a particular worker             Serving LLMs with high throughput requires careful alloca-
+     𝐻          Number of KV heads on a particular worker           tion of GPU memory. This is challenging because the total
+     𝐷          Dimension of each attention head                    context length of a request is not known in advance. Serv-
+     𝑃          Number of bytes needed to store one element         ing systems worked around this challenge by pre-reserving
+     𝐵          Maximum batch size                                  KV cache space assuming that each context is as long as
+     𝐿          Maximum context length supported by the
+                                                                    the maximum length supported by the model (e.g., 200K
+                model
+     𝐿′         Context length of a request seen thus far
+                                                                    for Yi-34B-200K). vLLM shows that this strategy is prone to
+                                                                    severe internal fragmentation. In fact, vLLM showed that
+           Table 2. Notations used in the paper.                    prior reservation is suboptimal even if the context lengths
+                                                                    are known in advance. This is because the per-request KV
+prompt tokens in parallel and produces the first output to-         cache grows one token at a time and hence prior reservation
+ken of the request. Thereafter, the decode phase iteratively        wastes memory over the entire lifetime of a request.
+processes the output token generated in the previous step              Inspired by the OS-based virtual memory systems, vLLM
+and produces the next output token in every iteration [36].         proposed PagedAttention to mitigate fragmentation by dy-
+   LLMs are built atop one of the variants of the transformer       namically allocating memory for the KV cache. PagedAt-
+architecture [73]; an LLM consists of multiple transformer          tention splits KV cache into fixed-sized blocks and allocates
+blocks. Internally, a transformer block contains two types of       memory for one block at a time. This way, vLLM allocates
+operators: position-wise and sequence-wise [78]. The former         only as much memory as a request needs, and only when
+category includes feed-forward network, layer normaliza-            required – not ahead-of-time.
+tion, activation, embedding layer, output sampling layer, and       GPUs and page sizes: NVIDIA GPUs support multiple page
+residual connections whereas attention is a sequence-level          sizes in the hardware [22, 58, 65, 79]. A single call to a CUDA
+operator. We primarily focus on attention since it is the pri-      VMM API can allocate one or more physical pages, which
+mary consumer of GPU memory in LLM inference. Table 2               we refer to as a page-group. We use page-groups to support
+summarizes the notations used in the paper.                         multiple allocation granularities for the KV cache, similar to
+   For the attention operator, the model computes the query,        how multiple page sizes are commonly used in conventional
+key and value vectors from a given sequence of tokens               OS-based virtual memory systems [52, 62].
+(𝑥 1, 𝑥 2, ...., 𝑥 𝐾 ) ∈ R𝐾 ×𝐸 where E represents the embedding
+size of the model. For each 𝑥𝑖 , query, key and value vectors       3 Issues with the PagedAttention Approach
+are computed as follows:                                            Despite being inspired by demand paging, the PagedAtten-
+                                                                    tion approach is different from it: PagedAttention implements
+             𝑞𝑖 = 𝑊𝑞 𝑥𝑖 , 𝑘𝑖 = 𝑊𝑘 𝑥𝑖 , 𝑣𝑖 = 𝑊𝑣 𝑥𝑖             (1)   demand paging in user space whereas conventional demand
+   The resulting 𝑘𝑖 and 𝑣𝑖 are appended to the key and value        paging is transparent to applications. This section elaborates
+vectors of the prior tokens of the corresponding request, pro-      on issues that arise with such an approach.
+                                 ′
+ducing two matrices 𝐾, 𝑉 ∈ R𝐿 × (𝐻 ×𝐷 ) where 𝐿 ′ represents
+the context length of the request seen so far, H is the number      3.1   Requires Re-writing the Attention Kernel
+of KV heads of the model on a worker and D is the dimension         Conventional implementations of the attention operator as-
+of each KV head. Then, attention is computed as follows:            sume that the two input tensors K and V (Equation 2) are
+                                                                    stored in contiguous memory. By departing from the con-
+                                               𝑞𝑖 𝐾 𝑇               ventional memory layout, PagedAttention requires an im-
+          𝐴𝑡𝑡𝑒𝑛𝑡𝑖𝑜𝑛(𝑞𝑖 , 𝐾, 𝑉 ) = 𝑠𝑜 𝑓 𝑡𝑚𝑎𝑥 (         )𝑉      (2)
+                                               𝑠𝑐𝑎𝑙𝑒                plementation of the attention operator to be modified so as
+   The attention score is computed separately for each re-          to compute attention scores over non-contiguous KV cache
+quest in the batch. A request executes until the model gen-         blocks. Writing correct and performant GPU kernels can be
+erates a special end-of-sequence token or reaches the max-          challenging for most programmers [7].
+imum context length for the request. Note that in each it-             Being a fundamental building block of the transformer
+eration of a request, all its preceding 𝑘𝑖 and 𝑣𝑖 are needed        architecture, the attention operator has witnessed a tremen-
+to compute attention. Hence, an inference engine stores the         dous pace of innovation in the systems and ML communities
+𝑘𝑖 and 𝑣𝑖 vectors in memory to reuse them across iterations.        for performance optimizations [2, 37–40, 42, 43, 47, 49, 68, 77,
+We refer to this state of all layers collectively as KV cache. In   80], and this trend is likely to continue. In the PagedAtten-
+systems prior to PagedAttention, the K cache (or V cache) at        tion model, keeping up with new research requires continued
+each layer of a worker is typically allocated as a 4D tensor of     efforts in porting new optimizations to a PagedAttention-
+shape [𝐵, 𝐿, 𝐻, 𝐷] where 𝐵 refers to batch size and 𝐿 refers        aware implementation. Production systems can therefore
+to the maximum possible context length of a request.                easily fall behind research, potentially losing performance
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands   Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+                                                                                                                   FA2                       FA2_Paged                                  FI                         FI_Paged
+                                                                                             1.6
+
+
+
+
+                                                                                                           1.42x
+
+
+
+
+                                                                                                                                                                                                                       1.37x
+                                                                                                                                                                                                   1.36x
+                                                                                                                                                         1.28x
+
+
+                                                                                                                                                                        1.30x
+
+
+
+
+                                                                                                                                                                                                                               1.26x
+                                                                                                                                                                                                           1.25x
+                                                                                                                                                                                1.25x
+                                                                                             1.4
+
+
+
+
+                                                                                                                                                 1.26x
+                                                                            Normalized Runtime
+
+
+
+
+                                                                                                                         1.11x
+                                                                                             1.2
+
+
+
+
+                                                                                                   1.07x
+
+
+
+
+                                                                                                                                 1.25x
+                                                                                             1.0
+                                                                                             0.8
+                                                                                             0.6
+                                                                                             0.4
+                                                                                             0.2
+Figure 1. PagedAttention involves two layers of memory                                       0.0     1K                    2K                      4K                     8K                        16K                 32K
+management: one in user space and one in OS kernel space.                                                                                        Context Length
+
+                                                                          Figure 2. Overhead of PagedAttention in prefill kernels
+and competitive advantage. To provide an example, Table 7                 (model: Llama-3-8B, one A100 GPU). Numbers on top show
+shows that the paged kernel of vLLM is already up to 2.8×                 overhead over the corresponding non-paged implementation
+slower than the FlashAttention-2 kernel [37].                             of FlashAttention-2 (FA2) and FlashInfer (FI).
+
+3.2   Adds Redundancy in the Serving Framework                                               3.5
+                                                                                             3.0                                                         Block Size
+PagedAttention makes an LLM serving system responsible
+
+
+
+
+                                                                            Normalized Runtime
+                                                                                                                             16                          32         64                                        128
+for managing the mappings between KV cache and dynami-                                       2.5
+
+
+
+
+                                                                                                                                         1.93x
+
+
+
+
+                                                                                                                                                                                                                                1.90x
+                                                                                                             1.90x
+
+
+
+
+                                                                                                                                                                                                      1.89x
+                                                                                                                                                                      1.86x
+cally allocated memory blocks. For example, consider a re-                                   2.0
+
+
+
+
+                                                                                                                                                                                                  1.47x
+
+
+
+
+                                                                                                                                                                                                                           1.46x
+                                                                                                                                                                  1.45x
+                                                                                                                                     1.44x
+                                                                                             1.5
+
+
+
+
+                                                                                                     1.26x
+                                                                                                    1.13x
+quest that allocates four KV cache blocks over time (left
+
+
+
+
+                                                                                                                                 1.09x
+
+
+
+
+                                                                                                                                                                                             1.02x
+
+
+
+
+                                                                                                                                                                                                                      1.01x
+                                                                                                                                                             1.01x
+half of Figure 1). These blocks are usually non-contiguous                                   1.0
+in virtual memory. During the computation of Equation 2,                                     0.5
+PagedAttention kernel needs to access all the elements of the                                0.0   1*16K                         2*16K                      4*16K                        8*16K                        16*16K
+                                                                                                                                  Batch Size * Context Length
+four KV cache blocks. To facilitate this, the serving system
+needs to track the virtual memory addresses of KV cache
+                                                                          Figure 3. Latency of vLLM’s paged decode kernel is sensitive
+blocks and pass them to the attention kernel at runtime. This
+                                                                          to block size (model: Llama-3-8B, one A100 GPU).
+approach effectively requires duplicating what the operating
+system already does for enabling virtual-to-physical address
+translation (right half in Figure 1).
+                                                                          blocks have a higher memory bandwidth utilization due to
+3.3   Performance Overhead                                                higher hit rates in the L1 cache.
+3.3.1 Runtime overhead on the GPU. PagedAttention                        3.3.2 Runtime overhead on the CPU. Implementing an
+slows down attention computation by adding extra code in                 additional memory manager can add performance issues in
+the critical path of execution. For example, the vLLM paper              the CPU runtime of the serving system. We refer to a few
+acknowledges that the PagedAttention-based implementa-                   real-world examples and our own observations on vLLM to
+tion was 20−26% slower than the corresponding none-paged                 corroborate this argument.
+FasterTransformer kernel, primarily due to the overhead                     To enable PagedAttention, a serving system needs to sup-
+of looking up Block-Tables and executing extra branches                  ply Block-Tables to the attention kernel. In vLLM, the latency
+(see Figure 18a in [51]). In addition, Figure 2 shows that               of preparing a Block-Table depends on batch composition
+incorporating PagedAttention has also added a significant                and grows proportional to max_num_blocks × batch_size
+performance overhead in other state-of-the-art kernel li-                where max_num_blocks refers to the number of KV cache
+braries. For example, PagedAttention based prefill kernels               blocks in the longest request of the batch. This is because
+of FlashAttention-2 and FlashInfer are up to 37% and 42%                 vLLM manages a Block-Table as a 2D tensor and aligns the
+slower than the non-paged kernels in the corresponding li-               number of KV cache blocks in each request by padding un-
+braries. Our analysis reveals that the number of instructions            occupied slots with zeros. If a batch contains a few long and
+executed in PagedAttention kernels is 7 − 13% higher than                many short requests, such padding results in a significant
+the non-paged kernels. Caching page indices also increases               overhead. In our earlier experiments, we observed that Block-
+register pressure, causing register spilling.                            Table preparation in vLLM was contributing 30% latency in
+   To highlight another example of difficulty involved in                decode iterations. While a recent fix [17] has mitigated some
+writing an efficient paged kernel, Figure 3 shows that the               of this overhead, we find that it can still be as high as 10%.
+performance of vLLM’s paged decode kernel is significantly               High overhead of PagedAttention has also been found in
+worse with large block sizes of 64 and 128. Our analysis                 TensorRT-LLM, degrading throughput by 11% [5]. This issue
+indicates that this is likely due to L1 cache efficiency: smaller        was attributed to the Python runtime of TensorRT-LLM and
+vAttention: Dynamic Memory Management for Serving LLMs                                                   ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+moving to a C++ runtime can mitigate the CPU overhead.                                         6000
+                                                                                               5000
+
+
+
+
+                                                                                   Tokens/second
+However, doing so requires non-trivial programming effort.
+                                                                                               4000
+   Overall, this section shows that PagedAttention adds a                                      3000
+significant programming burden while also being inefficient.                                   2000
+In vAttention, we propose a more principled approach to                                        1000                         Yi-6B          Llama-3-8B         Yi-34B
+                                                                                                  0
+dynamic KV cache memory management. However, before                                                      1         64       128        192              256      300
+                                                                                                                              Batch Size
+delving into vAttention, we first highlight some of the fun-
+damental characteristics of LLM serving workloads from a                                                            (a) Decode throughput.
+memory management perspective.                                                                     800
+
+
+
+
+                                                                                   Memory Allocation
+                                                                                                   700
+                                                                                                   600
+
+
+
+
+                                                                                     (MB/second)
+                                                                                                   500
+4    Insights into LLM Serving Systems                                                             400
+                                                                                                   300
+To understand the memory allocation pattern of LLM serving                                         200
+                                                                                                   100                      Yi-6B          Llama-3-8B         Yi-34B
+systems, we experiment with Yi-6B running on a single A100                                           0
+                                                                                                             1      64       128       192              256      300
+GPU, and Llama-3-8B and Yi-34B running on two A100 GPUs                                                                        Batch Size
+with tensor-parallelism (TP). We set the initial context length                                                  (b) Rate of memory allocation.
+of each request to 1K tokens, vary the batch size from 1 to 320
+and measure the throughput and memory requirement of the                        Figure 4. Decode throughput (top) and the rate of physical
+decode phase (see §6 for our discussion and optimizations                       memory allocation (bottom) saturate at large batch sizes.
+for the prefill phase).
+Observation-1: KV cache memory requirement is predictable
+on a per-iteration basis. Due to auto-regressive decoding,                      5.1                Design Overview
+once a request enters the decode phase, its KV cache size                       vAttention employs distinct allocation policies for virtual and
+increases uniformly by one token per iteration. This allows                     physical memory. Specifically, we allocate a large contiguous
+the serving system to determine in advance if additional                        buffer for the KV cache in virtual memory ahead-of-time
+memory will be required during the iteration’s execution.1                      (similar to systems prior to PagedAttention) while deferring
+Observation-2: KV cache does not require high memory allo-                      the allocation of physical memory to runtime (similar to
+cation bandwidth. The memory footprint of a single token                        PagedAttention). This design preserves virtual contiguity
+across all layers is typically few 10s-100s of kilobytes of                     of KV cache without fragmenting physical memory. Note
+memory. For example, the per-token memory footprint of                          that this approach could fragment and waste virtual mem-
+Yi-6B, Llama-3-8B and Yi-34B is 64KB, 128KB and 240KB,                          ory. However, this is not an issue since virtual memory is
+respectively. Further, each iteration runs for 10s-100s of mil-                 abundant, e.g., modern 64-bit systems provide a 128TB user-
+liseconds implying that a request requires at most a few                        addressable virtual memory per process.2
+megabytes of memory per second. While batching improves
+system throughput [35, 36, 63, 82], the number of tokens                        5.1.1 Pre-reserving virtual memory. Since virtual mem-
+generated per second plateaus beyond a certain batch size                       ory is abundant, we pre-allocate it in size that is large enough
+(Figure 4a). This implies that the memory allocation band-                      to hold the KV cache of the maximum batch size (config-
+width requirement also saturates at large batch sizes (e.g., at                 urable) that needs to be supported. In doing so, we assume
+256 for Yi-34B). For all the models we studied, we observe                      that each request’s context length is same as the maximum
+that the highest memory allocation rate is at most 750MB per                    supported by the model.
+second (Figure 4b). vAttention leverages these observations                     5.1.2 Number of virtual memory buffers. A serving
+to optimize KV cache memory management.                                         framework maintains separate K and V tensors for each layer
+                                                                                of the model. Therefore, we reserve 2×𝑁 buffers on a worker
+5    vAttention: Design and Implementation                                      where 𝑁 is the number of layers managed by that worker.
+Our primary observation is that physical memory fragmenta-                      5.1.3 Size of a virtual memory buffer. The maximum
+tion can be avoided without making KV cache non-contiguous                      size of a buffer is 𝐵𝑆 = 𝐵 × 𝑆 where B is the maximum
+in virtual memory. To realize this, vAttention decouples the                    batch size and 𝑆 is the maximum size of a single request’s
+allocation of virtual memory from physical memory by lever-                     per-layer K cache (or V cache) on a worker. Further, 𝑆 =
+aging system support for demand paging (instead of imple-                       𝐿 × 𝐻 × 𝐷 × 𝑃, where 𝐿 is the maximum context length
+menting demand paging in user space, as in PagedAttention).                     supported by the model, 𝐻 is the number of KV heads on
+                                                                                a worker, 𝐷 is the dimension of each KV head and 𝑃 is the
+1 Note that this prediction is possible only at the granularity of individual   2 64-bit systems use only 48 bits for virtual addresses today, providing a per-
+
+iterations; the total KV cache requirement of a request remains unknown         process virtual memory space of 256TB which is divided equally between
+as it depends on the total number of output tokens in the request.              the user space and (OS) kernel space.
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands          Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+                               Each light shaded region represents a virtual tensor for one request’s K cache (or V cache) without any physical pages
+                               Each dark shaded region represents part of K cache (or V cache) tensor that is mapped into physical memory
+
+              R1         R2                R1         R2                   R1        R2                             R2                          R3         R2
+
+
+        Virtual Memory
+        Physical Memory
+
+
+                   (a)                          (b)                               (c)                            (d)            R3 arrives
+                                                                                                                                                     (e)
+                                                                                             R1 exits
+
+Figure 5. Dynamic memory management in vAttention for a single K cache (or V cache) tensor. (a) shows a virtual tensor for
+a batch of two requests with no physical memory allocation yet. (b) R1 is allocated one physical page. (c) R1 is allocated two
+pages and R2 is allocated one page. (d) R1 has completed but vAttention does not reclaim its memory (deferred reclamation).
+(e) when R3 arrives, vAttention assigns R1’s tensor to it which is already backed by physical memory.
+
+                                                                                                                                 Latency (microseconds)
+       CUDA VM APIs               vAttention VM APIs            Description                                                   64KB 128KB 256KB 2MB
+       cuMemAddressReserve *      vMemReserve *                 Allocate a buffer in virtual memory                            18         17            16          2
+       cuMemCreate *              vMemCreate *                  Allocate a handle in physical memory                           1.7         2            2.1         29
+       cuMemMap                   vMemMap                       Map a physical handle to a virtual buffer                       8         8.5            9          2
+       cuMemSetAccess             -                             Enable access to a virtual buffer                               -          -             -          38
+       cuMemUnmap                 -                             Unmap physical handle from a virtual buffer                     -          -             -          34
+       cuMemRelease *             vMemRelease *                 Free physical pages of a handle                                 2          3             4          23
+       cuMemAddressFree *         vMemFree *                    Free a virtual memory buffer                                   35         35            35          1
+Table 3. CUDA VMM APIs. * represents APIs that we use once while instantiating or terminating the serving framework. Rest
+of the APIs are used for (un)mapping physical memory pages at runtime. CUDA APIs (prefixed with cu) support only 2MB
+pages, whereas our CUDA extension APIs (prefixed with v) support fine-grained allocations.
+
+
+
+number of bytes based on model precision (e.g., P=2 for                                                         LLM Serving System (e.g., vLLM)
+FP16/BF16). As an example, consider Yi-34B with FP16 and                                                  Other objects                            KV cache APIs
+
+two-way tensor-parallelism (TP-2). In this case, 𝑁 = 60, 𝐻 =                                              PyTorch (Tensors)          vAttention (Virtual Tensors)
+
+4, 𝐷 = 128, 𝑃 = 2 (8 KV heads of Yi-34B are split evenly on                                              cudaMalloc, …                             cuMemMap, …
+two GPUs), and maximum supported context length 𝐿 =
+200𝐾. For this configuration, 𝑆 = 200𝑀𝐵 (200𝐾 ∗ 4 ∗ 128 ∗                                                          CUDA Runtime/Drivers
+
+2). Assuming 𝐵 = 500, the maximum size of each buffer                                                                     GPU Memory
+per-worker is 𝐵𝑆 = 100𝐺𝐵 (500 × 200𝑀𝐵). Therefore, the
+total virtual memory requirement for 60 layers is 120 buffers                        Figure 6. An LLM serving system interacts with vAttention
+of 100GB each (12TB total). Note that the size of virtual                            for KV cache management with a set of simple APIs listed
+address space available grows with the number of workers,                            in Table 4. All other memory objects (e.g., activations) are
+e.g., with two TP workers, the total size of user-addressable                        allocated by the standard PyTorch caching allocator.
+virtual address space is 256TB. Therefore, virtual memory is
+always plentiful to satisfy large allocations. Figure 5 shows
+an example of how vAttention allocates physical memory
+pages dynamically.
+                                                                                     5.2.1 CUDA virtual memory APIs. Table 3 provides
+5.2   Leveraging CUDA Virtual Memory Support                                         an overview of CUDA VMM APIs that allow decoupling
+The standard GPU memory allocation interface cudaMalloc                              the allocation of virtual memory from physical memory.
+does not support demand paging, i.e., it allocates virtual                           The allocation granularity depends on the page size used by
+memory and physical memory at the same time. However,                                the GPU. Further, the size of a virtual memory buffer or a
+recent CUDA versions provide programmers a fine-grained                              physical memory handle must be a multiple of the physical
+control over managing virtual and physical memory, includ-                           memory allocation granularity. Physical memory pages can
+ing support for decoupling their allocations [12, 45]. We                            be allocated to (or de-allocated from) sub-regions in a virtual
+leverage these low-level APIs.                                                       memory buffer independently of other sub-regions.
+vAttention: Dynamic Memory Management for Serving LLMs                           ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+           APIs    Description                                         Algorithm 1 Using vAttention in a serving framework.
+            init   Initializes vAttention with model parameters.
+                                                                        1: max_batch_size ← B
+                   arguments: 𝑁 , 𝐵, 𝐿, 𝐻, 𝐷, 𝑃, page-group-size.
+                   return value: a list of KV cache tensors.            2: cache_seq_len ← [0]*B
+  alloc_reqid      Allocates an unused reqId and marks it active        3: req_batch_idx ← dict()
+                   arguments: None                                      4: vattention.init(config_params)
+                   return value: an integer reqId                       5: while !request_pool.is_empty() do
+      free_reqid   Frees a reqId and marks it inactive
+                                                                        6:   for 𝑅𝑖 in new_requests do
+                   arguments: an integer reqId
+                   return value: None                                   7:        if can_schedule(𝑅𝑖 ) then
+            step   Ensures KV cache tensors are backed by physical      8:             idx ← vattention.alloc_reqid()
+                   pages up to the current context length of each       9:             req_batch_idx[𝑅𝑖 ] ← idx
+                   active request                                      10:             cache_seq_len[idx] ← prompt_len(𝑅𝑖 )
+                   arguments: an array of size B containing sequence
+                                                                       11:        end if
+                   lengths of each reqId
+                   return value: 0 (success), -1 (failure).            12:    end for
+                                                                       13:    vattention.step(cache_seq_len)
+Table 4. Key APIs that vAttention exposes to a serving frame-
+                                                                       14:    model.forward()
+work for dynamic KV cache memory management.
+                                                                       15:    for 𝑅𝑖 in active_requests do
+                                                                       16:        idx ← req_batch_idx[𝑅𝑖 ]
+                                                                       17:        if is_complete(𝑅𝑖 ) then
+5.2.2 Extending PyTorch caching allocator. KV cache                    18:             cache_seq_len[idx] ← 0
+is a collection of tensors. In current deep learning frame-            19:             vattention.free_reqid(idx)
+works such as PyTorch, a tensor allocated via APIs such as             20:        else
+torch.empty comes with pre-allocated physical memory.                  21:             cache_seq_len[idx] + = 1
+This is because the PyTorch caching allocator relies on the            22:        end if
+cudaMalloc interface (Figure 6). Relying on the low-level              23:    end for
+API support from CUDA, we extend the PyTorch caching                   24: end while
+allocator to allow an application to reserve a virtual memory
+buffer for a tensor without committing physical memory
+ahead-of-time. We refer to tensors allocated via these APIs            Internally, vAttention reserves 2 × 𝑁 virtual tensors on the
+as virtual tensors.                                                    worker, as shown in Figure 5(a), where 𝑁 is the number of
+                                                                       layers hosted by the worker. These virtual tensors are re-
+5.2.3 Request-level KV cache indexing. A virtual ten-                  served for the lifetime of the serving application. In addition,
+sor represents the K cache (or V cache) of a layer for the maxi-       vAttention also pre-allocates physical memory pages at each
+mum batch size B. In these tensors, different requests occupy          worker during initialization. However, these pages are not
+different non-overlapping sub-regions (say sub-tensors). We            mapped into the KV cache at this point.
+locate the sub-tensor of a request with a unique integer iden-
+tifier reqId that lies in the range of 0 to 𝐵 − 1 (note that           5.3.2 Scheduling a new request. When a new request is
+at most 𝐵 requests run simultaneously). The K cache (or V              scheduled for the first time, the serving framework obtains
+cache) offset of a request’s sub-tensor in the virtual tensor of       a new reqId from vAttention via alloc_reqid (line 8). All
+the entire batch is reqId × 𝑆 where 𝑆 is the maximum size              subsequent memory management operations of the request
+of per-layer K cache (or V cache) of a request on a worker.            are tagged with this reqId.
+The request identifier reqId is allocated by vAttention.
+                                                                       5.3.3 Model execution. Before scheduling a batch for ex-
+5.3     Serving LLMs with vAttention                                   ecution, the framework needs to ensure that the KV cache
+                                                                       sub-tensors of each active request are backed by physical
+We build vAttention as a Python library that internally uses
+                                                                       memory (Figure 5(b) and (c)). For this purpose, before dis-
+a CUDA/C++ extension for interacting with CUDA drivers.
+                                                                       patching the first kernel of an iteration to the GPU, the
+Our library exposes a set of simple APIs to the serving frame-
+                                                                       framework invokes the step API (line 13), specifying the
+work (shown in Figure 6, Table 4 and Algorithm 1). For
+                                                                       current context length of each request (context length is
+simplicity, we discuss the use of these APIs from a single
+                                                                       set to 0 for each inactive reqId). Internally, vAttention en-
+worker’s perspective; all workers behave the same.
+                                                                       sures that enough physical pages are mapped for each active
+5.3.1 Initial setup. When the serving framework starts,                reqId before returning execution back to the framework. If
+each model worker loads the vAttention library and config-             vAttention cannot satisfy the memory demand, it returns
+ures it with model parameters 𝑁 , 𝐻, 𝐷, 𝑃, 𝐵 and a preferred           with a failure in response to which a serving framework can
+page-group size (§6.2) via the init API (line 4 in Algorithm 1).       preempt one or more requests to allow forward progress
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands   Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+(this is similar to vLLM’s default behavior). We leave more               6.1   Hiding Latency of Memory Allocation
+sophisticated policies such as swapping out KV cache to CPU               The serving framework invokes the step API in every itera-
+memory as future work.                                                    tion. The latency of step depends on the number of page-
+   Depending on whether a request is in the prefill phase                 groups that need to be mapped into KV cache. Consider,
+or decode phase, different amount of physical memory may                  for example, that the KV cache of one request needs to be
+need to be mapped for a given iteration. The prefill phase                extended for Yi-34B which has 60 layers. This requires 120
+processes the input tokens of a given prompt in parallel.                 calls to cuMemMap + cuMemSetAccess each of which takes
+Therefore, the amount of physical memory needed to be                     about 40 microseconds. Therefore, growing the KV cache of
+mapped depends on the number of prompt tokens being                       one request by new page-groups (two per layer) adds about
+scheduled. If the total K cache size of all prompt tokens at              5 millisecond latency to the corresponding iteration. The
+one layer of the model is 𝑠 and page-group size is 𝑡, then each           latency overhead grows proportional to the number of re-
+worker needs to ensure that at least (𝑠 + 𝑡 − 1)/𝑡 page-groups            quests that need new page-groups in a given iteration. We
+are mapped in each of the 2 × 𝑁 KV cache sub-tensors of the               propose the following optimizations to hide this latency:
+given reqId.
+   For a request in the decode phase, the number of new                   6.1.1 Overlapping memory allocation with compute
+page-groups required is at most one per virtual tensor. This              (decode phase). We leverage the predictability of memory
+is because each iteration produces only one output token for              demand to overlap memory allocation with computation. In
+a request. vAttention internally tracks the number of page-               particular, note that each iteration produces a single output
+groups mapped for each request and maps new page-groups                   token for every decode request. Therefore, memory demand
+only when prior page-groups are about to be exhausted.                    for a decode iteration is known ahead-of-time. Further, in the
+                                                                          decode phase, a request requires at most one new page-group
+5.3.4 Request completion. A request terminates when
+                                                                          for each of its virtual tensors. vAttention keeps track of the
+it reaches user specified or the maximum context length
+                                                                          current context length and how much physical memory is
+supported by the model, or when the model produces a spe-
+                                                                          already mapped for each request. Using this information, it
+cial end-of-sequence token. The framework notifies vAtten-
+                                                                          determines when a request would need more memory and
+tion of a request’s completion with free_reqid (line 19).
+                                                                          uses a background thread to allocate new page-groups when
+Internally, vAttention may unmap the physical pages of a
+                                                                          the preceding iteration is executing. For example, consider
+completed request or defer them to be freed later (§6.1.2).
+                                                                          that a request R1 would require more physical memory in
+Supporting continuous batching: Continuous batching
+                                                                          iteration i. When the serving framework invokes step API
+poses one challenge in computing attention in our design.
+                                                                          in iteration i-1, vAttention launches a background thread
+When a request from somewhere in the middle of a batch
+                                                                          that maps page-groups for iteration i. Since per-iteration
+exits, it creates an unused hole in the virtual tensors of
+                                                                          latency is typically in the range of 10s-100s of milliseconds,
+KV cache. This layout is not supported by implementations
+                                                                          the background thread has enough time to prepare physical
+that expect the query (Q) and KV cache to be of the same
+                                                                          memory mappings for an iteration before it starts executing.
+size in batch (𝐵) dimension. However, FlashAttention pro-
+                                                                          This way, vAttention hides the latency of CUDA APIs by
+vides rich API support to address this issue; its argument
+                                                                          performing memory allocations out of the critical path.
+cache_batch_idx allows Q and KV cache to have different
+batch sizes and also be arranged in arbitrary order (i.e., batch          6.1.2 Deferred reclamation + eager allocation (prefill
+index 0 in Q can be mapped to batch index 1 in KV cache). vAt-            phase). We observe that allocating physical memory for the
+tention benefits from this API support in terms of both per-              prefill phase can be avoided in many cases. Consider that
+formance and ease of programming; when the request com-                   a request R1 completed in iteration i and a new request R2
+position of a batch changes, we update cache_batch_idx                    joins the running batch in iteration i+1. To avoid allocating
+of running requests such that their Q tensors map to their                page-groups to R2 from scratch, vAttention simply defers the
+respective KV cache based on their reqId.                                 reclamation of R1’s page-groups (Figure 5(d)) and assigns
+                                                                          R1’s reqId to R2. This way, R2 uses the same tensors for its
+6    Optimizations                                                        KV cache that R1 was using – which are already backed by
+There are two challenges in using CUDA virtual memory                     physical pages (Figure 5(e)). Therefore, new allocations are
+support for serving LLMs. First, invoking CUDA VMM APIs                   required only if R2’s context length is higher than R1.
+at runtime incurs high latency. Second, cuMemCreate cur-                     We further optimize the prefill phase by proactively allo-
+rently allocates memory only at the granularity of large                  cating a small number of page-groups ahead of time. For this
+pages, i.e., multiples of 2MB. Use of large pages can waste               purpose, we try to keep a certain number of page-groups
+physical memory due to internal fragmentation. This section               mapped into the virtual tensors of one of the inactive reqId.
+details a set of simple-yet-effective optimizations that we               When a new request arrives, we allocate this reqId. At the
+introduce to overcome these challenges.                                   same time, we identify a new reqId to be allocated next and
+vAttention: Dynamic Memory Management for Serving LLMs                             ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+eagerly map physical page-groups for it. In most cases, these              Model         Hardware     # Q Heads   # KV Heads     # Layers
+eager allocations obviate the need to allocate physical mem-               Yi-6B          1 A100          32            4           32
+ory in the critical path of prefill execution. Finally, we trigger         Llama-3-8B     2 A100s         32            8           32
+                                                                           Yi-34B         2 A100s         56            8           60
+memory reclamation only when the number of page-groups
+cached in vAttention falls below a certain threshold (e.g.,                Table 5. Models and hardware used for evaluation.
+less than 10% of GPU memory). We delegate both deferred
+reclamation and eager allocation to the background thread
+that the step API spawns.
+                                                                     use tensor-parallelism degree of two (TP-2) for both Llama-
+6.2    Mitigating Internal Fragmentation                             3-8B and Yi-34B. To demonstrate the portability benefit of
+                                                                     vAttention, we use 1–2 H100 GPUs.
+We mitigate internal fragmentation by reducing the granu-
+                                                                     Evaluation methodology: The computation and memory
+larity of physical memory allocation. NVIDIA GPUs natively
+                                                                     allocation pattern of the prefill and decode phases is substan-
+support at least three page sizes: 4KB, 64KB and 2MB [22,
+                                                                     tially different [35, 46, 82]. Attention kernels used for these
+58, 65, 79]. Therefore, in principal, physical memory can be
+                                                                     two phases are also different and hence we evaluate them
+allocated in any multiple of 4KB sizes. The simplest way to
+                                                                     separately. The prefill phase requires one time memory allo-
+achieve this would be to extend the existing CUDA VMM
+                                                                     cation potentially spanning multiple pages. In comparison,
+APIs (listed in Table 3) to also support allocating smaller
+                                                                     the decode phase requires incremental memory allocation
+pages (similar to how mmap in Linux supports multiple page
+                                                                     over the lifetime of a request [51]. We define prefill through-
+sizes [52, 62]). Unfortunately, the CUDA VMM APIs are im-
+                                                                     put as the number of prompt tokens processed per second,
+plemented in the closed-source NVIDIA drivers which makes
+                                                                     and decode throughput as the number of tokens generated
+it impossible for us to modify their implementation.
+                                                                     per second.
+    Fortunately, some part of NVIDIA drivers (particularly re-
+                                                                     Serving framework: For a fair comparison, we use vLLM
+lated to unified memory management) is open-source. There-
+                                                                     v0.2.7 as a common serving framework in all our experi-
+fore, we implement a new set of APIs in the open-source
+                                                                     ments. We integrated state-of-the-art kernel libraries of both
+NVIDIA drivers to mimic the same functionality that existing
+                                                                     FlashAttention-2 v2.5.9 [1, 42, 43] and FlashInfer v0.4.0 [3]
+CUDA APIs provide but with support for multiple page sizes.
+                                                                     as attention back-ends into vLLM, and further added support
+The second column in Table 3 shows our new APIs: most of
+                                                                     for dynamic memory allocation via vAttention to their non-
+our APIs have a one-to-one relationship with existing CUDA
+                                                                     paged kernels. While FlashAttention-2 and FlashInfer are
+APIs except for vMemMap that combines the functionality
+                                                                     both based on the same underlying techniques (e.g., FlashDe-
+of cuMemMap and cuMemSetAccess, and vMemRelease that
+                                                                     coding [2]), they use different Block-Table formats; the for-
+combines the functionality of cuMemUnmap and cuMemRelease
+                                                                     mer use a simple lookup table whereas the latter uses a
+for simplicity. In contrast to CUDA VMM APIs, our APIs al-
+                                                                     compressed Block-Table to optimize lookups.
+locate physical memory in 64KB, 128KB and 256KB sized
+                                                                     Baselines: We compare performance obtained by using the
+page-groups. A serving framework can configure a desired
+                                                                     non-paged attention kernels (backed by vAttention for dy-
+page-group size in vAttention while initializing it (we use
+                                                                     namic memory allocation), and their paged counterparts. In
+the standard 2MB pages if the configured page-group size is
+                                                                     addition, we also compare against vLLM’s decode kernel
+2MB). Table 3 shows the latency of each API with different
+                                                                     (note that vLLM does not have a paged prefill kernel). We
+page-group sizes.
+                                                                     also profiled each system to find its best performing configu-
+                                                                     ration. Accordingly, we set KV cache block size to 16 for both
+7     Evaluation                                                     vLLM and FlashInfer, and 256 for FlashAttention-2. Using a
+Our evaluation answers the following questions:                      higher block size for vLLM increases its kernel latency by
+                                                                     up to 1.9× as shown in Figure 3, and using a smaller block
+      • How does vAttention impact the performance of at-            size for FlashAttention-2 paged kernel increases its latency
+        tention kernels and the overall performance of prefill       by up to 9%. We find that the choice of page size does not
+        and decode phases (§7.1, §7.2)?                              affect vAttention as long as fragmentation is not a concern.
+      • How does vAttention impact the end-to-end LLM serv-
+        ing throughput (§7.3, §7.4, §7.5)?                           7.1     Prefill Evaluation
+      • What is the effect of each of our optimizations (§7.6)?
+                                                                     We evaluate 4 configurations for prefill: FA2_Paged, FI_Paged,
+Models and hardware: We evaluate three models Yi-6B [33],            FA2_vAttention and FI_vAttention. Configurations with the
+Llama-3-8B [21] and Yi-34B [32]. We conduct most of our              “_Paged” suffix represent the PagedAttention-based kernel
+evaluation on a single NVIDIA A100 GPU for Yi-6B, and                and those with “_vAttention” use the non-paged kernels of
+two NVLink-connected A100 GPUs for Llama-3-8B and Yi-                the respective library. Figure 7 shows the prefill throughput
+34B (see Table 5). Each GPU has 80GB physical memory. We             for our models. We summarize key findings below.
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                     Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+                                    Yi-6B (1 A100)                                                       Llama-3-8B (2 A100s)                                                  Yi-34B (2 A100s)
+                                                                                    24000                                                              5000
+            15000                                                                   20000
+Tokens/second
+
+
+
+
+                                                                                                                                           Tokens/second
+                                                                        Tokens/second
+            12000                                                                                                                                      4000
+                                                                                    16000
+             9000       FA2_Paged                                                               FA2_Paged                                              3000         FA2_Paged
+                        FI_Paged                                                    12000       FI_Paged                                                            FI_Paged
+             6000                                                                    8000                                                              2000
+                        FA2_vAttention                                                          FA2_vAttention                                                      FA2_vAttention
+             3000       FI_vAttention                                                4000       FI_vAttention                                          1000         FI_vAttention
+                0 1K   2K    4K     8K    16K 32K 64K 128K 192K                         0 1K   2K   4K      8K   16K 32K 64K 128K 192K                    0 1K      2K   4K    8K     16K   32K   64K 128K 192K
+                                  Context Length                                                         Context Length                                                       Context Length
+
+Figure 7. Prefill throughput. vAttention backed systems outperform the paged counterparts of both FlashAttention-2 and
+FlashInfer. Throughput for longer contexts is lower due to the quadratic complexity of prefill attention.
+
+                   Context               FlashAttention-2                           FlashInfer                        Model     BS   vLLM                  FA2_Paged      FI_Paged FA2_vAttention
+     Model
+                   Length                  Paged vAttention         Paged                  vAttention
+                                                                                                                              16         32.3                11.5              15.2                 11.3
+                   64K               10.6 (7.0)         9.1 (5.5)   10.9 (6.0)    9.1 (5.4)                           Yi-6B
+                                                                                                                              32         64.1                25.5              25.4                 25.3
+     Yi-6B         128K             37.9 (30.3)       30.5 (23.1)   35.4 (25.4)   30.7 (23.3)
+                   192K             81.5 (70.0)       64.6 (53.6)   73.0 (58.3)   65.1 (53.6)
+                                                                                                                      Llama-3 16         17.8                11.9              12.1                 11.8
+     Llama-3       64K                 6.0 (3.4)        5.2 (2.7)   6.7 (3.0)     5.3 (2.8)                           -8B     32         35.3                25.4             23.23                 25.3
+     -8B           128K             20.4 (15.4)       16.8 (11.6)   20.3 (12.8)   16.8 (11.4)                                 12         41.4                17.4              24.1                 17.4
+                                                                                                                      Yi-34B
+                   192K             43.3 (35.6)       34.8 (26.9)   40.9 (29.7)   34.7 (26.7)                                 16         55.1                21.7              28.8                 21.8
+                   64K              25.5 (13.2)       22.8 (10.3)   26.0 (11.2)   22.7 (10.1)
+     Yi-34B        128K             82.8 (56.9)       68.4 (43.2)   76.0 (46.7)   67.4 (42.5)
+                                                                                                                  Table 7. Total latency of attention kernel (sum of all layers)
+                   192K           170.7 (131.8)      136.9 (98.8)   148.8 (104.7) 134.6 (96.5)                    per decode iteration (in milliseconds, BS = batch size).
+Table 6. Prefill completion and attention (in parenthesis)
+time with different attention back-ends (unit: seconds).
+                                                                                                                   phase of a long prompt is primarily dominated by attention
+                                                                                                                   computation, as can be observed by comparing the numbers
+Small contexts: For small contexts, prefill cost is dominated                                                      inside parenthesis with total prefill completion time in Ta-
+by the linear operators, i.e., attention’s contribution is rela-                                                   ble 6. For FlashAttention-2, nearly all the gains of vAttention
+tively low [36]. Hence, even though vAttention helps speed                                                         are due to faster attention kernels, e.g., prefill gains of 1.5
+up attention computation, the throughput of both paged and                                                         seconds, 7.4 seconds and 16.9 seconds for Yi-6B are all due to
+vAttention back-ends is nearly identical in FlashAttention-2.                                                      gains in attention computation. vAttention enabled kernels
+However, for FlashInfer, we find that using vAttention helps                                                       also help with the FlashInfer back-end. In addition, FI_Paged
+improve prefill throughput even for small contexts. This is                                                        also has other sources of overheads, e.g., in the 14 seconds
+because FlashInfer incurs various other sources of overhead                                                        of total savings (Yi-34B, 192K context), only 7 seconds is due
+in the paged version. First, appending a new K or V ten-                                                           to attention and the rest is due to other sources.
+sor to the KV cache requires a single tensor copy operation
+in vAttention, whereas in a paged implementation, it re-                                                           7.2      Decode Evaluation
+quires appending one block at a time (the copy operation has                                                      For decodes, in addition to FA2_Paged and FI_Paged, we
+been optimized for FlashAttention-2 by vLLM [13]). Second,                                                        also evaluate the throughput obtained with vLLM’s decode
+FlashInfer involves creation and deletion of a few objects                                                        kernel (the first ever kernel to support PagedAttention). For
+for its compressed Block-Tables in every iteration. vAtten-                                                       vAttention, we use FlashAttention-2’s non-paged kernel. Un-
+tion avoids such overheads because it maintains KV cache’s                                                        fortunately FlashInfer’s non-paged decode kernel has signif-
+virtual contiguity, eliminating the need for a Block-Table.                                                       icantly higher latency (up to 14.6×) compared to all these
+Long contexts: The contribution of attention computation                                                          other kernels. Hence, while vAttention can support dynamic
+becomes significant at 16K and higher context lengths in our                                                      memory allocation for FlashInfer’s non-paged decode kernel,
+experiments. Therefore, even for FlashAttention-2 back-end,                                                       we omit it for evaluation in this section.
+vAttention outperforms the paged counterpart. For exam-                                                              Figure 8 shows the decode throughput of Yi-6B, Llama-3-
+ple, at context length 192K, FA2_vAttention outperforms                                                           8B and Yi-34B with varying batch size up to 32 (except for
+FA2_Paged by 1.24×, 1.26× and 1.24× for Yi-6B, Llama-3-8B                                                         Yi-34B which runs out of memory for batch size 32). We set
+and Yi-34B, respectively. Similarly, for FlashInfer back-ends,                                                    the initial context length of each request to 16K tokens and
+FI_vAttention improves prefill throughput by up to 1.25×                                                          calculate decode throughput based on the mean latency of
+and 1.36× for Yi-6B and Llama-3-8B (context length 16K),                                                          400 decode iterations.
+and 1.17× for Yi-34B (context length 32K).                                                                           First, vAttention is on par with the best of PagedAttention
+Attention time: vAttention’s improvement in prefill through-                                                      as shown by FA2_Paged and FA2_vAttention in Figure 8.
+put is primarily due to faster attention kernels enabled by a                                                     In comparison, FI_Paged has somewhat lower throughput
+(virtually) contiguous KV cache. This is because the prefill                                                      and vLLM is the worst for all models and configurations.
+vAttention: Dynamic Memory Management for Serving LLMs                                                                            ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+            1000           Yi-6B (1 A100)                                 1000          Llama-3-8B (2 A100s)                                                   400                Yi-34B (2 A100s)
+             800     vLLM               FI_Paged                           800     vLLM                   FI_Paged                                                        vLLM                 FI_Paged
+Tokens/second
+
+
+
+
+                                                              Tokens/second
+
+
+
+
+                                                                                                                                                   Tokens/second
+                     FA2_Paged          FA2_vAttention                             FA2_Paged              FA2_vAttention                                       300        FA2_Paged            FA2_vAttention
+             600                                                           600
+                                                                                                                                                               200
+             400                                                           400
+             200                                                           200                                                                                 100
+               0 1    2     4       8        12   16     32                  0 1    2      4       8                12          16     32                          0 1      2           4       8      12        16
+                                Batch Size                                                     Batch Size                                                                               Batch Size
+
+Figure 8. Decode throughput. FA2_vAttention is on par with FA2_Paged (note the overlapping lines) which is the best among
+all PagedAttention based alternatives, while outperforming FI_Paged and vLLM.
+
+For example, FA2_Paged and FA2_vAttention outperform                                                                      6                                                      5.25
+vLLM by up to 1.99×, 1.58× and 1.53× for Yi-6B, Llama-                                                                    5                                                                    FA2_Paged
+
+
+
+
+                                                                                                        Requests per minute
+                                                                                                                                                                     4.55 4.27                 FI_Paged
+3-8B and Yi-34B, respectively. The primary reason is that                                                                 4                                                                    FA2_vAttention
+                                                                                                                                            3.28
+vLLM’s decode kernel has significantly higher latency than                                                                3     2.79 2.75
+the FlashAttention-2 based kernels; while FlashAttention-2                                                                2
+has continuously adopted new optimizations (e.g., FlashDe-                                                                                                                                      1.30 1.28 1.47
+                                                                                                                          1
+coding [2]), vLLM has lagged behind. For example, Table 7
+                                                                                                                          0           Yi-6B                              Llama-3-8B                  Yi-34B
+shows that vLLM’s PagedAttention kernel incurs up to 2.8×,
+1.5×, and 2.5× higher latency than FlashAttention-2 kernels
+for Yi-6B, Llama-3-8B and Yi-34B. This is despite vLLM being                                           Figure 9. Offline inference throughput while serving long-
+in an actively maintained open-source serving stack, as well                                           context requests from the arXiv-Summarization dataset [11].
+as being used by various companies for serving LLMs. This
+is an important result that underlines the importance of low                                           and the number of output tokens per-request varies from 17
+software complexity and portability.                                                                   to 5153. The mean prefill to decode token ratio is 356. Fig-
+   Second, relative gains of FA2_vAttention and FA2_Paged                                              ure 9 shows throughput for different attention backends for
+increase over vLLM with the batch size, e.g., as batch size                                            all three models. FA2_vAttention outperforms FA2_Paged
+increases from 4 to 32 for Llama-3-8B, relative gains increase                                         by 1.18×, 1.15× and 1.13×, and FI_Paged by 1.19×, 1.23×,
+from 1.05× to 1.58×. This is because the latency of a decode                                           and 1.14× for Yi-6B, Llama-3-8B and Yi-34B, respectively. In
+attention kernel is proportional to the total number of tokens                                         general, vAttention’s performance gains are proportional to
+in the batch [34]. Therefore, the contribution of attention                                            the context length and the prefill to decode token ratio (P:D
+kernel in the overall latency – hence gains with a more                                                ratio); these factors determine how much prefill attention
+efficient kernel – increase with the batch size. Further, for                                          contributes to the total runtime. A higher P:D ratio as well
+the same reasons as discussed in §7.1 (faster attention and                                            as longer context lengths indicate that the workload is more
+lower CPU overhead), FA2_vAttention delivers up to 1.23×                                               prefill bound. vAttention provides higher gains in such cases.
+higher throughput than FI_Paged (Yi-6B, batch size 12).
+   Finally, note that vAttention is only as good as the state-                                         7.4                    End-to-end Performance: Online Scenarios
+of-the-art PagedAttention for decode throughput, as com-                                            We evaluate an online inference scenario serving long-context
+pared to prefills where it outperforms PagedAttention. This                                         requests from arXiv-Summarization [11]. In total, we run
+is because in case of decode attention, paged and non-paged                                         512 requests wherein the per-request input context length
+kernels have similar latency as shown in Table 7. We believe                                        varies from 22K to 45K tokens (mean 29K), the number of
+this is due to memory bound nature of decode attention, i.e.,                                       decode tokens varies from 6 to 3250 (mean 348) and the
+memory stalls make it possible to hide the effect of additional                                     mean P:D ratio is 129. We evaluate performance near the
+compute that paging support requires. However, hiding com-                                          serving capacity of the system which denotes the maximum
+pute overhead in a prefill attention kernel is hard because it                                      load a system can handle without incurring high queuing
+is already compute bound (see Table 6 for vAttention’s gains                                        delays [35, 51]. We vary input load (queries-per-second or
+in the prefill kernel).                                                                             QPS) based on Poisson distribution and schedule requests in
+                                                                                                    first-come-first-serve order. Figure 10 shows the CDF of the
+7.3             End-to-end Performance: Offline Scenarios                                           end-to-end request execution latency for this experiment. We
+We measure the end-to-end system throughput in an offline                                           see that vAttention consistently outperforms both baselines.
+scenario as the number of requests completed per minute. We                                         For example, FA2_vAttention reduces the median request ex-
+evaluate a total of 427 long-context requests from the arXiv-                                       ecution latency over FA2_Paged by up to 42% (QPS 0.25) for
+Summarization workload trace wherein the total context                                              Yi-6B, by up to 28% (QPS 0.3) for Llama-3-8B and by up to 29%
+length per-request varies from 64K tokens to 192K tokens                                            for Yi-34B (QPS 0.1). The primary reason for vAttention’s
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                             Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+  1.0                                Yi-6B (TP-1, QPS=0.2)                           1.0               Yi-6B (TP-1, QPS=0.25)
+  0.8                                                                                0.8
+                                                                                                                                                                    40
+
+
+
+
+                                                                                                                                                      Latency (ms)
+  0.6                                                                                0.6
+CDF
+
+
+
+
+                                                                                   CDF
+  0.4                                                                                0.4
+                                                                FA2_Paged                                                       FA2_Paged                           20
+  0.2                                                           FI_Paged             0.2                                        FI_Paged                                                                                      Without overlapping
+                                                                FA2_vAttention                                                  FA2_vAttention                                                                                With Overlapping
+  0.0 0                                                                              0.0 0
+                                   200           400           600         800                 200       400   600     800 1000 1200 1400                                 0 0                 100     200         300            400         500
+                               Llama-3-8B (TP-2, QPS=0.25)                                         Llama-3-8B (TP-2, QPS=0.3)
+  1.0                                                                                1.0                                                                                                              Decode Iteration
+  0.8                                                                                0.8
+  0.6                                                                                0.6
+                                                                                                                                                     Figure 12. Latency of decode iterations with and without
+CDF
+
+
+
+
+  0.4
+                                                                FA2_Paged          CDF
+                                                                                     0.4
+                                                                                                                                FA2_Paged            overlapping memory allocation with compute (batch size=32,
+  0.2                                                           FI_Paged             0.2                                        FI_Paged
+                                                                FA2_vAttention                                                  FA2_vAttention       context length=4K–8K, model: Llama-3-8B)
+  0.0 0                       50         100         150      200    250     300     0.0 0         200         400      600          800      1000
+  1.0                               Yi-34B (TP-2, QPS=0.1)                           1.0             Yi-34B (TP-2, QPS=0.125)
+  0.8                                                                                0.8
+                                                                                                                                                                                  6
+
+
+
+
+                                                                                                                                                             Prefill Time (seconds)
+  0.6                                                                                0.6                                                                                               Without CUDA APIs
+                                                                                                                                                                                  5
+CDF
+
+
+
+
+                                                                                   CDF
+
+
+
+
+  0.4                                                           FA2_Paged            0.4                                        FA2_Paged
+                                                                                                                                                                                       CUDA APIs + 64KB pages (synchronous)
+                                                                                                                                                                                  4
+
+
+
+
+                                                                                                                                                                                                                                     1.07x
+                                                                                                                                                                                       CUDA APIs + 2MB (synchronous)
+
+
+
+
+                                                                                                                                                                                                                                    1.02x
+                                                                                                                                                                                                                                    1.00x
+  0.2                                                           FI_Paged             0.2                                        FI_Paged
+                                                                FA2_vAttention                                                  FA2_vAttention
+                                                                                                                                                                                  3    CUDA APIs + Deferred reclamation
+  0.0 0                      200    400        600     800 1000 1200 1400            0.0 0           500        1000          1500         2000
+
+
+
+
+                                                                                                                                                                                                             1.15x
+                            Request Execution Latency (seconds)                               Request Execution Latency (seconds)
+                                                                                                                                                                                  2
+
+
+
+
+                                                                                                                                                                                                            1.03x
+                                                                                                                                                                                                            1.00x
+                                                                                                                                                                                      1.08x
+                                                                                                                                                                                      1.02x
+                                                                                                                                                                                      1.00x
+                                                                                                                                                                                  1
+Figure 10. CDF of end-to-end request execution latency in
+                                                                                                                                                                                  0   Yi-6B             Llama-3-8B                  Yi-34B
+online inference under varying load.
+                                                                                                                                                     Figure 13. Prefill completion time of a single prompt of 16K
+                        12                                                                                                                           tokens with different memory allocation strategies.
+                        10
+                                                                                           10.17                FA2_Paged
+                                                                                    9.28
+      Requests per minute
+
+
+
+
+                                                       8.90
+                                                                             8.06                               FA2_vAttention
+                         8                                                                                      FA3_vAttention
+                                   5.93 6.57
+                                                                                                                                                     speedup of up to 1.35× (Yi-6B) over FA2_vAttention which
+                         6                                                                                                                           is already up to 1.15× faster than FA2_Paged.
+                         4                                                                                       2.65 2.81
+                                                                                                                                 3.50
+                         2                                                                                                                           7.6                    Ablation Studies
+                         0                      Yi-6B                            Llama-3-8B                              Yi-34B                      7.6.1 Hiding allocation latency. Figure 12 shows the la-
+                                                                                                                                                     tency of more than 500 decode iterations of Llama-3-8B. For
+  Figure 11. Offline inference throughput on H100 GPUs.                                                                                              this experiment, we used a batch of 32 requests with per
+                                                                                                                                                     request prefill context length varying between 2K to 3K to-
+                                                                                                                                                     kens. It is evident that overlapping memory allocation with
+performance gain is that it can compute the prefill phase of                                                                                         compute effectively hides the latency of CUDA VMM APIs.
+new requests faster than the PagedAttention-based systems                                                                                            We used 2MB pages for this experiment to show that even
+which substantially reduces queuing delays. Consistent with                                                                                          the worst case memory allocation latency can be hidden by
+our prior results, FI_Paged is slower than FA2_Paged and                                                                                             overlapping it with compute (Table 3 shows that 2MB pages
+hence our gains our FI_Paged are relatively higher compared                                                                                          incur highest latency). In contrast, allocating memory syn-
+to our gains over FA2_Paged.                                                                                                                         chronously via CUDA APIs leads to frequent latency spikes
+                                                                                                                                                     of 5 to 15 milliseconds, depending on how many requests
+7.5                         Exemplifying Portability: FlashAttention-3                                                                               require physical memory allocation in a given iteration.
+We demonstrate the portability benefit of vAttention with                                                                                            7.6.2 Deferred reclamation. Figure 13 shows that syn-
+the recently released FA3 kernel [67]. FA3 is optimized for                                                                                          chronous memory allocation incurs prefill overhead of up
+the NVIDIA Hopper architecture and did not support Page-                                                                                             to 1.15× with 64KB pages and up to 1.03× with 2MB pages.
+dAttention when released. Therefore, dynamic memory allo-                                                                                            In most cases, deferred reclamation eliminates the need to
+cation via PagedAttention is not feasible for FA3 at the time                                                                                        invoke CUDA VMM APIs for prefills because a newly arrived
+of writing this paper (integration of FA3 into vLLM is also a                                                                                        request can simply re-use physical memory allocated to a
+work in progress [16, 26]). vAttention not only enables dy-                                                                                          prior request. This way, deferred reclamation ensures that
+namic memory allocation with FA3, it also requires no code                                                                                           prefill latency is not affected by memory allocation.
+changes to deploy FA3. Figure 11 shows the offline inference
+throughput of our models with 1–2 H100 GPUs (Yi-6B de-                                                                                               7.6.3 Effect of page size. In many applications, use of
+ployed on a single GPU and the other models on two GPUs                                                                                              smaller pages can potentially degrade performance due to
+each) on the same arXiv-Summarization-based workload as                                                                                              TLB thrashing [52, 62, 64, 70]. We find that this is not the
+evaluated in §7.3. FA3 with vAttention provides an additional                                                                                        case for LLM inference. For example, Figure 14 shows that
+vAttention: Dynamic Memory Management for Serving LLMs                                                                                                         ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+                  1.8                                                              1.8                                                                 400
+                                         2MB             64KB                                       2MB        64KB                                                    2MB         256KB        128KB        64KB
+ Normalized Runtime
+
+
+
+
+                                                                  Normalized Runtime
+                  1.6                                                              1.6
+
+
+
+
+                                                                                                                                          Max Batch Size
+                  1.4                                                              1.4                                                                 300
+
+
+
+
+                                                                                                                                                                                      1.27x
+                                                                                                                                                                                      1.26x
+                                                                                                                                                                                      1.23x
+                        1.02x
+
+
+
+
+                                                                                                            1.02x
+
+                                                                                                                    1.02x
+                                                 1.01x
+                                 1.00x
+
+                                         1.00x
+
+
+
+
+                                                                                          1.00x
+
+                                                                                                    1.00x
+
+
+
+
+                                                                                                                            1.00x
+
+
+
+
+                                                                                                                                                                   1.28x
+                                                          0.98x
+
+
+
+
+                                                                                                                                                                   1.27x
+                                                                                                                                                                   1.24x
+                  1.2                                                              1.2
+                  1.0                                                              1.0
+                  0.8
+                  0.6
+                                                                                   0.8
+                                                                                   0.6
+                                                                                                                                                       200
+                  0.4                                                              0.4
+                                                                                                                                                       100
+
+
+
+
+                                                                                                                                                                                                         1.21x
+                                                                                                                                                                                                         1.20x
+                                                                                                                                                                                                         1.18x
+                  0.2                                                              0.2
+                  0.0   2K      4K       8K      16K     32K                       0.0 1*32K 2*32K 4*32K 8*32K 16*32K
+                             Context Length (Prefill)                                  Batch Size * Context Length (Decode)
+                                                                                                                                                           0       Yi-6B           Llama-3-8B            Yi-34B
+Figure 14. Effect of page size on the runtime of
+                                                                                                                                    Figure 15. Maximum batch size obtained with different page-
+FlashAttention-2’s prefill (left) and decode (right) attention
+                                                                                                                                    group sizes for a dynamic workload.
+kernels (model: Llama-3-8B).
+                                                                                                                                                           Config.         64KB    128KB      256KB     2MB
+                                                 Block Size (# Tokens in a page-group)
+        Model
+                                                 64KB 128KB 256KB            2MB                                                                               TP-1        7.59    14.56      27.04     35.17
+        Yi-6B (TP-1)                                    64           128                          256               2048                                       TP-2        15.18   29.12      54.08     70.34
+        Yi-6B (TP-2)                                   128           256                          512               4096            Table 9. Physical memory allocation bandwidth (GB per
+        Llama-3-8B (TP-1)                               32            64                          128               1024            second) with varying allocation granularity.
+        Llama-3-8B (TP-2)                               64           128                          256               2048
+        Yi-34B (TP-1)                                   32            64                          128               1024
+        Yi-34B (TP-2)                                   64           128                          256               2048
+Table 8. KV cache block size as a function of page-group                                                                            decodes (Figure 4). Larger page-group sizes and higher TP di-
+size and degree of tensor parallelism.                                                                                              mensions increase the memory allocation rate proportionally.
+                                                                                                                                    Therefore, memory allocation bandwidth of CUDA VMM
+                                                                                                                                    APIs is more than sufficient for LLM inference.
+
+the execution latency of an attention kernel remains largely                                                                        8         Discussion
+unaffected when the KV cache is allocated using 64KB pages,                                                                         8.1 Managing KV cache via Unified Memory
+compared to using 2MB pages. In a separate experiment, we
+                                                                                                                                    To enable dynamic memory allocation, we also considered
+find that these results are also consistent with very large
+                                                                                                                                    leveraging unified memory via cudaMallocManaged [58, 60].
+models, e.g., Llama-3-70B and GPT-3-175B. We attribute this
+                                                                                                                                    However, we find that unified memory support is currently
+to the regular computation pattern of the attention operator
+                                                                                                                                    not suitable for serving LLMs. First, it does not support par-
+as well as the hand-tuned implementations that explicitly
+                                                                                                                                    tial freeing, preventing reclamation of physical memory of
+try to avoid irregular memory accesses.
+                                                                                                                                    individual requests. Second, it lacks support for memory
+   Table 8 shows the block size i.e., number of tokens per
+                                                                                                                                    aliasing which prevents de-duplication of KV cache content
+physical page-group. Smaller page-groups enable fine-grained
+                                                                                                                                    in physical memory (de-duplication is useful when requests
+allocation, approaching vLLM’s recommended block size of
+                                                                                                                                    share a common prefix [51]), consequently limiting batch
+16–32 (the minimum block size in FlashAttention-2 is 256
+                                                                                                                                    size. cudaMallocManaged also allocates 2MB pages by de-
+– higher than vAttention). This shows that vAttention is
+                                                                                                                                    fault which can cause severe fragmentation. However, our
+as effective in reducing fragmentation as PagedAttention.
+                                                                                                                                    changes in NVIDIA drivers are based on unified memory: we
+In terms of end-to-end system performance, we find that
+                                                                                                                                    allocate virtual tensors using cudaMallocManaged, enabling
+2MB pages are good enough for many online serving sce-
+                                                                                                                                    support for partial freeing and page sharing with additional
+narios where latency constraints prevent use of very high
+                                                                                                                                    APIs. In addition, we introduce latency hiding optimizations
+batch sizes. In contrast, smaller page-groups are better for
+                                                                                                                                    and support for smaller pages. Therefore, one could con-
+throughput-oriented scenarios where maximizing batch size
+                                                                                                                                    sider our extensions to NVIDIA drivers as “unified memory
+is important to obtain peak performance. For example, using
+                                                                                                                                    optimized for LLM serving”.
+2MB pages could serve batch sizes of up to 187, 203 and
+56 for Yi-6B, Llama-3-8B and Yi-34B on a dynamic trace                                                                              8.2            Reducing Fragmentation via Tensor Slicing
+(dataset: OpenChat [74], load: 7 queries per seconds). In con-
+                                                                                                                                    To reduce fragmentation caused by 2MB pages, we also pro-
+trast, 64KB pages helped serve batch sizes of up to 240, 258
+                                                                                                                                    vide an alternative method that does not require modifying
+and 68 for our models as shown in Figure 15.
+                                                                                                                                    NVIDIA drivers. In this method, we use a single 2MB page
+7.6.4 Memory allocation bandwidth. Table 9 shows that                                                                               to store the KV cache tokens of all layers for a given request.
+even with 64KB pages (our smallest), vAttention can allocate                                                                        This can be done by allocating one virtual tensor of shape
+as much as 7.6GB physical memory per second per GPU.                                                                                [𝐵, 𝐿, 𝑁 , 𝐻, 𝐷] for K cache (and one for V cache) and slicing it
+This is more than an order of magnitude higher than the                                                                             across all layers, instead of allocating 2 × 𝑁 virtual tensors of
+maximum memory allocation rate of 750MB per second of                                                                               shape [𝐵, 𝐿, 𝐻, 𝐷]. This reduces fragmentation to 1/𝑁 of the
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands   Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+
+                         Block size (# Tokens in a 2MB page)
+    Model
+                         w/o Tensor Slicing w/ Tensor Slicing
+    Yi-6B (TP-1)                2048                   64
+    Yi-6B (TP-2)                4096                   128
+    Llama-3-8B (TP-1)           1024                   32
+    Llama-3-8B (TP-2)           2048                   64
+    Yi-34B (TP-1)               1024                   18
+    Yi-34B (TP-2)               2048                   36                 Figure 16. Illustration of code changes needed to replace
+                                                                          the prefill attention kernel of FlashAttention-2 by FlashInfer
+Table 10. KV cache block size with and without tensor slic-
+                                                                          when using vAttention for memory allocation.
+ing with 2MB pages.
+
+
+
+                                                                          PagedAttention has been adopted in various serving frame-
+prior design as shown in Table 10. In this design, the K cache            works e.g., TensorRT-LLM [6], LightLLM [4], and libraries
+(or V cache) of a particular layer 𝑛 is represented by slice              e.g., FlashAttention-2 [1] and FlashInfer [3]. Some other con-
+[𝐵, 𝐿, 𝑛 : 𝑛 + 1, 𝐻, 𝐷] of the original tensor, and can be passed         current works have also proposed optimizations for attention
+to attention kernels for computation. However, note that                  kernels [29, 39, 47, 49, 66, 67, 76, 80]. Deploying new kernels
+with tensor slicing, the K cache (and V cache) of each layer is           for inference is hard with PagedAttention. vAttention offers
+no longer contiguous. Computing attention over such a ten-                an alternate – which we believe is also a more principled –
+sor slice is possible only if the the attention kernel supports           approach to dynamic KV cache memory management that
+memory addressing with strides. While many kernels (e.g.,                 makes it easier to deploy new kernels.
+FlashAttention-2) support strides out-of-the-box, the earlier                In a recent work, GMLake [45] showed that using CUDA
+versions of FlashInfer lacked such support [14]. Therefore,               virtual memory support can mitigate fragmentation in DNN
+relying on tensor slicing as the primary method of reduc-                 training jobs, increasing training batch size. In particular,
+ing fragmentation would have prevented vAttention from                    GMLake uses CUDA support to coalesce multiple smaller
+supporting FlashInfer kernels. Hence, to support unmodified               physical memory pages into a single virtually contiguous
+FlashInfer kernels, we chose to add support for smaller pages             object that can prevent out-of-memory errors. In contrast,
+in NVIDIA drivers. Importantly, our two solutions are com-                vAttention targets optimizing inference workloads.
+patible with each other; one could deploy smaller pages with
+tensor slicing to further reduce fragmentation, if required.
+                                                                          10    Conclusion
+8.3    Programming Effort                                                 In this paper, we propose vAttention for dynamic KV cache
+PagedAttention requires significant programming effort. For               memory management in LLM serving systems. The key high-
+example, integrating FlashInfer decode kernels in vLLM                    light of vAttention is that it mitigates fragmentation in phys-
+required more than 600 lines of code changes in over 15                   ical memory while retaining the contiguity of KV cache in
+files [24, 27, 30]. Implementing the initial paging support in            virtual memory. We present various examples to highlight
+FlashAttention-2 kernel also required ≈ 280 lines of code                 that vAttention reduces programming burden while improv-
+changes [20] and additional efforts to support small block                ing portability and performance compared to the popular
+sizes [8]. In contrast, vAttention makes it feasible to replace           PagedAttention approach.
+one attention kernel with another with only a few lines of
+code changes in the serving framework (Figure 16). Note                   Acknowledgments
+that the example shown in Figure 16 has no interaction with               We thank our shepherd Sam Ainsworth, along with the
+memory management; this is precisely the goal of vAttention,              anonymous ASPLOS reviewers, for their valuable feedback.
+i.e., when a slow kernel is replaced by a fast kernel, memory             We thank NVIDIA for useful discussions on CUDA VMM
+management should continue to work transparently.                         APIs and for sharing their experiences with vAttention. We
+                                                                          also thank members of the open-source community (GitHub
+9     Related Work                                                        user names izhuhaoran and tongping) for trying to upstream
+Optimizing LLM inference is an active area of research [44,               the vAttention approach to vLLM [23, 31], and Zihao Ye for
+50, 53–57, 71, 72, 81, 83]. Various techniques have been pro-             clarifying the role of register spilling in the runtime over-
+posed to improve different aspects of LLM serving like batch-             head of PagedAttention. Ajay Nayak is supported by the
+ing [35, 51, 78], disaggregation [48, 63, 82], scheduling [69,            Prime Minister’s Fellowship Scheme for Doctoral Research,
+75]. However, central to all these techniques is the need                 co-sponsored by the Confederation of Indian Industry, the
+for efficient KV cache memory management. Since vLLM,                     Government of India, and Microsoft Research India.
+vAttention: Dynamic Memory Management for Serving LLMs                                     ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+References                                                                          Inference. Proceedings of The Seventh Annual Conference on Machine
+ [1] 2022. FlashAttention. https://github.com/Dao-AILab/flash-attention.            Learning and Systems, 2024, Santa Clara (2024).
+ [2] 2023. Flash-Decoding for long-context inference. https://crfm.stanford.   [35] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+     edu/2023/10/12/flashdecoding.html.                                             Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-
+ [3] 2023. FlashInfer: Kernel Library for LLM Serving. https://github.com/          jee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with
+     flashinfer-ai/flashinfer.                                                      Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design
+ [4] 2023. LightLLM: A Light and Fast Inference Service for LLM. https:             and Implementation (OSDI 24). USENIX Association, Santa Clara, CA,
+     //github.com/ModelTC/lightllm.                                                 117–134. https://www.usenix.org/conference/osdi24/presentation/
+ [5] 2023. Performance decay when using paged attention. https://github.            agrawal
+     com/NVIDIA/TensorRT-LLM/issues/75.                                        [36] Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra,
+ [6] 2023. TensorRT-LLM: A TensorRT Toolbox for Optimized Large Lan-                Bhargav S. Gulavani, and Ramachandran Ramjee. 2023. SARATHI: Ef-
+     guage Model Inference. https://github.com/NVIDIA/TensorRT-LLM.                 ficient LLM Inference by Piggybacking Decodes with Chunked Prefills.
+ [7] 2023. Use optimized kernels for MQA/GQA. https://github.com/vllm-              arXiv:2308.16369 [cs.LG]
+     project/vllm/issues/1880.                                                 [37] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy,
+ [8] 2024. Add support for small page sizes. https://github.com/Dao-                Federico Lebrón, and Sumit Sanghai. 2023. GQA: Training General-
+     AILab/flash-attention/pull/824.                                                ized Multi-Query Transformer Models from Multi-Head Checkpoints.
+ [9] 2024.      Amazon CodeWhisperer.             https://aws.amazon.com/           arXiv:2305.13245 [cs.CL]
+     codewhisperer/.                                                           [38] Iz Beltagy, Matthew E. Peters, and Arman Cohan. 2020. Longformer:
+[10] 2024. Bing AI. https://www.bing.com/chat.                                      The Long-Document Transformer. arXiv:2004.05150 [cs.CL]
+[11] 2024. ccdv/arxiv-summarization. https://huggingface.co/datasets/          [39] Ganesh Bikshandi and Jay Shah. 2023. A Case Study in CUDA Kernel
+     ccdv/arxiv-summarization.                                                      Fusion: Implementing FlashAttention-2 on NVIDIA Hopper Architec-
+[12] 2024. CUDA Toolkit Documentation: Virtual Memory Manage-                       ture using the CUTLASS Library. arXiv:2312.11918 [cs.LG]
+     ment. https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA_           [40] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever.
+     _VA.html.                                                                      2019.     Generating Long Sequences with Sparse Transformers.
+[13] 2024. Custom CUDA kernels for KV cache copy operations. https:                 arXiv:1904.10509 [cs.LG]
+     //github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu.           [41] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma,
+[14] 2024.        Custom strides to support non-contiguous KV                       Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won Chung,
+     cache.           https://github.com/flashinfer-ai/flashinfer/commit/           Charles Sutton, Sebastian Gehrmann, Parker Schuh, Kensen Shi, Sasha
+     85b1878996a29814f674ee5000facb1e2e763d9a.                                      Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker Barnes, Yi
+[15] 2024.       Faster Transformer.           https://github.com/NVIDIA/           Tay, Noam Shazeer, Vinodkumar Prabhakaran, Emily Reif, Nan Du,
+     FasterTransformer.                                                             Ben Hutchinson, Reiner Pope, James Bradbury, Jacob Austin, Michael
+[16] 2024. [Feature]: FlashAttention 3 support. https://github.com/vllm-            Isard, Guy Gur-Ari, Pengcheng Yin, Toju Duke, Anselm Levskaya,
+     project/vllm/issues/6348#issuecomment-2540969988.                              Sanjay Ghemawat, Sunipa Dev, Henryk Michalewski, Xavier Garcia,
+[17] 2024. Fix eager mode performance. https://github.com/vllm-project/             Vedant Misra, Kevin Robinson, Liam Fedus, Denny Zhou, Daphne
+     vllm/pull/2377.                                                                Ippolito, David Luan, Hyeontaek Lim, Barret Zoph, Alexander Spiri-
+[18] 2024. Github Copilot. https://github.com/features/copilot.                     donov, Ryan Sepassi, David Dohan, Shivani Agrawal, Mark Omernick,
+[19] 2024. Google Bard. https://bard.google.com.                                    Andrew M. Dai, Thanumalayan Sankaranarayana Pillai, Marie Pellat,
+[20] 2024. Implement Page KV Cache. https://github.com/Dao-AILab/flash-             Aitor Lewkowycz, Erica Moreira, Rewon Child, Oleksandr Polozov,
+     attention/commit/54e80a3829c6d2337570d01e78ebd9529c02d342.                     Katherine Lee, Zongwei Zhou, Xuezhi Wang, Brennan Saeta, Mark
+[21] 2024. Meta-Llama-3-8B. https://huggingface.co/meta-llama/Meta-                 Diaz, Orhan Firat, Michele Catasta, Jason Wei, Kathy Meier-Hellstern,
+     Llama-3-8B.                                                                    Douglas Eck, Jeff Dean, Slav Petrov, and Noah Fiedel. 2022. PaLM:
+[22] 2024. Pascal MMU Format Changes. https://nvidia.github.io/open-                Scaling Language Modeling with Pathways. CoRR abs/2204.02311
+     gpu-doc/pascal/gp100-mmu-format.pdf.                                           (2022). https://doi.org/10.48550/arXiv.2204.02311 arXiv:2204.02311
+[23] 2024. PoC of dAttention support (based on vAttention). https://github.    [42] Tri Dao. 2023. FlashAttention-2: Faster Attention with Better Paral-
+     com/vllm-project/vllm/pull/9078.                                               lelism and Work Partitioning. arXiv:2307.08691 [cs.LG]
+[24] 2024. Refactor Attention Take 2. https://github.com/vllm-project/         [43] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
+     vllm/pull/3462.                                                                2024. FLASHATTENTION: fast and memory-efficient exact attention
+[25] 2024. Replit Ghostwriter. https://replit.com/site/ghostwriter.                 with IO-awareness. In Proceedings of the 36th International Conference
+[26] 2024. [Roadmap] vLLM Roadmap Q4 2024 #9006. https://github.com/                on Neural Information Processing Systems (New Orleans, LA, USA)
+     vllm-project/vllm/issues/9006#issue-2559831134.                                (NIPS ’22). Curran Associates Inc., Red Hook, NY, USA, Article 1189,
+[27] 2024. Separate attention backends. https://github.com/vllm-project/            16 pages.
+     vllm/pull/3005/.                                                          [44] Tyler Griggs, Xiaoxuan Liu, Jiaxiang Yu, Doyoung Kim, Wei-Lin Chi-
+[28] 2024. Text Generation Inference. https://huggingface.co/text-                  ang, Alvin Cheung, and Ion Stoica. 2024. Mélange: Cost Efficient
+     generation-inference.                                                          Large Language Model Serving by Exploiting GPU Heterogeneity.
+[29] 2024. Tile primitives for speedy kernels. https://github.com/                  arXiv:2404.14527 [cs.DC] https://arxiv.org/abs/2404.14527
+     HazyResearch/ThunderKittens.                                              [45] Cong Guo, Rui Zhang, Jiale Xu, Jingwen Leng, Zihan Liu, Ziyu Huang,
+[30] 2024. Use FlashInfer for Decoding. https://github.com/vllm-project/            Minyi Guo, Hao Wu, Shouren Zhao, Junping Zhao, and Ke Zhang. 2024.
+     vllm/pull/4353.                                                                GMLake: Efficient and Transparent GPU Memory Defragmentation for
+[31] 2024. VMM KV cache for NVIDIA GPUs. https://github.com/vllm-                   Large-scale DNN Training with Virtual Memory Stitching. In Proceed-
+     project/vllm/pull/6102.                                                        ings of the 29th ACM International Conference on Architectural Support
+[32] 2024. Yi-34B-200K. https://huggingface.co/01-ai/Yi-34B-200K.                   for Programming Languages and Operating Systems, Volume 2 (La Jolla,
+[33] 2024. Yi-6B-200K. https://huggingface.co/01-ai/Yi-6B-200K.                     CA, USA) (ASPLOS ’24). Association for Computing Machinery, New
+[34] Amey Agrawal, Nitin Kedia, Jayashree Mohan, Ashish Panwar, Nipun               York, NY, USA, 450–466. https://doi.org/10.1145/3620665.3640423
+     Kwatra, Bhargav S Gulavani, Ramachandran Ramjee, and Alexey Tu-
+     manov. 2024. Vidur: A Large-Scale Simulation Framework For LLM
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands          Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+[46] Connor Holmes, Masahiro Tanaka, Michael Wyatt, Ammar Ahmad                  [59] Matthew Nicely and NVIDIA. 2024. Accelerating Transformers with
+     Awan, Jeff Rasley, Samyam Rajbhandari, Reza Yazdani Aminabadi,                   NVIDIA cuDNN 9. https://developer.nvidia.com/blog/accelerating-
+     Heyang Qin, Arash Bakhtiari, Lev Kurilenko, and Yuxiong He. 2024.                transformers-with-nvidia-cudnn-9/
+     DeepSpeed-FastGen: High-throughput Text Generation for LLMs via             [60] NVIDIA. 2024. CUDA C++ Programming Guide. https://docs.nvidia.
+     MII and DeepSpeed-Inference. arXiv:2401.08671 [cs.PF]                            com/cuda/cuda-c-programming-guide/index.html
+[47] Ke Hong, Guohao Dai, Jiaming Xu, Qiuli Mao, Xiuhong Li, Jun Liu,            [61] OpenAI. 2023. GPT-4 Technical Report. CoRR abs/2303.08774 (2023).
+     kangdi chen, Yuhan Dong, and Yu Wang. 2024. FlashDecoding++:                     https://doi.org/10.48550/arXiv.2303.08774 arXiv:2303.08774
+     Faster Large Language Model Inference with Asynchronization, Flat           [62] Ashish Panwar, Sorav Bansal, and K. Gopinath. 2019. HawkEye: Effi-
+     GEMM Optimization, and Heuristics. In Proceedings of Machine Learn-              cient Fine-Grained OS Support for Huge Pages. In Proceedings of the
+     ing and Systems, P. Gibbons, G. Pekhimenko, and C. De Sa (Eds.), Vol. 6.         Twenty-Fourth International Conference on Architectural Support for
+     148–161. https://proceedings.mlsys.org/paper_files/paper/2024/file/              Programming Languages and Operating Systems (Providence, RI, USA)
+     5321b1dabcd2be188d796c21b733e8c7-Paper-Conference.pdf                            (ASPLOS ’19). Association for Computing Machinery, New York, NY,
+[48] Cunchen Hu, Heyang Huang, Liangliang Xu, Xusheng Chen, Jiang Xu,                 USA, 347–360. https://doi.org/10.1145/3297858.3304064
+     Shuang Chen, Hao Feng, Chenxi Wang, Sa Wang, Yungang Bao, et al.            [63] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+     2024. Inference without Interference: Disaggregate LLM Inference                 Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient
+     for Mixed Downstream Workloads. arXiv preprint arXiv:2401.11181                  Generative LLM Inference Using Phase Splitting. In 2024 ACM/IEEE
+     (2024).                                                                          51st Annual International Symposium on Computer Architecture (ISCA).
+[49] Aditya K Kamath, Ramya Prabhu, Jayashree Mohan, Simon Peter,                     118–132. https://doi.org/10.1109/ISCA59077.2024.00019
+     Ramachandran Ramjee, and Ashish Panwar. 2024. POD-Attention:                [64] Bharath Pichai, Lisa Hsu, and Abhishek Bhattacharjee. 2014. Archi-
+     Unlocking Full Prefill-Decode Overlap for Faster LLM Inference.                  tectural support for address translation on GPUs: designing memory
+     arXiv:2410.18038 [cs.LG] https://arxiv.org/abs/2410.18038                        management units for CPU/GPUs with unified address spaces. In Pro-
+[50] Ferdi Kossmann, Bruce Fontaine, Daya Khudia, Michael Cafarella,                  ceedings of the 19th International Conference on Architectural Support
+     and Samuel Madden. 2024. Is the GPU Half-Empty or Half-Full?                     for Programming Languages and Operating Systems (Salt Lake City,
+     Practical Scheduling Techniques for LLMs. arXiv:2410.17840 [cs.LG]               Utah, USA) (ASPLOS ’14). Association for Computing Machinery, New
+     https://arxiv.org/abs/2410.17840                                                 York, NY, USA, 743–758. https://doi.org/10.1145/2541940.2541942
+[51] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin                 [65] B Pratheek, Neha Jawalkar, and Arkaprava Basu. 2022. Designing
+     Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Sto-                     Virtual Memory System of MCM GPUs. In 2022 55th IEEE/ACM Inter-
+     ica. 2023. Efficient Memory Management for Large Language Model                  national Symposium on Microarchitecture (MICRO). 404–422. https:
+     Serving with PagedAttention. In Proceedings of the 29th Symposium                //doi.org/10.1109/MICRO56248.2022.00036
+     on Operating Systems Principles (Koblenz, Germany) (SOSP ’23). As-          [66] Rya Sanovar, Srikant Bharadwaj, Renee St. Amant, Victor Rühle, and
+     sociation for Computing Machinery, New York, NY, USA, 611–626.                   Saravan Rajmohan. 2024. Lean Attention: Hardware-Aware Scal-
+     https://doi.org/10.1145/3600006.3613165                                          able Attention Mechanism for the Decode-Phase of Transformers.
+[52] Youngjin Kwon, Hangchen Yu, Simon Peter, Christopher J. Rossbach,                arXiv:2405.10480 [cs.AR] https://arxiv.org/abs/2405.10480
+     and Emmett Witchel. 2016. Coordinated and Efficient Huge Page               [67] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ra-
+     Management with Ingens. In 12th USENIX Symposium on Operating                    mani, and Tri Dao. 2024. FlashAttention-3: Fast and Accurate Attention
+     Systems Design and Implementation (OSDI 16). USENIX Association,                 with Asynchrony and Low-precision. (2024).
+     Savannah, GA, 705–721. https://www.usenix.org/conference/osdi16/            [68] Noam Shazeer. 2019. Fast Transformer Decoding: One Write-Head is
+     technical-sessions/presentation/kwon                                             All You Need. arXiv:1911.02150 [cs.NE]
+[53] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024.               [69] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin,
+     InfiniGen: Efficient Generative Inference of Large Language Models               Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang.
+     with Dynamic KV Cache Management. arXiv:2406.19707 [cs.LG]                       2023. FlexGen: high-throughput generative inference of large language
+     https://arxiv.org/abs/2406.19707                                                 models with a single GPU. In Proceedings of the 40th International
+[54] Da Ma, Lu Chen, Situo Zhang, Yuxun Miao, Su Zhu, Zhi Chen, Hong-                 Conference on Machine Learning (Honolulu, Hawaii, USA) (ICML’23).
+     shen Xu, Hanqi Li, Shuai Fan, Lei Pan, and Kai Yu. 2024. Compressing             JMLR.org, Article 1288, 23 pages.
+     KV Cache for Long-Context LLM Inference with Inter-Layer Attention          [70] Seunghee Shin, Michael LeBeane, Yan Solihin, and Arkaprava Basu.
+     Similarity. arXiv:2412.02252 [cs.CL] https://arxiv.org/abs/2412.02252            2018. Neighborhood-Aware Address Translation for Irregular GPU Ap-
+[55] Saaduddin Mahmud, Mason Nakamura, and Shlomo Zilberstein. 2024.                  plications. In 2018 51st Annual IEEE/ACM International Symposium on
+     MAPLE: A Framework for Active Preference Learning Guided by Large                Microarchitecture (MICRO). 352–363. https://doi.org/10.1109/MICRO.
+     Language Models. arXiv:2412.07207 [cs.LG] https://arxiv.org/abs/                 2018.00036
+     2412.07207                                                                  [71] Prajwal Singhania, Siddharth Singh, Shwai He, Soheil Feizi, and Abhi-
+[56] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhi-                     nav Bhatele. 2024. Loki: Low-rank Keys for Efficient Sparse Attention.
+     hao Jia, and Rashmi Vinayak. 2024. Helix: Distributed Serving                    arXiv:2406.02542 [cs.LG] https://arxiv.org/abs/2406.02542
+     of Large Language Models via Max-Flow on Heterogeneous GPUs.                [72] Foteini Strati, Sara Mcallister, Amar Phanishayee, Jakub Tarnawski,
+     arXiv:2406.01566 [cs.LG] https://arxiv.org/abs/2406.01566                        and Ana Klimovic. 2024. DéjàVu: KV-cache Streaming for Fast, Fault-
+[57] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi, Dahua Lin, Bin Cui,           tolerant Generative LLM Serving. arXiv:2403.01876 [cs.DC] https:
+     and Zhihao Jia. 2023. SpotServe: Serving Generative Large Language               //arxiv.org/abs/2403.01876
+     Models on Preemptible Instances. arXiv:2311.15566 [cs.DC] https:            [73] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+     //arxiv.org/abs/2311.15566                                                       Jones, Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin. 2017.
+[58] Ajay Nayak, Pratheek B., Vinod Ganapathy, and Arkaprava Basu. 2021.              Attention is All you Need. In Advances in Neural Information Pro-
+     (Mis)managed: A Novel TLB-based Covert Channel on GPUs. In Pro-                  cessing Systems, I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach,
+     ceedings of the 2021 ACM Asia Conference on Computer and Commu-                  R. Fergus, S. Vishwanathan, and R. Garnett (Eds.), Vol. 30. Curran As-
+     nications Security (Virtual Event, Hong Kong) (ASIA CCS ’21). As-                sociates, Inc. https://proceedings.neurips.cc/paper_files/paper/2017/
+     sociation for Computing Machinery, New York, NY, USA, 872–885.                   file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf
+     https://doi.org/10.1145/3433210.3453077                                     [74] Guan Wang, Sijie Cheng, Xianyuan Zhan, Xiangang Li, Sen Song, and
+                                                                                      Yang Liu. 2023. OpenChat: Advancing Open-source Language Models
+vAttention: Dynamic Memory Management for Serving LLMs                                    ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+     with Mixed-Quality Data. arXiv:2309.11235 [cs.CL]                             Ré, Clark Barrett, Zhangyang "Atlas" Wang, and Beidi Chen. 2023.
+[75] Bingyang Wu, Yinmin Zhong, Zili Zhang, Gang Huang, Xuanzhe                    H2O: Heavy-Hitter Oracle for Efficient Generative Inference of
+     Liu, and Xin Jin. 2023. Fast Distributed Inference Serving for Large          Large Language Models. In Advances in Neural Information Pro-
+     Language Models. arXiv:2305.05920 [cs.LG]                                     cessing Systems, A. Oh, T. Naumann, A. Globerson, K. Saenko,
+[76] Mengdi Wu, Xinhao Cheng, Oded Padon, and Zhihao Jia. 2024. A                  M. Hardt, and S. Levine (Eds.), Vol. 36. Curran Associates, Inc., 34661–
+     Multi-Level Superoptimizer for Tensor Programs. arXiv:2405.05751              34710. https://proceedings.neurips.cc/paper_files/paper/2023/file/
+[77] Zihao Ye, Lequn Chen, Ruihang Lai, Yilong Zhao, Size Zheng, Junru             6ceefa7b15572587b78ecfcebb2827f8-Paper-Conference.pdf
+     Shao, Bohan Hou, Hongyi Jin, Yifei Zuo, Liangsheng Yin, Tianqi Chen,     [81] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+     and Luis Ceze. 2024. Accelerating Self-Attentions for LLM Serving with        Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Sto-
+     FlashInfer. https://flashinfer.ai/2024/02/02/introduce-flashinfer.html        ica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024.
+[78] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and                SGLang: Efficient Execution of Structured Language Model Programs.
+     Byung-Gon Chun. 2022. Orca: A Distributed Serving System for                  arXiv:2312.07104 [cs.AI] https://arxiv.org/abs/2312.07104
+     Transformer-Based Generative Models. In 16th USENIX Symposium on         [82] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+     Operating Systems Design and Implementation (OSDI 22). USENIX Asso-           anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating
+     ciation, Carlsbad, CA, 521–538. https://www.usenix.org/conference/            Prefill and Decoding for Goodput-optimized Large Language Model
+     osdi22/presentation/yu                                                        Serving. In 18th USENIX Symposium on Operating Systems Design and
+[79] Zhenkai Zhang, Tyler Allen, Fan Yao, Xing Gao, and Rong Ge. 2023.             Implementation (OSDI 24). USENIX Association, Santa Clara, CA, 193–
+     TunneLs for Bootlegging: Fully Reverse-Engineering GPU TLBs for               210. https://www.usenix.org/conference/osdi24/presentation/zhong-
+     Challenging Isolation Guarantees of NVIDIA MIG. In Proceedings of             yinmin
+     the 2023 ACM SIGSAC Conference on Computer and Communications            [83] Kan Zhu, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu, Dedong Xie,
+     Security (Copenhagen, Denmark) (CCS ’23). Association for Computing           Yufei Gao, Qinyu Xu, Tian Tang, Zihao Ye, Keisuke Kamahori, Chien-
+     Machinery, New York, NY, USA, 960–974. https://doi.org/10.1145/               Yu Lin, Stephanie Wang, Arvind Krishnamurthy, and Baris Kasikci.
+     3576915.3616672                                                               2024. NanoFlow: Towards Optimal Large Language Model Serving
+[80] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lian-                   Throughput. arXiv:2408.12757 [cs.DC] https://arxiv.org/abs/2408.
+     min Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher                   12757
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands   Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramchandran Ramjee, & Ashish Panwar
+
+
+A      Artifact Appendix                                                  need to have Docker and NVIDIA Docker installed on your
+                                                                          system. You can then launch the docker container and navi-
+A.1     Abstract
+                                                                          gate to the folder containing vAttention artifact, as follows:
+vAttention is a simpler, portable and performant alternative
+                                                                           $ docker run --gpus all -it \
+to PagedAttention for dynamic memory management in LLM
+                                                                             -p 8181:8181 --rm --ipc=host --cap-add=SYS_ADMIN \
+serving systems. This artifact contains instructions to install
+                                                                             rnp1910/vattention:asplos_25_pytorch_run
+vAttention and scripts to reproduce key results of our paper               $ cd /workspace/vattention/scripts/artifact_asplos25
+(Figures 2, 3, 4, 6, 7, 8, 9, 11). The scripts are configured to run
+three large language models: Yi-6B, Llama-3-8B and Yi-34B.                  Then follow the experiment workflow detailed in A.7
+A.2     Artifact check-list (meta-information)                            A.6   Accessing Llama-3-8B
+      • Algorithm: Dynamic memory management for serving                  Accessing Llama-3-8B requires logging into huggingface
+        LLMs.                                                             with the user’s private token (HF_TOKEN below). Login as
+      • Run-time environment: CUDA 12.1, Python 3.10, PyTorch             follows before any experiment:
+        2.3.0.
+      • Hardware: Two NVLink connected NVIDIA A100 GPUs                    $ (vattn) huggingface-cli login --token HF_TOKEN
+        with 80GB memory each.
+      • Disk space required: 200GB.                                       A.7   Experiment workflow
+      • Time needed to prepare workflow: 1 hour.
+      • Time needed to complete experiments: 1-2 days.                    You can launch all experiments at once or individually as:
+      • Publicly available?: Yes                                           $ (vattn) ./run_all.sh
+      • Archived DOI?: https://doi.org/10.5281/zenodo.14048692                       OR
+                                                                           $ (vattn) ./run_figure_2.sh
+A.3     Description                                                        $ (vattn) ./run_figure_3.sh
+A.3.1     How to access. Clone the artifact as follows:
+ $ git clone https://github.com/microsoft/vattention                      A.8   Evaluation and expected results
+                                                                          The raw output logs and the final plots will be redirected to
+A.3.2 Hardware dependencies. Running Yi-6B requires                       ./logs. and ./plots/ subdirectories within the main arti-
+one NVIDIA A100 GPU with 80GB memory while the other                      fact directory vattention/scripts/artifact_asplos25/.
+two models require two NVLink-connected A100 GPUs with                    The plots are in the same format as the paper and can be
+80GB memory each.                                                         compared directly. The expected result is that non-paged or
+A.3.3 Software dependencies. Requires PyTorch 2.3.0                       vAttention based configurations would perform better than
+and CUDA 12.1 (later CUDA versions may or may not work).                  the PagedAttention counterparts, especially at longer con-
+                                                                          text lengths. However, the exact numbers may differ from the
+A.3.4 Expected runtime. Figures 2, 3, and 11 should take                  paper depending on GPUs and software libraries installed
+a few minutes each. Figures 4, 7 should take about 1 hour                 on the experiment system.
+each. Figure 6 requires approximately 3 hours. Figures 8 and
+9 may consume more than 12 hours each.                                    A.9   Experiment customization
+A.4     Installation                                                      Reproducing Figures 8 and 9 of the paper requires running
+                                                                          a large number of requests and hence these experiments
+Move to the directory containing artifact scripts, create and             can take more than 24 hours to complete. To reduce the
+activate a conda environment, then install the artifact as                experimental time, we have configured their scripts to run
+follows:                                                                  with a smaller number of requests (100 each) by default. If
+ $ cd vattention/scripts/artifact_asplos25/                               you want to run the full trace, execute these scripts with
+ $ conda create -n vattn python=3.10                                      the --full argument, i.e., ./run_figure_8.sh --full and
+ $ conda activate vattn
+                                                                          ./run_figure_9.sh --full. If two NVLink connected GPUs
+ $ (vattn) ./install.sh
+                                                                          aren’t available, update run scripts to avoid running Llama-3-
+  vattention/scripts/artifact_asplos25/README.md file                     8B and Yi-34B. You can also configure Llama-3-8B to run on a
+provides detailed installation instructions.                              single GPU by setting --model_tensor_parallel_degree
+                                                                          to 1 in the ./helpers/common.sh file. Note that such changes
+A.5     Alternate Setup: Docker Image                                     would likely impact the absolute performance numbers con-
+We also provide a docker image for vAttention with all its                siderably but vAttention is still expected to perform better
+dependencies pre-installed. To access the docker image, you               than PagedAttention.
+
