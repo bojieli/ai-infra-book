@@ -46,3 +46,5 @@
 2026-09-09 提前准备复核：第 5 章沿同一 64 MiB 张量区分总工作和完成时间，验证额外复制与三类缓冲的代价；第 8→9 章再辨认旧式换出、重计算和 connector 缓存的真实路径。[PipeLLM／vLLM 对照](../../references/framework-history/2026-09-09/pipellm-swap/README.md)保留模型、保护范围和工件限制。顺序预测错误与无用准备比例不是同一指标，也未把论文优化归为当前框架功能。
 
 2026-09-09 补查 [POD 上层调用边界](../../references/framework-history/2026-09-09/pod-callers/README.md)：固定 vLLM／SGLang 的 FlashInfer backend 所读分支分别使用阶段 wrapper；SGLang 的上下文分段与 LSE 合并也不等于跨请求阶段共驻。第 5→8 章沿用已有混合批次实验，区分合批、上下文分解和设备共驻，先记录实际 backend／dtype／DCP，再看完整迭代。当前三份文件的符号搜索不代表全仓库未采用 POD，也未验证实际安装的 FlashInfer 版本。
+
+2026-09-09 补查 [PartIR／Shardy 的证明与搜索边界](../../references/framework-history/2026-09-09/partir-shardy/expanded-reading/NOTES.md)：论文的 MCTS、Core→SPMD 证明、当前优先级传播、外部自动分区回调和贪心通信生成分别取证。沿第 5→6 章既有切分案例核算重分片与 padding，不把接口或 IR 测试当作任意模型硬件的最优搜索。沿用实验 6-2；不采用图注与坐标不符的搜索时间数字，不新增论文计数。

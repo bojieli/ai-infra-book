@@ -49,7 +49,10 @@ def verify():
     assert (global_flops, local_flops) == (131072, 16384)
     assert (dp_weight_bytes, tp_weight_bytes, fsdp_weight_bytes) == (1024, 512, 128)
     assert ring_ar_sent == 2048 and weight_gather_received == 384
+    from verify_partir_expanded import verify as verify_expanded
+    expanded = verify_expanded()
     result = {
+        "supplemental_reading": expanded,
         "status": "passed",
         "archived_files": len(inventory["files"]),
         "source_responses": len(sources),

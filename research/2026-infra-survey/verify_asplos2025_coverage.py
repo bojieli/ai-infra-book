@@ -47,6 +47,16 @@ def verify(base=None, serving=None, testing=None):
         if p['reading_status'] == 'selected_sections_read':
             entry['selected_reading'] = p['selected_reading']
     assert sum(e['abstract_read'] for e in entries.values()) == base['primary_abstracts_screened']
+    # Preserve the original canonical page scope and attach later reading once.
+    from verify_partir_expanded import verify as check_partir_expanded
+    expanded = check_partir_expanded()
+    entries[80]['supplemental_reading'] = {
+        'proof_file': 'references/framework-history/2026-09-09/partir-shardy/expanded-reading/reading-proof.json',
+        'full_physical_pdf_pages': expanded['full_pages'],
+        'partial_page': expanded['partial_page'],
+        'additional_full_pages_over_original': expanded['additional_full_pages'],
+        'new_papers_with_selected_reading': 0,
+    }
     proof_names = {114: 'comet', 116: 'pod', 117: 'tapas', 120: 'ratte', 133: 'graphpipe'}
     additional = []
     for folder in ('serving-113-117', 'screening-111-123', 'screening-111-128', 'screening-129-135', 'frugal-discovery'):
