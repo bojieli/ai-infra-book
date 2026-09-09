@@ -18,7 +18,7 @@
 
 ## 公开稿与读取进度
 
-当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续三批阅读记录，覆盖 **108 篇完整摘要、100 份代表 PDF／1,706 页、21 篇声明正文范围**，仍缺 76 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
+当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续四批阅读记录，覆盖 **112 篇完整摘要、104 份代表 PDF／1,765 页、21 篇声明正文范围**，仍缺 72 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
 
 新增八篇来自 [COMET／POD／TAPAS](serving-113-117/README.md)及[编译器与测试筛选](screening-111-123/README.md)。其中 COMET、POD、TAPAS、Ratte 合计选读 30 页，只补现有量化、混合批处理、资源约束和 Agent 优化实验的判断条件，其余四篇归档备查。MetaMut 属于正式 2024 卷、2025 日程，保留原始年份。维护命令为 `python research/2026-infra-survey/verify_asplos2025_coverage.py`；该检查复核原清单及后续批次的来源、身份与页级证据，再生成统一索引。它不代表全部正文已读。
 
@@ -59,3 +59,5 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 新增选读范围为 NeuSight 物理页 2–14（沿用已核实并行阅读范围）和 PartIR 物理页 3–5（主任务新读）；分别见[预测校准](../../../framework-history/2026-09-09/neusight-calibration/NOTES.md)与[分片策略](../../../framework-history/2026-09-09/partir-shardy/NOTES.md)。摘要与代表 PDF 的数量不等于全文完成数量，PartIR 剩余方法、评估和证明仍未计入已读。
 
 第 123／128 项的[缺口补查](screening-111-128/README.md)新增两篇完整摘要、两份 PDF／31 页，均归档不采用，不增加正文选读范围。
+
+第 129–135 项[本批筛读](screening-129-135/README.md)新增四篇原始摘要和四份 PDF／59 页。GraphPipe 进入正文候选，其余暂归档备查；没有增加正文选读数量。
