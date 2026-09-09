@@ -6,7 +6,7 @@
 
 使用 [Qwen3-8B 配置](../references/outline-checks/2026-09-07/scaling-history/qwen3-8b-config.json)、[V4-Flash 配置](../references/outline-checks/2026-09-07/scaling-history/deepseek-v4-flash-inference-config.json)及其[参考代码](../references/outline-checks/2026-09-07/scaling-history/deepseek-v4-flash-inference-model.py)。K3 采用 [报告](../references/files/papers/kimi-k3.pdf)、[配置](../references/outline-checks/2026-09-07/model-accounting/kimi-k3-config.json)和[参考代码](../references/outline-checks/2026-09-07/model-accounting/kimi-k3-modeling_kimi_linear.py)，固定 revision `f831ab66814297da540d832a5235f8e904f29d06`。下载了配置与代码，没有加载远程代码或下载模型权重。
 
-B 为请求数，S 为已有历史长度，P 为每个请求本次新输入长度，G 为随后生成长度。第一遍使用所有请求等长、无跨请求共享、未切分的教学条件；实际输入变长、共享前缀、TP 复制与状态精度随后逐项加入。
+B 为请求数，S 为 prefill 前已有历史长度，P 为每个请求本次新输入长度，H=S+P 为 prefill 结束后的历史长度，G 为请求输出数。普通因果生成中，首输出由 prefill 给出，最后一个输出不再额外前向；G≥1 时，后续单 token 前向次数 D=G−1。按调用次数给定的算例使用 D，推测执行或额外前向按实际路径另计。第一遍使用所有请求等长、无跨请求共享、未切分的教学条件；实际输入变长、共享前缀、TP 复制与状态精度随后逐项加入。
 
 每个模型分别交付以下结果，不能只交一个“显存需求”：
 
@@ -26,7 +26,7 @@ S=0、P=8192、B=1 的主干投影／FFN 约 113.799 TFLOPs，有效因果注意
 
 BF16 权重中的上述主干矩阵约 13,891,534,848 bytes；“整轮读取一次”是假定充分批内复用的基线，不包括嵌入和输出头等其他权重。B 变大时，这份主干权重可能被批内复用，FLOPs 则随 token 数增长。prefill 不应默认每个 token 独立从 HBM 读取整模型。
 
-每个历史 token 的 KV 为 144 KiB，S=8192 的历史占 1.125 GiB。一次全历史 decode 逻辑上使用已有历史并写入新的 144 KiB；生成 G token 的旧历史参与字节按 `144 KiB×[GS+G(G−1)/2]` 累加，当前 token 当步访问、实际缓存命中及其他流量另计。最终容量则按 `144 KiB×(S+G)` 算。连续访问的总量与同时驻留的大小显然不同。
+对单个请求，每个历史 token 的 KV 为 144 KiB，H=8192 的历史占 1.125 GiB。从这份历史继续执行 D 次单 token 前向，旧历史参与字节按 `144 KiB×[DH+D(D−1)/2]` 累加，追加写入 `144 KiB×D`；当前 token 当步参与、实际缓存命中及其他流量另计。保留该上下文时的有效 KV 容量为 `144 KiB×(H+D)`，实际分配还需页尾取整与工作区。只请求首个输出时 D=0，不凭空增加一次 decode；请求完成后的释放另算。累计访问与同时驻留分别计量。
 
 ## V4-Flash：压缩、选择与索引分别计数
 

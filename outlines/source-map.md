@@ -777,3 +777,4 @@
 | `sequence-npu-framework-evolution` | [FlexSP 与 MLLM 版本对照](../references/framework-history/2026-09-09/sequence-and-npu/NOTES.md) | 4、6、10、12 | 补充／版本参照 | 十二个读取范围；GQA 扩展载荷、v1 分工与 2026 Qwen3 AOT 条件 |
 | `qwen3-length-distribution-case` | [相同 token 的训练工作](../case-studies/training-compute.md#同一批-token-的长度分布) | 2、6、10 | 扩写 10 | 实验 10-3／图 10-3 选做；有效配对、真实发送量和标签权重 |
 | `interview-2026-tenth-pass` | [第十次原帖与日期核对](../references/interviews/2026-09-09/tenth-pass/README.md) | 2、3、8、11、12、13 | 补充／版本参照 | 四篇主帖、两位基础模型公司自述方向；题号保持 21，RL 专栏只作线索 |
+| `qwen-request-accounting-audit` | [Qwen3 请求计数与跨章衔接](../research/2026-infra-survey/qwen-request-accounting/README.md) | 2、6、8、9、10 | 补充／版本参照 | 区分输出与前向次数；页边界及 PD 主模型复算，保留正确的调用次数算例 |
