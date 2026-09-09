@@ -1,0 +1,63 @@
+Sami Alabed, Daniel Belov, Bart Chrzaszcz, Juliana Franco, Dominik Grewe, Dougal Maclaurin, James Molloy, Tom Natan, Tamara Norman, Xiaoyue Pan,
+                         Adam Paszke, Norman A. Rink, Michael Schaarschmidt, Timur Sitdikov, Agnieszka Swietlik, Dimitrios Vytiniotis, and Joel Wee
+
+func @main ( %x : tensor <64x8xf32 > ,                                      These operations gather the shards on the corresponding
+             %w1 : tensor <8 x16xf32 > ,                                    dimensions. This sharding of parameters, after batch paral-
+             %w2 : tensor <16 x8xf32 >)                                     lelism, is the essence of FSDP [48, 72]. More complex shard-
+     attributes { mesh ={ " B " :4 , " M " :2}} {                           ings are possible on top of this schedule. For example, shard-
+  %x1 = matmul ( %x, %w1 ) : tensor <64 x16xf32 >                           ing the input and output activation (%x and the return value)
+  %x2 = matmul ( %x1, %w2 ) : tensor <64 x8xf32 >
+                                                                            on the model axis 𝑀 will convert the all_reduce operation
+  return %x2 : tensor <64 x8xf32 >
+}
+                                                                            to a reduce_scatter and introduce an all_gather on the
+                                                                            input %x before using it in the first matmul. We omit the code
+           Listing 2. Data-parallel matmul chain.                           but stress that this is the ES strategy in Section 7.
+The resulting device-local program above takes a first argu-                    The sequence of examples above highlights that (i) shard-
+ment of smaller shape 64x8 since each device acts in parallel               ing strategies compose; (ii) by following algebraic reasoning,
+on a slice of %x determined by the devices along axis 𝐵. At                 a model can be partitioned just by sharding its inputs and pa-
+the same time, the shape of parameters %w1 and %w2 remains                  rameters, and sometimes internal operations, see Section 8;
+constant across all devices.                                                (iii) it suffices to utilize information about parallel and con-
+                                                                            tracting dimensions. In the rest of the paper we show how
+   Adding model parallelism. By further partitioning the                    to express sharding strategies through semantics-preserving
+parameter %w1 on 𝑑𝑖𝑚 = 1 and %w2 on 𝑑𝑖𝑚 = 0 along axis 𝑀,                   rewrite actions to go from an unpartitioned program (as in
+each device along axis 𝐵 may perform a smaller multiplica-                  Listing 1) to a device-local program (as in Listings 2 to 4).
+tion with a different parameter shard:
+func @main ( %x : tensor <64 x8xf32 > ,                                        A note on scale. A large ML model may contain +100k
+             %w1 : tensor <8 x8xf32 > ,                                     of tensors and operations on them (e.g., dot-products, con-
+             %w2 : tensor <8x8xf32 >) attributes ... {                      volutions, scatter ops, control-flow operations, and more).
+  %x1 = matmul ( %x, %w1 ) : tensor <64 x8xf32 >                            A good API should not burden the user with a decision per
+  %x2 = matmul ( %x1, %w2 ) : tensor <64 x8xf32 >                           tensor or operation.
+  %x3 = all_reduce <" M " > %x2 : tensor <64 x8xf32 >
+  return %x3 : tensor <64 x8xf32 > }                                        3     A schedule is all you need
+    Listing 3. Data-parallel and sharded matmul chain.                      Users express their partitioning strategies in PartIR using tac-
+The first matmul is a map over the second dimension of                      tics. Conceptually, a tactic mirrors a strategy: it defines which
+%w1, so no special care is necessary. We only need to re-                   values must be sharded and how (e.g., BP is achieved by
+member that %x1 is partitioned along its second dimension.                  sharding the data arrays on the batch dimension). Addition-
+For the second matmul, observe that both of its operands                    ally, it defines propagation barriers that ensure conflict-free
+are partitioned along the contracting dimensions. Hence,                    shardings (Section 5.2.3). The user can manually define these
+an all_reduce operation across axis 𝑀 recovers the orig-                    tactics or invoke automatic tools [2, 54, 73]. A sequence of
+inal program semantics. This sharding of pairs of matrix                    these tactics forms a schedule in an API inspired by work in
+multiplications is the essence of the Megatron sharding in                  kernel-generating DSLs [9, 29, 47, 71]. The API itself is fairly
+Transformers [56].                                                          minimal, and shown in Table 1, yet it is powerful enough to
+                                                                            express most sharding strategies. For example, the following
+   Adding fully sharded parameters. Notice that the pa-                     schedule achieves the FSDP sharding of Listing 4:
+rameters are only sharded on axis 𝑀 (but not 𝐵) in List-
+                                                                                # 1. Arrange devices in a BxM mesh.
+ing 3. To further shard the parameters on dimensions 0 and                      mesh = maps . mesh ( device_array , ( " B " , " M " ) )
+1, respectively, we would need to insert two all_gather                         # 2. Define sharding strategies as series of tactics.
+operations before they are needed in the multiplications:                       BP = ManualPartition ({ " x " :0} , axis = " B " )
+func @main ( %x : tensor <64 x8xf32 > ,                                         MP = ManualPartition ({ " w1 " :1} , axis = " M " )
+             %w1 : tensor <2x8xf32 > ,                                          Z3 = ManualPartition ({ " w1 " :0 , " w2 " :1} , axis = " B " )
+             %w2 : tensor <8 x2xf32 >)                                          schedule = [ BP , MP , Z3 ]
+     attributes { mesh = { " B " :4 , " M " :2}} {                              # 3. Partition and get distributed function & metadata.
+  %w1g = all_gather [{ " B " } , {}] %w1 :                                      dist_fn , metadata = PartIR. jit (f , mesh , schedule )
+    tensor <8 x8xf32 >                                                            Listing 5. Partitioning strategies as a series of tactics.
+  %x1 = matmul ( %x, %w1g ) : tensor <64 x8xf32 >
+  %w2g = all_gather [{} , { " B " }] %w2 :                                  The first tactic BP partitions the first argument "x" on dimen-
+    tensor <8 x8xf32 >                                                      sion (DIM) 0 and across axis "B"; yielding batch parallelism
+  %x2 = matmul ( %x1, %w2g ) : tensor <64 x8xf32 >                          (Listing 2). The second tactic MP partitions input w1 on DIM
+  %x3 = all_reduce <" M " > %x2 : tensor <64 x8xf32 >                       1. The compiler will identify that this action shards the con-
+  return %x3 : tensor <64 x8xf32 > }                                        tracting DIM of a matmul and will shard w2 on DIM 0 through
+ Listing 4. Data-parallel and fully sharded matmul chain.                   a process we call propagation invoked at the end of every
+                                                                        4
