@@ -16,3 +16,5 @@ RESCQ、Cascade 首页有正式 DOI，QECC-Synth、GraphPipe 首页没有；后�
 GraphPipe 与前面 Spindle 的问题也需分开：前者摘要围绕单个 DNN 的图结构流水，后者已有记录涉及共享组件的多分支训练。下一步阅读重点是二者是否对同一约束作出不同选择，而非再列一种并行名词。
 
 130 HetEC 与 135 Frugal 本轮仍缺原始摘要；[Frugal 的作者工件仓库](https://github.com/thustorage/Frugal)仅作为后续寻找论文与实验条件的线索，不运行安装或训练脚本。131、136 已在前批筛读，本批不重复计数。核验命令：`python research/2026-infra-survey/verify_asplos_graph_quantum.py`；统一索引由 `verify_asplos2025_coverage.py` 更新。本批不新增大纲节、实验或配图。
+
+后续选读 GraphPipe 物理页 3–9，查看页 3、8、9 的图，见[正文记录](GRAPHPIPE-READING.md)。从正文候选转为现有实验 10-5 的计数变体：区分在途微批与样本，并保留 PP+DP、默认调度与 V100 评估边界。其他三篇仍没有正文阅读计数，上表为最初摘要筛选判断。

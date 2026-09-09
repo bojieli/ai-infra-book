@@ -22,6 +22,8 @@ def check(s):
 
 
 def verify():
+    from verify_graphpipe_reading import verify as check_graphpipe
+    graphpipe = check_graphpipe()
     sources = json.loads((D / 'sources.json').read_text())
     for s in sources:
         check(s)
@@ -64,9 +66,11 @@ def verify():
         assert (r['doi'] in text) == (n in (132, 134))
         info = subprocess.check_output(['pdfinfo', str(ROOT/r['pdf']['file'])], text=True)
         assert int(re.search(r'^Pages:\s+(\d+)', info, re.M)[1]) == r['pdf']['pages']
-        assert r['view']['actually_viewed'] and r['body_reading_status'] == 'not_read'
+        assert r['view']['actually_viewed']
+        assert r['body_reading_status'] == ('selected_pages_read' if n == 133 else 'not_read')
     result = dict(status='passed', primary_abstracts_screened=4, representative_pdfs=4,
-                  representative_pdf_pages=59, body_candidates=[133], selected_sections_read=0,
+                  representative_pdf_pages=59, body_candidates=[], selected_sections_read=1,
+                  selected_body_pages=graphpipe['selected_body_pages'],
                   first_pages_viewed=4, source_responses=len(sources), new_outline_sections=0)
     assert sum(r['pdf']['pages'] for r in records) == 59
     (D/'validation.json').write_text(json.dumps(result, indent=2) + '\n')

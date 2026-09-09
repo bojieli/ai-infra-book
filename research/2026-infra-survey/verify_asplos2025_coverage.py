@@ -45,7 +45,7 @@ def verify(base=None, serving=None, testing=None):
         if p['reading_status'] == 'selected_sections_read':
             entry['selected_reading'] = p['selected_reading']
     assert sum(e['abstract_read'] for e in entries.values()) == base['primary_abstracts_screened']
-    proof_names = {114: 'comet', 116: 'pod', 117: 'tapas', 120: 'ratte'}
+    proof_names = {114: 'comet', 116: 'pod', 117: 'tapas', 120: 'ratte', 133: 'graphpipe'}
     additional = []
     for folder in ('serving-113-117', 'screening-111-123', 'screening-111-128', 'screening-129-135'):
         path = D / folder / 'screening.json'
@@ -86,10 +86,10 @@ def verify(base=None, serving=None, testing=None):
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (112, 104, 1765, 21)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (112, 104, 1765, 22)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
     summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names)
-    assert summary['additional_selected_body_pages'] == 30
+    assert summary['additional_selected_body_pages'] == 37
     output = {'summary': summary, 'records': [entries[n] for n in sorted(entries)]}
     (D / 'reading-coverage.json').write_text(json.dumps(output, ensure_ascii=False, indent=2) + '\n')
     return summary
