@@ -776,3 +776,4 @@
 | `asplos25-llm-npu-body` | [llm.npu 正文与工件范围](../references/proceedings/ASPLOS/2025/llm-npu-reading.json) | 4、5、12 | 补充／版本参照 | 十四页与八张图页；静态块、量化、CPU／NPU 原型与模拟区分 |
 | `sequence-npu-framework-evolution` | [FlexSP 与 MLLM 版本对照](../references/framework-history/2026-09-09/sequence-and-npu/NOTES.md) | 4、6、10、12 | 补充／版本参照 | 十二个读取范围；GQA 扩展载荷、v1 分工与 2026 Qwen3 AOT 条件 |
 | `qwen3-length-distribution-case` | [相同 token 的训练工作](../case-studies/training-compute.md#同一批-token-的长度分布) | 2、6、10 | 扩写 10 | 实验 10-3／图 10-3 选做；有效配对、真实发送量和标签权重 |
+| `interview-2026-tenth-pass` | [第十次原帖与日期核对](../references/interviews/2026-09-09/tenth-pass/README.md) | 2、3、8、11、12、13 | 补充／版本参照 | 四篇主帖、两位基础模型公司自述方向；题号保持 21，RL 专栏只作线索 |
