@@ -23,7 +23,7 @@ def verify():
                 assert sha256(raw).hexdigest() == item['sha256']
             result['manifest_files_checked'] = len(manifest['files'])
         results[folder] = result
-    assert results['root-dspark-execution']['source_files'] == 4
+    assert results['root-dspark-execution']['source_files'] == 6
     assert results['parallel-mlx-speculation-body']['source_files'] == 14
     return {'status': 'passed', 'new_paper_abstracts': 0, 'new_paper_body_scopes': 0,
             'scope': 'Static source identity, declared reading ranges, own arithmetic; no upstream execution or performance validation.',
