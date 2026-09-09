@@ -1,0 +1,7 @@
+# 缓存实例繁忙时的真实请求对照
+
+两独立Qwen3-8B worker同GPU，每个max_running_requests=1。复用实际Agent末轮输入，worker0预热此输入，worker1冷缓存。向worker0发送无关输入并强制128输出；通过原生/get_load确认该实例有实际工作后，发送1输出的目标请求。
+
+cache_first固定选择有缓存的worker0；queue_first根据同一次实际负载快照选num_reqs最小的worker。各3轮，轮内顺序由seed909随机决定；每条件清空两worker并重新预热。保存请求原始结果、决策快照及等待期间连续负载采样。只对比真实缓存/负载规则，不声称使用原生router或已实现完成时间预测。
+
+先预定核验：所有目标输出与预热相同；cache_first实际有缓存命中且能采到目标等待；queue_first选空闲worker1且冷缓存。若条件不满足保留失败，不将其归为成功样本。完成时间以请求调用到返回计，负载采样只给离散观测，不替代精确调度时间。共享GPU下的忙worker仍竞争GPU，不能当两台独立机器。
