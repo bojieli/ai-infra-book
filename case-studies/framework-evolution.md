@@ -125,3 +125,5 @@ NSDI 2026 的 ServeGen 为这些框架实验补充负载依据：全局相同的
 KV 量化的版本比较接回 8.4.4：vLLM 从 2024 scalar-scale 文档到 2026 Attention 融合／分层选择，SGLang 从 2025 FP4 存储到当前分阶段访问，Ollama 从早期 KV 选项到当前后端入口。用同一 Qwen3 请求计算格式、scale、工作区，再判断转换成本，见[算例](kv-quantization-and-execution.md)与[固定资料范围](../references/framework-history/2026-09-08/kv-quantization/README.md)。沿用实验 8-8，不增加框架功能节。
 
 2026-09-09 多 LoRA 复核补上代表版本的准入语义：vLLM 2024 逐请求到 2025 动态加载和固定 2026 文档入口，SGLang 2025 前缀身份／CSGMV 到 2026 加载重叠与排空；Ollama 三期 adapter 变更重载作为不同服务方式的对照。[读取范围与合入日期](../references/framework-history/2026-09-09/lora-admission/README.md)分别记录；Inkling 的 B200 W4A16 TP8 专用双流实现不能推广给全部模型。四请求算例比较平均与最晚完成时间，接现有实验 8-3，不新增工具介绍节。
+
+2026-09-09 的 vTrain 选读接到第 13.5／实验 13-6：先用容量和通信下界缩小范围，再判断孤立 profile 是否足以区分两个接近的方案。[配置排序算例](profile-and-plan-ranking.md)说明通信修正可能反转排名，原论文的 A100／FP16 误差不作当前框架的固定修正系数。只补该判断，不增加仿真器教程。
