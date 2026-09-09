@@ -108,7 +108,34 @@ def verify(base=None, serving=None, testing=None):
         followup_pages += len(record['selected_reading']['physical_pdf_pages'])
         additional.append(n)
     assert followup_pages == 16
-    assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134, 151, 152, 182]
+    from verify_asplos_memory_pool import verify as check_memory_pool
+    assert check_memory_pool()['status'] == 'pass'
+    memory_path = D / 'parallel-next/reading-records.json'
+    memory = json.loads(memory_path.read_text())
+    assert {r['program_order'] for r in memory['records']} == {145, 175}
+    memory_selected = 0
+    memory_pages = 0
+    for record in memory['records']:
+        n = record['program_order']
+        entry = entries[n]
+        assert record['doi'] == entry['doi'] and not entry['abstract_read']
+        entry['abstract_read'] = True
+        entry['representative_pdf'] = record['representative_pdf']
+        entry['version_notes'] = record['version_notes']
+        entry['provenance'].append(str(memory_path.relative_to(ROOT)))
+        entry['adoption'] = {'decision': 'existing_experiment_extension' if n == 175 else 'body_reading_candidate', 'reason': record['editorial_decision']}
+        if record['selected_reading']['physical_pdf_pages']:
+            entry['selected_reading'] = {**record['selected_reading'], 'proof_file': str(memory_path.relative_to(ROOT))}
+            memory_selected += 1
+            memory_pages += len(record['selected_reading']['physical_pdf_pages'])
+        additional.append(n)
+    for gap in memory['gaps']:
+        entry = entries[gap['program_order']]
+        assert gap['doi'] == entry['doi'] and not entry['abstract_read']
+        entry['provenance'].append(str(memory_path.relative_to(ROOT)))
+        entry['gap_reason'] = gap['gap_reason']
+    assert memory_selected == 1 and memory_pages == 4
+    assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134, 145, 151, 152, 175, 182]
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
         'program_entries': len(entries),
@@ -117,14 +144,14 @@ def verify(base=None, serving=None, testing=None):
         'public_pdf_pages': sum(e['representative_pdf']['pages'] for e in entries.values() if e['representative_pdf']),
         'selected_sections_read': sum(e['selected_reading'] is not None for e in entries.values()),
         'additional_abstracts_over_canonical': len(additional),
-        'additional_selected_scopes_over_canonical': len(proof_names) + len(followups),
+        'additional_selected_scopes_over_canonical': len(proof_names) + len(followups) + memory_selected,
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (116, 107, 1816, 25)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (118, 109, 1849, 26)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages
-    assert summary['additional_selected_body_pages'] == 53
+    summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names) + followup_pages + memory_pages
+    assert summary['additional_selected_body_pages'] == 57
     output = {'summary': summary, 'records': [entries[n] for n in sorted(entries)]}
     (D / 'reading-coverage.json').write_text(json.dumps(output, ensure_ascii=False, indent=2) + '\n')
     return summary
