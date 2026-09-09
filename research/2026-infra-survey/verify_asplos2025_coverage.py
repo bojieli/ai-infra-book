@@ -25,6 +25,8 @@ def verify(base=None, serving=None, testing=None):
     assert check_security_quantum()['status'] == 'passed'
     from verify_asplos_graph_quantum import verify as check_graph_quantum
     assert check_graph_quantum()['status'] == 'passed'
+    from verify_frugal_discovery import verify as check_frugal_discovery
+    assert check_frugal_discovery()['status'] == 'passed'
     manifest = json.loads((D / 'manifest.json').read_text())
     papers = {p['program_order']: p for p in manifest['papers']}
     assert len(papers) == len({p['doi'] for p in papers.values()}) == 184
@@ -47,7 +49,7 @@ def verify(base=None, serving=None, testing=None):
     assert sum(e['abstract_read'] for e in entries.values()) == base['primary_abstracts_screened']
     proof_names = {114: 'comet', 116: 'pod', 117: 'tapas', 120: 'ratte', 133: 'graphpipe'}
     additional = []
-    for folder in ('serving-113-117', 'screening-111-123', 'screening-111-128', 'screening-129-135'):
+    for folder in ('serving-113-117', 'screening-111-123', 'screening-111-128', 'screening-129-135', 'frugal-discovery'):
         path = D / folder / 'screening.json'
         for record in json.loads(path.read_text())['records']:
             n = record['program_order']
@@ -56,7 +58,7 @@ def verify(base=None, serving=None, testing=None):
             # Prevent silent double counting or replacement of a later canonical scope.
             assert not entry['abstract_read'], f'Already canonical: {n}; reconcile this adapter'
             entry['abstract_read'] = True
-            entry['representative_pdf'] = record['pdf']
+            entry['representative_pdf'] = record.get('pdf')
             entry['provenance'].append(str(path.relative_to(ROOT)))
             entry['version_notes'] = record['version_notes']
             entry['adoption'] = {'decision': record['decision'], 'reason': record['reason']}
@@ -73,7 +75,7 @@ def verify(base=None, serving=None, testing=None):
             else:
                 assert record['body_reading_status'] == 'not_read'
             additional.append(n)
-    assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 132, 133, 134]
+    assert sorted(additional) == [112, 114, 116, 117, 118, 120, 121, 122, 123, 128, 129, 130, 132, 133, 134]
     summary = {
         'status': 'passed', 'scope': 'Unique ASPLOS 2025 presentation-program DOIs, including 2024-volume papers; selected scopes only, not full-paper reading.',
         'program_entries': len(entries),
@@ -86,7 +88,7 @@ def verify(base=None, serving=None, testing=None):
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
         'canonical_records_preserved': True,
     }
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (112, 104, 1765, 22)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['public_pdf_pages'], summary['selected_sections_read']) == (113, 104, 1765, 22)
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
     summary['additional_selected_body_pages'] = sum(len(entries[n]['selected_reading']['physical_pdf_pages']) for n in proof_names)
     assert summary['additional_selected_body_pages'] == 37

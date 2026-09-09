@@ -16,6 +16,8 @@
 
 ## 当前入口
 
+[Frugal 寻源](../../references/proceedings/ASPLOS/2025/frugal-discovery/README.md)确认作者主页都指向本轮返回 403 的出版入口，保留原文缺口；另从 PNNL 补齐 HetEC 原始完整摘要。ASPLOS 2025 当前覆盖 113 篇摘要、104 份代表 PDF、22 篇声明正文范围，71 篇摘要待补；未把工件 README 算成论文正文。
+
 GraphPipe 已选读物理页 3–9，见[依赖与激活驻留](../../references/proceedings/ASPLOS/2025/screening-129-135/GRAPHPIPE-READING.md)。实验 10-5 只补在途样本计数和默认调度边界；独立教学激活项为 768→640 MiB，不是论文实测。ASPLOS 2025 的声明正文范围现为 22 篇，摘要和 PDF 数量不变。
 
 第 129–135 项的[新一批筛读](../../references/proceedings/ASPLOS/2025/screening-129-135/README.md)补四篇原始摘要和四份 PDF／59 页；GraphPipe 留待正文核对，其余备查，未扩张大纲。ASPLOS 2025 统一索引现有 112 篇完整摘要、104 份代表 PDF、21 篇声明正文范围，72 篇摘要待补。下方保留此前检查快照。

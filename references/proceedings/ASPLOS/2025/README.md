@@ -18,7 +18,7 @@
 
 ## 公开稿与读取进度
 
-当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续四批阅读记录，覆盖 **112 篇完整摘要、104 份代表 PDF／1,765 页、22 篇声明正文范围**，仍缺 72 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
+当前统一入口为 [reading-coverage.json](reading-coverage.json)：按 184 个正式日程 DOI 合并原清单与后续五批阅读记录，覆盖 **113 篇完整摘要、104 份代表 PDF／1,765 页、22 篇声明正文范围**，仍缺 71 篇摘要。它是由原始记录生成的总索引；下文原清单的 98／90／17 及逐批数字保留为阶段历史，不与新批次重复相加。
 
 新增八篇来自 [COMET／POD／TAPAS](serving-113-117/README.md)及[编译器与测试筛选](screening-111-123/README.md)。其中 COMET、POD、TAPAS、Ratte 合计选读 30 页，只补现有量化、混合批处理、资源约束和 Agent 优化实验的判断条件，其余四篇归档备查。MetaMut 属于正式 2024 卷、2025 日程，保留原始年份。维护命令为 `python research/2026-infra-survey/verify_asplos2025_coverage.py`；该检查复核原清单及后续批次的来源、身份与页级证据，再生成统一索引。它不代表全部正文已读。
 
@@ -63,3 +63,5 @@ Earth+ 的 2024 作者 v1 有六位作者，含 Ranveer Chandra；已归档正�
 第 129–135 项[本批筛读](screening-129-135/README.md)新增四篇原始摘要和四份 PDF／59 页。GraphPipe 进入正文候选，其余暂归档备查；没有增加正文选读数量。
 
 随后补读 [GraphPipe](screening-129-135/GRAPHPIPE-READING.md) 七页正文范围并查看三张图页，现有 22 篇声明正文范围。只接入已有微批实验，不增加摘要或 PDF 数量。
+
+[Frugal 寻源与 HetEC 摘要](frugal-discovery/README.md)保留三份失败响应；第 130 项由 PNNL 原始完整摘要补齐，第 135 项仍缺原文。PDF 和正文选读数量不变。
