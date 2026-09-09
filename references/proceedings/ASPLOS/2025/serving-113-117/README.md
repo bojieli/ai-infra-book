@@ -27,3 +27,5 @@ TAPAS 的作者 v1 未在首页印出 DOI，题名和全部作者与正式目录
 官方源码线索是 `microsoft/vattention` 的 `pod_attn`，另有 FlashInfer POD 接口线索；本轮尚未固定和阅读这些路径，不宣称当前 vLLM／SGLang 已采用同一实现。提纲仅在现有片内重叠问题中补“单独最优与共驻最优不同”的判断，不新增框架功能列表。
 
 第 113 项的作者主页链接到 LMServe。该入口是后续核对研究原型演进的线索，不能凭仓库名称或功能简介反推论文全文。原始失败响应、版本文字和未读范围全部保留。
+
+后续已固定研究仓库与 FlashInfer，并选读 wrapper 构造、规划和部分执行路径，见[接口复核](../../../../framework-history/2026-09-09/pod-implementation/README.md)。这关闭了“是否存在公开库接口”的疑问；底层 dispatch 和当前上层服务的调用仍待核对。
