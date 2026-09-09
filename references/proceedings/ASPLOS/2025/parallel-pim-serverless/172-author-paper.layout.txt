@@ -1,0 +1,1221 @@
+ Medusa: Accelerating Serverless LLM Inference with
+                  Materialization
+               Shaoxun Zeng                                     Minhui Xie                                     Shiwei Gao
+             Tsinghua University                             Tsinghua University                           Tsinghua University
+                Beijing, China                                  Beijing, China                                Beijing, China
+        zsx21@mails.tsinghua.edu.cn                      xmh19@mails.tsinghua.edu.cn                   gsw23@mails.tsinghua.edu.cn
+
+                                           Youmin Chen                                    Youyou Lu*
+                                     Tsinghua University                            Tsinghua University
+                                        Beijing, China                                 Beijing, China
+                                chenyoumin@tsinghua.edu.cn                      luyouyou@tsinghua.edu.cn
+
+Abstract                                                                          Init                                                Generate
+                                                                                runtime                  Loading phase                first word
+Serverless is a promising paradigm to provide scalable, cost-
+efficient, and easy-to-use model inference services. However,
+                                                                                 0.8s                      2.8s                         0.06s
+the cold start of model inference functions requires load-                       22%               76% (Our work focuses)                2%
+ing models to the devices, which incurs high latencies and
+undermines the benefits of serverless computing. In LLMs,                            Init      Load         Load           Init     Capture
+                                                                                    model                                            CUDA
+things get even worse since two extra stages are introduced:                      structure   weights     tokenizer      KV cache    graph
+a KV cache initialization stage that profiles and anticipates                        0.8s       0.4s         0.2s          0.5s      0.9s
+memory reservation for KV cache, and a capturing stage
+which dynamically constructs CUDA graphs for different
+                                                                             Figure 1. Cold start timeline when serving Qwen1.5 4B.
+batch sizes. Both stages are paramount to the inference per-
+formance, but become the main culprit of cold start latency.
+   This paper proposes Medusa to mitigate the long cold                     Keywords: LLM; serverless computing; machine learning
+start latency through state materialization. Instead of dy-                 system
+namic profiling and construction in the runtime, Medusa
+materializes the CUDA graphs as well as the information                     ACM Reference Format:
+needed by the KV cache initialization in the offline phase,                 Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, Youyou
+and restores them efficiently in the online phase. Medusa                   Lu. 2025. Medusa: Accelerating Serverless LLM Inference with
+further introduces two novel techniques – offline-online coop-              Materialization. In Proceedings of the 30th ACM International Con-
+                                                                            ference on Architectural Support for Programming Languages and
+erated parameters restoration and triggering-kernels enhanced
+                                                                            Operating Systems, Volume 1 (ASPLOS ’25), March 30–April 3, 2025,
+kernel address restoration – to tackle non-deterministic issues             Rotterdam, Netherlands. ACM, New York, NY, USA, 16 pages. https:
+in CUDA graphs. Medusa successfully materializes and re-                    //doi.org/10.1145/3669940.3707285
+stores CUDA graphs across 10 models (with a total of 139364
+CUDA graph nodes), and reduces the latency of model load-
+ing by 42.5%. Under real-world LLM inference workloads,                     1    Introduction
+Medusa reduces the tail latency of the time to first token                  The widespread adoption of large language models (LLMs)
+(TTFT) by 53.0%.                                                            has led to a phenomenal increase in demand for serving LLM
+                                                                            inference at a large scale [11, 16, 17, 35]. Serverless comput-
+CCS Concepts: • Information systems → Information                           ing [22, 41] presents a promising paradigm for providing scal-
+storage systems.                                                            able, cost-efficient, and easily accessible LLM inference ser-
+                                                                            vices. LLM inference requests are highly bursty, potentially
+∗ Youyou Lu is the corresponding author.                                    fluctuating by 10-20 times within a 30-second window [38].
+                                                                            Accommodating the highest request rates would require
+                                                                            massive, expensive GPU resources. Consequently, the pay-
+                     This work is licensed under a Creative Commons         as-you-go nature of the serverless paradigm is particularly
+                     Attribution International 4.0 License.                 well-suited for serving LLMs at scale, reducing operational
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+                                                                            costs for users significantly. As a result, several major cloud
+© 2025 Association for Computing Machinery.
+                                                                            providers offer serverless LLM inference services, includ-
+ACM ISBN 979-8-4007-0698-1/25/03. . . $15.00                                ing Amazon SageMaker [9], Microsoft Azure [26], Alibaba
+https://doi.org/10.1145/3669940.3707285                                     PAI [5], and among others.
+
+
+
+                                                                      653
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                    Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+   Despite the benefits of the serverless paradigm, scaling               while edges represent execution dependencies. Simply re-
+to accommodate bursty user requests presents a notorious                  moving these stages would introduce unacceptable perfor-
+challenge known as the cold start problem. This occurs when               mance degradation, placing us in a dilemma between long
+launching a new serving instance from scratch, which typi-                cold start latency and low inference serving throughput.
+cally takes orders of magnitude [13, 34, 53, 54] longer time                 We propose state materialization to mitigate the prolonged
+than serving a request on an already-running instance. The                cold start latency. This approach involves estimating the
+long cold start latency can significantly impair the time-to-             available free GPU memory allocated for the KV cache and
+first-token (TTFT), a critical metric in LLM inference serv-              saving the CUDA graph states offline. During a cold start,
+ing [1, 14]. The cold start latency stems primarily from the              these states are restored and reused, significantly reducing
+runtime initialization phase (e.g., user codes and execution              latency. While available KV cache space can be derived via
+environment) and loading phase (e.g., loads model-specific                profiling, materializing CUDA graphs raises the following
+data and performs warm-up profilings), as shown in Figure 1.              challenges. First, the data pointers in CUDA graph node pa-
+Existing work [2, 15, 25, 27, 34, 40, 42, 54, 57] focuses on              rameters are subject to change, as there is no guarantee that
+eliminating the overhead introduced by runtime initializa-                addresses returned by malloc remain constant between dif-
+tion. However, we find that in the serverless LLM inference,              ferent launches. This variability makes a correct restoration
+the loading phase accounts for a major part (76%) of the cold             of data pointers complicated. Second, to materialize and re-
+start time. While some recent work proposes to speed up the               store the correct kernels, we can traverse the symbol tables
+loading phase through efficient model weights loading [14]                of dynamic-link libraries using the kernel’s mangled name.
+and model structure initialization [19], they overlook unique             However, not every kernel is present in the symbol tables
+stages introduced by the LLM inference, i.e., KV cache ini-               (e.g., some cuBLAS kernels), making it challenging to locate
+tialization and CUDA graph capturing. These stages account                these kernels during runtime.
+for 50% of the loading phase duration.                                       To address the first challenge, we observe that, in contrast
+   Both above stages are introduced for improving the serv-               to the non-deterministic nature of data pointers, the control
+ing throughput. KV cache [36] is a de facto solution employed             flow exhibits strict determinism. Such a deterministic control
+by inference frameworks [23, 45, 46] to reduce recomputa-                 flow forms a strong correlation between the data pointers
+tion overhead. By caching the context of earlier tokens, KV               and the buffer allocation sequence. Based on this observation,
+cache eliminates repeated computation when generating new                 we identify the corresponding indexes of data pointers in
+output tokens in the sequence. Inference frameworks [23, 45,              the buffer allocation sequence offline and restore the correct
+46] also employ CUDA graphs [30, 32] to reduce the CPU-                   data pointers by replaying the buffer allocation sequence
+induced kernel launching overhead. Launching each kernel                  during runtime (§4). To address the second challenge, we
+individually by the CPU incurs non-negligible overhead, as                leverage triggering-kernels to trigger kernels loading at the
+kernel execution on the GPU can be as fast as microseconds.               CUDA module level, and use the kernel’s name to locate the
+CUDA graph groups multiple GPU kernels into a single                      corresponding kernel’s address (§5).
+graph, enabling the submission of multiple kernels via a                     We build Medusa, a serverless LLM inference system to ap-
+single CPU launching instead of launching each kernel in-                 ply state materialization. We evaluate Medusa on 10 popular
+dividually. By leveraging the CUDA graph, we observe the                  LLM models including Falcon [6], Llama2 [49], Qwen1.5 [47],
+performance acceleration can be up to 2.4× in our experi-                 and Yi [56] from huggingface [46]. For a given model, Medusa
+ments (Figure 3).                                                         materializes and restores CUDA graphs for 35 different batch
+   However, we find that the two stages are the main culprit              sizes (same as in vLLM [23]) with a total number of CUDA
+of cold start latency; both of them require time-consuming                graph nodes of 139364. Medusa reduces the latency of the
+profiling and construction during runtime, accounting for                 loading phase by 42.5%. Under real-world LLM inference
+50% of the loading phase duration (Figure 1). In the KV cache             workload (ShareGPT [48]), Medusa reduces the tail latency
+initializaiton stage, the primary task is to determine the avail-         of the time to first token (TTFT) by 53.0%.
+able free GPU memory that can be allocated to the KV cache.
+A typical solution [23] is profiling forwarding, where the
+framework would run a model forwarding with a maximum
+sequence length and a maximum batch size, and profiles                    2   Background and Motivation
+the residual free GPU memory space. In the capturing stage,               The cold start overhead is a notorious issue for serverless
+CUDA graphs are constructed through capturing forwarding.                 inference in practical applications. Despite a rich body of
+Specifically, the framework launches normal model forward-                existing efforts [2, 8, 13, 15, 25, 34, 40, 43, 50, 54, 57] dedi-
+ing surrounded by the CUDA graph capturing API calls for                  cated to optimizing it, this issue in the scenario of LLM has
+different batch sizes [23]. This process subsequently gener-              not yet been thoroughly explored. In this section, we first
+ates a low-level kernel execution graph. In this graph, nodes             provide an overview of all stages involved in LLM inference
+record parameters (e.g., data pointers) and kernels’ addresses,           cold start, along with a quantitative breakdown of the cost
+
+
+
+                                                                    654
+Medusa: Accelerating Serverless LLM Inference with Materialization                                     ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+                  init model struct   init tokenizer   capture CUDA graph                                    w/o CUDA graph                   with CUDA graph
+                  load weights        init KV cache                                                                                      6
+      100                                                                                       4
+
+
+
+
+                                                                                  Latency (s)
+
+
+
+
+                                                                                                                           Latency (s)
+                                                                                                                                         4
+Percentage
+
+
+
+
+                                                                                                2                                        2
+             50
+
+                                                                                                0                           0
+                                                                                                    Qw    Q      Q     L                     Qw    Q       Q       L
+              0
+                    Fa     L   L      Q       Q    Q   Q  Q   Y   Y                                   en wen wen lama                          en wen wen lama
+                       lco lam lam wen wen wen wen wen i 6B i 9B                                        1.5    1.    1.   2                      1.5     1.5     1.5   2
+                          n 7 a2     a2      1.5 1.5 1.5 1.5 1.5                                            0.5 5 1.8 5 4B 7B                        0.5     1.8     4B 7B
+                             B   7 B    1 3B    0.5 1.8 4B 7B 14                                               B     B                                  B       B
+                                                   B   B         B                                    (a) Batch size = 1                        (b) Batch size = 8
+
+                   Figure 2. Breakdown of the loading phase.                                    Figure 3. Acceleration brought by the CUDA graph.
+
+
+in each stage (§2.1). According to our breakdown, the cap-                         the available free GPU memory space. ❺ CUDA graph cap-
+turing stage constitutes a significant portion; therefore, we                      turing stage. The CUDA graphs are used to accelerate the
+introduce CUDA graphs (§2.2) and analyze the reasons why                           model forwarding during serving inference. This phase cre-
+their capturing costs a long latency (§2.3). Finally, we discuss                   ates CUDA graphs for different batches, which is done by
+the opportunities and challenges for accelerating cold starts                      first launching warm-up forwarding, followed by capturing
+in serverless LLM inference.                                                       forwarding. The warm-up and capturing are repeated several
+                                                                                   times given different batch sizes.
+2.1 Cold Start of Serverless LLM Inference                                            Figure 2 further quantitatively shows each stage’s latency
+As shown in Figure 1, we break down the cold start proce-                          in the loading phase across ten different LLM models, using
+dure in the vanilla vLLM [23] system using Qwen1.5 4B as                           vanilla vLLM [23]. We can see that the following two stages
+an example. It mainly consists of three phases: 1) initializing                    stand out. First, the KV cache initialization stage is time-
+runtime phase (22%), which includes loading Python code                            consuming (18%) since it requires profiling forwarding with
+and packages, as well as setting up the execution environ-                         a long sequence and large batch size. Second, CUDA graphs
+ment; 2) loading phase (76%), which loads model-specific                           play a pivotal role in performance optimization (§2.2), how-
+data and performs warm-up profilings; and 3) generating the                        ever, capturing them introduces notable overhead, i.e., 32%
+first token (2%).                                                                  of the loading phase. Overall, these two stages account for
+   With the help of existing works [15, 27, 40, 42], the initializ-                47% on average among different models in the vanilla vLLM.
+ing runtime phase can be totally eliminated. For example, we                       Note that the remaining stages, such as the model structure
+can leverage a pool of warm containers which have already                          initialization stage and the model weights loading stage, can
+loaded the user codes and Python packages [2, 33, 34]. Thus,                       be further optimized with existing works [14, 19], which will
+our work focuses on the loading phase, whose overhead                              make the proportion of the KV cache initialization stage and
+predominates. We further breakdown the loading phase into                          CUDA graph capturing stage even more significant.
+the following five stages. ❶ Model structure initialization
+stage. This stage involves instantiating the structure of the                     2.2 CUDA Graph
+model, e.g., the number of layers and each kernel within the                      CUDA graph is a feature released in CUDA 10 to improve
+layers. It would also allocate tensors’ buffers on the GPU to                     the model forwarding performance by reducing the CPU-
+store model weights. ❷ Model weights loading stage. This                          induced kernel launching overhead. It is widely adopted by
+stage loads model weights from persistent storage media into                      many LLM inference frameworks [23, 44, 45]. Fast advances
+the pre-allocated tensors in GPU. ❸ Tokenizer loading stage.                      in GPU architectures make GPU performance grow rapidly,
+In this stage, the framework loads the tokenizer specified by                     resulting in kernel execution in GPU even as fast as microsec-
+each model into memory, which would be used to convert                            onds. As a result, launching each kernel individually by the
+user input strings into a series of token IDs. ❹ KV cache                         CPU incurs non-negligible overhead. CUDA graph organizes
+initialization stage. For better GPU memory management,                           multiple GPU kernels into a graph, which describes the ker-
+the framework manages the KV cache at the granularity                             nels to execute and their dependencies. Instead of launching
+of blocks [23]. In this stage, the framework should first get                     each kernel individually, the CUDA graph enables launching
+the available GPU memory for KV cache blocks, which is                            a graph of kernels via a single CPU launching.
+achieved by a profiling forwarding, i.e., launching a model                       The benefits of CUDA graphs. CUDA graph can signifi-
+forwarding with a maximum sequence length and maximum                             cantly reduce inference latency. We conducted an experiment
+batch size, and profiles the residual free GPU memory space.                      to evaluate inference latency with and without CUDA graph,
+Then, the framework allocates KV cache blocks based on                            as shown in Figure 3. For this experiment, the model was
+
+
+
+                                                                            655
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands               Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+preloaded onto the GPU and prepared for inference, allow-             # get model                           rotary_embedding_kernel
+                                                                                                            (q, k, …);
+ing us to assess the pure acceleration provided by the CUDA           model = from_pretrained(name)
+                                                                                                            ...
+                                                                      # capture a CUDA graph
+graph during the inference process. The detailed experimen-           graph = torch.cuda.CUDAGraph()        reshape_and_cache_kernel
+                                                                      with torch.cuda.graph(graph):         (k, v, KCache, VCache, …);
+tal settings are described in §7. We used a prompt length of            output = model(input)               ...
+161 tokens and an output length of 338 tokens, which are              # forward by replaying                paged_attention_kernel
+                                                                      graph.replay()                        (q, KCache, VCache, …);
+the average lengths in the popular ShareGPT dataset [48].                                                   ...
+Inference latency was measured as the time duration from
+                                                                      (a) Capture CUDA graph with PyTorch      (b) Underlying kernels
+the beginning of prefilling to the end of the last token’s
+generation. Our results show that CUDA graph can achieve              paged_attention_kernel
+performance acceleration of up to 2.4×.                               kernel addr = 0x17939b10
+                                                                      kernel params = 0x1e40d9e0
+Two ways to build CUDA graphs. There are two ways                     param index = 0, size = 8
+                                                                      raw: 00a0fecd127f0000
+to build CUDA graphs. The first is with explicit API calls,           param index = 1, size = 8
+which require experts to build a CUDA graph by adding each            raw: 0038f513137f0000
+                                                                      param index = 2, size = 8
+kernel node individually using the low-level APIs, such as            raw: 003cf513137f0000
+cudaGraphAddKernelNode(). However, this method is not
+supported by high-level frameworks like PyTorch [7] due                     (d) CUDA graph node               (c) Captured CUDA graph
+to its impracticality. For example, some highly optimized
+but closed-source kernels, such as cuBLAS kernels [29] are            Figure 4. CUDA graph capturing and the node contents.
+hidden from user applications and cannot be explicitly added
+to the CUDA graphs because their kernel addresses are un-
+known.                                                               model forwarding. The CUDA driver takes care of the correct
+   As a result, it is more efficient to build CUDA graphs in         execution order of all kernels, and the kernels are executed
+a second way, i.e., stream capture, which only requires run-         according to their given parameters, which we refer to as
+ning a model forwarding wrapped by the capturing API calls           self-replaying.
+provided by CUDA. The CUDA driver would record all the                  Across different self-replaying of the CUDA graph, ker-
+kernels as well as their dependencies within the capture             nels read and write using the given data pointers recorded
+range, and automatically build the CUDA graphs without               during graph capture. Therefore, one must ensure that these
+handcrafting. vLLM as well as other popular inference frame-         pointers consistently reference the same buffers as they did
+works [23, 45, 46] leverage this approach by default.                during the initial capture [37]. To this end, in the capturing
+   A typical workflow of capturing the CUDA graph is shown           stage, PyTorch [7] reserves these allocated buffers and never
+in Figure 4(a), where capturing is done by model forwarding.         frees or returns them to the CUDA driver afterwards; other-
+During capturing, the CPU launches the underlying kernels            wise, replaying of CUDA graph might cause illegal memory
+as shown in Figure 4(b), and the CUDA driver records all the         accesses or data corruption.
+launched kernels as well as their execution dependencies.
+After the capturing, a CUDA graph is built automatically             2.3 Analysis of CUDA Graph Capturing Overhead
+by the CUDA driver with the nodes representing the ker-              Capturing offers a more efficient method for building CUDA
+nels, and the edges representing the execution dependencies          graphs. However, capturing the model forwarding process in-
+between kernels (shown in Figure 4(c)). The nodes of the             troduces delays, which contradicts the need to minimize cold
+CUDA graph could be inspected by the CUDA API to get its             start latency. Moreover, two factors exacerbate the overhead
+kernel address and parameters. As shown in Figure 4(d), a            associated with capturing CUDA graphs.
+CUDA graph node contains the kernel address, the pointer             Warm-up. First, warm-up forwarding is required [21, 28]
+to the array of all parameters, the number of parameters,            before the actual capturing process. This necessity arises
+and the size of each of them. The dependency represented             because certain CUDA API calls are prohibited during the
+by edges forces the correct execution order from the source          capturing, such as device (or stream) synchronization [20, 31].
+node to the destination node.                                        However, the initial launch of some kernels requires initial-
+The limitations and characteristics of capturing. There              izing the runtime or context, which internally triggers these
+are also some limitations when using capturing. For example,         CUDA APIs. For instance, the first call to cuBLAS functions
+capturing multiple CUDA graphs within a process at the               in PyTorch would internally trigger cuBLAS initialization,
+same time would cause CUDA-related errors. As a result,              which invokes synchronization, causing the capturing to fail.
+each CUDA graph should be captured one by one.                       Multiple batch sizes. Second, a CUDA graph is completely
+   After capturing the CUDA graph, the subsequent model              bound up with a specific batch size. Since changes in input
+forwarding could be performed by replaying the CUDA                  result in variations in the argument shapes of the underlying
+graph, which causes all kernels recorded in the CUDA graphs          kernels, different batch sizes necessitate capturing the CUDA
+to be executed and produces the output identical to a normal         graph multiple times, further worsening cold start latency.
+
+
+
+                                                               656
+Medusa: Accelerating Serverless LLM Inference with Materialization                          ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+For example, in vLLM [23], capturing 35 different batch sizes                     GPU memory used by KV cache (abbreviated as material-
+accounts for 30% of the loading phase on average (Figure 2).                      ize KV cache initialization), and CUDA graphs in an offline
+                                                                                  phase and restore them efficiently in the online phase, which
+2.4 Potential Solutions and Limitations                                           introduces less latency compared with dynamic profiling or
+Hot spares are unaffordable. Existing works employ hot                            construction in the runtime.
+spares to mitigate cold-starts [9, 51, 55]. This approach pro-                       The process of materializing the KV cache primarily in-
+visions a collection of ready-to-serve instances for bursty                       volves saving and restoring the available free GPU memory
+request rates. While applicable to serverless LLM inference,                      size. As for the materialization of CUDA graphs, we observe
+it leads to resource wastage during periods of low request                        that the model structure remains unchanged during every
+rates. Furthermore, the diversity of model types makes it                         cold start, resulting in a near identical CUDA graph, i.e., only
+unaffordable to over-provision for every type of model.                           the address of the kernels and parameters may change. So
+Asynchronous execution of stages is insufficient. An in-                          it is also applicable to materialize the CUDA graphs con-
+tuitive approach to reduce the latency is executing different                     ceptually. However, it is nontrivial due to the low-level and
+stages simultaneously in the loading phase, thus hiding the                       ready-to-execute nature of the CUDA graph. Specifically, the
+latency. However, a naive asynchronous execution could not                        CUDA graph records the raw pointers address of the kernel
+hide all the latency due to the following reasons. First, the                     and the parameters, which are subject to changes in every
+dependencies between different stages necessitate a ordered                       launch, making blindly dumping and loading the memory
+execution of them. For example, the capturing stage requires                      address space infeasible. We detail the challenges as follows.
+model forwarding which in turn relies on the KV cache. This                       Challenge I: Non-deterministic data pointers in param-
+dependency mandates that the KV cache initialization stage                        eters of CUDA graphs. The kernel parameters fall into
+precede the capturing stage. Second, the model weights load-                      two categories, including the constants, e.g., 4-byte integers,
+ing involves disk I/O, which could be executed in parallel                        and the data pointers, e.g., the address of the input and out-
+with the other stages, i.e., the tokenizer loading (CPU in-                       put buffers. The constants remain unchanged in the CUDA
+volves) and KV cache initialization (CPU + GPU involves)                          graph between different launches, so it is straightforward
+stages. However, our analysis reveals that it is insufficient to                  to materialize and restore them. However, the data point-
+fully conceal the latencies of the two stages. As illustrated                     ers require more sophisticated considerations since there is
+in Figure 2, for 60% of the models, the model weights load-                       no guarantee that cudaMalloc() returns the same address
+ing stage does not fully cover the combined latency of the                        across different cold starts. Such non-determinism requires
+tokenizer loading and KV cache initialization stages1 .                           us to amend the data pointers in the restored CUDA graph
+Deferring the capturing stage is ineffective. Instead of                          nodes to the correct address which hold the required data of
+capturing all CUDA graphs for different batch sizes in the                        the kernel parameters.
+loading phase, we could defer this process until serving infer-                   Challenge II: Randomized and even hidden kernel ad-
+ence requests. This involves running warm-up and capturing                        dress of CUDA graphs. In the offline phase, we can get a
+CUDA graphs of a given batch size when serving the corre-                         CUDA graph after capturing and inspecting the kernel ad-
+sponding request batches. However, this method does not                           dress in the graph nodes’ information. However, the address
+fundamentally eliminate the capturing latency; it merely de-                      is subject to change since the process address space is ran-
+lays and disperses it across different requests in the inference                  domized in every launch. So, instead of saving the kernel
+serving phase.                                                                    address in the offline phase, Medusa materializes the kernel’s
+                                                                                  mangled names. During the online phase, we can load the
+                                                                                  kernel mangled names, and traverse the symbols tables of
+2.5 Our Approach and Challenges                                                   dynamic-link libraries to locate the corresponding kernel
+                                                                                  address. However, it does not always work since not every
+To reduce the latency of the KV cache initialization stage
+                                                                                  kernel is present in the symbol tables. For example, we find
+and the capturing CUDA graphs stage, we identify the long
+                                                                                  that cuBLAS kernels can not be found in the symbol table of
+latency is attributable to the dynamic profiling or construc-
+                                                                                  the cuBLAS libraries.
+tion in the runtime. Specifically, the KV cache initialization
+acquires the available free GPU memory space through a
+dynamic profiling forward; the capturing stage requires mul-                      3   Medusa: Design Overview
+tiple model forwarding to construct the CUDA graphs. To
+                                                                                  To accelerate the serverless LLM inference cold start, we
+mitigate the overhead incurred by runtime dynamic opera-
+                                                                                  propose Medusa to reduce the overhead of the KV cache
+tions, we propose to materialize the size of the available free
+                                                                                  initialization and capturing CUDA graphs in the runtime by
+                                                                                  materializing and restoring the CUDA graphs.
+1 Note that the breakdown shows the vanilla time series where the loading            Medusa includes two phases: offline phase and online
+weights stage is synchronously executed.                                          phase. The goal of the offline phase is to materialize the
+
+
+
+                                                                            657
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                            Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+                                            Offline phase                                                            Online phase
+                     Capturing stage                                     Analysis stage
+
+   # capture the CUDA graph                 KV cache            Indirect index pointer table         Replay (de)allocations              Restored
+   graph = torch.cuda.CUDAGraph()
+   with torch.cuda.graph(graph):         Available free          params idx <-> alloc idx             Alloc                             CUDA graph
+                                                                 params idx <-> alloc idx             Free
+     output = model(input)               GPU memory                                                   Alloc
+                                                                 params idx <-> alloc idx
+                                                                                                      …
+
+
+
+       Launching &                                  Offline-online Cooperated Parameters Restoration(§4)
+   buffer (de)allocations
+     Alloc
+                                                                    Kernels names table                        Node info
+     Launch kernel                          Node info                                                                                    KV cache
+                                                                 Node idx <-> kernel name                     params ptr
+     Free
+                                                                 Node idx <-> kernel name                     kernel ptr              Available free
+     Alloc                                 params ptr
+     Launch kernel                                               Node idx <-> kernel name                                             GPU memory
+                                           kernel ptr
+     …
+                                                                                                                               Materialization of
+                                                   Triggering Kernels Enhanced Kernel Address Restoration (§5)             KV Cache Initialization (§6)
+
+
+                                                        Figure 5. Overview of Medusa.
+
+KV cache initialization and CUDA graphs, and the online                          to load their modules, which contains the kernels we need to
+phase is a cold start where Medusa restores the previously                       restore the CUDA graph. Medusa then uses the materialized
+materialized KV cache initialization and CUDA graphs in-                         kernel’s name to traverse the modules and restore the correct
+stead of dynamically profiling or constructing them. Notably,                    kernel address.
+the offline phase is executed only once for each unique com-                     Workflow. As shown in Figure 5, the offline phase further
+bination of <GPU type, model type>.                                              splits into two stages, capturing stage and analysis stage.
+Key ideas. To overcome the indeterminacy of data pointers                        In the capturing stage, Medusa captures the CUDA graphs
+in parameters (Challenge I ), we observe that, compared with                     via a model forwarding, during which Medusa intercepts
+the non-deterministic nature of data pointers, the control                       the kernel’s launching as well as the buffer (de)allocation se-
+flow exhibits strict determinism. Each time an inference ser-                    quence for further analysis. At the end of the capturing stage,
+vice starts, the control flow follows a strict order defined by                  Medusa saves the CUDA graphs information including the
+the user’s code – first allocate data buffers for storing the                    nodes and the dependencies. In this stage, Medusa also per-
+data, e.g., the model parameters, and then launches the ker-                     forms a profiling forwarding to materialize the KV cache
+nels based on the returned address of the buffers, i.e., the data                initialization by saving the available free GPU memory.
+pointers. In terms of the data buffer allocations, the control                      In the analysis stage, Medusa materializes the CUDA
+flow would also allocate each layer’s data buffers in order,                     graphs by synthesizing the output of the capturing stage, i.e.,
+due to the layers being initialized sequentially. Such a deter-                  the kernels’ launching and the buffer allocation sequence, as
+ministic control flow forms a strong correlation between the                     well as each node’s information. The analysis process finds
+data pointers and the buffer allocation sequence, i.e., the 𝑖-th                 the correlation between the pointers of the parameters and
+data pointer is returned by the 𝑖-th buffer allocation.                          the corresponding index in the buffer allocation sequence,
+   Leveraging this property, Medusa introduces an interme-                       and records such correlation in the indirect index pointer
+diate representation, called the indirect index pointer (§4.1),                  table, which could be used in the online phase to restore
+which points to the index in the buffer allocation sequence.                     the pointers of parameters (§4). Also, Medusa uses kernels
+For example, if a pointer is returned by the 𝑖th buffer allo-                    name table to record the node’s kernel name, which could
+cation, its corresponding indirect index pointer is 𝑖. In the                    be used to restore the kernel’s address (§5).
+online phase, Medusa replays the buffer (de)allocation2 se-                         During the cold start (online phase), Medusa loads the ma-
+quence and restores the buffer pointers address in the CUDA                      terialized CUDA graphs, and restores them to the ready-to-
+graph nodes using these indirect index pointers. Given an                        execute ones. Medusa first replays the buffer (de)allocation
+indirect index pointer 𝑖, Medusa uses the address returned                       sequence and records the returned addresses. For the point-
+by the 𝑖-th buffer allocation as the pointer and restores it to                  ers of parameters, Medusa leverages the indirect index pointer
+the CUDA graph nodes. Medusa also introduces a copy-free                         table to find the corresponding pointers returned by the
+buffer contents restoration (§4.3) to reduce the overhead of                     buffer allocations, and fills them to the CUDA graph node’s
+restoring the buffer contents.                                                   parameters. For the kernels’ address, Medusa uses triggering-
+   To overcome the randomized and even hidden kernel ad-                         kernels to force the module loading, and leverage the kernels’
+dresses (Challenge II ), Medusa leverages triggering-kernels (§5)                name to match the corresponding address. Worth noticing,
+to trigger the loading of kernels by forcing the CUDA driver                     the dependencies could be restored with the information
+2 Buffer deallocation is also replayed to prevent GPU memory overflow.
+
+
+
+
+                                                                           658
+Medusa: Accelerating Serverless LLM Inference with Materialization                         ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+ A = cudaMalloc(4096) --- i th                                                   index pointer table in the offline phase and restores the pa-
+                                    False Indirect index pointer table
+ cudaFree(A)                       positive Some_kernel parameters               rameters with the help of the indirect index pointer table in
+ A = cudaMalloc(4096) --- i+1 th            index of A <->                       the online phase.
+                                            allocation index i
+ Launch_some_kernel( A )
+       Actual indirect index pointer: i+1                                        4.1 Indirect Index Pointers Analysis
+                                                                 Offline         In the offline phase, Medusa analyzes and transforms all
+                   A = cudaMalloc(4096) --- i th                 Online          data pointers to their corresponding index in the allocation
+                   cudaFree(A)                                                   sequence, i.e., indirect index pointers. To do so, Medusa
+                                                                                 intercepts all allocation calls, and records the returned ad-
+                   B = cudaMalloc(4096) --- i+1 th
+                                                                                 dresses. Given a data pointer in kernel parameters, Medusa
+                    Launch_some_kernel( A )
+                                                                                 searches it in the returned addresses to find a match, and
+                   correct: Launch_some_kernel( B )                              then materializes it as the indirect index pointer.
+                                                                                    Note that simply matching data pointers may cause false
+Figure 6. A false positive example (in blue), and the correct                    positives. Multiple matches could be found since the buffers
+one (in red) in indirect index pointers substitution.                            could be allocated and deallocated multiple times, and the
+                                                                                 following allocation may return the same address which is
+                                                                                 deallocated before, resulting in a false positive as matching
+                                                                                 the wrong indirect index.
+of the source node’s index and the destination node’s in-                           As shown in Figure 6, in the offline phase, the 𝑖-th and
+dex, which have already been saved during the offline phase.                     (𝑖 + 1)-th allocations return the same address ‘A’. Then,
+Medusa also accelerates KV cache initialization by restoring                     ‘some_kernel’ uses the (𝑖 + 1)-th returned address ‘A’ as
+the pre-saved available free GPU memory space (§6), hence                        its parameter. Given the kernel’s parameter ‘A’, since there
+eliminating the profiling forwarding in the online phase.                        are two matches in the allocation sequence, false positive
+                                                                                 indirect index pointers to 𝑖 would cause data corruptions as
+4    Offline-online Cooperated Parameters                                        follows. In the online phase, since the allocation returned
+     Restoration                                                                 address in a non-deterministic way, the 𝑖-th allocation may
+                                                                                 differ from the (𝑖 + 1)-th allocation, i.e., ‘A’ and ‘B’ respec-
+The kernel’s parameters fall into two categories: constants
+                                                                                 tively. However, the false positive indirect index pointer
+and data pointers. Constants, for example, are 4-byte integers.
+                                                                                 would restore the data pointer to the 𝑖th allocation returned
+Data pointers are 8-byte values that point to the buffers the
+                                                                                 address ‘A’, resulting in data corruptions.
+kernel accesses during execution. The constants and data
+                                                                                 Trace-based indirect index pointers analysis. We ob-
+pointers can be easily distinguished, as the pointers are 8
+                                                                                 serve that, although the buffers are allocated and deallocated,
+bytes long and usually begin with a high address prefix.
+                                                                                 the kernels would always use the allocated buffers before
+However, since the high address prefix may also contain
+                                                                                 they have been deallocated. So, Medusa further intercepts
+false positive candidates (which are rare), Medusa validates
+                                                                                 the cudaLaunchKernel() to analyse along with the alloca-
+and corrects these exceptions afterwards. To validate, we run
+                                                                                 tion sequence in the offline phase. With the sequence of the
+a model forwarding and compare the outputs of the original
+                                                                                 allocation and cudaLaunchKernel(), Medusa matches the
+and speculative versions of CUDA graphs. Medusa can then
+                                                                                 pointers address of a kernel backwards from its correspond-
+validate the speculations and report errors when the results
+                                                                                 ing cudaLaunchKernel(), and records the first match as the
+mismatch.
+                                                                                 indirect index pointers. Note that, the pointer addresses are
+   To materialize and restore constants, we directly save
+                                                                                 matched when the addresses are identical or within the range
+their plain values, and restore them in the online phase. In
+                                                                                 of the allocated buffer.
+contrast, materialize and restore data pointers is non-trivial,
+as the data pointers recorded in the CUDA graph node are
+subject to change across different cold starts due to the non-                   4.2 Replaying-Based Data Pointers Restoration
+deterministic addresses returned by malloc. Consequently,                        In the online cold start phase, Medusa restores the data
+simply using the data pointers materialized in the offline                       pointers based on the indirect index pointers. The online
+phase would lead to invalid memory access. We observe                            phase follows an identical control flow as in the offline phase,
+that, the deterministic control flow forms a strong corre-                       except it eliminates CUDA graph capturing. Thus, Medusa
+lation between the data pointers and the buffer allocation                       replays the buffer allocation (and deallocation) sequence and
+sequence. We propose to use the indirect index pointers, i.e.,                   records all the returned addresses. Then, for a given kernel,
+the corresponding index in the allocation sequence. Medusa                       Medusa leverages the indirect index pointers to obtain the
+employs an offline-online cooperative parameters restora-                        corresponding correct pointer addresses and fills them into
+tion approach, which analyzes and constructs an indirect                         the CUDA graph node.
+
+
+
+                                                                           659
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                  Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+4.3 Copy-Free Buffer Contents Restoration                               library, then use dlsym() to get its function handler. Finally,
+Besides restoring the pointers, Medusa should also make                 we use cudaGetFuncBySymbol() to load it.
+sure the buffer’s contents are restored correctly. The intu-               Most of the kernels (e.g. 69.2% in the Llama2 13B with
+itive is dumping all the buffer pointed by the CUDA graph               the batch size of 1) can be restored in such a way. However,
+nodes’ parameters in the offline phase and restoring them by            there are kernels whose addresses cannot be found in the
+reading and copying in the online phase. However, saving the            dynamic-link library. For example, we find kernels in the
+buffer contents of every pointer is both expensive and unneces-         cuBLAS library can not be found by in the symbol table of
+sary. There are two types of buffers whose contents could               the dynamic-link libary (dlsym()). These kernels are close-
+be skipped from saving and restoration. First, the buffers of           source and are somehow hidden by not being shown in the
+model parameters contain the model weights loaded from                  symbol tables.
+the storage before capturing the CUDA graphs, so there is                  Instead, we resort to another way to find their kernel ad-
+no need to save these buffers again. Second, the temporary              dress by traversing the module. The module is a set of kernels,
+buffers are allocated to store the intermediate results between         and the CUDA driver loads kernels in the granularity of the
+several kernels, and would be deallocated after the relevant            module, i.e., when loading a specific kernel, the CUDA driver
+kernels are finished. These temporary buffers could also                would load the whole module containing the specific kernel
+be discarded since the contents are managed by the CUDA                 as well as others within the module. As a result, by traversing
+graph’s kernels automatically. Identifying the model param-             a module, we can resolve multiple kernels’ addresses at a time.
+eters buffers and temporary buffers to skip their contents              Specifically, we utilize cuModuleEnumerateFunctions() to
+restoration could greatly reduce the cost of data transfer.             enumerate all kernel addresses within the module. Subse-
+   Medusa identifies model parameters buffers with the                  quently, we employ cuFuncGetName() to retrieve each ker-
+following observation: the model parameters are already                 nel’s name and compare it with the target kernel’s name.
+prepared before capturing the CUDA graphs. As a result,                 Upon finding a match, we get the corresponding kernel’s
+Medusa filters the pointers of model parameters out if they             address and record it in the CUDA graph node for kernel
+are allocated before the CUDA graphs capturing.                         address restoration.
+   Medusa identifies temporary buffers by leveraging the                   In order to trigger the module loading, Medusa leverages
+self-replaying characteristics of the CUDA graphs. The ker-             triggering-kernels. There are some kernels within the target
+nels in the CUDA graph automatically read from and write                module which contain the target kernels we want to resolve.
+to the buffers using recorded pointers. Consequenctly, if the           Once the triggering-kernels are executed by the CUDA driver,
+buffers are deallocated after replaying is finished, it indi-           they force the CUDA driver to load the module we want, and
+cates that their contents can be discarded and will not be              then we can enumerate all kernels in the module and get
+accessed in subsequent CUDA graph replays. This character-              the target kernel address by comparing the kernel names. At
+istic distinguishes temporary buffers from permanent buffers            last, we fill the kernel address to the corresponding CUDA
+used across different launches of CUDA graphs. Temporary                graph nodes.
+buffers can be identified if they are deallocated after cap-
+turing. In practice, we find that only 9.0% kernels require
+                                                                        5.1 Handwriting triggering-kernels
+permanent buffers. Each of these kernels needs two perma-
+nent buffers, with each buffer contains only 4 bytes holding            At first, we manually find triggering-kernels (usually matrix
+a magic number for launching. Therefore, restoring only the             multiplication). For example, we find a certain kind of matrix
+contents of the permanent buffers can significantly reduce              multiplication can trigger to load the module which contains
+the overhead.                                                           several cuBLAS kernels in the CUDA graph nodes. This sim-
+                                                                        ple method works well at first. It requires less than five ker-
+                                                                        nels to trigger the loading of all the modules a CUDA graph
+                                                                        needs. However, such human efforts become unacceptable
+5    Triggering-Kernels Enhanced Kernel                                 because, it requires finding some new trigging kernels given
+     Address Restoration                                                different batch sizes, which makes us resort to a smarter way
+The goal of kernel address restoration is to fill the correct           to trigger the module loading.
+kernel addresses into CUDA graph nodes. These kernel ad-
+dresses can vary across different cold starts; therefore, Medusa
+uses the kernels’ mangled names for materialization and                 5.2 First layer as triggering-kernels
+restoration. In the offline phase, Medusa materializes the              We find that the first layer of models is inherently a triggering-
+kernels’ mangled names and construct a mapping between                  kernel. Most of the LLM models are composed of multiple
+each kernel’s mangled name and its dynamic-link library. In             structurally identical layers. For example, Llama2 13B has
+the online phase, given the materialized kernel’s mangled               40 layers, each containing the same kernels and some size
+name and its dynamic-link library, we first dlopen() the                of the input and output buffers. This feature inspires us that
+
+
+
+                                                                  660
+Medusa: Accelerating Serverless LLM Inference with Materialization                               ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+                           Table 1. Models and their parameter sizes as well as the number of CUDA graph nodes.
+
+                                 Falcon   Llama2 Llama2 Qwen1.5 Qwen1.5 Qwen1.5 Qwen1.5 Qwen1.5                                         Yi         Yi
+                  model
+                                   7B       7B        13B       0.5B            1.8B              4B           7B           14B         6B         9B
+
+              parameter size     13.4GB   12.6GB     24.2GB    1.2GB          3.4GB              7.4GB       14.4GB       26.4GB      11.3GB    16.4GB
+       CUDA graph nodes          14406     12518     16150     9118            9550              16150        12902       16350       12902      19318
+
+
+
+                                              vLLM                   vLLM + async                   Medusa
+                                                                               6
+
+              4
+
+
+
+
+                                                                           Latency (s)
+Latency (s)
+
+
+
+
+                                                                                         4
+
+              2                                                                          2
+
+              0                                                                          0
+                  Fa     L   L      Q      Q     Q   Q     Q    Y   Y                         Fa     L   L     Q       Q     Q      Q   Q    Y   Y
+                     lco lam lam wen wen wen wen wen i 6B i 9B                                   lco lam lam wen wen wen wen wen i 6B i 9B
+                        n 7 a2    a2      1.    1.  1.
+                                            50 51 54 57 511.   1.                                   n 7 a2    a2      1.    1.     1.
+                                                                                                                        50 51 54 57 51 1.   1.
+                           B   7B    13                                                                B   7B    13
+                                        B     .5B .8B B      B    4B                                                B     .5B .8B B       B    4B
+                                   (a) Loading phase time                                                          (b) Cold start time
+
+                                           Figure 7. Overall loading phase time and cold start time.
+
+the kernels of the first layer are inherent in the triggering-                   memory space. In the offline phase, Medusa runs a profiling
+kernels, which could relieve us of the labour of finding the                     forwarding and records the available free GPU memory. In
+suitable triggering-kernels manually.                                            the online phase, Medusa directly take the offline recorded
+   We now describe how we leverage the first layer kernels as                    value as available free GPU memory, hence eliminating the
+the triggering-kernels to enhance our kernel address restora-                    runtime dynamic profiling overhead.
+tion process. During the online phase, we run and capture
+the first layer of the model, which is fast compared with cap-
+turing the whole model forwarding since it only accounts
+for a small proportion of the whole model (e.g., only 1/40
+in Llama2 13B). After the CUDA graph of the first layer has
+been built, we enumerate all the CUDA graph nodes to get                          7          Evaluation
+the kernel’s corresponding address. Based on these addresses,                    Platform setup. We use one server equipped with 4 A100-
+we can fill all kernel addresses in the CUDA graph nodes                         40GB SXM4 GPUs interconnected via NVLink. The host has
+since the kernels are repetitive in the following layers.                        2 AMD EPYC 7642 CPUs and 256GB DDR4 memory. Storage
+                                                                                 devices include 4 Optane P5800X SSDs (400GB each). The
+                                                                                 software environment includes PyTorch 2.2.0 and CUDA
+6             Materialization of KV Cache                                        version 12.4. While application trace experiments utilize all
+              Initialization                                                     4 A100 GPUs, other experiments are conducted on a single
+The KV cache initialization requires the available free GPU                      A100 GPU.
+memory to reserve a continuous buffer for the KV cache. In                       Compared strategies.
+the vanilla implementation of vLLM [23], this is achieved                        • vLLM [23] is an efficient inference framework that man-
+through dynamic profiling forwarding at runtime. Notably,                          ages KV cache at the granularity of blocks to reduce mem-
+the "continuous" in this context refers to "a continuous chunk                     ory fragmentation. Each stage in the loading phase of
+of GPU buffer." The KV blocks are still managed as sep-                            vLLM operates in a synchronized manner.
+arate "block bases" and reside within the continuous KV                          • vLLM + async represents the vLLM plus naive asynchro-
+cache buffer, which is exactly the default implementation in                       nous model weights loading. The model weights loading
+vLLM [23].                                                                         stage is asynchronous with the tokenizer loading stage and
+   We now present how to reduce the latency of the KV cache                        the KV cache initialization stage.
+initialization stage through materialization. The invariance                     • Medusa enables all optimizations including the material-
+here is that given the same model and GPU type, the profiling                      ization of CUDA graphs, and the materialization of the KV
+forwarding would result in the same available free GPU                             cache initialization.
+
+
+
+                                                                        661
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands              Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+7.1 Models
+                                                                            0.85s           0.39s 0.21s      0.50s          0.90s
+We use 10 popular LLM models from huggingface [46], in-                  Init model      Load model Load        Init        Capture
+cluding Falcon [6], Llama2 [49], Qwen1.5 [47], and Yi [56]. Ta-           structure        weights tokenizer KV cache        phase    2.85s
+ble 1 shows their parameter sizes and the total number of the                                       (a) vLLM
+CUDA graph nodes with 35 different batch sizes. Capturing                      Load                              Init
+CUDA graphs of 35 different batch sizes is a default strategy                tokenizer    0.21s   0.52s        KV cache
+as in vLLM [23], and we keep it in all experiments.
+                                                                           0.85s            0.47s   bubble         0.90s
+                                                                         Init model      Load model               Capture  2.48s
+7.2 Overall Performance                                                   structure        weights                 phase
+We evaluate the loading phase latency using three different                                    (b) vLLM + async
+strategies in Figure 7(a), and the overall cold start latency
+in Figure 7(b). We make the following observations.                             Load          Init
+                                                                              tokenizer   KV cache       Warm-up
+    First, Medusa can reduce the loading phase latency effec-                               0.02s
+                                                                                0.23s                      0.31s
+tively (Figure 7(a)). The average loading phase latency reduc-
+tion is 42.5% compared with vLLM, and 34.4% compared with
+vLLM + async. This demonstrates that the naive asynchro-                   0.85s          0.42s        0.26s
+                                                                        Init model      Load model       Restore 1.67s
+nous model weight loading is limited in the aspect of hiding             structure        weights     CUDA graph
+all the latency. Instead, Medusa further enables the mate-                                       (c) Medusa
+rialization of the CUDA graph, which reduces the latency
+of the capturing stage (including warm-up and capturing                        Figure 8. Breakdown of different strategies.
+forwarding). Medusa also employs the materialization of
+KV cache initialization to eliminate the dynamic profiling of
+available GPU memory to allocate KV cache. By reordering            phase (including the warm-up and capturing forward) takes
+the KV cache initialization stage before the model weights          0.9 seconds.
+loading stage, Medusa also makes the warm-up of the cap-               With the naive asynchronous weight loading (Figure 8(b)),
+turing stage be executed in parallel with the model weights         the model weights loading is asynchronous with the tok-
+loading stage, further reducing the loading phase latency.          enizer loading as well as the KV cache initialization, reducing
+    Second, by reducing the latency of the loading phase,           the latency of loading phase by 13.0% compared with vLLM.
+Medusa can reduce the overall cold start latency effectively ( Fig- We make two observations here.
+ure 7(b)), with 34.9% on average. The loading phase consti-            First, model weights loading and the KV cache initializa-
+tutes the predominant portion of the overall cold start latency.    tion exhibit mutual interference, increasing longer latency in
+As a result, by reducing the overhead of the loading phase,         model weights loading stage, i.e., 0.08 seconds. We observe
+Medusa eventually reduces the overall latency.                      similar interference as in other model’s. The reason is that
+    Third, Medusa is effective across different types of models     the KV cache initialization requires a profiling forwarding
+with different parameter sizes. Among all models, Medusa            with the maximum sequence length and the maximum batch
+demonstrates the most significant latency reduction when            sizes, during which, we find 3 that some of the asynchronous
+applied to Llama2 13B, with 42.9% compared with vLLM. The           CUDA memory copies issued by the model weights loading
+least latency reduction is observed in Qwen1.5 0.5B, which          stage are blocked.
+is 21.1% compared with vLLM.                                           Second, the model weights loading stage could not cover
+                                                                    all of the tokenizer loading and the KV cache initialization
+                                                                    stages, leaving a 0.26 seconds bubble. We also confirm that 6
+7.3 Breakdowns of Medusa                                            out of 10 models have such bubbles. This demonstrates the
+To better understand the benefit of our designs, we measure         naive asynchronous execution could not hide all the latency.
+the latency of each stage in the loading phase and report              Medusa further reduces the loading phase latency as
+them in Figure 8. The example model is Qwen1.5 4B, with             shown in Figure 8(c) in the following two ways. First, Medusa
+the total model parameters size of 7.4GB.                           enables the materialization in the KV cache initialization
+    Figure 8(a) shows the latency breakdown of vLLM, where          stage and CUDA graph capturing stage. As a result, the la-
+each phase is executed in a synchronous manner. The total           tency of KV cache initialization stage is greatly reduced since
+latency is 2.85 seconds. The model structure initialization         the profiling forward is eliminated, i.e. from 0.50 seconds
+stage takes 0.85 seconds, followed by the model weights             to 0.02 seconds. With the materialization of CUDA graphs,
+loading stage of 0.39s. After the model weights loading stage,      Medusa reduces the capturing stage from 0.90 seconds to
+it takes 0.21 seconds to load the tokenizer, and another 0.50
+seconds to initialize the KV cache. At last, the capturing          3We use Nsight Systems tool, which is provided by NVIDIA.
+
+
+
+
+                                                                  662
+Medusa: Accelerating Serverless LLM Inference with Materialization                                      ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+                       capture stage    analysis stage                                                            vLLM                   w/o CUDA graph
+       60                                                                                                         vLLM + async           Medusa
+                                                                                         1.0                                           1.0
+Time (s)
+
+
+
+
+       40                                                                                                               1.00                                    1.00
+                                                                                         0.8                                           0.8
+                                                                                         0.6                            0.98           0.6                      0.98
+
+
+
+
+                                                                           CDF
+
+
+
+
+                                                                                                                                 CDF
+       20                                                                                                               0.96
+                                                                                         0.4                                           0.4                      0.96
+                                                                                                                        0.94
+           0                                                                             0.2                                           0.2
+               Fa     L   L      Q       Q    Q   Q  Q   Y   Y                                              1   2    3                            1     2    3
+                  lco lam lam wen wen wen wen wen i 6B i 9B                                0                                             0
+                     n 7 a2     a2      1.5 1.5 1.5 1.5 1.5                                    0           1      2      3                 0      1       2       3
+                        B   7 B    1 3B    0.5 1.8 4B 7B 14
+                                              B   B         B                                                Latency (s)                            Latency (s)
+                                                                                                      (a) RPS=2, Llama2 7B                   (b) RPS=2, Qwen1.5 4B
+                                                                                         1.0                                           1.0
+                  Figure 9. Overhead of offline phase.
+                                                                                         0.8                            1.00           0.8                            1.00
+                                                                                                                        0.98                                          0.98
+                                                                                         0.6                            0.96           0.6                            0.96
+
+
+
+
+                                                                           CDF
+
+
+
+
+                                                                                                                                 CDF
+                                                                                                                        0.94                                          0.94
+                                                                                         0.4                            0.92           0.4
+                                                                                                                        0.90                                          0.92
+                                                                                         0.2                                           0.2                            0.90
+0.57 seconds. This is because Medusa only needs to warm up                                                1   2     3                                1    2       3
+                                                                                           0                                             0
+and capture the first layer of the model, while the warm-up                                    0         1     2      3    4                 0       1    2      3
+and capturing of subsequent layers can be skipped, as we                                                    Latency (s)                              Latency (s)
+                                                                                                      (c) RPS=10, Llama2 7B                  (d) RPS=10, Qwen1.5 4B
+can restore their CUDA graphs from materialization. This
+optimization reduces the capturing stage latency from 0.90                 Figure 10. 99th-percentile tail latency of time to first to-
+seconds to 0.57 seconds. Second, by reducing the KV cache                  ken (TTFT) under different RPS with real-world traces.
+initialization stage, Medusa gains the opportunity to exe-
+                                                                                                                  vLLM                           w/o CUDA graph
+cute the warm-up asynchronously with the model weights                                                            vLLM + async                   Medusa
+loading stage, further reducing overall latency. In summary,                                                                             3
+                                                                           99th Latency (s)
+
+
+with the materialization of KV cache initialization and CUDA                                  3
+                                                                                                                                         2
+graphs, Medusa successfully reduces the bubble within the                                     2
+asynchronous execution, reducing the latency by 41.4% com-                                    1                                          1
+pared with vLLM, and 32.7% compared with vLLM + async.                                        0                                          0
+                                                                                                  0    1 2 3 4 5 6                           0 1 2 3 4 5 6 7 8
+                                                                                                        Throughput (RPS)                        Throughput (RPS)
+7.4 Offline Phase Overhead Analysis                                                                       (a) Llama2 7B                          (b) Qwen1.5 4B
+We now demonstrate the overhead associated with the offline
+phase. The offline phase consists of the capturing stage and               Figure 11. 99th-percentile tail latency of TTFT under differ-
+analysis stage. In the capturing stage, Medusa runs a cold                 ent system overall throughput.
+start process to record the memory space for allocating the
+                                                                              We leverage a pool of warm execution environments which
+KV cache block. Most importantly, Medusa captures the
+                                                                           have loaded the user codes and Python packages as the state-
+CUDA graphs for multiple batch sizes and materializes them
+                                                                           of-the-art works [2, 33, 34], so the runtime initialization is
+in the analysis stage.
+                                                                           eliminated, and the time required to launch an inference
+    Figure 9 shows the breakdown of offline phase. It takes
+                                                                           serving instance is equal to the duration of the loading
+39.2 seconds on average to perform an offline phase including
+                                                                           phase. Since cold starts primarily affect the time to first to-
+a capturing stage and an analysis stage. The duration of the
+                                                                           ken (TTFT), we collect the TTFT and overall system through-
+capturing stage is relatively constant, with an average of
+                                                                           put as the metrics. To understand the performance without
+9.7 seconds. The analysis stage needs to analyse 35 different
+                                                                           CUDA graph, we add a new compared strategy w/o CUDA
+CUDA graphs, accounting for a major part of the offline
+                                                                           graph. In this strategy, we remove the capturing stage in
+phase. In summary, the offline phase incurs relatively low
+                                                                           the cold start process, and the other parts of the cold start
+overhead, requiring less than one minute to complete.
+                                                                           process follows the same as in vLLM. While this strategy
+                                                                           reduces the cold-start latency, it comes at the cost of sub-
+7.5 Application Traces                                                     sequent inference serving being unable to benefit from the
+We further evaluate Medusa using real-world workloads. We                  acceleration provided by the CUDA graphs. We evaluate
+use the ShareGPT dataset [48] as the real-world trace, which               all the strategies with two models, namely Llama2 7B and
+contains a collection of user-generated interactions with                  Qwen1.5 4B.
+ChatGPT. The user request arrival pattern follows a Poisson                   As shown in Figure 10, Medusa can reduce the tail la-
+distribution, and we vary the requests per second (RPS),                   tency of TTFT under all settings. For example, in Figure 10(a),
+using values of 2 and 10, to simulate the different levels of              Medusa reduces the 99th-percentile latency by 50.5% com-
+frequency.                                                                 pared with vLLM. Similarly, in Figure 10(b), Medusa achieves
+
+
+
+                                                                     663
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                     Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+a 53.0% reduction compared with vLLM. This is because                     cases as a single 40GB A100 GPU can support Llama2 13B
+Medusa can reduce the latency of cold start, and hence                    or smaller models. Regarding multi-GPU support, Medusa’s
+shortens the request waiting time in the pending queue,                   core concepts remain applicable, particularly regarding KV
+eventually resulting in a shorter tail latency of TTFT. We                cache and CUDA graph materialization. One potential future
+also observe similar results when changing the model to                   exploration is constructing the indirect index pointer table
+Qwen1.5 4B.                                                               across multiple GPU instances. We make it future work.
+   Compared with w/o CUDA graph, Medusa achieves
+lower 99th-percentile tail latency for two reasons. First, the            9    Related Work
+end-to-end cold start latency of w/o CUDA graph is longer
+                                                                          Serverless ML inference systems. There are lots of ex-
+than Medusa. Simply removing the capturing stage fails
+                                                                          isting works [3, 4, 12, 24, 39, 55, 58, 59] aim to optimize
+to achieve the same latency as Medusa’s, because the KV
+                                                                          the throughput of serverless ML inference through requests
+cache initialization stage still accounts for a significant part.
+                                                                          batching or scheduling. Medusa differs from these works
+Instead, Medusa also reduces the KV cache initialization
+                                                                          by concentration on reducing the overhead associated with
+latency by materialization. Second, removing the CUDA
+                                                                          cold start. Phantom [14] is a recent work proposed to re-
+graphs results in increased latency for serving user requests,
+                                                                          duce the startup latency through fast model weights loading
+which also hurts the tail latency.
+                                                                          and locality-driven migration. However, it overlooks two
+   We incrementally increase the RPS to simulate more fre-
+                                                                          critical stages in the cold start process: KV cache initializa-
+quent client interactions and monitor two key performance
+                                                                          tion stage and CUDA graph capturing stage. Medusa, in
+metrics: the system’s overall serving throughput and the cor-
+                                                                          contrast, specifically addresses and optimizes the latency of
+responding 99th-percentile TTFT tail latency. The results are
+                                                                          these stages through materialization.
+shown in Figure 11. Across all tested scenarios, Medusa con-
+                                                                          Optimizations for serverless cold start. A line of works [2,
+sistently achieves the lowest tail latency compared to other
+                                                                          15, 25, 27, 34, 40, 42, 57] focuses on speeding up the cold start
+approaches. At lower request rates, the tail latency remains
+                                                                          of serverless through a set of warm containers. The warm
+relatively low for all systems, as a single inference serving
+                                                                          containers have already undergone some runtime initializa-
+instance can adequately handle the client’s requests without
+                                                                          tion, e.g., the codes or Python packages have been loaded,
+launching additional instances. As the request rate increases,
+                                                                          which turns a cold start into a warm start, thus reducing
+we observe a rise in tail latency across all approaches, at-
+                                                                          the latency. MITOSIS [54] argues that pre warm-up con-
+tributed to the latency involved in launching new inference
+                                                                          tainers may not be sufficient to serve bursty requests, so
+serving instances to meet the growing demand. Medusa
+                                                                          it proposes to leverage remote forking to reduce the cold
+outperforms the compared strategies (Figure 11(a)). When
+                                                                          start latency. These works focus on eliminating the runtime
+the system’s overall serving throughput is around 4.5 QPS
+                                                                          initialization (such as VMs or containers), instead, Medusa
+with Llama2 7B, the 99th-percentile tail latency of Medusa
+                                                                          focuses on the loading phase, and is orthogonal to those
+is 43.0%, 29.9%, and 27.0% lower than vLLM, vLLM + async,
+                                                                          of works. Optimus [19] proposes to accelerate the model
+and w/o CUDA graph, respectively. Subsequently, when the
+                                                                          structure initialization stage by transforming an existing
+request rate exceeds the system’s processing capacity, the tail
+                                                                          model with a similar structure in warm containers. On the
+latency increases as the queueing time becomes dominant.
+                                                                          other hand, Medusa focuses on optimizing other parts in
+                                                                          the loading phase, i.e., KV cache initialization and CUDA
+8    Discussion                                                           graphs capturing.
+                                                                             Another line of works propose to accelerate cold start
+Device-side memory allocations and indirect pointers.
+                                                                          through checkpoint and restore [8, 10, 13, 18, 43, 50, 52]. They
+Memory allocations may occur within kernels (device-side),
+                                                                          persist the complete states of a already launched instance
+and data pointers could be indirect, such as pointers to arrays
+                                                                          into storage as checkpoints, and restore the checkpoints
+of pointers, complicating parameter restoration. Currently,
+                                                                          when a new invocation arrives. By leveraging checkpoints,
+Medusa only intercepts allocations from host-side APIs and
+                                                                          the cold start latency could be shortened since once the
+handles direct pointers exclusively. Our empirical analysis of
+                                                                          restoration finished, the instance is ready to serve. Instead
+10 models (comprising 139,364 CUDA graph nodes) revealed
+                                                                          of taking a full checkpoint of the instance, Medusa only
+no instances of device-side allocations or indirect pointers in
+                                                                          materializes the CUDA graphs and the information needed
+CUDA kernels. Despite their rarity, we maintain validation to
+                                                                          by the KV cache initialization, which is more lightweight
+ensure correctness (§4). Simple solutions could be employed
+                                                                          and could be combined with these previous works.
+to address these potential issues in future work; for example,
+intercepting device-side allocations could be implemented
+by adding a pass during compilation.                                      10     Conclusion
+Multi-GPU support. Currently, Medusa supports the mod-                    This paper introduces Medusa, which mitigates cold start
+els that fit on a single GPU, which covers a wide range of use            latency in serverless LLM inference by materializing KV
+
+
+
+                                                                    664
+Medusa: Accelerating Serverless LLM Inference with Materialization                     ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+cache initialization and CUDA graphs. Its core concept can                 A.4    Installation
+be generalized to other scenarios where dynamic profiling                  Run command MAX_JOBS=32 python setup.py develop to install
+and construction can be eliminated through materialization.                Medusa.
+Medusa also presents the materialization of CUDA graphs,
+which could be applied to other systems leveraging CUDA                    A.5    Experiment workflow
+graphs. Overall, Medusa significantly reduces cold start la-               Several directories should be created for logs and other intermediate
+tency, enhancing serverless LLM inference efficiency.                      data:
+                                                                             Run ./scripts/mktmpfs.sh to create directories for storing logs.
+                                                                             Run python scripts/serverless_llm.py –save_tensor to save model
+Acknowledgements                                                           parameters into the SSDs.
+We sincerely thank our shepherd Hubertus Franke for help-                    Run python scripts/serverless_llm.py –offline to save CUDA
+ing us improve the paper. We also thank the anonymous                      Graph.
+reviewers for their feedback. This work is supported by the                  After creating these directories, follow the steps below to repro-
+National Natural Science Foundation of China (Grant No.                    duce all results.
+62332011).
+                                                                           A.6    Evaluation and expected results
+                                                                                 • Figure 7 and Figure 2:
+A       Artifact Appendix
+                                                                                   Run mkdir experiments/overall to create the directory for
+A.1 Abstract                                                                       logs.
+This appendix describes the workflow of Medusa. The source                         Run python scripts/overall.py > results/Figure7 for Figure 7.
+code and scripts for all experiments are publicly available at:                    This experiment shows the overall loading phase time and
+https://github.com/thustorage/Medusa.                                              cold start time.
+                                                                                   Run python scripts/breakdown.py > results/Figure2 for Fig-
+                                                                                   ure 2. This experiment shows the breakdown of the loading
+A.2     Artifact check-list (meta-information)                                     phase given all evaluated models.
+      • Model: 10 models listed in Table 1                                       • Figure 3:
+      • Data set: public ShareGPT dataset                                          Run mkdir experiments/cuda_graph to create the directory
+      • Run-time environment: CUDA version 12.4; root access                       for logs.
+      • Hardware: we will provide GPU and SSD                                      Run python scripts/cuda_graph.py > results/Figure3 for Fig-
+      • Metrics: time-to-first-token (TTFT)                                        ure 3. This experiment shows the acceleration brought by
+      • Output: numerical results                                                  the CUDA graph given four models.
+      • Experiments: automated scripts, and all results are                      • Table 1:
+        within 5% variation                                                        Run python scripts/calculations.py > results/Table1 for Table
+      • How much disk space required (approximately)?: less                        1. This experiment shows the models and their parameter
+        than 150GB                                                                 sizes as well as the number of CUDA graph nodes.
+      • How much time is needed to prepare workflow (ap-                         • Figure 9:
+        proximately)?: 3-4 hours                                                   Run mkdir experiments/offline to create the directory for
+      • How much time is needed to complete experiments                            logs.
+        (approximately)?: 2-3 hours                                                Run python scripts/offline.py > results/Figure9 for Figure 9.
+      • Publicly available?: yes                                                   This experiment shows the overhead of the offline phase.
+      • Code licenses?: Apache-2.0 license                                       • Figure 10:
+      • Data licenses?: Apache-2.0 license                                         Run mkdir experiments/traces;
+                                                                                   mkdir experiments/traces/qps2;
+A.3     Description                                                                mkdir experiments/traces/qps10 to create the directory for
+A.3.1    How to access.                                                            logs.
+                                                                                   Run python scripts/traces.py > results/Figure10 for Figure
+      • https://github.com/thustorage/Medusa.                                      10. This experiment shows the 99th-percentile tail latency
+                                                                                   of time to first token (TTFT) under different RPS with real-
+A.3.2    Hardware dependencies.                                                    world traces.
+                                                                                 • Figure 11:
+      • 2 AMD EPYC 7642 CPUs
+                                                                                   Run mkdir experiments/traces_throughput to create the di-
+      • 256GB DDR4 memory
+                                                                                   rectory for logs.
+      • 4 Optane P5800X SSDs (400GB each)
+                                                                                   Run python scripts/traces_throughput.py
+      • 4 A100-40GB SXM4 GPUs interconnected via NVLink
+                                                                                   > results/Figure11 for Figure 11. This experiment shows the
+A.3.3    Software dependencies.                                                    99th-percentile tail latency of TTFT under different system
+                                                                                   overall throughput.
+      • PyTorch 2.2.0                                                            • Figure 8 and Figure 1:
+      • CUDA version 12.4                                                          Run python scripts/breakdown_Qwen.py
+
+
+
+
+                                                                     665
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                 Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+       > results/Figure8_Figure1 for Figure 8 and Figure 1. This                           serverless fast. In EuroSys ’20: Fifteenth EuroSys Conference 2020, Her-
+       experiment shows the breakdown of different strategies.                             aklion, Greece, April 27-30, 2020, Angelos Bilas, Kostas Magoutis, Evan-
+                                                                                           gelos P. Markatos, Dejan Kostic, and Margo I. Seltzer (Eds.). ACM,
+                                                                                           32:1–32:15. https://doi.org/10.1145/3342195.3392698
+                                                                                      [11] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Pondé
+References                                                                                 de Oliveira Pinto, Jared Kaplan, Harrison Edwards, Yuri Burda,
+                                                                                           Nicholas Joseph, and Greg Brockman. et al. 2021. Evaluating Large
+ [1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+                                                                                           Language Models Trained on Code. CoRR abs/2107.03374 (2021).
+     Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-
+                                                                                           arXiv:2107.03374 https://arxiv.org/abs/2107.03374
+     jee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with
+                                                                                      [12] Seungbeom Choi, Sunho Lee, Yeonjae Kim, Jongse Park, Youngjin
+     Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design
+                                                                                           Kwon, and Jaehyuk Huh. 2022. Serving Heterogeneous Machine Learn-
+     and Implementation (OSDI 24). USENIX Association, Santa Clara, CA,
+                                                                                           ing Models on Multi-GPU Servers with Spatio-Temporal Sharing. In
+     117–134. https://www.usenix.org/conference/osdi24/presentation/
+                                                                                           2022 USENIX Annual Technical Conference, USENIX ATC 2022, Carlsbad,
+     agrawal
+                                                                                           CA, USA, July 11-13, 2022, Jiri Schindler and Noa Zilberman (Eds.).
+ [2] Istemi Ekin Akkus, Ruichuan Chen, Ivica Rimac, Manuel Stein, Klaus
+                                                                                           USENIX Association, 199–216. https://www.usenix.org/conference/
+     Satzke, Andre Beck, Paarijaat Aditya, and Volker Hilt. 2018. SAND:
+                                                                                           atc22/presentation/choi-seungbeom
+     Towards High-Performance Serverless Computing. In 2018 USENIX
+                                                                                      [13] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Chenggang
+     Annual Technical Conference, USENIX ATC 2018, Boston, MA, USA,
+                                                                                           Qin, Qixuan Wu, and Haibo Chen. 2020. Catalyzer: Sub-millisecond
+     July 11-13, 2018, Haryadi S. Gunawi and Benjamin C. Reed (Eds.).
+                                                                                           Startup for Serverless Computing with Initialization-less Booting. In
+     USENIX Association, 923–935. https://www.usenix.org/conference/
+                                                                                           ASPLOS ’20: Architectural Support for Programming Languages and
+     atc18/presentation/akkus
+                                                                                           Operating Systems, Lausanne, Switzerland, March 16-20, 2020, James R.
+ [3] Ahsan Ali, Riccardo Pinciroli, Feng Yan, and Evgenia Smirni. 2020.
+                                                                                           Larus, Luis Ceze, and Karin Strauss (Eds.). ACM, 467–481. https:
+     Batch: machine learning inference serving on serverless platforms                     //doi.org/10.1145/3373376.3378512
+     with adaptive batching. In Proceedings of the International Conference           [14] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii
+     for High Performance Computing, Networking, Storage and Analysis, SC
+                                                                                           Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: Low-
+     2020, Virtual Event / Atlanta, Georgia, USA, November 9-19, 2020, Chris-              Latency Serverless Inference for Large Language Models. In 18th
+     tine Cuicchi, Irene Qualters, and William T. Kramer (Eds.). IEEE/ACM,                 USENIX Symposium on Operating Systems Design and Implementa-
+     69. https://doi.org/10.1109/SC41405.2020.00073                                        tion (OSDI 24). USENIX Association, Santa Clara, CA, 135–153. https:
+ [4] Ahsan Ali, Riccardo Pinciroli, Feng Yan, and Evgenia Smirni. 2022.                    //www.usenix.org/conference/osdi24/presentation/fu
+     Optimizing Inference Serving on Serverless Platforms. Proc. VLDB
+                                                                                      [15] Alexander Fuerst and Prateek Sharma. 2021. FaasCache: keeping
+     Endow. 15, 10 (2022), 2071–2084. https://doi.org/10.14778/3547305.                    serverless computing alive with greedy-dual caching. In ASPLOS ’21:
+     3547313
+                                                                                           26th ACM International Conference on Architectural Support for Pro-
+ [5] Alibaba. 2024. Platform for AI (PAI)-Elastic Algorithm Service. https:
+                                                                                           gramming Languages and Operating Systems, Virtual Event, USA, April
+     //www.alibabacloud.com/product/machine-learning
+                                                                                           19-23, 2021, Tim Sherwood, Emery D. Berger, and Christos Kozyrakis
+ [6] Ebtesam Almazrouei, Hamza Alobeidli, Abdulaziz Alshamsi, Alessan-
+                                                                                           (Eds.). ACM, 386–400. https://doi.org/10.1145/3445814.3446757
+     dro Cappelli, Ruxandra Cojocaru, Mérouane Debbah, Étienne Goffinet,
+                                                                                      [16] Github. 2024. Github Copilot. https://github.com/features/copilot
+     Daniel Hesslow, Julien Launay, Quentin Malartic, Daniele Mazzotta,
+                                                                                      [17] Google. 2024. Google GEMINI. https://gemini.google.com
+     Badreddine Noune, Baptiste Pannier, and Guilherme Penedo. 2023.
+                                                                                      [18] gVisor team. 2024. Checkpoint/Restore in gVisor. https://gvisor.dev/
+     The Falcon Series of Open Language Models. CoRR abs/2311.16867                        docs/user_guide/checkpoint_restore/
+     (2023). https://doi.org/10.48550/ARXIV.2311.16867 arXiv:2311.16867
+                                                                                      [19] Zicong Hong, Jian Lin, Song Guo, Sifu Luo, Wuhui Chen, Roger Wat-
+ [7] Jason Ansel, Edward Yang, Horace He, Natalia Gimelshein, Animesh
+                                                                                           tenhofer, and Yue Yu. 2024. Optimus: Warming Serverless ML In-
+     Jain, Michael Voznesensky, Bin Bao, Peter Bell, David Berard, Ev-
+                                                                                           ference via Inter-Function Model Transformation. In Proceedings of
+     geni Burovski, Geeta Chauhan, Anjali Chourdia, Will Constable,
+                                                                                           the Nineteenth European Conference on Computer Systems, EuroSys
+     Alban Desmaison, Zachary DeVito, Elias Ellison, Will Feng, Jiong
+                                                                                           2024, Athens, Greece, April 22-25, 2024. ACM, 1039–1053. https:
+     Gong, Michael Gschwind, Brian Hirsh, Sherlock Huang, Kshiteej
+                                                                                           //doi.org/10.1145/3627703.3629567
+     Kalambarkar, Laurent Kirsch, Michael Lazos, Mario Lezcano, Yanbo                 [20] Github issue. 2024. CUDA Graph error caused by synchronization.
+     Liang, Jason Liang, Yinghai Lu, CK Luk, Bert Maher, Yunjie Pan,
+                                                                                           https://github.com/microsoft/onnxruntime/issues/15002
+     Christian Puhrsch, Matthias Reso, Mark Saroufim, Marcos Yukio Sir-
+                                                                                      [21] Github issue. 2024. Warm-up before CUDA graph capturing. https:
+     aichi, Helen Suk, Michael Suo, Phil Tillet, Eikan Wang, Xiaodong
+                                                                                           //github.com/pytorch/pytorch/issues/99397
+     Wang, William Wen, Shunting Zhang, Xu Zhao, Keren Zhou, Richard
+                                                                                      [22] Eric Jonas, Johann Schleier-Smith, Vikram Sreekanti, Chia-che Tsai,
+     Zou, Ajit Mathews, Gregory Chanan, Peng Wu, and Soumith Chin-
+                                                                                           Anurag Khandelwal, Qifan Pu, Vaishaal Shankar, João Carreira, Karl
+     tala. 2024. PyTorch 2: Faster Machine Learning Through Dynamic
+                                                                                           Krauth, Neeraja Jayant Yadwadkar, Joseph E. Gonzalez, Raluca Ada
+     Python Bytecode Transformation and Graph Compilation. In 29th
+                                                                                           Popa, Ion Stoica, and David A. Patterson. 2019. Cloud Program-
+     ACM International Conference on Architectural Support for Program-                    ming Simplified: A Berkeley View on Serverless Computing. CoRR
+     ming Languages and Operating Systems, Volume 2 (ASPLOS ’24). ACM.
+                                                                                           abs/1902.03383 (2019). arXiv:1902.03383 http://arxiv.org/abs/1902.
+     https://doi.org/10.1145/3620665.3640366
+                                                                                           03383
+ [8] Lixiang Ao, George Porter, and Geoffrey M. Voelker. 2022. FaaSnap:
+                                                                                      [23] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+     FaaS made fast using snapshot-based VMs. In EuroSys ’22: Seventeenth
+                                                                                           Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Sto-
+     European Conference on Computer Systems, Rennes, France, April 5 - 8,
+                                                                                           ica. 2023. Efficient Memory Management for Large Language Model
+     2022, Yérom-David Bromberg, Anne-Marie Kermarrec, and Christos
+                                                                                           Serving with PagedAttention. In Proceedings of the 29th Symposium
+     Kozyrakis (Eds.). ACM, 730–746. https://doi.org/10.1145/3492321.
+                                                                                           on Operating Systems Principles, SOSP 2023, Koblenz, Germany, Oc-
+     3524270
+                                                                                           tober 23-26, 2023, Jason Flinn, Margo I. Seltzer, Peter Druschel, An-
+ [9] AWS. 2024. AWS SageMaker. https://aws.amazon.com/pm/sagemaker/                        toine Kaufmann, and Jonathan Mace (Eds.). ACM, 611–626. https:
+[10] James Cadden, Thomas Unger, Yara Awad, Han Dong, Orran Krieger,
+                                                                                           //doi.org/10.1145/3600006.3613165
+     and Jonathan Appavoo. 2020. SEUSS: skip redundant paths to make
+
+
+
+
+                                                                                666
+Medusa: Accelerating Serverless LLM Inference with Materialization                                ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+
+[24] Jie Li, Laiping Zhao, Yanan Yang, Kunlin Zhan, and Keqiu Li. 2022.               [40] Rohan Basu Roy, Tirthak Patel, and Devesh Tiwari. 2022. IceBreaker:
+     Tetris: Memory-efficient Serverless Inference through Tensor Shar-                    warming serverless functions better with heterogeneity. In ASPLOS
+     ing. In 2022 USENIX Annual Technical Conference, USENIX ATC 2022,                     ’22: 27th ACM International Conference on Architectural Support for
+     Carlsbad, CA, USA, July 11-13, 2022, Jiri Schindler and Noa Zilber-                   Programming Languages and Operating Systems, Lausanne, Switzerland,
+     man (Eds.). USENIX Association. https://www.usenix.org/conference/                    28 February 2022 - 4 March 2022, Babak Falsafi, Michael Ferdman, Shan
+     atc22/presentation/li-jie                                                             Lu, and Thomas F. Wenisch (Eds.). ACM, 753–767. https://doi.org/10.
+[25] Zijun Li, Linsong Guo, Quan Chen, Jiagan Cheng, Chuhao Xu, Deze                       1145/3503222.3507750
+     Zeng, Zhuo Song, Tao Ma, Yong Yang, Chao Li, and Minyi Guo. 2022.                [41] Hossein Shafiei, Ahmad Khonsari, and Payam Mousavi. 2022. Server-
+     Help Rather Than Recycle: Alleviating Cold Startup in Serverless Com-                 less Computing: A Survey of Opportunities, Challenges, and Appli-
+     puting Through Inter-Function Container Sharing. In 2022 USENIX An-                   cations. ACM Comput. Surv. 54, 11s (2022), 239:1–239:32. https:
+     nual Technical Conference, USENIX ATC 2022, Carlsbad, CA, USA, July                   //doi.org/10.1145/3510611
+     11-13, 2022, Jiri Schindler and Noa Zilberman (Eds.). USENIX Associa-            [42] Mohammad Shahrad, Rodrigo Fonseca, Iñigo Goiri, Gohar Irfan
+     tion, 69–84. https://www.usenix.org/conference/atc22/presentation/li-                 Chaudhry, Paul Batum, Jason Cooke, Eduardo Laureano, Colby Tres-
+     zijun-help                                                                            ness, Mark Russinovich, and Ricardo Bianchini. 2020. Serverless in
+[26] Microsoft. 2024. Azure ML. https://learn.microsoft.com/en-us/azure/                   the Wild: Characterizing and Optimizing the Serverless Workload
+     machine-learning                                                                      at a Large Cloud Provider. In 2020 USENIX Annual Technical Confer-
+[27] Anup Mohan, Harshad S. Sane, Kshitij Doshi, Saikrishna Edupuganti,                    ence, USENIX ATC 2020, July 15-17, 2020, Ada Gavrilovska and Erez
+     Naren Nayak, and Vadim Sukhomlinov. 2019. Agile Cold Starts for                       Zadok (Eds.). USENIX Association, 205–218. https://www.usenix.org/
+     Scalable Serverless. In 11th USENIX Workshop on Hot Topics in Cloud                   conference/atc20/presentation/shahrad
+     Computing, HotCloud 2019, Renton, WA, USA, July 8, 2019, Christina               [43] Simon Shillaker and Peter R. Pietzuch. 2020. Faasm: Lightweight
+     Delimitrou and Dan R. K. Ports (Eds.). USENIX Association. https:                     Isolation for Efficient Stateful Serverless Computing. In 2020 USENIX
+     //www.usenix.org/conference/hotcloud19/presentation/mohan                             Annual Technical Conference, USENIX ATC 2020, July 15-17, 2020, Ada
+[28] NVIDIA. 2024. Accelerating PyTorch with Native CUDA Graphs Sup-                       Gavrilovska and Erez Zadok (Eds.). USENIX Association, 419–433.
+     port. https://www.nvidia.com/en-us/on-demand/session/gtcspring22-                     https://www.usenix.org/conference/atc20/presentation/shillaker
+     s41965/                                                                          [44] Huggingface team. 2024. text-generation-inference. https://github.
+[29] NVIDIA. 2024. cuBLAS. https://docs.nvidia.com/cuda/cublas/                            com/huggingface/text-generation-inference
+[30] NVIDIA. 2024. CUDA graph API. https://docs.nvidia.com/cuda/cuda-                 [45] MLC team. 2023. MLC-LLM. https://github.com/mlc-ai/mlc-llm
+     runtime-api/group__CUDART__GRAPH.html                                            [46] Huggingface teams. 2024. Huggingface. https://huggingface.co
+[31] NVIDIA. 2024. CUDA graphs programming model. https://www.olcf.                   [47] Qwen teams. 2024. Introducing Qwen1.5. https://qwenlm.github.io/
+     ornl.gov/wp-content/uploads/2021/10/013_CUDA_Graphs.pdf                               blog/qwen1.5/
+[32] NVIDIA. 2024. Getting Started with CUDA Graphs. https://developer.               [48] Sharegpt teams. 2023. Sharegpt. https://sharegpt.com
+     nvidia.com/blog/cuda-graphs/                                                     [49] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Alma-
+[33] Edward Oakes, Leon Yang, Kevin Houck, Tyler Harter, Andrea C.                         hairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal
+     Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. 2017. Pipsqueak: Lean                    Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton-
+     Lambdas with Large Libraries. In 37th IEEE International Conference                   Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes,
+     on Distributed Computing Systems Workshops, ICDCS Workshops 2017,                     Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami,
+     Atlanta, GA, USA, June 5-8, 2017, Aibek Musaev, João Eduardo Ferreira,                Naman Goyal, Anthony Hartshorn, Saghar Hosseini, Rui Hou, Hakan
+     and Teruo Higashino (Eds.). IEEE Computer Society, 395–400. https:                    Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel Kloumann,
+     //doi.org/10.1109/ICDCSW.2017.32                                                      Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut
+[34] Edward Oakes, Leon Yang, Dennis Zhou, Kevin Houck, Tyler Har-                         Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier
+     ter, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. 2018.                     Martinet, Todor Mihaylov, Pushkar Mishra, Igor Molybog, Yixin Nie,
+     SOCK: Rapid Task Provisioning with Serverless-Optimized Contain-                      Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi,
+     ers. In 2018 USENIX Annual Technical Conference, USENIX ATC 2018,                     Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian,
+     Boston, MA, USA, July 11-13, 2018, Haryadi S. Gunawi and Benjamin C.                  Xiaoqing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xi-
+     Reed (Eds.). USENIX Association, 57–70. https://www.usenix.org/                       ang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela
+     conference/atc18/presentation/oakes                                                   Fan, Melanie Kambadur, Sharan Narang, Aurélien Rodriguez, Robert
+[35] OpenAI. 2024. OpenAI ChatGPT. https://openai.com/index/chatgpt/                       Stojnic, Sergey Edunov, and Thomas Scialom. 2023. Llama 2: Open
+[36] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin,                       Foundation and Fine-Tuned Chat Models. CoRR abs/2307.09288 (2023).
+     James Bradbury, Anselm Levskaya, Jonathan Heek, Kefan Xiao, Shivani                   https://doi.org/10.48550/ARXIV.2307.09288 arXiv:2307.09288
+     Agrawal, and Jeff Dean. 2022. Efficiently Scaling Transformer Inference.         [50] Dmitrii Ustiugov, Plamen Petrov, Marios Kogias, Edouard Bugnion,
+     CoRR abs/2211.05102 (2022). https://doi.org/10.48550/ARXIV.2211.                      and Boris Grot. 2021. Benchmarking, analysis, and optimization of
+     05102 arXiv:2211.05102                                                                serverless function snapshots. In ASPLOS ’21: 26th ACM International
+[37] PyTorch. 2024. PyTorch CUDA Graphs. https://pytorch.org/blog/                         Conference on Architectural Support for Programming Languages and
+     accelerating-pytorch-with-cuda-graphs/#api-example                                    Operating Systems, Virtual Event, USA, April 19-23, 2021, Tim Sherwood,
+[38] Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu,                         Emery D. Berger, and Christos Kozyrakis (Eds.). ACM, 559–572. https:
+     Weimin Zheng, and Xinran Xu. 2024. Mooncake: A KVCache-centric                        //doi.org/10.1145/3445814.3446714
+     Disaggregated Architecture for LLM Serving. CoRR abs/2407.00079                  [51] Ao Wang, Shuai Chang, Huangshi Tian, Hongqi Wang, Haoran Yang,
+     (2024). https://doi.org/10.48550/ARXIV.2407.00079 arXiv:2407.00079                    Huiba Li, Rui Du, and Yue Cheng. 2021. FaaSNet: Scalable and Fast
+[39] Francisco Romero, Qian Li, Neeraja J. Yadwadkar, and Christos                         Provisioning of Custom Serverless Container Runtimes at Alibaba
+     Kozyrakis. 2021. INFaaS: Automated Model-less Inference Serving.                      Cloud Function Compute. In 2021 USENIX Annual Technical Conference
+     In 2021 USENIX Annual Technical Conference, USENIX ATC 2021, July                     (USENIX ATC 21). USENIX Association, 443–457. https://www.usenix.
+     14-16, 2021, Irina Calciu and Geoff Kuenning (Eds.). USENIX Associa-                  org/conference/atc21/presentation/wang-ao
+     tion, 397–411. https://www.usenix.org/conference/atc21/presentation/
+     romero
+
+
+
+
+                                                                                667
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands                               Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, & Youyou Lu
+
+
+[52] Kai-Ting Amy Wang, Rayson Ho, and Peng Wu. 2019. Replayable                         Yu, Peng Liu, Qiang Liu, Shawn Yue, Senbin Yang, Shiming Yang, Tao
+     Execution Optimized for Page Sharing for a Managed Runtime En-                      Yu, Wen Xie, Wenhao Huang, Xiaohui Hu, Xiaoyi Ren, Xinyao Niu,
+     vironment. In Proceedings of the Fourteenth EuroSys Conference 2019,                Pengcheng Nie, Yuchi Xu, Yudong Liu, Yue Wang, Yuxuan Cai, Zhenyu
+     Dresden, Germany, March 25-28, 2019, George Candea, Robbert van                     Gu, Zhiyuan Liu, and Zonghong Dai. 2024. Yi: Open Foundation
+     Renesse, and Christof Fetzer (Eds.). ACM, 39:1–39:16. https://doi.org/              Models by 01.AI. CoRR abs/2403.04652 (2024). https://doi.org/10.
+     10.1145/3302424.3303978                                                             48550/ARXIV.2403.04652 arXiv:2403.04652
+[53] Liang Wang, Mengyuan Li, Yinqian Zhang, Thomas Ristenpart, and                 [57] Hanfei Yu, Rohan Basu Roy, Christian Fontenot, Devesh Tiwari, Jian
+     Michael M. Swift. 2018. Peeking Behind the Curtains of Server-                      Li, Hong Zhang, Hao Wang, and Seung-Jong Park. 2024. Rain-
+     less Platforms. In 2018 USENIX Annual Technical Conference, USENIX                  bowCake: Mitigating Cold-starts in Serverless with Layer-wise Con-
+     ATC 2018, Boston, MA, USA, July 11-13, 2018, Haryadi S. Gunawi                      tainer Caching and Sharing. In Proceedings of the 29th ACM Inter-
+     and Benjamin C. Reed (Eds.). USENIX Association, 133–146. https:                    national Conference on Architectural Support for Programming Lan-
+     //www.usenix.org/conference/atc18/presentation/wang-liang                           guages and Operating Systems, Volume 1, ASPLOS 2024, La Jolla, CA,
+[54] Xingda Wei, Fangming Lu, Tianxia Wang, Jinyu Gu, Yuhan Yang,                        USA, 27 April 2024- 1 May 2024, Rajiv Gupta, Nael B. Abu-Ghazaleh,
+     Rong Chen, and Haibo Chen. 2023. No Provisioned Concurrency: Fast                   Madan Musuvathi, and Dan Tsafrir (Eds.). ACM, 335–350. https:
+     RDMA-codesigned Remote Fork for Serverless Computing. In 17th                       //doi.org/10.1145/3617232.3624871
+     USENIX Symposium on Operating Systems Design and Implementation,               [58] Minchen Yu, Zhifeng Jiang, Hok Chun Ng, Wei Wang, Ruichuan
+     OSDI 2023, Boston, MA, USA, July 10-12, 2023, Roxana Geambasu and                   Chen, and Bo Li. 2021. Gillis: Serving Large Neural Networks in
+     Ed Nightingale (Eds.). USENIX Association, 497–517. https://www.                    Serverless Functions with Automatic Model Partitioning. In 41st IEEE
+     usenix.org/conference/osdi23/presentation/wei-rdma                                  International Conference on Distributed Computing Systems, ICDCS
+[55] Yanan Yang, Laiping Zhao, Yiming Li, Huanyu Zhang, Jie Li, Mingyang                 2021, Washington DC, USA, July 7-10, 2021. IEEE, 138–148. https:
+     Zhao, Xingzhen Chen, and Keqiu Li. 2022. INFless: a native server-                  //doi.org/10.1109/ICDCS51616.2021.00022
+     less system for low-latency, high-throughput inference. In ASPLOS              [59] Chengliang Zhang, Minchen Yu, Wei Wang, and Feng Yan. 2019. MArk:
+     ’22: 27th ACM International Conference on Architectural Support for                 Exploiting Cloud Services for Cost-Effective, SLO-Aware Machine
+     Programming Languages and Operating Systems, Lausanne, Switzer-                     Learning Inference Serving. In 2019 USENIX Annual Technical Con-
+     land, 28 February 2022 - 4 March 2022, Babak Falsafi, Michael Ferd-                 ference, USENIX ATC 2019, Renton, WA, USA, July 10-12, 2019, Dahlia
+     man, Shan Lu, and Thomas F. Wenisch (Eds.). ACM, 768–781. https:                    Malkhi and Dan Tsafrir (Eds.). USENIX Association, 1049–1062. https:
+     //doi.org/10.1145/3503222.3507709                                                   //www.usenix.org/conference/atc19/presentation/zhang-chengliang
+[56] Alex Young, Bei Chen, Chao Li, Chengen Huang, Ge Zhang, Guanwei
+     Zhang, Heng Li, Jiangcheng Zhu, Jianqun Chen, Jing Chang, Kaidong
+
+
+
+
+                                                                              668
+
