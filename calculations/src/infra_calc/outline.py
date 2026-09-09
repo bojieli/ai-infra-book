@@ -1048,7 +1048,25 @@ def sync() -> dict:
            '[完整图片请求](../calculations/results/image-request-original.md)固定给定30,000,000输入bytes与5,000,000成片bytes，上/下行20/100Mbit/s：上传12s、下载0.4s、单次残余RTT0.1s、模型0.3s，共12.8s。连接已可用，其他零时间是教学假设；[模型降至0.03s](../calculations/results/image-request-faster-model.md)只省0.27s。'
            '[同质量压缩条件](../calculations/results/image-request-up20.md)声明输入减为15MB、额外编码0.2s/解码0.1s，在20Mbit/s节省5.7s；上行400Mbit/s时打平，再快则额外编解码得不偿失。声明本地5s时，原始/压缩路径的上行等时点分别为400/7与400/13 Mbit/s；严格高于才远端更快，固定开销已超过本地时没有有限可赢上行。'
            '[图12-1](../calculations/figures/image-request/figure.svg)将原图上传、处理、编码与成片回传的依赖和完整成片曲线分列。运行 `python3 calculations/calc.py image-request-budget --inputs calculations/scenarios/image-request-example.json --format md`；参数允许声明准备/建链/队列/文件编解码与成片可用开销。复用连接只减建链，残余RTT只计一次。'
-           '文件bytes不是由像素或VAE tensor推导，RAW/JPEG标签不证明等质量；压缩同质量是显式条件。阶段表是串行预算而非网络抓包时间线；预览与分块重叠尚未声明依赖，保持未知，不能把成片时间换名为预览时间。',
+           '文件bytes不是由像素或VAE tensor推导，RAW/JPEG标签不证明等质量；压缩同质量是显式条件。阶段表是串行预算而非网络抓包时间线；本串行入口的预览保持未知，下面另以显式块依赖核算分块与额外预览，不能把成片时间换名为预览时间。',
            '> **图 12-1')
+    insert('12-端边云协同.md', 'C66-image-streaming',
+           '[整图屏障](../calculations/results/image-stream-whole-image-without-preview.md)与[声明独立块](../calculations/results/image-stream-independent-blocks-without-preview.md)保持30MB输入、5MB成片、0.3s处理工作相同，分三块后完整成片分别12.8s/12.36s。独立块必须明确输入/模型/输出编码无跨块依赖；不能据此声称任意RAW精修模型可分块。'
+           '上传、共享处理/编码、下行各是一个串行资源，三者允许重叠；前向/反向传播各0.05s只影响到达，不占用链路，不再加整体RTT。输出逐事件依赖、资源、起止时刻与bytes，最后全部成片块到达才开始组装。'
+           '[额外局部预览](../calculations/results/image-stream-independent-blocks-with-preview.md)声明已处理前缀生成500KB低质量预览、额外编码0.05s，到达4.32s而完整成片仍12.36s；[整图屏障加预览](../calculations/results/image-stream-whole-image-with-preview.md)则预览12.29s、完整成片12.85s。预览是额外工作与下行载荷，可能拖慢最终结果，不能替代成片质量。'
+           '运行 `python3 calculations/calc.py image-request-streaming --inputs calculations/scenarios/image-streaming-example.json --format md` 修改块bytes、处理/编码秒数、传播及预览。固定顺序和非抢占FIFO是声明调度，不称最优或实测；无预览元数据时保留未知，跨块依赖在独立模式拒绝。',
+           '> **图 12-1')
+    insert('12-端边云协同.md', 'C68-finite-window',
+           '[有限ACK窗口图片请求](../calculations/results/window-reused.md)沿30MB上传、5MB成片、20/100Mbit/s及每向0.05s传播，把ACK、发送/接收窗口、头部和指定丢段连接为同一事件队列。25KB数据段和40B数据头/ACK、IW50KB/cap1MB、逐ACK增长25KB均为教学输入，不是TCP/QUIC默认参数。发送端只使用已到达ACK携带的连续前缀；选择性确认释放唯一在途bytes，缺口仍限制接收窗口右边界。'
+           '[去除头/ACK且给足窗口](../calculations/results/window-payload-baseline.md)回到12.8s基线；[小接收窗口](../calculations/results/window-receive-limited.md)与[指定一段丢失](../calculations/results/window-loss.md)逐事件展示等待和额外wire bytes，重传不增加唯一文件bytes。ACK同刻到达先取消timeout，过短RTO触发其他timeout时拒绝超出单次恢复合同，未冒充自适应RTO。'
+           '[四条有序握手消息](../calculations/results/window-fresh.md)与[两条消息](../calculations/results/window-ticket.md)按各自bytes/方向/到达依赖计时，只是显式消息图，不能直接改名为真实TLS或0RTT。上传完整接收即开始模型，未等最后ACK；未结束的上传ACK继续与下载共享回程，完整成片和最后ACK时刻分开。'
+           '运行 `python3 calculations/calc.py connection-window --inputs calculations/scenarios/connection-window-example.json --format md`；JSON保留段ID、发送预约、ACK前缀、窗口、重组峰值及取消timer。官方RFC5681/6298/8446原件已固定校验，只用于概念与实现差异的依据；本例不实现RFC拥塞控制、loss-window reset、真实恢复/0RTT及语音/截图轨迹，C68仍待。',
+           '### 12.3.3 多流传输与媒体截止时间')
+    insert('12-端边云协同.md', 'C68-request-sequence',
+           '[四轮每次建链](../calculations/results/sequence-image-complete_received-fresh.md)、[缩短声明握手图](../calculations/results/sequence-image-complete_received-ticket.md)、[仅首轮握手但重置窗口](../calculations/results/sequence-image-complete_received-reuse_reset.md)和[保留双向窗口](../calculations/results/sequence-image-complete_received-reuse_warm.md)使用同30MB上传/5MB响应及共同事件队列。四轮总唯一输入120MB、输出20MB；握手默认四条400/800/400/800B消息，累计分别9600/4800/2400/2400B，仅是声明消息图。'
+           '完整响应到达即提交下一轮时，上轮ACK仍占用双向FIFO并更新原连接；上下行cwnd与未确认信用分别保留，不能使用未来final窗口。重置cwnd也不清除尚未确认bytes，旧ACK仍按身份释放信用。'
+           '[等待ACK排空](../calculations/results/sequence-image-quiet-reuse_warm.md)与[64KiB小请求](../calculations/results/sequence-small-complete_received-reuse_warm.md)分开比较；[只在第二轮丢段](../calculations/results/sequence-image-request2-loss.md)保留额外wire bytes而不增加唯一输入。每请求记录提交、连接就绪、模型、完整响应与最后ACK，响应时长用完成减提交，握手等待不再与链路忙时重复相加。'
+           '运行 `python3 calculations/calc.py connection-sequence --inputs calculations/scenarios/connection-sequence-example.json --format md` 可改策略、提交触发、think time和双向初窗。真实TLS/QUIC握手/0RTT、拥塞控制器及媒体/截图截止时间仍待，不以本教学事件结果作实际协议性能排名。',
+           '### 12.3.3 多流传输与媒体截止时间')
     return {"updated": sorted(updated),
             "next": "python3 scripts/render_outline.py; python3 scripts/verify_outline.py"}
