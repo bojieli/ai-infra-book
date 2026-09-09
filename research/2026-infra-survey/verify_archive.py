@@ -624,7 +624,7 @@ assert c['shared_graph_rows']==min(t for t in c['graph_tiers'] if t>=max(c['dp_p
 assert c['scenarios']['compact']['expected_total_tokens_per_second']>c['scenarios']['full']['expected_total_tokens_per_second']>c['scenarios']['cap_accept']['expected_total_tokens_per_second']
 assert math.isclose(c['sglang_2025_overlap_relative_improvement'],c['sglang_2025_overlap_tokens_per_second']/c['sglang_2025_baseline_tokens_per_second']-1)
 # Same request multiset, different temporal composition; independent integer counts.
-c=a['workload_mix_teaching'];A,B=c['classes']['A'],c['classes']['B'];duration=c['window_seconds'];Pcap=c['assumed_prefill_input_tokens_per_second_per_instance'];Dcap=c['assumed_decode_output_tokens_per_second_per_instance']
+c=a['workload_mix_teaching'];A,B=c['classes']['A'],c['classes']['B'];duration=c['window_seconds'];Pcap=c['assumed_prefill_input_tokens_per_second_per_instance'];Dcap=c['assumed_decode_sequence_token_steps_per_second_per_instance']
 for name,windows in c['traces'].items():
  assert sum(sum(w) for w in windows)==c['total_requests']==2*duration*c['request_rate_rps']
  assert all(sum(w)==duration*c['request_rate_rps'] for w in windows)
@@ -634,18 +634,19 @@ for name,windows in c['traces'].items():
 for key,counts in [('uniform',c['traces']['uniform'][0]),('shifted_first',c['traces']['shifted'][0]),('shifted_second',c['traces']['shifted'][1])]:
  rec=c['rates'][key]
  for field in ['input','output']:assert math.isclose(rec[field],(counts[0]*A[field+'_tokens']+counts[1]*B[field+'_tokens'])/duration)
- assert math.isclose(rec['P'],rec['input']/Pcap) and math.isclose(rec['D'],rec['output']/Dcap)
+ assert math.isclose(rec['P'],rec['input']/Pcap) and math.isclose(rec['D'],rec['decode_steps']/Dcap)
+ assert math.isclose(rec['decode_steps'],sum(counts[i]*max(x['output_tokens']-1,0) for i,x in enumerate((A,B)))/duration)
 assert c['mean_candidate_P']==math.ceil(c['rates']['uniform']['P']);assert c['mean_candidate_D']==math.ceil(c['rates']['uniform']['D'])
-capacity=c['mean_candidate_D']*Dcap;assert c['decode_capacity_output_tokens_per_second']==capacity
+capacity=c['mean_candidate_D']*Dcap;assert c['decode_capacity_sequence_token_steps_per_second']==capacity
 backlog=0
 for counts in c['traces']['shifted']:
- backlog=max(0,backlog+counts[0]*A['output_tokens']+counts[1]*B['output_tokens']-duration*capacity)
-assert backlog==c['second_window_end_output_token_backlog']==79872
-assert math.isclose(c['second_window_excess_output_tokens_per_second'],c['rates']['shifted_second']['output']-capacity)
-assert c['no_further_work_drain_seconds']==backlog/capacity==13
+ backlog=max(0,backlog+counts[0]*max(A['output_tokens']-1,0)+counts[1]*max(B['output_tokens']-1,0)-duration*capacity)
+assert backlog==c['second_window_end_decode_step_backlog']==79632
+assert math.isclose(c['second_window_excess_decode_steps_per_second'],c['rates']['shifted_second']['decode_steps']-capacity)
+assert c['no_further_work_drain_seconds']==backlog/capacity==12.9609375
 assert c['fixed_window_candidate_P']==math.ceil(max(x['P'] for x in c['rates'].values()))
 assert c['fixed_window_candidate_D']==math.ceil(max(x['D'] for x in c['rates'].values()))
-assert c['second_window_reconfigured_P']*Pcap>c['rates']['shifted_second']['input'] and c['second_window_reconfigured_D']*Dcap>c['rates']['shifted_second']['output']
+assert c['second_window_reconfigured_P']*Pcap>c['rates']['shifted_second']['input'] and c['second_window_reconfigured_D']*Dcap>c['rates']['shifted_second']['decode_steps']
 # Communication tuning: workload-derived sizes, concurrent join, and search payback.
 c=a['communication_tuning_teaching'];cfg=json.loads((ROOT/c['config']).read_text())
 assert cfg['intermediate_size']%c['tp']==0 and cfg['hidden_size']%c['tp']==0
