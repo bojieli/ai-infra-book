@@ -31,3 +31,13 @@ model.train 的 global_batch_sizes 明确按每步 rollout 数计量，常见一
 config.finalize_model_grads_func 绑定外部 Megatron 的 finalize_model_grads。当前档案没有固定实际安装的 Megatron 依赖，所以本次不宣称已闭合其 DP 平均、CP 补偿或 token 归一化。日志 reduce_train_step_metrics 发生在更新后的另一路，也不能由日志值直接推出梯度分母。
 
 可进入既有实验的结论已经明确：比较调度前先写清目标按 token、样本还是 rollout 加权；检查切分后分母来自哪个范围，再核对后端额外缩放。本书的简单反例用于验证这个问题，不替代具体训练栈的正确性测试。只在第10章原有梯度累积变体引用此接口，完整算法、所有框架排名及未公开性能不展开。
+
+## 官方构建默认值与后端缩放
+
+后续找到同一 slime 提交的 Dockerfile：默认 Megatron 为 `1dcf0dafa884ad52ffb243625717a3471643e087`，并应用 `PATCH_VERSION=latest` 下两份 Megatron 补丁。构建参数可被覆盖，末尾 SLIME_COMMIT 默认仍为 main；因此它提供可复查的默认组合，不证明任意已发布镜像或用户环境恰好等于本次快照。没有执行 Dockerfile 或应用补丁。
+
+已保存两份补丁，枚举受改文件；选读 DDP／buffer 开头的备份参数变化。补丁未列 schedules.py 或 finalize_model_grads.py。按默认 Megatron 提交获取这两份源文件并选读 loss 返回处理与最终 token 归一化，未声称读完全部调度。
+
+三返回值 loss 路径中，非 per-token 模式会除返回的 normalizer（至少一）及微批数。slime 该模式返回 normalizer=1，因此它前面乘微批数与这里的除法配对；DP/CP 的其余缩放仍需结合具体 DDP 配置。per-token 模式跳过这段局部除法，finalize_model_grads 在传入 token 计数时先沿 PP 广播，再在 DP/CP 组求和，以总计数倒数缩放梯度。
+
+这一证据已足以说明教学重点：局部 loss、后端累积和最终梯度是连续路径。分母与缩放必须在这条路径上对齐，不能根据日志平均或单函数的一次乘除给出正确性结论。实际 DDP 通信操作、配置传播、全零掩码与特殊分支未全部验证；不能把本次源文件阅读写成真实安装或全算法验收。
