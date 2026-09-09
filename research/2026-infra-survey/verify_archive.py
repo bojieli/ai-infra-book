@@ -486,6 +486,9 @@ for slots,gib in c['logical_kv_gib'].items():assert gib==int(slots)*per_slot
 assert c['delta_gib']==c['logical_kv_gib']['4']-c['logical_kv_gib']['1']
 c=a['rl_logprob_teaching'];assert c['correct_ratio']==math.exp(c['current_logprob']-c['behavior_logprob'])==1
 assert math.isclose(c['wrong_ratio'],math.exp(c['current_logprob']-c['wrong_recomputed_denominator_logprob']));assert c['wrong_ratio']>c['clip_upper']
+assert math.isclose(c['update_ratio'],math.exp(c['current_logprob']-c['old_training_logprob']))
+assert math.isclose(c['old_to_behavior_ratio'],math.exp(c['old_training_logprob']-c['behavior_logprob']))
+assert math.isclose(c['update_ratio']*c['old_to_behavior_ratio'],c['correct_ratio'])
 assert c['route_uint16_bytes']==c['tokens']*c['moe_layers']*c['top_k']*2==6*2**20;assert c['route_int32_bytes']==2*c['route_uint16_bytes']
 c=a['rl_supply_teaching'];assert c['rates_unit']=='trajectories_per_second';assert c['filter_location']=='after_verifier_before_learner'
 assert math.isclose(c['accepted_supply_upper_bound'],min(c['learner_capacity'],min(c['generator_capacity'],c['verifier_capacity'])*(1-c['post_verifier_reject_fraction'])))
