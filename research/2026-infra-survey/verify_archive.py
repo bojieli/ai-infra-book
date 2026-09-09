@@ -803,6 +803,8 @@ from verify_asplos_testing_batch import verify as verify_asplos_testing_batch
 asplos_testing_batch=verify_asplos_testing_batch()
 from verify_pod_implementation import verify as verify_pod_implementation
 pod_implementation=verify_pod_implementation()
+from verify_pod_callers import verify as verify_pod_callers
+pod_callers=verify_pod_callers()
 from verify_asplos2025_coverage import verify as verify_asplos2025_coverage
 asplos2025_coverage=verify_asplos2025_coverage(asplos2025_public, serving_batch, asplos_testing_batch)
 from verify_ascend_components import verify as verify_ascend_components
@@ -860,4 +862,5 @@ report['asplos2025_coverage']=asplos2025_coverage
 report['serving_batch']=serving_batch
 report['asplos_testing_batch']=asplos_testing_batch
 report['pod_implementation']=pod_implementation
+report['pod_callers']=pod_callers
 (Path(__file__).parent/'archive-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));assert not errors

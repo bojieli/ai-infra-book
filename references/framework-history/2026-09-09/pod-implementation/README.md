@@ -36,3 +36,5 @@ FlashInfer 固定提交的底层核对进一步区分了准备与稳态：
 此次路径是 Python wrapper → JIT 生成函数 → CUDA 入口 → POD dispatch，尚未核对最终构建工具、链接导出和完整 device kernel。也没有找到并验证上层 vLLM／SGLang 服务调用，因此不能把库实现存在写成上层框架已采用。网页搜索无结果不作为未采用的证据。
 
 原 `flashinfer/jit/attention.py` 路径在固定提交返回 404，响应原样保留；随后以完整 Git tree 定位 `flashinfer/jit/attention/modules.py`。目录改动不推断为行为改动。所有新增材料只深化既有第 5 章 POD／图执行说明，不新增章节或实验。
+
+后续已补查[固定 vLLM／SGLang 上层 backend 的部分路径](../pod-callers/README.md)，区分阶段 wrapper、上下文分段和 POD 共驻。该核对关闭了所读分支的调用疑问，不扩展为全框架采用／未采用的判断，也不把这里固定的 FlashInfer 提交视为上层实际安装版本。

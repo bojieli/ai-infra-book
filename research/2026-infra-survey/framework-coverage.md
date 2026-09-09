@@ -44,3 +44,5 @@
 2026-09-09 重复片段复核：Apophenia 的自动匹配与 vLLM 外部批次分派分别取证。第 5 章沿现有 Qwen3 算子链核对输入绑定、收齐片段和设备进度；第 8 章继续区分请求内部就绪与合批等待。更少分析工作并不自动缩短整条链，声明来源与教学时间线见既有图执行案例。
 
 2026-09-09 提前准备复核：第 5 章沿同一 64 MiB 张量区分总工作和完成时间，验证额外复制与三类缓冲的代价；第 8→9 章再辨认旧式换出、重计算和 connector 缓存的真实路径。[PipeLLM／vLLM 对照](../../references/framework-history/2026-09-09/pipellm-swap/README.md)保留模型、保护范围和工件限制。顺序预测错误与无用准备比例不是同一指标，也未把论文优化归为当前框架功能。
+
+2026-09-09 补查 [POD 上层调用边界](../../references/framework-history/2026-09-09/pod-callers/README.md)：固定 vLLM／SGLang 的 FlashInfer backend 所读分支分别使用阶段 wrapper；SGLang 的上下文分段与 LSE 合并也不等于跨请求阶段共驻。第 5→8 章沿用已有混合批次实验，区分合批、上下文分解和设备共驻，先记录实际 backend／dtype／DCP，再看完整迭代。当前三份文件的符号搜索不代表全仓库未采用 POD，也未验证实际安装的 FlashInfer 版本。
