@@ -1,0 +1,13 @@
+# V4 optimizer public integration: finite independent review
+
+The public integration passes this finite review. Candidate SHA is `f920785ea14541365664914f35aa141cb160fdb7c9ab976402e11c21b1e3863a`; reviewed public module SHA is `faeb00a34ce0306a1a68dff4fa57090ec12dbdb3d3004d83c7fce4214b50beb6`. All **30 integration assertions pass**. The current public optimizer tests also pass **5/5 with zero skips** in the available Python/Torch environment, including the polynomial numerical oracle. This is an integration/difference review, not a repeated whole optimizer mathematical audit or a claim of full V4 training completion.
+
+After removing only the added hashlib/PROJECT imports and the first report-lock verification loop, the complete public module AST is identical to the frozen candidate. Matrix formulas, group classification, conditional unknown policies, coefficients and result construction are unchanged.
+
+All four public scenario dictionaries match the frozen scenario inputs. Each public Python result equals the candidate Python result. Each serialized result also equals its frozen JSON and the corresponding real CLI JSON output. JSON comparisons normalize tuples to JSON arrays, as required for the pre-existing coefficient list; no numeric tolerance is applied. The dedicated report dispatcher returns exactly the optimizer's own Markdown, and the CLI Markdown default follows that same path.
+
+The fixed source guard now reads `configs/v4-optimizer-report.lock.json` under the calculations root, then verifies its local `sources/v4-optimizer/deepseek-v4.txt` and `.pdf`. Both local files match their locked hashes and the original archive files exactly. `original_file` preserves their historical provenance. Nonmutating read interception independently simulates **missing txt, changed txt, missing pdf, and changed pdf**; every case rejects before producing a result. No actual source file is deleted or changed.
+
+The public reproduction loop selects the four `v4_optimizer` scenarios, calls `calculate(**row['scenario'])`, saves each result, and lists the outputs. Its input binding uses `PROJECT / row['file']` for the local report lock, while configuration hashing includes the lock itself. This is a scoped wiring inspection and does not replace the parent's concurrently running full reproduction.
+
+Evidence is in `verification.json`, including module, lock, CLI, report, reproduce and local-source hashes; individual assertions are in `checks.json`. Re-run `PYTHONDONTWRITEBYTECODE=1 python calculations/research/v4-optimizer-integration-independent/check.py`. The only created inputs are local review-directory CLI scenario files. Public source, tests, configuration and results were not modified.

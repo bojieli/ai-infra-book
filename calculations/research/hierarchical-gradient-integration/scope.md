@@ -1,0 +1,11 @@
+# C37 gradient integration boundary
+
+The original 7.2.1 asks for real training gradient or gradient-bucket messages, flat versus hierarchical reduction, and per-NIC/uplink/cut bytes. This delivery selects one real first-layer Qwen3-8B gate gradient with explicit FP32/BF16 wire width; it does not substitute a TP activation or multiply one tensor by layer count.
+
+The complete flat and hierarchical executions preserve exact element intervals and rank contribution ownership at phase boundaries. The independent checker replays small integers and disjoint contribution sets over all message-membership intervals. It separately recounts all endpoint/NIC/egress/ingress/directional-cut/shared-cut resources, integer striping, logical adds and exact round barriers. Twelve fixed scenes cover two dtypes, three algorithms and one/two NICs; receiver bottlenecks and fixed shared-resource ceilings are tested separately.
+
+The public wrapper and 24 CLI invocations match all candidate fields in the canonical python3 environment except the calculation identifier. An initial comparison against candidate JSON produced by another Python interpreter differed in the last bits of the legacy traffic.account float sum (0.01412086144 versus 0.014120861440000002). Exact Fraction ledgers and all integer fields agreed. Candidate results were regenerated and independently checked with the canonical python3 interpreter, after which complete JSON equality passed. No tolerance was used to ignore an integer or exact-rational difference.
+
+Rates and launches are declared inputs. The temporal result is the sum of round-resource lower bounds plus assumed launch costs under explicit barriers. Reduction work, protocol scheduling, interference and full training time are unknown; a non-excluded budget is not feasibility proof. The sum target is not an averaged gradient, nor a floating-point bitwise equivalence claim.
+
+C37 remains open: real framework buckets and whole-model scheduling, TP/PP/EP placements, V4-Pro/K3 cross-server inference, neighbor NIC draining when borrowing, and original strong/weak scaling requirements. Figure7-3 covers several parallel dimensions, so this DP ledger alone does not mark the full figure delivered.

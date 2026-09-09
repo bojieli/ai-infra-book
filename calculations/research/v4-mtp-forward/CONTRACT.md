@@ -1,0 +1,9 @@
+# Fixed Flash MTPBlock one-call contract
+
+World size1, explicit B/T/start_pos, caller-supplied hidden[B,T,4,4096] from the output of base Block42 before base hc_head/finalnorm, and caller-supplied token IDs. This is a source-defined MTPBlock call, not a proof of correct next-token alignment in a deployed drafter. The caller chooses the ID/hidden position alignment; no target forward is executed or charged. T>1 requires start_pos0; positive start requires one token and an already valid independent MTP cache. No acceptance/sampling/verification is inferred.
+
+MTP layer43 has compress_ratios[43]=0. Use isolated function globals with a copied one-layer config solely to reuse pure per-layer accounting functions; do not modify shared module globals or public config. Virtual layer0 in those helpers is remapped to actual source layer43, no hash layers, no compressor/indexer. Hyper-connections helper already includes finalHChead once; do not append it again. It does not count MTP embedding repeat because MTP broadcasts an addition instead; its base-only repeat-size field is removed.
+
+New input outer path: shared embedding gather; enorm on BT rows; hnorm on4BT rows; e_proj[BT,H] and h_proj[4BT,H]; broadcast sum4BTH. Two block norms and final MTP norm are additional BT each. Shared output head performs2BHV and no T factor, although finalHChead/norm process allT.
+
+Checkpoint own MTP shapes/keys/dtypes/payload and logical parameter count must be verified against fixed headers; embedding/head are shared aliases, counted separately once only if not already resident. wo_a checkpoint/runtime dtype differences remain explicit. FP8 Linear ledger is eligible only for source calls using the FP8 path; ratio0 KV simulation and routed FP4→FP8 are distinct accounts. Interfaces are operand endpoints, no complete HBM/allocator/latency claim. Actual cast/temporary setup not expanded remains unknown.

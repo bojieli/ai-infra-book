@@ -1,0 +1,12 @@
+# C22 independent pre-implementation admission review
+
+Author directory planned: research/stage-resource-bounds. This preliminary note records checks against current public hardware/model helpers; it is not acceptance of the not-yet-frozen candidate.
+
+1. `hardware.select_peak` requires exact input/accumulator/execution-unit/sparsity and floating operation kind. Preserve the selected row's source/supporting_evidence, especially nominal/API FP32 versus limited internal precision of specific Hopper FP8 instructions. Model MoE routing or sparse attention is not NVIDIA 2:4 sparsity.
+2. `v4_fp8_linear.py:57,76–85` gives the actual non-routed FP8 execution path: wq_a/wq_b/wkv_shared/wo_b/index_wq_b, FP8 activation/weight GEMM with FP32 nominal accumulation, fixed tile comparison and separate BF16 input conversion. Routed FP4 weight storage does not authorize dividing its executed GEMM by an FP4 Tensor peak. Valid and padded work are alternative/replacement measures, never summed.
+3. FP32 tensor dtype or `F.linear(x.float(), weight)` establishes mathematical input type, not by itself a vector execution instruction. An IEEE-FP32 vector provider is a declared implementation assumption; do not quietly select TF32. A fused instruction's internal precision limitation must not be hidden by a renamed accumulator field.
+4. A missing rate with zero work contributes zero; a missing rate with positive work makes the corresponding complete stage bound unknown. Known-component maxima can remain visible but must not be labeled complete. Sequential sum-of-stage-maxima and global max-of-sums have different dependency assumptions. Tensor/vector resources cannot be collapsed into a single mixed FLOPs denominator.
+5. Public V4 forward explicitly lacks complete runtime/HBM bytes. Caller-specified interface traffic is a conditional traffic assumption, not source-proven physical HBM. Checkpoint weight payload plus known state is a necessary capacity lower bound: passing it cannot establish full runtime capacity; failing it establishes impossibility for that single-device resident scope. System/rack aggregate peaks must not pair with a single-chip memory capacity.
+6. Planned independent cases: exact peak rejection, FP4-storage/FP8-execute counterexample, unknown-positive versus unknown-zero work, capacity ±1 byte, zero bandwidth/rate/bool rejection, mixed sequential resource counterexample, and per-model stage conservation against unchanged forward.
+
+No shared or author-candidate files changed. Full independent verification awaits author freeze.

@@ -1,0 +1,13 @@
+# Omni audio frontend public integration — independent acceptance
+
+Accepted public module SHA: `da405f5503dbafde2955ec887792fdd44925fdada16fb805d9e72ee9525fc145`. Its five complete function ASTs (`evidence`, `reference_fft_work`, `mel_filter_initialization`, `calculate`, `markdown`) equal the previously independently accepted module SHA `53095fde1770b14e467d3035c15f68e34695f1aa98fa28632450be2a7c65cb60`. Only module-level source-root/import setup changes. The public module file is byte-identical to the frozen migration candidate.
+
+`check.py` performed65 assertions: candidate manifest hashes and sizes, all five function ASTs, ten copied files including the local lock, all nine originals against their original research copies, four result objects against both frozen versions, input replay, Markdown equality and six directly runnable candidate tests. No author migration script was run; it writes author bindings, which this audit avoids.
+
+`check_public.py` then ran the actual `calculations/calc.py omni-audio-preprocess` command in eight subprocesses: four input scenarios, JSON and Markdown each. All parsed JSON fields and complete rendered Markdown agree with frozen artifacts. Six installed public tests pass, zero skipped. Public module and all ten source/lock files equal the staged files before and after the audit.
+
+Two negative cases invoke the actual public CLI dispatch with only the module's source root redirected to a temporary exact clone: missing preprocessor original, then same-length modified preprocessor bytes. Both exit nonzero and emit no result; the latter explicitly reports `Source mismatch`. Shared/public original files were never modified. This verifies the checksum path through public dispatch while avoiding interference with the parent's ongoing full reproduction. It does not claim OS-level isolation or immunity to an attacker rewriting both code and trusted locks.
+
+The local source lock's retained relative `sources/...` locators are deliberate and resolve under `calculations/sources/omni-audio-preprocess/`. This audit verifies that bundle; it does not claim global catalog registration. Existing mathematical acceptance remains unchanged:30s effective constructor cap, Hann401, dropped final STFT frame, batch-context masks, max-index outputs, separately declared reference FFT, incomplete library FFT internals and no encoder duplication. No remaining blocking migration issue was found.
+
+Evidence: `migration-results.json`, `public-results.json`, `tests.log`, `public-tests.log`; rerun with `/Users/boj/miniconda3/bin/python check.py` and `check_public.py`. Only this independent research directory was written.

@@ -1,0 +1,13 @@
+# Statistical protocol, declared before fitting
+
+Preserve the original threshold: N >= 2,000,000,000 is held out. Candidate family: the author's standard (non-deduplicated) Pythia 70M, 160M, 410M, 1.4B and 2.8B runs using git d36f623, FP16, batch 1024, sequence length 2048, seed 1234 and the declared size-dependent learning-rate policy. Do not add other precision, batch variants or reruns after inspecting fit quality.
+
+Use every archived validation observation in the selected seven run segments (eight records). Compare natural-log token losses estimating the same held-out population, provided the source audit verifies tokenizer, preprocessing, split and loss reduction. Identical finite evaluation samples are not required. Report iterator advancement/restart uncertainty and unequal or correlated sampling; no claim of identical deterministic evaluation. One loss per point is not enough to estimate its variance. The primary fit uses equal point weights; sensitivity uses equal total weight per model, retaining all rows. No inverse-variance claim is made.
+
+Fit E + A*(N/1e9)^(-alpha) + B*(D/1e10)^(-beta) on the training split only, exponents fixed grid 0.10 through 0.60 in increments 0.05. Nonnegative E,A,B are allowed, including B=0: this is explicitly broader than the existing teaching fitter's strictly positive A/B contract. Keep any boundary solution and report beta unidentifiable when B=0. Also report a refined predetermined 0.05 through 0.80 grid in increments 0.05 and leave-one-training-size-out sensitivity. Never choose a fit using held-out loss.
+
+D is logged completed optimizer step times the fixed training batch's 2,097,152 tokens. N must be derived from the official architecture/parameter convention before admission. C=6ND is only the familiar analytical proxy, not measured training compute. The limited D coverage, model-specific learning-rate policy, same-model checkpoint correlation and held-out N/D extrapolation are limitations. Do not infer a universal compute-optimal schedule or model quality guarantee from these eight observations. Training-loss histories are excluded from this validation-loss protocol.
+
+## Subsequent source-audit gate failure
+
+The exact d36f623 implementation takes the explicit train_data_paths/valid_data_paths branch and builds each dataset over all documents. The selected configs use the same path for train and validation. The displayed split string applies to a different branch and therefore does not prove a held-out population here. Any generated fit is explicitly an exploratory training-document-pool diagnostic, not an accepted generalization fit. This finding was recorded after the protocol and before acceptance; no labels or holdout threshold are changed.

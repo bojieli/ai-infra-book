@@ -1,0 +1,11 @@
+# Hardware status amendment and C22 replay
+
+The amendment is accepted as a prose-only update to the historical H01–H07 acceptance. Reversing exactly `/status`, `/pending_families`, and `/devices/45/notes/0`, then using the original serialization, reconstructs the **original catalog byte SHA** `6a2451972d01cb5f08a61cac759cd4a1339cf97297a1a0464e3f173174b6550a`. The current catalog SHA is `387a75e06e8ce5d39f0ef6cb4bff9d4703ef305f379619e05e21d24a5ebfe23c`. Device 45 remains `a800-40gb-active`. Consequently every other catalog field, numerical value, unit, precision condition, and embedded source reference remains exactly unchanged.
+
+The independent replay also compares the current hardware-only public source-lock subset with the original H07 acceptance binding. The 97 source rows remain unchanged. Historical acceptance files are neither rewritten nor treated as if they originally bound the new byte hash; this amendment supplies the explicit link.
+
+Using the amended public hardware catalog, the frozen C22 module `7a339350d3039c10f521158f567101f12a4a3555d6157a0ee757bcd3fa2f1d17` reproduces **25 of 25 frozen candidate JSON objects exactly**. The comparison includes all numerical values, source rows, unknowns, admission fields, capacities, and declared assumptions, not just a selected summary. No candidate output or public result is overwritten. The independent C22 scope and unknown-capacity correction remain as recorded in `stage-resource-bounds-independent/REVIEW.md`.
+
+Two residual status phrases were reported during inspection: the audit renderer's claim that manual hardware review “still needs completion,” and the chapter 4 paragraph saying the full model inventory remains to be checked. The parent confirmed fixes to both generators; the generated outline is being synchronized by the public reproduction process. These are prose issues, not numerical regressions, and this report does not claim to verify a concurrently running full-book regeneration.
+
+Re-run `PYTHONDONTWRITEBYTECODE=1 python calculations/research/hardware-status-amendment-independent/check.py`. Machine evidence is in `verification.json`; every replayed scenario records its frozen result SHA. Only this new independent research directory was written.

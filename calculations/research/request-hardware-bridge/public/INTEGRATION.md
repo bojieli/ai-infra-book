@@ -1,0 +1,9 @@
+# Public candidate T08
+
+Copy normally imported src/infra_calc/topics/request_hardware_bridge.py and portable tests to matching public locations. Add four flat book.append.json scenarios and a dedicated CLI; use markdown(result) so original_request, per-call mapper, hardware/supporting evidence, capacity representations and unknowns remain visible. No new source download, model weights or shared changes are part of this candidate.
+
+calculate fixes S0/P128/B1, G4 or G1, balanced routing and expanded K3. scalar_vector_provider and fp32_matrix_vector_provider are explicit arithmetic-provider assumptions; capacity_bytes overrides the scenario comparison limit without rewriting the official device's nominal capacity. No arbitrary special-rate override or mixed PV cast is supplied. Source mapping and finite admission boundaries are in ../SOURCE-MAP.md and ../CONTRACT.md.
+
+The rate reducer reports independent known-resource constraints, not independent physical Tensor units for BF16 and FP8. Their maximum is a weak condition even when the underlying units are shared; it must not be interpreted as simultaneous peak attainment. FP32 matrices/scalars explicitly share one vector work bucket when enabled. All complete physical-HBM/request-runtime fields remain unknown. Do not rank models or invent offload/parallel topology to overcome single-device capacity.
+
+Original request is preserved in full, with per-model total matrix/scalar/special conservation assertions. Partial and overlapping interfaces remain distinct and are normalized only as labelled arithmetic exercises; their denominator does not make the numerator actual HBM. V4 checkpoint storage and source allocation are separate; K3 A_log conflict prevents direct checkpoint execution admission. Acceptance is a finite resource bridge, not whole Experiment2-9 quality-constrained selection.

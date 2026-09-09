@@ -1,0 +1,25 @@
+# N definition and validation-loss input review (no fitting)
+
+Decision: keep the33 rows as candidates, not a single approved control group. N>=2e9 holdout remains unchanged. Independent per-row findings are in N-loss-per-point-review.json; no loss-based selection, fit or residual inspection was performed.
+
+## Official definition evidence
+
+The locked [NeurIPS supplement](https://proceedings.neurips.cc/paper_files/paper/2023/file/9d89448b63ce1e2e8dc7af72c984c196-Supplemental-Conference.pdf), Appendix S Eq23, includes token and positional embeddings in N. Its formula is12*l*h²+13*l*h+(50257+2048)*h, described as the authors' parameter estimate. Appendix K describes final C4 loss on a common210M-token validation subset, distinct from smaller changing subsets used during training. These paper-level statements do not override individual run evidence.
+
+The fixed repository PARAMS_MAP is the actual numeric source used by the notebook. Preserve its supplied precision and call it an author parameter estimate, not nominal model-name count, nonembedding count, or independently verified checkpoint-exact parameter count. Official utils/model_params.sh and utils/flops-params_py.py are separately downloaded and SHA-locked in this directory. The latter helper uses a different norm/bias formula from Eq23; no explicit evidence was found that it generated PARAMS_MAP. It must not silently replace those values.
+
+Nine candidate log matches provide actual h/l for comparison with Eq23. Differences range from rounding-sized deltas to exact-count conventions: e.g.196m's201236224 differs from Eq23's201192320 by43904. This equals49*h and is consistent with vocab padding50257→50304 plus final2*h normalization parameters, but that is an inference requiring model implementation evidence, not proof of the run's exact parameter count. All supplied N values remain unchanged. The25m map35.5M versus published h448/l6 (~37.89M) requires actual training-shape evidence before approval; neither model name nor paper table alone resolves it.
+
+## Loss units and actual control conflict
+
+Two official small final-validation TensorBoard files for2b855b55bc4 are locked here at the Hub's fixed revision. One is an empty initial log; the980-byte final log contains loss2.5741167068481445 and perplexity13.119723320007324. exp(loss) matches perplexity within1e-7 relative error, and six-place rounding matches notebook2.574117. This directly establishes natural-log cross-entropy (nats) for this point. extract_val_log.py reads protobuf events only, without training or fitting. The 'gigaflos (without embeddings)' tag labels the horizontal compute coordinate, not N's parameter definition or a different loss unit.
+
+The nine loss-matched run logs do not substantiate one common evaluation sample set. Independently inspected indexmap names request6400,25600 and51200 sequences of length2048, matching logged eval_iters100 with global batch64/256/512. These correspond to13,107,200 /52,428,800 /104,857,600 positions, not a common210M. The logs also identify loss as CrossEntropy. Dataset family and tokenizer alone are insufficient to equate these evaluation controls. Hardware_audit additionally checks exact training D/U budgets; its discovered name-versus-script token discrepancy reinforces the need for a gate.
+
+Of the matching logs, the51200-sequence points are above the predeclared2e9 holdout threshold; the25600-sequence points are below it. Do not merge validation groups to manufacture a usable train/holdout pair, move the threshold, substitute training validation curves, or silently correct N/D. The finite next step is to require an explicit control_id containing the actual final validation subset/sequence budget and training/tokenizer rules; unresolved rows remain excluded, and a fit adapter returns insufficient matched controls when no group spans the required split.
+
+## Deliverables and bounds
+
+n-loss-sources.lock.json binds the supplement, two official utilities and two official TensorBoard files with URLs/revisions/SHA/bytes/retrieval timestamps. N-loss-per-point-review.json contains all33 original record IDs, unchanged author N/loss and predeclared splits, plus available h/l/formula differences and indexmap evidence. The referenced run logs remain in the author's source directory and are bound by its source work; they were read only. No weights downloaded, no shared files edited, no fitting performed. Further training-adapter mathematics awaits a frozen candidate.
+
+Protocol clarification after main-agent methodological review: the strict same-subset insufficient decision above is a historical gate for that original protocol, not a universal prohibition on fitting different-size held-out samples. A separately predeclared statistical protocol may treat them as noisy estimates of the same population target, with tokenizer/loss/data-population evidence and sensitivity analysis, while retaining the N>=2e9 holdout and every eligible observed loss. Different sample count alone is insufficient to declare incompatible estimation targets. The initial fit was not performed.

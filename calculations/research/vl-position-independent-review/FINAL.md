@@ -1,0 +1,9 @@
+# 最终修复复核
+
+public候选的两项修复通过，新增uniform边界修复也通过。当前vl_position_bridge.py SHA为e38e2c0d4eef558df0aee4ec7fb485d5ff9f0faf1334a40d81442fe5cf06e452；其余候选/测试/锁哈希见final-acceptance.json。
+
+实际读取diff行为确认：图像decode追加每次8B arange输出、delta重复的8B读/8B输出；纯文本改为独立language默认arange+past计数，去掉get_rope_index节点与缓存delta，保留数学delta0及rope_delta_cached=False。static int64三轴位置及KV计数无改变。
+
+再次提取固定官方源码进行41组CPU位置、123次decode对照全部匹配。public定向10测试通过。另独立调用真实vl_request默认uniform输入并attach，确认images=None分支已修正，2000prompt、delta -1520、finalKV2127正确；可迁测试bootstrap已在文件中。
+
+接受此有限位置桥接及声明的setup接口账。字段是int64逻辑接口，不是allocator/HBM；跨设备to的复制条件和generation wrapper仍需在实际执行映射中另计，不扩大为完整runtime性能验收。未修改作者或公共文件。
