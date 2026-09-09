@@ -82,8 +82,14 @@ def verify():
     assert phase['response_status_counts'] == {'403': 24, '200': 6}
     assert not phase['book_outline_changed'] and not phase['skeleton_changed']
     assert phase['actually_viewed_page_count'] == 5
-    for key in ['catalog', 'structure']:
-        assert sha(ROOT / phase['current_outline_basis'][key]) == phase['current_outline_basis'][key + '_sha256']
+    # This packet records a historical editing basis, not today's outline bytes.
+    basis = json.loads((DEST / 'configuration-wall-outline-basis/manifest.json').read_text())
+    snapshots = {row['key']: row for row in basis['files']}
+    assert set(snapshots) == {'catalog', 'structure'}
+    for key, row in snapshots.items():
+        assert row['original_file'] == phase['current_outline_basis'][key]
+        assert row['sha256'] == phase['current_outline_basis'][key + '_sha256']
+        assert sha(ROOT / row['snapshot_file']) == row['sha256']
     sources = {s['id']: s for s in json.loads((DEST / 'sources.json').read_text())}
     assert len(phase['new_response_ids']) == len(set(phase['new_response_ids'])) == 30
     for sid in phase['new_response_ids']:
