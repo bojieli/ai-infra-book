@@ -29,7 +29,7 @@ def verify(base=None):
         if r.get('pdf_pages'):
             e['representative_pdf'] = {'file': r['pdf_file'], 'sha256': r['pdf_sha256'], 'pages': r['pdf_pages']}
     assert sum(e['abstract_read'] for e in entries.values()) == base['primary_abstracts_screened']
-    for folder in ('parallel-abstracts', 'parallel-abstracts-next'):
+    for folder in ('parallel-abstracts', 'parallel-abstracts-next', 'parallel-abstracts-third', 'parallel-abstracts-fourth', 'parallel-abstracts-fifth'):
         packet = D / folder
         subprocess.run([sys.executable, str(packet / 'verify.py')], check=True, capture_output=True)
         handoff = json.loads((packet / 'verification.json').read_text())
@@ -68,10 +68,10 @@ def verify(base=None):
         'pdf_pages': sum(e['representative_pdf']['pages'] for e in entries.values() if e['representative_pdf']),
         'selected_sections_read': sum(e['selected_reading'] is not None for e in entries.values()),
         'remaining_abstract_orders': [n for n, e in entries.items() if not e['abstract_read']],
-        'additional_full_primary_abstracts': 11, 'errors': [],
+        'additional_full_primary_abstracts': 26, 'errors': [],
     }
     summary['remaining_abstracts'] = len(summary['remaining_abstract_orders'])
-    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (52, 48, 742, 2)
+    assert (summary['primary_abstracts_screened'], summary['public_pdfs'], summary['pdf_pages'], summary['selected_sections_read']) == (67, 58, 898, 2)
     (D / 'reading-coverage.json').write_text(json.dumps({'summary': summary, 'records': list(entries.values())}, ensure_ascii=False, indent=2) + '\n')
     return summary
 
