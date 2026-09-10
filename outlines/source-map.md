@@ -34,9 +34,9 @@
 | `isl-tutorial` | [Presburger Formulas and Polyhedral Compilation](../references/files/documents/isl-tutorial.pdf) | 5 | 章末 5 | 已归档 |
 | `isl-manual` | [Integer Set Library Manual](../references/files/documents/isl-manual.html) | 5 | 补充／版本参照 | 已归档 |
 | `tvm-architecture` | [Apache TVM Design and Architecture](../references/files/documents/tvm-architecture.html) | 5 | 补充／版本参照 | 已归档 |
-| `roofline` | [Roofline: An Insightful Visual Performance Model for Floating-Point Programs and Multicore Architectures](../references/files/papers/roofline.pdf) | 1,4,13 | 章末 1,4,13 | 已归档 |
-| `hardware-lottery` | [The Hardware Lottery](../references/files/papers/hardware-lottery.pdf) | 1,13 | 章末 2,13 | 已归档 |
-| `tpu-v1` | [In-Datacenter Performance Analysis of a Tensor Processing Unit](../references/files/papers/tpu-v1.pdf) | 1,3,4,13 | 章末 1,4,13 | 已归档 |
+| `roofline` | [Roofline: An Insightful Visual Performance Model for Floating-Point Programs and Multicore Architectures](../references/files/papers/roofline.pdf) | 1,4,13 | 章末 1,4 | 已归档 |
+| `hardware-lottery` | [The Hardware Lottery](../references/files/papers/hardware-lottery.pdf) | 1,13 | 章末 2 | 已归档 |
+| `tpu-v1` | [In-Datacenter Performance Analysis of a Tensor Processing Unit](../references/files/papers/tpu-v1.pdf) | 1,3,4,13 | 章末 1,4 | 已归档 |
 | `tpu-v4` | [TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning with Hardware Support for Embeddings](../references/files/papers/tpu-v4.pdf) | 4,6,13 | 章末 6 | 已归档 |
 | `nvidia-v100` | [NVIDIA Tesla V100 GPU Architecture](../references/files/specs/nvidia-v100.pdf) | 4 | 章末 4 | 已归档 |
 | `nvidia-a100` | [NVIDIA A100 Tensor Core GPU Architecture](../references/files/specs/nvidia-a100.pdf) | 4 | 章末 4 | 已归档 |
@@ -59,7 +59,7 @@
 | `ollama` | [Ollama Development and Compute Backends](../references/files/documents/ollama.html) | 5,9 | 补充／版本参照 | 已归档 |
 | `nccl-guide` | [NCCL User Guide](../references/files/documents/nccl-guide.html) | 6,7 | 章末 6,7 | 已归档 |
 | `nccl-collectives` | [NCCL Collective Operations](../references/files/documents/nccl-collectives.html) | 6,7 | 章末 6,7 | 已归档 |
-| `ub-reflection` | [Unified Bus 背后的思考](../references/files/documents/ub-reflection.html) | 6,7,13 | 章末 1,6,7,13 | 已归档 |
+| `ub-reflection` | [Unified Bus 背后的思考](../references/files/documents/ub-reflection.html) | 6,7,13 | 正文 7；章末 1,6,7 | 第 7 章阅读全文，提炼设计动机与取舍；7.1.3、7.3–7.5，协议细节以规范为准 |
 | `ub-spec-entry` | [Unified Bus Base Specification 2.0 Preview 官方入口](../references/files/specs/ub-spec-entry.html) | 6,7 | 补充／版本参照 | 仅入口 |
 | `openurma` | [OpenURMA: A Clean-Room Open Implementation of the Unified Bus Protocol](../references/files/papers/openurma.pdf) | 6,7 | 章末 7 | 已归档 |
 | `openurma-readme` | [OpenURMA official README](../references/files/documents/openurma-readme.md) | 6,7 | 补充／版本参照 | 已归档 |
@@ -112,8 +112,8 @@
 | `ub-base-preview` | [Unified Bus Base Specification 2.0 Preview](../references/files/specs/ub-base-preview.pdf) | 6,7 | 补充／版本参照 | 已归档 |
 | `ub-os-reference` | [Unified Bus Software Reference Design for Operating Systems 2.0](../references/files/specs/ub-os-reference.pdf) | 6,7,12 | 补充／版本参照 | 已归档 |
 | `ub-root-table` | [Unified Bus Root Table Specification 1.0](../references/files/specs/ub-root-table.pdf) | 6,7 | 补充／版本参照 | 已归档 |
-| `h100-vs-4090` | [A100/H100 太贵，何不用 4090？](../references/files/documents/h100-vs-4090.html) | 3,4,11 | 章末 1,4,6,8,9,10,12,13 | 已归档 |
-| `opentallas-readme` | [OpenTallas architecture and analysis](../references/files/documents/opentallas-readme.md) | 2,4,5,6,7,9,13 | 章末 4,13 | 本地固定快照 |
+| `h100-vs-4090` | [A100/H100 太贵，何不用 4090？](../references/files/documents/h100-vs-4090.html) | 3,4,11 | 章末 4,6,8,9,10,12 | 已归档 |
+| `opentallas-readme` | [OpenTallas architecture and analysis](../references/files/documents/opentallas-readme.md) | 2,4,5,6,7,9,13 | 章末 4 | 本地固定快照 |
 | `kueue-clusterqueue` | [Kueue ClusterQueue](../references/files/documents/kueue-clusterqueue.html) | 12 | 章末 11 | 已归档 |
 | `kueue-preemption` | [Kueue Preemption](../references/files/documents/kueue-preemption.html) | 12 | 章末 11 | 已归档 |
 | `fat-tree` | [A Scalable, Commodity Data Center Network Architecture](../references/files/papers/fat-tree.pdf) | 7 | 章末 7 | 已归档 |
@@ -231,25 +231,25 @@
 | `qwen3` | [Qwen3 Technical Report](../references/files/papers/qwen3.pdf) | 2,3,13 | 章末 2,3 | 已归档 |
 | `mixtral` | [Mixtral of Experts](../references/files/papers/mixtral.pdf) | 2,10 | 补充／版本参照 | 已归档 |
 | `deepseek-r1` | [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](../references/files/papers/deepseek-r1.pdf) | 3,11,13 | 章末 3,10 | 已归档 |
-| `test-time-compute` | [Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters](../references/files/papers/test-time-compute.pdf) | 3,13 | 章末 3,13 | 已归档 |
+| `test-time-compute` | [Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters](../references/files/papers/test-time-compute.pdf) | 3,13 | 章末 3 | 已归档 |
 | `deepseek-infra` | [Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures](../references/files/papers/deepseek-infra.pdf) | 6,10,13 | 章末 7,9 | 已归档 |
 | `deepseek-serving-report` | [Day 6: DeepSeek-V3/R1 Inference System Overview](../references/files/documents/deepseek-serving-report.md) | 6,10,13 | 补充／版本参照 | 已归档 |
 | `dynamo-production` | [How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale](../references/files/documents/dynamo-production.html) | 10,12 | 补充／版本参照 | 已归档 |
 | `tensorrt-llm-architecture` | [TensorRT LLM Architecture Overview](../references/files/documents/tensorrt-llm-architecture.html) | 5,9,10 | 补充／版本参照 | 已归档 |
 | `bojieli-phd-thesis` | [基于可编程网卡的高性能数据中心系统](../references/files/papers/bojieli-phd-thesis.pdf) | 1,4,5,7,13 | 章末 1,7 | 作者提供 |
-| `logicfolding-energy` | [Huawei’s τ Chip Was Supposed to Melt?](../references/files/papers/202609.00031v1.pdf) | 1,4,13 | 扩写 13 | 作者提供 |
+| `logicfolding-energy` | [Huawei’s τ Chip Was Supposed to Melt?](../references/files/papers/202609.00031v1.pdf) | 1,4,13 | 补充／版本参照 | 作者提供 |
 | `otel-genai-current` | [OpenTelemetry GenAI metrics — fixed commit](../references/outline-checks/2026-09-07/otel-genai-metrics.md) | 12 | 补充／版本参照 | 已归档 |
 | `beyond-chinchilla-v1` | [Beyond Chinchilla-Optimal，arXiv v1](../references/outline-checks/2026-09-07/beyond-chinchilla-v1.html) | 新增 | 章末 3 | 已归档 |
 | `beyond-chinchilla-pmlr` | [Beyond Chinchilla-Optimal，ICML 2024 发表页](../references/outline-checks/2026-09-07/beyond-chinchilla-pmlr.html) | 新增 | 补充／版本参照 | 已归档 |
 | `rfc9001` | [RFC 9001](../references/outline-checks/2026-09-07/rfc9001.txt) | 新增 | 章末 12 | 已归档 |
 | `rfc9221` | [RFC 9221](../references/outline-checks/2026-09-07/rfc9221.txt) | 新增 | 章末 12 | 已归档 |
-| `beyond-chinchilla-icml24` | [Beyond Chinchilla-Optimal，ICML 2024 正式全文](../references/outline-checks/2026-09-07/beyond-chinchilla-icml24.pdf) | 新增 | 章末 3,13 | 已归档 |
+| `beyond-chinchilla-icml24` | [Beyond Chinchilla-Optimal，ICML 2024 正式全文](../references/outline-checks/2026-09-07/beyond-chinchilla-icml24.pdf) | 新增 | 章末 3 | 已归档 |
 | `llama1-v1` | [LLaMA 原始技术报告 v1](../references/outline-checks/2026-09-07/scaling-history/llama1-v1.pdf) | 补充 | 章末 2,3 | 已归档；固定快照 |
 | `qwen25-v2` | [Qwen2.5 技术报告 v2](../references/outline-checks/2026-09-07/scaling-history/qwen25-v2.pdf) | 补充 | 章末 3 | 已归档；固定快照 |
 | `llama31-card` | [Llama 3.1 官方模型卡](../references/outline-checks/2026-09-07/scaling-history/llama31-card.md) | 补充 | 章末 3 | 已归档；固定快照 |
 | `qwen35-blog` | [Qwen3.5 官方发布与训练说明](../references/outline-checks/2026-09-07/scaling-history/qwen35-blog.html) | 补充 | 章末 3 | 已归档；固定快照 |
 | `kimi-k15-v4` | [Kimi k1.5 report v4](../references/outline-checks/2026-09-07/scaling-history/kimi-k15-v4.pdf) | 补充 | 补充／版本参照 | 已归档；固定快照 |
-| `jeff-dean-ladis2009` | [Jeff Dean LADIS 2009 original slides (Columbia mirror)](../references/outline-checks/2026-09-07/scaling-history/jeff-dean-ladis2009.pdf) | 补充 | 章末 1 | 已归档；固定快照 |
+| `jeff-dean-ladis2009` | [Jeff Dean LADIS 2009 original slides (Columbia mirror)](../references/outline-checks/2026-09-07/scaling-history/jeff-dean-ladis2009.pdf) | 补充 | 正文 1；章末 1 | 已归档；固定快照 |
 | `qwen3-8b-config` | [qwen3-8b official configuration at b968826d9c46dd6066d109eabc6255188de91218](../references/outline-checks/2026-09-07/scaling-history/qwen3-8b-config.json) | 补充 | 章末 2,6 | 已归档；固定快照 |
 | `deepseek-v4-flash-config` | [deepseek-v4-flash official configuration at 60d8d70770c6776ff598c94bb586a859a38244f1](../references/outline-checks/2026-09-07/scaling-history/deepseek-v4-flash-config.json) | 补充 | 补充／版本参照 | 已归档；固定快照 |
 | `deepseek-v4-flash-config.json` | [deepseek-v4-flash reference inference/config.json](../references/outline-checks/2026-09-07/scaling-history/deepseek-v4-flash-inference-config.json) | 补充 | 章末 2 | 已归档；固定快照 |
@@ -668,7 +668,7 @@
 | `hybrid-vllm-pr-45939` | [[1/N][Core] add partial prefix cache primitives](../references/framework-history/2026-09-08/hybrid-state/vllm-pr-45939.json) | 补充 | 补充／版本参照 | 已归档；固定快照 |
 | `hybrid-vllm-pr-47782` | [[Core] Preserve Marconi caching with selective hybrid cache retention](../references/framework-history/2026-09-08/hybrid-state/vllm-pr-47782.json) | 补充 | 补充／版本参照 | 已归档；固定快照 |
 | `hybrid-vllm-pr-49502` | [[3/N][Core][KV Connector] Support reliable partial-tail KV offload for sub-block prompts](../references/framework-history/2026-09-08/hybrid-state/vllm-pr-49502.json) | 补充 | 补充／版本参照 | 已归档；固定快照 |
-| `micro24-paper-011` | [A Mess of Memory System Benchmarking, Simulation and Application Profiling](../references/proceedings/MICRO/2024/paper-011.pdf) | 补充 | 章末 1,4 | 已归档；固定快照 |
+| `micro24-paper-011` | [A Mess of Memory System Benchmarking, Simulation and Application Profiling](../references/proceedings/MICRO/2024/paper-011.pdf) | 补充 | 章末 4 | 已归档；固定快照 |
 | `micro25-paper-014` | [StreamTensor](../references/proceedings/MICRO/2025/paper-014.pdf) | 补充 | 章末 5 | 已选读物理页 3–14；FPGA 条件独立登记 |
 | `micro25-paper-030` | [LLM.265](../references/proceedings/MICRO/2025/paper-030.pdf) | 补充 | 章末 8 | 已选读物理页 4–13；现有引擎、硬件设计与模型估计分开 |
 | `micro25-nvidia-codec-matrix` | [NVIDIA 编解码支持表](../references/proceedings/MICRO/2025/nvidia-codec-matrix.html) | 补充 | 补充／版本参照 | 固定网页；只核相应设备的编码／解码表行 |
@@ -690,13 +690,13 @@
 | `redfuser-quant-generated` | [RedFuser FP8 生成示例](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/quant-generated.txt) | 官方实现 | 补充／版本参照 | 实验 5-4 扩写；前缀尺度与 cast 核对，未运行内核 |
 | `redfuser-quant-test` | [RedFuser FP8 参考与误差测试](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/quant-test.txt) | 官方实现 | 补充／版本参照 | 实验 5-4 扩写；完整静态阅读，随机输入容差不代表普遍等价 |
 | `redfuser-onnx-float8` | [ONNX Float8 类型与转换](../references/proceedings/ASPLOS/2026/redfuser-crosschecks/onnx-float8.html) | 官方文档 | 补充／版本参照 | 实验 5-4 扩写；只读 E4M3FN/E5M2 定义与 Cast 两节 |
-| `asplos26-paper-101` | [RhymeRL：历史草稿与 RL 供给](../references/proceedings/ASPLOS/2026/paper-101.pdf) | 补充 | 补充／版本参照 | 8.3.1／10.5.3；选读公开 v1 页 2–12 内声明范围，正式版另核 |
-| `rhymerl-vllm-suffix-guide` | [vLLM 固定 Suffix 指南](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-suffix-guide.txt) | 补充 | 补充／版本参照 | 8.3.1 扩写；完整指南，未执行示例 |
+| `asplos26-paper-101` | [RhymeRL：历史草稿与 RL 供给](../references/proceedings/ASPLOS/2026/paper-101.pdf) | 补充 | 补充／版本参照 | 8.5.2／10.5.2；选读公开 v1 页 2–12 内声明范围，正式版另核 |
+| `rhymerl-vllm-suffix-guide` | [vLLM 固定 Suffix 指南](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-suffix-guide.txt) | 补充 | 补充／版本参照 | 8.5.2 扩写；完整指南，未执行示例 |
 | `rhymerl-vllm-rejection` | [vLLM 固定 rejection sampler](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/vllm-rejection.txt) | 补充 | 补充／版本参照 | 草稿与目标概率；仅读取登记行段，不代表全部采样路径审计 |
-| `rhymerl-arctic-cache` | [Arctic 固定历史缓存](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/arctic-cache.txt) | 补充 | 补充／版本参照 | 实验 8-5／10-8；完整静态阅读，容量上限与请求数分别计量 |
-| `asplos26-paper-127` | [LOOPRAG：候选反馈与评测范围](../references/proceedings/ASPLOS/2026/paper-127.pdf) | 补充 | 补充／版本参照 | 5.3.5 扩写；选读公开 v1 页 4–13、18–22，采用方法与条件，不移用 CPU 加速倍数 |
+| `rhymerl-arctic-cache` | [Arctic 固定历史缓存](../references/proceedings/ASPLOS/2026/rhymerl-crosschecks/arctic-cache.txt) | 补充 | 补充／版本参照 | 实验 8-5／10-7；完整静态阅读，容量上限与请求数分别计量 |
+| `asplos26-paper-127` | [LOOPRAG：候选反馈与评测范围](../references/proceedings/ASPLOS/2026/paper-127.pdf) | 补充 | 补充／版本参照 | 5.3.4 扩写；选读公开 v1 页 4–13、18–22，采用方法与条件，不移用 CPU 加速倍数 |
 | `optval-fib-evaluation` | [FlashInfer 比赛：B200、基线与评分](../references/framework-history/2026-09-08/optimization-validation/starter-evaluation.md) | 补充 | 补充／版本参照 | 实验 5-6；固定比赛提交，不作为所有 GPU／模型的默认评测条件 |
-| `optval-fib-default` | [FlashInfer-Bench 默认评估器](../references/framework-history/2026-09-08/optimization-validation/fib-default.py) | 补充 | 补充／版本参照 | 5.3.5；完整静态阅读，专用 evaluator 与时间后端另核 |
+| `optval-fib-default` | [FlashInfer-Bench 默认评估器](../references/framework-history/2026-09-08/optimization-validation/fib-default.py) | 补充 | 补充／版本参照 | 5.3.4；完整静态阅读，专用 evaluator 与时间后端另核 |
 | `optval-fib-runtime` | [FlashInfer-Bench apply 运行时](../references/framework-history/2026-09-08/optimization-validation/fib-runtime.py) | 补充 | 补充／版本参照 | 实验 5-9；完整静态阅读，匹配表与完整引擎集成待核 |
 | `remote-ordering-paper` | [Efficient Remote Memory Ordering（作者公开稿）](../references/proceedings/ASPLOS/2026/paper-116.pdf) | 7 | 补充／版本参照 | 正文页 2–13 选读；新硬件方案与无写冲突性能参照分别记录 |
 | `remote-ordering-nvshmem-using` | [远端排序对照：nvshmem-using](../references/framework-history/2026-09-09/remote-ordering/nvshmem-using.html) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
@@ -704,30 +704,30 @@
 | `remote-ordering-nvshmem-sync` | [远端排序对照：nvshmem-sync](../references/framework-history/2026-09-09/remote-ordering/nvshmem-sync.html) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
 | `remote-ordering-author-readme` | [远端排序对照：author-readme](../references/framework-history/2026-09-09/remote-ordering/author-readme.md) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
 | `remote-ordering-nvshmem-ib-common` | [远端排序对照：nvshmem-ib-common](../references/framework-history/2026-09-09/remote-ordering/nvshmem-ib-common.cpp) | 7 | 补充／版本参照 | 声明范围见 remote-ordering/reading.json；文档快照与固定提交分别核对 |
-| `reward-resources-polyrl-readme` | [验证资源对照：polyrl-readme](../references/framework-history/2026-09-09/rollout-resources/polyrl-readme.md) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-polyrl-usage` | [验证资源对照：polyrl-usage](../references/framework-history/2026-09-09/rollout-resources/polyrl-usage.md) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-polyrl-roadmap` | [验证资源对照：polyrl-roadmap](../references/framework-history/2026-09-09/rollout-resources/polyrl-roadmap.md) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-verl-reward-loop` | [验证资源对照：verl-reward-loop](../references/framework-history/2026-09-09/rollout-resources/verl-reward-loop.py) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-verl-reward-remote` | [验证资源对照：verl-reward-remote](../references/framework-history/2026-09-09/rollout-resources/verl-reward-remote.py) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-verl-reward-limited` | [验证资源对照：verl-reward-limited](../references/framework-history/2026-09-09/rollout-resources/verl-reward-limited.py) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-verl-agent-loop` | [验证资源对照：verl-agent-loop](../references/framework-history/2026-09-09/rollout-resources/verl-agent-loop.py) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-verl-v041-trainer` | [验证资源对照：verl-v041-trainer](../references/framework-history/2026-09-09/rollout-resources/verl-v041-trainer.py) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `reward-resources-python-futures` | [验证资源对照：python-futures](../references/framework-history/2026-09-09/rollout-resources/python-futures.html) | 11 | 补充／版本参照 | 11.3.3；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
-| `rlboost-recovery-rlboost-polyrl-install` | [可抢占资源对照：rlboost-polyrl-install](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-install.md) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-gitmodules` | [可抢占资源对照：rlboost-polyrl-gitmodules](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-gitmodules.txt) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-launch-sglang` | [可抢占资源对照：rlboost-polyrl-launch-sglang](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-launch-sglang.sh) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-config` | [可抢占资源对照：rlboost-polyrl-config](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-config.toml) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-qwen3-14b-config` | [可抢占资源对照：rlboost-qwen3-14b-config](../references/framework-history/2026-09-09/rlboost-recovery/qwen3-14b-config.json) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-sglang-launch` | [可抢占资源对照：rlboost-polyrl-sglang-launch](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-launch.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-sglang-autopatch` | [可抢占资源对照：rlboost-polyrl-sglang-autopatch](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-autopatch.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-handlers` | [可抢占资源对照：rlboost-polyrl-handlers](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-handlers.rs) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-state` | [可抢占资源对照：rlboost-polyrl-state](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-state.rs) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-utils` | [可抢占资源对照：rlboost-polyrl-utils](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-utils.rs) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-fsdp-interface` | [可抢占资源对照：rlboost-polyrl-fsdp-interface](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-fsdp-interface.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-sender` | [可抢占资源对照：rlboost-polyrl-sender](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sender.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-receiver` | [可抢占资源对照：rlboost-polyrl-receiver](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-receiver.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-sglang-patches` | [可抢占资源对照：rlboost-polyrl-sglang-patches](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-patches.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
-| `rlboost-recovery-rlboost-polyrl-tcp-engine` | [可抢占资源对照：rlboost-polyrl-tcp-engine](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-tcp-engine.py) | 11 | 补充／版本参照 | 11.3.2；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `reward-resources-polyrl-readme` | [验证资源对照：polyrl-readme](../references/framework-history/2026-09-09/rollout-resources/polyrl-readme.md) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-polyrl-usage` | [验证资源对照：polyrl-usage](../references/framework-history/2026-09-09/rollout-resources/polyrl-usage.md) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-polyrl-roadmap` | [验证资源对照：polyrl-roadmap](../references/framework-history/2026-09-09/rollout-resources/polyrl-roadmap.md) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-verl-reward-loop` | [验证资源对照：verl-reward-loop](../references/framework-history/2026-09-09/rollout-resources/verl-reward-loop.py) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-verl-reward-remote` | [验证资源对照：verl-reward-remote](../references/framework-history/2026-09-09/rollout-resources/verl-reward-remote.py) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-verl-reward-limited` | [验证资源对照：verl-reward-limited](../references/framework-history/2026-09-09/rollout-resources/verl-reward-limited.py) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-verl-agent-loop` | [验证资源对照：verl-agent-loop](../references/framework-history/2026-09-09/rollout-resources/verl-agent-loop.py) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-verl-v041-trainer` | [验证资源对照：verl-v041-trainer](../references/framework-history/2026-09-09/rollout-resources/verl-v041-trainer.py) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `reward-resources-python-futures` | [验证资源对照：python-futures](../references/framework-history/2026-09-09/rollout-resources/python-futures.html) | 11 | 补充／版本参照 | 11.3.4；固定版本与声明范围见 rollout-resources/reading.json，非完整框架实现审计 |
+| `rlboost-recovery-rlboost-polyrl-install` | [可抢占资源对照：rlboost-polyrl-install](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-install.md) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-gitmodules` | [可抢占资源对照：rlboost-polyrl-gitmodules](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-gitmodules.txt) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-launch-sglang` | [可抢占资源对照：rlboost-polyrl-launch-sglang](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-launch-sglang.sh) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-config` | [可抢占资源对照：rlboost-polyrl-config](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-config.toml) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-qwen3-14b-config` | [可抢占资源对照：rlboost-qwen3-14b-config](../references/framework-history/2026-09-09/rlboost-recovery/qwen3-14b-config.json) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-sglang-launch` | [可抢占资源对照：rlboost-polyrl-sglang-launch](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-launch.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-sglang-autopatch` | [可抢占资源对照：rlboost-polyrl-sglang-autopatch](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-autopatch.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-handlers` | [可抢占资源对照：rlboost-polyrl-handlers](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-handlers.rs) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-state` | [可抢占资源对照：rlboost-polyrl-state](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-state.rs) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-utils` | [可抢占资源对照：rlboost-polyrl-utils](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-utils.rs) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-fsdp-interface` | [可抢占资源对照：rlboost-polyrl-fsdp-interface](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-fsdp-interface.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-sender` | [可抢占资源对照：rlboost-polyrl-sender](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sender.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-receiver` | [可抢占资源对照：rlboost-polyrl-receiver](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-receiver.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-sglang-patches` | [可抢占资源对照：rlboost-polyrl-sglang-patches](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-sglang-patches.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
+| `rlboost-recovery-rlboost-polyrl-tcp-engine` | [可抢占资源对照：rlboost-polyrl-tcp-engine](../references/framework-history/2026-09-09/rlboost-recovery/polyrl-tcp-engine.py) | 11 | 补充／版本参照 | 11.3.3；固定实现或官方配置，声明范围见 rlboost-recovery/reading.json |
 | `asplos26-pact-body` | [PACT 正文范围](../references/proceedings/ASPLOS/2026/pact-reading.json) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；窗口停顿、迁移与 NUMA 模拟条件 |
 | `asplos26-camp-body` | [Camp 正文范围](../references/proceedings/ASPLOS/2026/camp-reading.json) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；未饱和预测、加权交错及平台条件 |
 | `memory-tiering-fixed-implementations` | [分层内存固定实现对照](../references/framework-history/2026-09-09/memory-tiering/README.md) | 6、9 | 补充／版本参照 | 6.6→9.3／9.5；PACT 工件演进、Camp 补丁、Linux 与 vLLM 对象边界 |
@@ -735,7 +735,7 @@
 | `asplos26-morphlux-body` | [Morphlux 正文范围](../references/proceedings/ASPLOS/2026/morphlux-reading.json) | 6、7、11 | 补充／版本参照 | 6.4→7.5／7.6→11.3；公开 v3 与正式版本、三种验证层次分开 |
 | `torus-allocation-fixed-artifact` | [资源分配与固定工件](../references/framework-history/2026-09-09/torus-allocation/README.md) | 6、7、11 | 补充／版本参照 | 形状、端口、容量与恢复；NCCL 接口不等于端口收益保证 |
 | `torus-allocation-arithmetic` | [Qwen3 消息与位置枚举](../research/2026-infra-survey/torus-allocation-arithmetic.json) | 6、7、11 | 补充／版本参照 | 现有实验 6-4、7-8、11-3；计算示例不替代物理系统实测 |
-| `asplos26-m2xfp-body` | [M²XFP 正文范围](../references/proceedings/ASPLOS/2026/m2xfp-reading.json) | 4、5、8 | 补充／版本参照 | 4.2.5→5.3→8.4；静态与动态编码、元数据及专用架构条件 |
+| `asplos26-m2xfp-body` | [M²XFP 正文范围](../references/proceedings/ASPLOS/2026/m2xfp-reading.json) | 4、5、8 | 补充／版本参照 | 4.2.4→5.3→8.4；静态与动态编码、元数据及专用架构条件 |
 | `metadata-quantization-implementations` | [格式与实际实现](../references/framework-history/2026-09-09/metadata-quantization/README.md) | 4、5、8 | 补充／版本参照 | 伪量化、vLLM v0.12.0 与固定当前路径；质量与执行分别核对 |
 | `metadata-quantization-qwen3-case` | [同一 Qwen3 权重的表示](../case-studies/kernel-orchestration-and-quantization.md) | 4、5、8 | 扩写 5 | 现有实验 4-2／5-4 与图 4-3；容量、搜索与缓冲推算，不新增编号 |
 | `asplos26-wave-body` | [Wave 正文范围](../references/proceedings/ASPLOS/2026/wave-reading.json) | 1、11 | 补充／版本参照 | 2025 出版卷、2026 日程；十三页正文范围与五张实际查看图页 |
@@ -743,7 +743,7 @@
 | `smartnic-policy-agent-budget` | [主机调度与 Agent 平台预算](../case-studies/host-policy-and-dispatch.md) | 1、11 | 扩写 1,11 | 实验 1-6／11-1 的延伸；核数翻转点、环境容量与任务吞吐 |
 | `asplos25-ascend-components-body` | [昇腾单元分析正文范围](../references/proceedings/ASPLOS/2025/ascend-components-reading.json) | 4、5 | 补充／版本参照 | 历史 MindSpore 与芯片条件、十三页正文和五张实际查看图页 |
 | `ascend-components-framework` | [激活分支与性能采集](../references/framework-history/2026-09-09/ascend-components/README.md) | 5、8、9 | 补充／版本参照 | 固定普通／310P 入口、三段发行说明及 PD 采集；不把接口当作论文工件 |
-| `ascend-components-qwen3-case` | [同一 Qwen3 的单元与流水推算](../case-studies/component-utilization-and-overlap.md) | 4、5 | 扩写 4,5,12,13 | 5.2.3／5.3.5、实验 5-6、图 5-5；R×E、缓冲和资源共享 |
+| `ascend-components-qwen3-case` | [同一 Qwen3 的单元与流水推算](../case-studies/component-utilization-and-overlap.md) | 4、5 | 扩写 4,5,12 | 5.2.2／5.3.4、实验 5-6、图 5-5；R×E、缓冲和资源共享 |
 | `asplos25-diffuse-body` | [Diffuse 正文范围](../references/proceedings/ASPLOS/2025/diffuse-reading.json) | 5、6 | 补充／版本参照 | 十二页正文与四张图页；任务、内核和临时存储的不同边界 |
 | `asplos25-cxlfork-body` | [CXLfork 正文范围](../references/proceedings/ASPLOS/2025/cxlfork-reading.json) | 6、11 | 补充／版本参照 | 十三页正文与四张图页；进程原型、共享页和分层限制 |
 | `snapshot-residency-e2b` | [E2B 模板读取与内存安装](../references/framework-history/2026-09-09/snapshot-residency/README.md) | 11 | 补充／版本参照 | 固定提交、六份响应／十个范围；不将原型当作云服务实现 |
@@ -756,12 +756,12 @@
 | `interview-eighth-discovery` | [第八次面试资料核对](../references/interviews/2026-09-09/eighth-pass/README.md) | 8、10 | 补充／版本参照 | 二次整理与受限原页，仅作线索；未新增一手样本或题号 |
 | `asplos25-picachu-body` | [PICACHU 正文范围](../references/proceedings/ASPLOS/2025/picachu-reading.json) | 4、5、13 | 补充／版本参照 | 十一页正文范围与五张实际查看图页；资源配比、共享缓冲与建模条件 |
 | `nonlinear-resources-framework` | [实际函数求值与缓存](../references/framework-history/2026-09-09/nonlinear-resources/README.md) | 4、5、13 | 补充／版本参照 | 固定 vLLM 基类入口；准备与稳态分别计量，不代表完整设备内核审计 |
-| `nonlinear-resources-case` | [同一 Qwen3 的非矩阵工作](../case-studies/component-utilization-and-overlap.md) | 4、5、13 | 扩写 4,5,12,13 | 既有实验 4-1／图 4-2；旋转、系数表、主张量流量与缓冲条件 |
+| `nonlinear-resources-case` | [同一 Qwen3 的非矩阵工作](../case-studies/component-utilization-and-overlap.md) | 4、5、13 | 扩写 4,5,12 | 既有实验 4-1／图 4-2；旋转、系数表、主张量流量与缓冲条件 |
 | `asplos25-apophenia-body` | [Apophenia 正文与工件附录](../references/proceedings/ASPLOS/2025/apophenia-reading.json) | 5、8 | 补充／版本参照 | 十三页声明范围与六张实际查看图页；重复身份、匹配等待与稳态条件 |
 | `trace-identification-framework` | [任务匹配与图封装](../references/framework-history/2026-09-09/trace-identification/README.md) | 5、8 | 补充／版本参照 | 公开 Legion 工件与固定 vLLM 源码；缓冲责任和实现范围分别取证 |
 | `trace-identification-case` | [图执行的身份与等待](../case-studies/graph-execution-tradeoffs.md) | 5、8 | 正文 8；章末 5,8 | 同一输入槽位与独立流水推算；既有实验 5-8／图 5-7 |
 | `interview-ninth-provenance` | [第九次面试寻源与日期核对](../references/interviews/2026-09-09/ninth-pass/README.md) | 1、3、10、11 | 补充／版本参照 | 一篇候选人原帖；历史平台、试读和推广线索分别记，不新增题号 |
-| `shared-gpu-group-readiness` | [整组就绪与模型恢复](../case-studies/resource-sharing-and-placement.md#同时可用的一组-gpu) | 6、9、11 | 扩写 11 | 实验 11-3／图 11-4；相同工作量的期限、填空与恢复变体 |
+| `shared-gpu-group-readiness` | [整组就绪与模型恢复](../case-studies/resource-sharing-and-placement.md#同时可用的一组-gpu) | 6、9、11 | 扩写 11 | 实验 11-4／图 11-4；相同工作量的期限、填空与恢复变体 |
 | `asplos25-pipellm-body` | [PipeLLM 正文与作者版本](../references/proceedings/ASPLOS/2025/pipellm-reading.json) | 5、8、9 | 补充／版本参照 | 十三页声明正文与六张图页；提前准备、保护条件及预测工作 |
 | `pipellm-preemption-framework` | [工件与三期 vLLM 抢占路径](../references/framework-history/2026-09-09/pipellm-swap/README.md) | 5、8、9 | 补充／版本参照 | 九份新响应、十六个读取范围；旧式换出、重计算与 connector 缓存 |
 | `pipellm-preparation-case` | [主机准备、复制与有效工作](../case-studies/host-transfer-and-buffer-lifetime.md#提前准备的工作是否有用) | 5、8、9 | 补充／版本参照 | 实验 5-2／图 5-2 选做；同一张量的等待、三类双槽与无用准备预算 |
@@ -779,11 +779,11 @@
 | `interview-2026-tenth-pass` | [第十次原帖与日期核对](../references/interviews/2026-09-09/tenth-pass/README.md) | 2、3、8、11、12、13 | 补充／版本参照 | 四篇主帖、两位基础模型公司自述方向；题号保持 21，RL 专栏只作线索 |
 | `qwen-request-accounting-audit` | [Qwen3 请求计数与跨章衔接](../research/2026-infra-survey/qwen-request-accounting/README.md) | 2、6、8、9、10 | 补充／版本参照 | 区分输出与前向次数；页边界及 PD 主模型复算，保留正确的调用次数算例 |
 | `asplos25-spindle-body` | [Spindle 正文与附录范围](../references/proceedings/ASPLOS/2025/spindle-reading.json) | 10 | 补充／版本参照 | 十五页与八张图页；共享组件、分支扩展曲线、汇合与重配 |
-| `spindle-wavefront-framework` | [共享组件训练与固定研究分支](../references/framework-history/2026-09-09/spindle-wavefront/NOTES.md) | 10 | 扩写 10 | 五个代码读取范围；实验 10-5／图 10-5 选做，完整运行时映射仍待核 |
-| `neusight-calibration` | [预测校准的论文与固定实现](../references/framework-history/2026-09-09/neusight-calibration/NOTES.md) | 13 | 扩写 13 | 实验 13-6 延伸；阶段误差、tile 数据与版本范围，不增加核心实验 |
+| `spindle-wavefront-framework` | [共享组件训练与固定研究分支](../references/framework-history/2026-09-09/spindle-wavefront/NOTES.md) | 10 | 扩写 10 | 五个代码读取范围；实验 10-4／图 10-4 选做，完整运行时映射仍待核 |
+| `neusight-calibration` | [预测校准的论文与固定实现](../references/framework-history/2026-09-09/neusight-calibration/NOTES.md) | 13 | 扩写 5 | 实验 13-6 延伸；阶段误差、tile 数据与版本范围，不增加核心实验 |
 | `partir-shardy-partitioning` | [分片策略与公开编译器路径](../references/framework-history/2026-09-09/partir-shardy/NOTES.md) | 6 | 扩写 6 | 三页方法正文、固定分支与局部形状复算；仅补现有 TP 案例的编译结果核对 |
 | `pod-attention-serving-method` | [POD 共驻方法与同批服务摘要](../references/proceedings/ASPLOS/2025/serving-113-117/README.md) | 5、8、11 | 扩写 5 | 只采用物理页4–8的共享资源判断；COMET／TAPAS候选，113仍缺摘要，正式清单合并待做 |
 
 ## 作者材料采用（2026-09-09）
 
-[七份来源快照与 SHA-256](../references/author-materials/2026-09-09/sources.json)补充本地作者材料：[上下文与技术判断](../case-studies/author-context-and-design.md)对应 3.1.4、4.6.4、5.3.4、8.2.4–8.2.5、12.1.3、12.2.3、13.4.1；[单 Agent、24×7 serving 成本](../case-studies/single-agent-serving-cost.md)对应 11.4.1、13.5.1 和实验 13-6。前缀复用以 AI Agent 书第 2 章及实验台账为主；两朵云短例的论文版本入口与阅读范围在案例笔记中登记。FastWake 未采用，原五篇作者文章不重复登记。
+[七份来源快照与 SHA-256](../references/author-materials/2026-09-09/sources.json)补充本地作者材料：[上下文与技术判断](../case-studies/author-context-and-design.md)对应 3.1.4、4.6.2、5.3.4、8.3.3–8.3.4、12.1.3、12.2.4、4.6.3；[单 Agent、24×7 serving 成本](../case-studies/single-agent-serving-cost.md)对应 11.4.4 的已解算例。前缀复用以 AI Agent 书第 2 章及实验台账为主；两朵云短例的论文版本入口与阅读范围在案例笔记中登记。FastWake 未采用，原五篇作者文章不重复登记。

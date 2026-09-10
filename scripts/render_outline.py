@@ -5,7 +5,7 @@ import re,html,json,hashlib
 from urllib.parse import quote
 R=Path(__file__).resolve().parents[1];O=R/'outlines'
 catalog=json.loads((O/'chapters.json').read_text())
-assert [c['number'] for c in catalog]==list(range(1,14))
+assert [c['number'] for c in catalog]==list(range(1,len(catalog)+1))
 assert {c['file'] for c in catalog}=={p.name for p in O.glob('[0-9][0-9]-*.md')}
 chapters=[]
 for entry in catalog:
@@ -23,7 +23,7 @@ for entry in catalog:
     core=re.findall(r'^> \*\*实验 (\d+-\d+)[^\n]*〔核心〕',s,re.M)
     assert core==entry['core_experiments'] and len(core)==3,(p,core)
 counts=dict(sections=sum(len(c['sections']) for c in chapters),subsections=sum(c['subcount'] for c in chapters),experiments=sum(c['labs'] for c in chapters),figures=sum(c['figs'] for c in chapters))
-summary=f'十三章共 {counts["sections"]} 节、{counts["subsections"]} 个小节、{counts["experiments"]} 项实验与计算、{counts["figures"]} 项配图计划'
+summary=f'十二章共 {counts["sections"]} 节、{counts["subsections"]} 个小节、{counts["experiments"]} 项实验与计算、{counts["figures"]} 项配图计划'
 h=(R/'skeleton.html').read_text();panorama=re.search(r'<figure class="infra-map".*?</figure>',h,re.S)[0]
 def inline(t):
     t=html.escape(t);t=re.sub(r'`([^`]+)`',r'<code>\1</code>',t)
@@ -48,14 +48,14 @@ for c in chapters:
         parts.append(f'<details class="outline-section" id="sec-{sec["num"].replace(".","-")}"{opened}><summary>{html.escape(sec["num"]+" "+sec["title"])}</summary><div class="outline-section-body">'+blocks(sec['intro']))
         for sub in sec['subs']:
             parts.append(f'<section class="outline-subsection" id="sec-{sub["num"].replace(".","-")}"><h4>{html.escape(sub["num"]+" "+sub["title"])}</h4>')
-            if sub['num']=='1.1.2':parts.append(panorama)
+            if sub['num']=='1.1.1':parts.append(panorama)
             parts.append(blocks(sub['body'])+'</section>')
         parts.append('</div></details>')
     parts.append('<div class="chapter-decision"><h4>本章的设计决定</h4>'+blocks(c['decision'])+'</div>')
     parts.append(f'<p class="chapter-end"><a href="outlines/{quote(c["path"].name)}">本章 Markdown 大纲</a> · <a href="outlines/extensions/{quote(c["path"].name)}">扩写资料</a> · {len(c["sections"])} 节／{c["subcount"]} 小节 · {c["labs"]} 项练习（3 项核心） · {c["figs"]} 项配图计划</p></article>')
 parts.append('</section>')
 h=re.sub(r'  <section id="chapter-details">.*?(?=  <section id="shared-cases">)','\n'.join(parts)+'\n\n',h,flags=re.S)
-h=re.sub(r'十三章共 \d+ 节、\d+ 个小节、\d+ 项实验与计算、\d+ 项配图计划',summary,h)
+h=re.sub(r'十[二三]章共 \d+ 节、\d+ 个小节、\d+ 项实验与计算、\d+ 项配图计划',summary,h)
 nav='\n'.join(f'<a href="#ch-{c["number"]}">{c["number"]:02d} · {html.escape(c["title"])}</a>' for c in catalog)
 h=re.sub(r'(<nav class="chapter-nav"[^>]*>).*?(</nav>)',lambda m:m[1]+'\n'+nav+'\n'+m[2],h,flags=re.S)
 (R/'skeleton.html').write_text(h)
@@ -63,7 +63,7 @@ for p in [R/'README.md',O/'README.md']:
     s=p.read_text();prefix='outlines/' if p==R/'README.md' else ''
     entries='\n'.join(f'{c["number"]}. [{c["title"]}]({prefix}{quote(c["file"])}): {c["summary"]}' for c in catalog)
     s=re.sub(r'<!-- CHAPTERS:START -->.*?<!-- CHAPTERS:END -->','<!-- CHAPTERS:START -->\n'+entries+'\n<!-- CHAPTERS:END -->',s,flags=re.S)
-    s=re.sub(r'十三章共 \d+ 节、\d+ 个小节、\d+ 项实验与计算、\d+ 项配图计划',summary,s)
+    s=re.sub(r'十[二三]章共 \d+ 节、\d+ 个小节、\d+ 项实验与计算、\d+ 项配图计划',summary,s)
     p.write_text(s)
 
 # Keep all source rows, updating primary chapter use and appending the new fixed configuration.
