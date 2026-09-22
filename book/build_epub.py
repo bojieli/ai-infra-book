@@ -82,12 +82,12 @@ def rasterize(pdf, cache):
 
 def prepare(number, source, edition, source_ref, figures):
     text = source.read_text(encoding='utf-8')
-    base = source.parent
+    base = MANUSCRIPTS if edition == 'zh-tw' else source.parent
     # Chapter titles keep their visible number ("第 2 章 …" / "Chapter 2 …") because
     # section headings carry manual numbers (2.1, 2.1.1) and EPUB does not number.
     if number == 0:
         text = re.sub(r'^# (.+?)\s*$', r'# \1 {#preface}', text, count=1, flags=re.M)
-    elif edition == 'zh':
+    elif edition in ('zh', 'zh-tw'):
         text = re.sub(r'^# (第\s*\d+\s*章.*?)\s*$', rf'# \1 {{#chapter-{number}}}', text, count=1, flags=re.M)
     else:
         text = re.sub(r'^# (.+?)\s*$', rf'# Chapter {number}  \1 {{#chapter-{number}}}', text, count=1, flags=re.M)
@@ -149,7 +149,7 @@ def main():
     parser.add_argument('--source-ref', help='Git commit for GitHub links in released EPUBs')
     args = parser.parse_args()
     meta = EDITIONS[args.edition]
-    home = HERE if args.edition == 'zh' else BOOK_EN
+    home = HERE if args.edition == 'zh' else (ROOT / 'book-zh-tw' if args.edition == 'zh-tw' else BOOK_EN)
     output_dir = (args.output_dir or home).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     work = HERE / 'build' / f'{meta["name"]}-epub'
