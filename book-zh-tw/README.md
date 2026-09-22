@@ -10,7 +10,7 @@
 | :--- | :--- |
 | `introduction.md`, `chapter01.md` … `chapter12.md` | 在地化校對後的繁體中文各章節 |
 | `cover.tex` | 沿用系列 ElegantBook 處理器與互聯拓撲繪圖的繁體中文封面 |
-| `preamble.tex` | 繁體中文字體設置（優先支援 `Songti TC`、`PingFang TC` 與 `Noto Serif CJK TC`） |
+| `preamble.tex` | 繁體中文排版配置（載入系列基礎樣式並相容全書 CJK 字型） |
 | `build_pdf.py`, `build_pdf.sh` | Pandoc + XeLaTeX 編譯腳本，對齊 `book-en/build_pdf.py` |
 | `assemble.py` | 從 `manuscripts/` 自動重建各章節 |
 | `tools/` | 翻譯腳本（`translate_tw.py`）、校驗工具（`verify_tw.py`）與技術術語表（`glossary.json`） |
