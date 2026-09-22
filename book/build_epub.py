@@ -41,6 +41,9 @@ EDITIONS = {
     'en': dict(name='AI-Infra-Book-EN', lang='en-US', author='Bojie Li',
                title='Understanding AI Infra', subtitle='Quantitative Analysis and System Design',
                toc_title='Contents', footnotes_title='Notes'),
+    'zh-tw': dict(name='AI-Infra-Book-ZH-TW', lang='zh-Hant', author='李博杰',
+                  title='深入理解 AI Infra', subtitle='量化分析與系統設計',
+                  toc_title='目錄', footnotes_title='註釋'),
 }
 
 
@@ -48,6 +51,9 @@ def sources(edition):
     """(number, path) for the preface (0) and chapters 1-12."""
     if edition == 'zh':
         return [(n, next(MANUSCRIPTS.glob(f'{n:02}-*.md'))) for n in range(13)]
+    elif edition == 'zh-tw':
+        book_tw = ROOT / 'book-zh-tw'
+        return [(0, book_tw / 'introduction.md')] + [(n, book_tw / f'chapter{n:02}.md') for n in range(1, 13)]
     return [(0, BOOK_EN / 'introduction.md')] + [(n, BOOK_EN / f'chapter{n:02}.md') for n in range(1, 13)]
 
 

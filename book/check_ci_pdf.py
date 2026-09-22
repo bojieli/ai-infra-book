@@ -12,6 +12,8 @@ EDITIONS = {
                                'SourceHanSansCN-Bold', 'LMRoman10-Regular', 'LatinModernMath-Regular')),
     'en': dict(name='AI-Infra-Book-EN', expected_text=('AI Infra', 'Edge-Cloud Coordination'),
                required_fonts=('Menlo-Regular', 'LMRoman10-Regular', 'LatinModernMath-Regular')),
+    'zh-tw': dict(name='AI-Infra-Book-ZH-TW', expected_text=('AI Infra', '端邊雲協同'),
+                  required_fonts=('Menlo-Regular', 'LMRoman10-Regular', 'LatinModernMath-Regular')),
 }
 
 
