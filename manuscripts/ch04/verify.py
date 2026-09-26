@@ -124,5 +124,19 @@ md8=td['measured_decode'];check(close(md8['bound_ms'],16344770560/1.792e12*1e3) 
 en=td['energy'];check([round(c['mac_breakeven_W'],1) for c in en['calls']]==[155.1,10.7] and [round(c['rtx_mJ'],1) for c in en['calls']]==[25.8,19.6],'projection energy')
 check([round(x['joules'],2) for x in en['decode_step']]==[7.30,5.24],'decode step energy')
 check(td['groq_kv']=={'chip_sram_bytes':220*2**20,'one_request':6,'eight_requests':42,'eight_requests_32k':168,'weights_bf16':72},'Groq chip counts')
-report={'status':'passed' if not errors else 'failed','chapter':4,'sections':7,'subsections':23,'exercises':7,'worked_examples':3,'figures':len(figs),'math_expressions':m['expressions'],'chinese_characters':len(re.findall(r'[\u4e00-\u9fff]',s)),'checks':checks,'errors':errors}
+# 4.3.2-4.4.4: L2 and synchronisation figures and prose come from the measured excerpt.
+sync=load('calculations/sources/opentallas/blackwell-sync-latency.json')
+import sys;sys.path[:0]=[str(HERE),str(HERE.parent)]
+from sync_figures import ladder_rows
+check([r[1] for r in ladder_rows(sync)]==[7,131,365.5,663,1004],'sync ladder values')
+ghz=sync['device']['sm_clock_ghz'];check(sync['device']['sms']==188 and sync['device']['l2_mib']==128,'device L2 and SMs')
+check(round(340/ghz/5)*5==120 and round(390/ghz/5)*5==135 and sync['l2']['load_round_trip_cycles']==[338,392],'L2 round trip range')
+check(sync['l2']['hit_latency_between_processes_cycles']==[354,870],'L2 variation')
+check(round(sum(sync['boundaries_cycles']['handoff_release_acquire'])/2,-1)==1050 and round(sum(sync['boundaries_ns']['handoff_release_acquire'])/2,-1)==370,'handoff cycles and ns')
+check(round(sum(sync['boundaries_ns']['handoff_no_fence'])/2,-1)==140,'no-fence handoff')
+check(sync['boundaries_ns']['pdl_chain']==366 and round(1900/ghz,-1)==660 and sync['all_sm_barrier_breakdown_cycles']['arrive_fence']==460,'all-SM barrier')
+check(round(sync['l2']['same_line_all_sms_8_warps_cycles']/sync['l2']['private_line_per_sm_cycles'])==9,'hot line ratio')
+check(sync['bandwidth_bytes_per_cycle_per_sm']=={'local_shared_memory':36,'l2':6.9,'distributed_shared_memory':1.3},'DSMEM bandwidth')
+check(38083/sync['boundaries_ns']['all_sm_gather_with_vector_fp32_16kib']>10,'cluster exchange slower than L2')
+report={'status':'passed' if not errors else 'failed','chapter':4,'sections':7,'subsections':24,'exercises':7,'worked_examples':3,'figures':len(figs),'math_expressions':m['expressions'],'chinese_characters':len(re.findall(r'[\u4e00-\u9fff]',s)),'checks':checks,'errors':errors}
 (HERE/'validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps(report,ensure_ascii=False,indent=2));raise SystemExit(bool(errors))

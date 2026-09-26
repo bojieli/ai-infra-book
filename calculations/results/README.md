@@ -1082,7 +1082,7 @@ KV分页与分支：逻辑、唯一有效和分配字节分别计量。
 | [persistent-tiles-slow-dispatch](persistent-tiles-slow-dispatch.md) | 16 | 582.270838 | 803.585055 | 4718592 |
 | [persistent-tiles-tail](persistent-tiles-tail.md) | 18 | 583.388554 | 359.399455 | 6291456 |
 | [persistent-one-tile](persistent-one-tile.md) | 2 | 582.270838 | 578.670838 | 12582912 |
-| [persistent-tiles-rtxpro6000](persistent-tiles-rtxpro6000.md) | 16 | 126.345151 | 115.357151 | 3145728 |
+| [persistent-tiles-rtxpro6000](persistent-tiles-rtxpro6000.md) | 16 | 126.345151 | 113.737151 | 3145728 |
 
 原始FFN运行记录：无分析器计时与Nsight事件分别核算。
 

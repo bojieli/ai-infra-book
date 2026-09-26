@@ -1,6 +1,6 @@
 # qwen-persistent-tasks — qwen3-8b
 
-输入：`{"activation_elements_per_second": 448000000000, "event_publish_ns": 200, "host_launch_ns": 5000, "matrix_flops_per_second": 503800000000000, "task_dispatch_ns": 500, "tile_rows": 64, "tokens": 512}`
+输入：`{"activation_elements_per_second": 448000000000, "event_publish_ns": 370, "host_launch_ns": 5000, "matrix_flops_per_second": 503800000000000, "task_dispatch_ns": 150, "tile_rows": 64, "tokens": 512}`
 
 数值是分析计算；字节以 bytes 保存，FMA=2，不是硬件测量。
 
@@ -15,28 +15,28 @@
 | completion_event_publications | 16 |
 | intertask_dependency_edges | 8 |
 | event_poll_iterations | `null` |
-| task_dispatch_total_ns | 8,000 |
-| event_publish_total_ns | 3,200 |
+| task_dispatch_total_ns | 2,400 |
+| event_publish_total_ns | 5,920 |
 | intermediate_total_bytes | 12,582,912 |
 | intermediate_write_read_bytes | 25,165,824 |
 | persistent_intermediate_live_peak_bytes | 3,145,728 |
 | barrier_finish_exact_ns | `"55696101008/440825"` |
 | barrier_finish_ns | 126,345.15058810185 |
-| persistent_finish_exact_ns | `"50852315908/440825"` |
-| persistent_finish_ns | 115,357.15058810185 |
-| hypothetical_speedup | 1.09525200600034 |
+| persistent_finish_exact_ns | `"50138179408/440825"` |
+| persistent_finish_ns | 113,737.15058810185 |
+| hypothetical_speedup | 1.1108520824972992 |
 | actual_gpu_seconds | `null` |
 
 | 块 | 行数 | 生产开始 us | 数据就绪 us | 消费开始 us | 消费完成 us |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 0 | 64 | 5.000000 | 18.487715 | 18.487715 | 20.943144 |
-| 1 | 64 | 18.487715 | 31.975431 | 31.975431 | 34.430859 |
-| 2 | 64 | 31.975431 | 45.463146 | 45.463146 | 47.918574 |
-| 3 | 64 | 45.463146 | 58.950861 | 58.950861 | 61.406290 |
-| 4 | 64 | 58.950861 | 72.438576 | 72.438576 | 74.894005 |
-| 5 | 64 | 72.438576 | 85.926292 | 85.926292 | 88.381720 |
-| 6 | 64 | 85.926292 | 99.414007 | 99.414007 | 101.869435 |
-| 7 | 64 | 99.414007 | 112.901722 | 112.901722 | 115.357151 |
+| 0 | 64 | 5.000000 | 18.307715 | 18.307715 | 20.583144 |
+| 1 | 64 | 18.307715 | 31.615431 | 31.615431 | 33.890859 |
+| 2 | 64 | 31.615431 | 44.923146 | 44.923146 | 47.198574 |
+| 3 | 64 | 44.923146 | 58.230861 | 58.230861 | 60.506290 |
+| 4 | 64 | 58.230861 | 71.538576 | 71.538576 | 73.814005 |
+| 5 | 64 | 71.538576 | 84.846292 | 84.846292 | 87.121720 |
+| 6 | 64 | 84.846292 | 98.154007 | 98.154007 | 100.429435 |
+| 7 | 64 | 98.154007 | 111.461722 | 111.461722 | 113.737151 |
 
 计量条件：
 
