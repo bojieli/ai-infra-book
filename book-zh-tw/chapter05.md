@@ -143,7 +143,7 @@ $$
 
 MMA 有兩種發出方式。warp 級指令由一個 warp 單獨發出，運算元要先裝進該 warp 的暫存器；Hopper 的 warpgroup 級指令由 4 個相鄰 warp（合稱一個 warpgroup）聯合發出，可以直接從共享記憶體取運算元，並且非同步執行：發出指令的 warp 在等待結果的同時可以做其他工作。FlashAttention-3 正是利用這種指令安排計算重疊。[^fa]
 
-**同步：非同步複製與柵欄。** 第 4.4.2 節用兩個輸入槽讓載入與計算重疊，前提是知道「槽已填滿」和「槽已用完」兩個時刻。在 SM 上，這兩個時刻由**柵欄（barrier）**給出。柵欄是共享記憶體中的一個計數器：參與者完成自己的一步後到達柵欄，計數達到預定值時，等在柵欄上的執行緒被放行。非同步複製（發出後由硬體在後臺完成、發出者不必等待的複製）完成時同樣到達柵欄，並按搬入的位元組數計數。每個槽配一對柵欄：「滿」柵欄由複製完成觸發，計算等它；「空」柵欄由計算結束觸發，下一次複製等它。
+**同步：非同步複製與柵欄。** 第 4.4.2 節用兩個輸入槽讓載入與計算重疊，前提是知道「槽已填滿」和「槽已用完」兩個時刻。在 SM 上，這兩個時刻由**柵欄（barrier）**給出。柵欄是共享記憶體中的一個計數器：參與者完成自己的一步後到達柵欄，計數達到預定值時，等在柵欄上的執行緒被放行。非同步複製（發出後由硬體在後臺完成、發出者不必等待的複製）完成時同樣到達柵欄，並按搬入的位元組數計數。每個槽配一對柵欄：「滿」柵欄由複製完成觸發，計算等它；「空」柵欄由計算結束觸發，下一次複製等它。這種柵欄只在單個 SM 內有效，放行一次僅需幾十個週期；SM 之間的交接須經由 L2，代價高出一到兩個數量級，見第 4.4.4 節。
 
 有了柵欄，warp 可以分工：一個 warp 只發複製（生產者），其餘 warp 只做計算（消費者），這種安排稱為 **warp specialization**。生產者 warp 發出塊 j+1 的複製後不必等它完成，轉而等「空」柵欄，準備寫入塊 j+2；消費者 warp 每等到一次「滿」柵欄，就接著計算下一塊。
 
@@ -741,13 +741,13 @@ $$
 
 圖重放和程式快取減少了主機的重複準備，加速器上還有另一類等待：對於有依賴關係的兩個 kernel，後一個通常仍要等前一個全部完成後才能開始。如果後一個運算子只需要前一個運算子的一塊結果，就可以把等待條件縮小到資料塊：第一塊算好後，立即開始後續運算，同時繼續計算其餘資料塊。
 
-**persistent kernel** 一直駐留在加速器上執行，從佇列中取出任務，透過事件確認所需資料是否準備好。這樣既減少主機反覆 kernel launch 的工作，也讓相鄰運算子能按塊重疊執行。Mirage Persistent Kernel／MPK 是採用這種任務排程方式的研究系統。[^persistent]
+**persistent kernel** 一直駐留在加速器上執行，從佇列中取出任務，透過完成標誌確認所需資料是否準備好。這樣既減少主機反覆 kernel launch 的工作，也讓相鄰運算子能按塊重疊執行。Mirage Persistent Kernel／MPK 是採用這種任務排程方式的研究系統。[^persistent]
 
-仍以 Qwen3-8B 的 up 投影后接 SiLU 活化函數為例，取 512 個 token 的特徵向量，每 64 個 token 的向量組成一個資料塊，共八塊。每塊投影為 $2\times64\times4096\times12288\approx6.44$ GFLOPs，按 RTX PRO 6000 的 BF16 稠密峰值 503.8 TFLOP/s 約需 12.8 μs；每塊活化運算需處理 $64\times12288$ 個 BF16 元素，每個元素讀 2 bytes、寫 2 bytes，按 1792 GB/s 的視訊記憶體頻寬約需 1.76 μs。設矩陣與向量資源獨立、緩衝充足，每次 kernel launch 需要 5 μs。等全部投影完成再開始執行活化函數，共需 $2\times5+8\times(12.8+1.76)\approx126$ μs。
+仍以 Qwen3-8B 的 up 投影后接 SiLU 活化函數為例，取 512 個 token 的特徵向量，每 64 個 token 的向量組成一個資料塊，共八塊。每塊投影為 $2\times64\times4096\times12288\approx6.44$ GFLOPs，按 RTX PRO 6000 的 BF16 稠密峰值 503.8 TFLOP/s 約需 12.8 μs；每塊活化運算需處理 $64\times12288$ 個 BF16 元素，每個元素讀 2 bytes、寫 2 bytes，按 1792 GB/s 的視訊記憶體頻寬約需 1.76 μs。設矩陣與向量資源獨立、緩衝充足，主機逐個提交時每次 kernel launch 需要 5 μs。等全部投影完成再開始執行活化函數，共需 $2\times5+8\times(12.8+1.76)\approx126$ μs。
 
-現在將計算分為八個投影任務和八個活化運算任務，每個任務增加 0.5 μs 排程時間、0.2 μs 完成通知時間。每塊投影變為 13.5 μs，活化運算變為 2.46 μs。一次 kernel launch 後，八塊投影首尾相接，每塊投影完成後立即執行活化，最後一塊活化運算在投影全部結束後收尾，完成時間為 $5+8\times13.5+2.46\approx115$ μs，加速比約為 1.1。
+現在將計算拆為八個投影任務和八個活化運算任務。每個任務開始前從共享佇列領取：對佇列計數器做一次帶回傳值的原子加，約需一次 L2 往返，取 0.15 μs；完成後釋出完成標誌，即第 4.4.4 節的一對一跨 SM 交接，取 0.37 μs。於是每塊投影約 13.3 μs，活化運算約 2.28 μs。只需一次 kernel launch，八塊投影首尾相接，每塊投影完成後立即執行活化，最後一塊活化運算在投影全部結束後完成，總時間為 $5+8\times13.3+2.28\approx114$ μs，加速比約為 1.1。
 
-這裡較慢的階段是投影。節省的約 11.0 μs 有兩個來源：少了一次 5 μs 的 kernel launch，七塊活化運算約 12.3 μs 隱藏在投影時間內；任務開銷又在關鍵路徑上加回 6.3 μs。活化運算每塊只需 1.76 μs，按塊提前開始，能隱藏的時間也僅限於此。兩個階段的耗時越接近，按塊重疊節省的時間越多；一個階段遠長於另一個時，收益基本只剩少一次 kernel launch。
+這裡較慢的階段是投影。節省的約 12.6 μs 有兩個來源：少了一次 5 μs 的 kernel launch，七塊活化運算約 12.3 μs 隱藏在投影時間內；任務開銷又在關鍵路徑上加回 4.7 μs。活化運算每塊只需 1.76 μs，按塊提前開始，能隱藏的時間也僅限於此。兩個階段的耗時越接近，按塊重疊節省的時間越多；一個階段遠長於另一個時，收益基本只剩少一次 kernel launch。
 
 ![圖 5-36 從等待全部投影到逐塊開始活化](images/figure-5-15-persistent.pdf)
 
@@ -755,9 +755,13 @@ $$
 
 ![圖 5-37 按塊開始活化後的時間線](images/figure-5-persistent-blocks.pdf)
 
-*圖 5-37：矩陣與向量資源獨立、緩衝充足。每個任務另計 0.7 μs 排程與通知，首塊投影完成後即可執行活化；投影首尾相接，活化運算只在每塊投影之後短暫工作，八塊流水約 115 μs 結束。*
+*圖 5-37：矩陣與向量資源獨立、緩衝充足。每個任務另計 0.52 μs 領取與通知，首塊投影完成後即可執行活化；投影首尾相接，活化運算只在每塊投影之後短暫工作，八塊流水約 114 μs 結束。*
 
 沿著圖 5-37 的投影時間線看，八塊投影首尾相接，中間沒有空隙。這與雙緩衝是同一個規律：第一塊先完成前一階段，之後每隔較慢階段所需的時間完成一塊；這裡較慢的是投影，正如第 5.3.2 節較慢的是搬移，流水的節拍由它決定。每個緩衝槽從投影開始一直被佔用到活化運算結束；沒有空槽時，投影任務就要等待。因此，任務佇列、完成事件和空閒緩衝共同決定下一塊何時能夠開始。
+
+上例的 5 μs 是主機逐個提交 kernel 的代價。在加速器一側，kernel 邊界本身要短得多：RTX PRO 6000 上，CUDA Graph 中兩個空 kernel 的間隔約 430 ns，使用 PDL 時約 370 ns，與第 4.4.4 節的一對一跨 SM 交接相當。persistent kernel 省去的是啟動開銷，依賴所需的 L2 往返依然存在。
+
+decode 時這一點更為突出。batch 為 1 時，每個矩陣—向量乘都分佈在全部 SM 上，下一個乘法須等待全部 SM 的結果，因此每個邊界都是一次全 SM 交接。以 Qwen3-8B 的 $4096\times4096$ BF16 投影為例，將 64 個乘法串成依賴鏈，權重全部從視訊記憶體讀取，並提前把下一個乘法的權重讀入共享記憶體。無依賴時每個乘法約 21 μs，受視訊記憶體頻寬限制；加入依賴後，每個邊界多出 1.2–2.3 μs。多出的時間主要花在等待最慢的 SM 上，而非交接本身：每個 SM 固定負責 21 或 22 行，視訊記憶體對各 SM 的服務並不均勻，預取只能掩蓋其中一部分。改為各 SM 在緩衝槽空出時從計數器領取下一批行，快者多做、慢者少做，每個邊界多出的時間降至 0.74–1.06 μs，接近第 4.4.4 節全 SM 交接的約 1 μs。這部分是依賴本身的代價，改變提交方式無法消除。[^boundary]
 
 ## 5.6 從區域性最佳化到完整請求
 
@@ -936,6 +940,8 @@ FPGA 是可設定邏輯元件，高層次綜合（HLS）將較高層程式轉換
 [^specialization]: [形狀特化的完整輸入與交點](https://github.com/bojieli/ai-infra-book/blob/main/calculations/results/specialization-medium.md)。
 
 [^exp8]: [實驗 5-8](https://github.com/bojieli/ai-infra-book/blob/main/experiments/ch05/05-08/README.md)與[軌跡分析 JSON](https://github.com/bojieli/ai-infra-book/blob/main/experiments/ch05/05-08/results/trace-analysis.json)。
+
+[^boundary]: 筆者在 RTX PRO 6000 Blackwell Workstation 上的測量，[測量說明](https://github.com/bojieli/ai-infra-book/blob/main/calculations/sources/opentallas/blackwell-sync-latency-notes.md)中「Under a real weight stream」一節及[數值摘錄](https://github.com/bojieli/ai-infra-book/blob/main/calculations/sources/opentallas/blackwell-sync-latency.json)。16 個 $4096\times4096$ 矩陣輪換使用，共 512 MiB，為 L2 容量的 4 倍；每個邊界多出的時間為依賴鏈每個乘法的中位耗時減去同結構無依賴 kernel 的耗時。CUDA Graph 與 PDL 的邊界用空 kernel 測得，實際 kernel 還要加上收尾與準備時間。
 
 [^persistent]: [裝置任務組織與 MPK](https://github.com/bojieli/ai-infra-book/blob/main/case-studies/execution-feedback.md)；[八塊任務計算](https://github.com/bojieli/ai-infra-book/blob/main/calculations/results/persistent-tiles-rtxpro6000.md)。投影按 RTX PRO 6000 的 BF16 稠密峰值 503.8 TFLOP/s 推得，活化運算按 1792 GB/s 視訊記憶體頻寬與每元素 4 bytes 讀寫（448 G 元素/s）推得，兩項取自[硬體表](https://github.com/bojieli/ai-infra-book/blob/main/calculations/results/hardware.md)；獨立資源、任務開銷和緩衝條件採用例中設定。
 

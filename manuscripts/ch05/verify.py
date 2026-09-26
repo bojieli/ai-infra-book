@@ -83,11 +83,18 @@ for mode,end in [('serial',4*(COPY_US+COMPUTE_US)),('double_buffer',4*COPY_US+CO
   check(all(a['start']+a['duration']<=b['start'] for a,b in zip(ordered,ordered[1:])),'single resource exclusivity')
 # 5.5.4 on RTX PRO 6000: projection at 503.8 TFLOP/s, SiLU at 1792 GB/s with 4 bytes per element.
 prod=2*64*4096*12288/503.8e12*1e6;consume=64*12288*4/1792e9*1e6
-persist=json.loads((ROOT/'calculations/results/persistent-tiles-rtxpro6000.json').read_text())['summary']
+persist_all=json.loads((ROOT/'calculations/results/persistent-tiles-rtxpro6000.json').read_text());persist=persist_all['summary'];persist_scenario=persist_all['scenario']
 check(math.isclose(2*5+8*(prod+consume),persist['barrier_finish_ns']/1000),'coarse task completion')
-check(math.isclose(5+8*(prod+.7)+consume+.7,persist['persistent_finish_ns']/1000),'persistent task completion')
-check([round(prod,1),round(consume,2),round(prod+.7,1),round(consume+.7,2),round(2*5+8*(prod+consume)),round(5+8*(prod+.7)+consume+.7),round(persist['hypothetical_speedup'],1)]==[12.8,1.76,13.5,2.46,126,115,1.1],'persistent printed values')
-check(round(5+7*consume-8*.7-.7,1)==11.0 and round(7*consume,1)==12.3 and round(5+7*consume,1)==17.3,'persistent saving decomposition')
+task=(persist_scenario['task_dispatch_ns']+persist_scenario['event_publish_ns'])/1000
+check(task==.52,'measured task overhead')
+check(math.isclose(5+8*(prod+task)+consume+task,persist['persistent_finish_ns']/1000),'persistent task completion')
+check([round(prod,1),round(consume,2),round(prod+task,1),round(consume+task,2),round(2*5+8*(prod+consume)),round(5+8*(prod+task)+consume+task),round(persist['hypothetical_speedup'],1)]==[12.8,1.76,13.3,2.28,126,114,1.1],'persistent printed values')
+check(round(5+7*consume-9*task,1)==12.6 and round(7*consume,1)==12.3 and round(9*task,1)==4.7,'persistent saving decomposition')
+
+sync=json.loads((ROOT/'calculations/sources/opentallas/blackwell-sync-latency.json').read_text());w=sync['weight_stream_chain']
+check(w['exposed_per_boundary_us']['dynamic_row_claim']==[0.74,1.06] and [round(x,1) for x in w['exposed_per_boundary_us']['fixed_tiles_prefetch_8_rows']]==[1.2,2.3] and round(sum(w['stream_only_us_per_product'])/2)==21,'weight-stream boundary costs')
+check(round(sync['boundaries_ns']['cuda_graph_gap_empty_kernels'],-1)==430 and round(sync['boundaries_ns']['pdl_chain'],-1)==370,'graph and PDL gaps')
+check(round(persist_scenario['event_publish_ns'],-1)==round(sum(sync['boundaries_ns']['handoff_release_acquire'])/2,-1) and 126<=persist_scenario['task_dispatch_ns']*1<=150,'task costs from measured handoff and atomic')
 
 # Check newly explained thresholds and the actual RMSNorm traffic objects.
 check(math.isclose(1560/3096/.4,1.25968992248062),'tile bandwidth reversal')
@@ -121,7 +128,7 @@ for b,a,traffic,updates in zip(*[figdata['5-8'][k] for k in ['kv_rows','q_rows',
  check(updates==math.ceil(8192/a)*math.ceil(8192/b),'attention diagram update counts')
 graph=figdata['5-13']
 check(np.allclose(np.array(graph['prepare_us'])+graph['copy_us']+np.array([graph['compute_us']]*3),graph['completion_us']),'graph-copy time components')
-check(np.allclose(figdata['5-15']['completion_us'],[2*5+8*(prod+consume),5+8*(prod+.7)+consume+.7]),'persistent diagram time components')
+check(np.allclose(figdata['5-15']['completion_us'],[2*5+8*(prod+consume),5+8*(prod+task)+consume+task]),'persistent diagram time components')
 
 # New diagrams must preserve the shared capacity, traffic and lifetime models.
 index=json.loads((HERE/'figure-index.json').read_text())

@@ -1,5 +1,6 @@
 """Physical resources and finite buffers at final book dimensions."""
 import numpy as np
+from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from figure_style import COL,STYLE,canvas,plot,text,box,arrow,Exporter
@@ -116,6 +117,8 @@ def draw(here,data,teaching):
             vals=d[key];a.bar(range(4),vals,color=[COL['blue'],COL['green']]*2,edgecolor=COL['line']);a.set(xticks=range(4),xticklabels=['1 行\n复用','1 行\n轮换','256 行\n复用','256 行\n轮换'],ylabel=label,ylim=(0,max(vals)*1.3))
             for i,v in enumerate(vals):a.text(i,v+max(vals)*.025,'256 B' if v<.001 else f'{v:.1f}',ha='center',fontsize=11)
             save(f,name)
+    from sync_figures import draw as draw_sync
+    data['4-sync']=draw_sync(out,Path(here).resolve().parents[1])
     from core_principles_figures import draw as draw_principles
     draw_principles(4, out)
     from energy_physics import draw as draw_energy
