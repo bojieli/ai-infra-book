@@ -78,6 +78,18 @@ This feedback loop already has publicly documented examples. The DeepSeek V3 rep
 
 ![Figure 4-3 Cross-generation co-design of models and hardware. Solid lines run downward through time: existing accelerators influence model choices, software running in production exposes long-term bottlenecks, hardware design responds to these needs, and new accelerators make more model schemes possible.](images/figure-4-codesign-loop.pdf)
 
+
+### GPU and Ascend: data paths and synchronization responsibility
+
+Both architectures move operands to on-chip storage, run matrix instructions, and write results back. The difference is which levels are managed automatically and which are explicitly arranged by the program or compiler.
+
+| Concern | NVIDIA GPU (typical CUDA path) | Ascend DaVinci (typical path) |
+|---|---|---|
+| Global-to-on-chip movement | Hardware caches provide a default path; high-performance kernels often use shared memory and asynchronous copies | The compiler or kernel arranges movement through MTE and on-chip buffers such as UB and L1 |
+| Partial sums | Tensor Cores update registers or shared-memory tiles | Cube updates an L0C accumulator |
+| Overlap | Asynchronous copy, barriers, and software pipelining | MTE movement, Cube computation, and explicit or generated synchronization |
+| Programmer responsibility | Choose tile shape, shared-memory layout, and synchronization points | Choose or generate tile shape, buffer placement, movement, and synchronization |
+
 ### 4.1.3 Constraints of Chip Area, Power, and Packaging
 
 Compute units, memory, and interfaces all occupy chip area and all consume power. The more resource allocated to one part, the less budget remains for the others. So to evaluate a local improvement, we must look at how much time the whole task saves.

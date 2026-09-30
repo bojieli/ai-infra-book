@@ -519,7 +519,7 @@ These examples show which transformations are permissible and which computation 
 
 ### 5.4.4 AKG: Organizing loops and storage with polyhedral compilation
 
-AKG is an automatic code generation and optimization system for tensor operators, whose core technique is **polyhedral compilation**. This method represents regular loops as three kinds of information: which iterations execute, which array elements each iteration reads and writes, and which reads and writes must preserve their relative order. Loop bounds and regular subscripts can be described with linear constraints, which is where the name "polyhedral" comes from. With this representation, the compiler can derive dependencies between iterations and adjust execution order accordingly.[^akg]
+AKG is an automatic code generation and optimization system for tensor operators, developed by Huawei and now open source; its core technique is **polyhedral compilation**. This method represents regular loops as three kinds of information: which iterations execute, which array elements each iteration reads and writes, and which reads and writes must preserve their relative order. Loop bounds and regular subscripts can be described with linear constraints, which is where the name "polyhedral" comes from. With this representation, the compiler can derive dependencies between iterations and adjust execution order accordingly.[^akg]
 
 Take matrix multiplication as an example: the compiler can determine that different i, j pairs correspond to different outputs, while updates along k point to the same accumulated result. Once a 64×64×32 tile is chosen, the required A and W regions can also be derived from array accesses: A is 64×32, W is 32×64. This determines both the loop execution order and which data must be read in, as well as how long that data must be retained.
 
@@ -541,7 +541,54 @@ In Figure 5-24, what determines the gap is the repeated reads feeding the 12 col
 
 AKG considers fusion and tiling together precisely to handle this kind of interaction. Once the location of intermediate-result computation changes, both which data each output block reads and how many times it reads it change; buffer requirements shift accordingly, which in turn affects the block sizes that can be used.
 
-### 5.4.5 Cost estimation and empirical selection
+
+#### GPU and Ascend: who arranges data movement and synchronization?
+
+Both architectures move operands to on-chip storage, run matrix instructions, and write results back. The main difference is which levels are managed automatically and which are explicitly arranged by the program or compiler.
+
+| Concern | NVIDIA GPU (typical CUDA path) | Ascend DaVinci (typical path) |
+|---|---|---|
+| Global-to-on-chip movement | Hardware caches provide a default path; high-performance kernels often use shared memory and asynchronous copies | The compiler or kernel arranges movement through MTE and on-chip buffers such as UB and L1 |
+| Partial sums | Tensor Cores update registers or shared-memory tiles | Cube updates an L0C accumulator |
+| Overlap | Asynchronous copy, barriers, and software pipelining | MTE movement, Cube computation, and explicit or generated synchronization |
+| Programmer responsibility | Choose tile shape, shared-memory layout, and synchronization points | Choose or generate tile shape, buffer placement, movement, and synchronization |
+
+### 5.4.5 TileLang-Ascend: writing the same schedule as a tile program
+
+TileLang was developed mainly by researchers from Peking University and Microsoft Research. It separates dataflow from scheduling: tile operations describe copies, matrix products, and reductions, while pipelining, layouts, thread binding, and data reordering describe execution. DeepSeek's TileKernels is based on TileLang and added a Huawei Ascend backend on September 30, 2026, so the same Python interfaces can target NVIDIA GPUs and Huawei Ascend NPUs. The separate TileLang-Ascend project provides Ascend C/PTO and AscendNPU IR adapters.[^tilelang]
+
+For $C=AB$, a compact Ascend-style pseudocode is:
+
+```python
+with T.Kernel(core_num, is_npu=True) as (cid, _):
+    A_L1 = T.alloc_L1((stages, BM, K_L1), "float16")
+    B_L1 = T.alloc_L1((stages, K_L1, BN), "float16")
+    A_L0 = T.alloc_L0A((stages, BM, BK), "float16")
+    B_L0 = T.alloc_L0B((stages, BK, BN), "float16")
+    C_L0 = T.alloc_L0C((BM, BN), "float32")
+    for ko1 in T.Pipelined(ceil_div(K, K_L1), num_stages=stages):
+        T.copy(A[...], A_L1[ko1 % stages, :, :])
+        T.copy(B[...], B_L1[ko1 % stages, :, :])
+        for ko0 in T.serial(ceil_div(K_L1, BK)):
+            T.copy(A_L1[ko1 % stages, ...], A_L0[ko0 % stages, ...])
+            T.copy(B_L1[ko1 % stages, ...], B_L0[ko0 % stages, ...])
+            T.mma(A_L0[ko0 % stages, ...], B_L0[ko0 % stages, ...], C_L0,
+                  init=(ko1 == 0 and ko0 == 0))
+    T.copy(C_L0, C[...])
+```
+
+`ko1` and `ko0` are the two levels of K blocking. The L1 buffers hold input tiles, the L0 buffers feed Cube, and `C_L0` survives the reduction. `T.Pipelined` overlaps the next movement with the current matrix operation. This is the same dataflow that AKG describes with isl maps and storage-management decisions; TileLang writes more of those decisions directly in the tile program.
+
+| Same decision | isl/AKG | TileLang-Ascend |
+|---|---|---|
+| Output tile | `floor(i/BM), floor(j/BN)` in an affine schedule | Tile coordinates and loops under `T.Kernel` |
+| K blocking | `floor(k/BK)` and an inner coordinate | `ko1`, `ko0` loops |
+| Input region | Derived from array-access relations | Source slices and destination buffers in `T.copy` |
+| On-chip storage | Storage management promotes data to UB/L1/L0 | `alloc_L1/L0A/L0B/L0C` declarations |
+| Matrix operation | Code generation selects the Cube instruction | `T.mma` expresses the Cube operation |
+| Pipeline and synchronization | Generated from dependencies, capacity, and the backend | `T.Pipelined` plus explicit or automatic synchronization |
+
+### 5.4.6 Cost estimation and empirical selection
 
 Example 5-8 already compares two implementations by read/write volume. Facing more combinations of tiling and fusion, a compiler narrows the search the same way, step by step: first check dependencies and numerical rules, then rule out implementations that don't fit in local storage, and finally estimate execution cost to decide which implementations to test first. Section 5.2 already gave one estimation method: comparing two tiles using access volume and effective bandwidth. A compiler can also factor in matrix-instruction utilization, register requirements, and launch cost to determine the testing order among implementations.
 
