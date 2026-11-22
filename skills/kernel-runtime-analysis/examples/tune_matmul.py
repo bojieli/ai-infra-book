@@ -22,6 +22,10 @@ def workload(shape, kernel):
                  for i in range(m) for j in range(n)]
 
     def run(tile, verify=False):
+        if verify:
+            # Every expected value is small. Poison the reusable output so a
+            # candidate that skips a store cannot inherit a previous pass.
+            C.memset(c, 0x5A, C.sizeof(c))
         start = perf_counter_ns()
         kernel(m, n, k, tile, a, b, c)
         elapsed = perf_counter_ns() - start
@@ -66,7 +70,7 @@ def tune(kernel, budget):
         if trial["tile"] in times:
             trial["median_ns"] = medians[trial["tile"]]
     fastest = min(medians, key=medians.get)
-    selected = fastest if medians[fastest] < 0.95 * medians[0] else 0
+    selected = fastest if medians[fastest] <= 0.95 * medians[0] else 0
     benchmark(selected, verify=True)
     return dict(shape=shape, architecture=platform.machine(), slice_budget_bytes=budget,
                 selected_tile=selected, trials=trials)
