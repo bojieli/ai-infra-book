@@ -54,6 +54,13 @@
 
 遇到书中的算例，不妨先自己估一下，再看推导和实验结果。也可以换成你正在使用的模型和硬件，看看结论是否改变。
 
+## 端侧 AI Infra 延伸阅读
+
+读完[第 12 章](manuscripts/12-端边云协同.md)后，可以按设备选书：
+
+- **手机、笔记本或边缘服务器**：Vijay Janapa Reddi 的 [*Introduction to Machine Learning Systems*](https://mlsysbook.ai/vol1/) 讲单节点上的模型压缩、硬件加速、基准测试与部署。可先选一个模型，记录权重大小、峰值内存和每步延迟，再用这些指标比较量化方案。
+- **微控制器与常开传感器**：Arm Education 的 [*Efficient Embedded Systems Design and Programming*](https://www.arm.com/resources/education/books/efficient-embedded-systems-nucleo) 从 STM32 Nucleo 上的处理器、外设和功耗预算讲起。要把这些约束用于推理，可配合 HarvardX 的 [TinyML 课程与实验](https://mlsysbook.ai/slides/tinyml.html)，观察采样、特征提取和推理各自占多少内存和时间。
+
 ## 配套计算与实验
 
 [配套计算工具](calculations/README.md)可以用来复算书中的数字，也可以换一组模型和输入，估算资源需求。工具附有模型配置和[结果索引](calculations/results/README.md)，静态计算只需 Python 3.10+ 标准库，无需 GPU 或模型权重。
