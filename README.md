@@ -137,6 +137,8 @@ python3 book/build_epub.py --edition zh       # EPUB 只需 Pandoc 与 Poppler�
 
 作者：[李博杰](https://01.me/)（[@bojieli](https://github.com/bojieli)）。
 
+关于 README 或官网的赞助展示、费用及联系方式，可以查阅[现有的赞助咨询讨论](https://github.com/bojieli/ai-infra-book/issues/41)。目前仓库没有公开的赞助位或价目表。
+
 感谢这些年一起做研究和工程的合作者，也感谢相关论文、开源项目与技术文档的作者，以及参与勘误和实验复现的读者。详细致谢见[前言](manuscripts/00-前言.md)，引用来源见正文脚注和[参考资料库](references/README.md)。本书 PDF 沿用《深入理解 AI Agent》的 ElegantBook / XeLaTeX 模板。
 
 英文版由 [@tg1482](https://github.com/tg1482) 翻译并贡献（[#4](https://github.com/bojieli/ai-infra-book/pull/4)）。
