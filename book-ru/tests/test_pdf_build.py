@@ -166,8 +166,15 @@ def test_prepare_preserves_html_section_anchor_in_latex(tmp_path: Path) -> None:
         ["pandoc", str(chapter), "--file-scope", "--to=latex"], text=True
     )
     target = re.search(r"\\hyperref\[([^\]]+)\]", tex)
-    assert target is not None
-    assert f"\\label{{{target[1]}}}" in tex
+    if target is not None:
+        assert "model-matrix-tables" in target[1]
+        assert f"\\label{{{target[1]}}}" in tex
+    else:
+        # Pandoc 3.1 emits hyperlink/hypertarget for standalone span anchors.
+        target = re.search(r"\\hyperlink\{([^}]+)\}", tex)
+        assert target is not None, tex
+        assert "model-matrix-tables" in target[1]
+        assert f"\\hypertarget{{{target[1]}}}" in tex
 
 
 def test_preview_can_include_second_chapter(tmp_path: Path) -> None:
