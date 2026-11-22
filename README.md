@@ -59,7 +59,7 @@
 读完[第 12 章](manuscripts/12-端边云协同.md)后，可以按设备选书：
 
 - **手机、笔记本或边缘服务器**：Vijay Janapa Reddi 的 [*Introduction to Machine Learning Systems*](https://mlsysbook.ai/vol1/) 讲单节点上的模型压缩、硬件加速、基准测试与部署。可先选一个模型，记录权重大小、峰值内存和每步延迟，再用这些指标比较量化方案。
-- **微控制器与常开传感器**：Arm Education 的 [*Efficient Embedded Systems Design and Programming*](https://www.arm.com/resources/education/books/efficient-embedded-systems-nucleo) 从 STM32 Nucleo 上的处理器、外设和功耗预算讲起。要把这些约束用于推理，可配合 HarvardX 的 [TinyML 课程与实验](https://mlsysbook.ai/slides/tinyml.html)，观察采样、特征提取和推理各自占多少内存和时间。
+- **微控制器与常开传感器**：Alexander G. Dean 的 [*Embedded Systems Fundamentals with Arm Cortex-M Based Microcontrollers*](https://www.arm.com/resources/education/books/efficient-embedded-systems-nucleo) 在 STM32 Nucleo-F091RC 上讲处理器、中断、外设和直接内存访问。要把这些约束用于推理，可配合 [TinyML 课程实验与配套代码](https://github.com/tinyMLx/courseware)，观察采样、特征提取和推理各自占多少内存和时间。
 
 ## 配套计算与实验
 
