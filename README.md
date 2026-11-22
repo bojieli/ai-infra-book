@@ -76,6 +76,8 @@ git lfs install
 git lfs pull --include="experiments/ch05/05-01/**" --exclude=""
 ```
 
+**练习做完后到哪里核对？** 第 1–3 章有一份按题号编排的[练习参考解答](research/ch01-03-model-led-rewrite-2026-09-10/exercise-answers.md)，附[中间数值](research/ch01-03-model-led-rewrite-2026-09-10/exercise-values.json)。其他章节可按正文的实验编号查找输入条件、推导和结果记录。例如第 4 章的[实验 4-4](experiments/ch04/04-04/README.md)展示如何从缓冲区容量推到调度结果。开放题可以用不同硬件和负载作答，核对时先对齐单位、假设和评价指标。
+
 [配套实验](experiments/README.md)按章节存放在 `experiments/chXX/XX-YY/` 中，每个实验都附有运行方法、输入条件和结果说明。需要 GPU 的实验会注明硬件与依赖要求；没有相应设备，也可以先阅读已有记录。复现或引用结果时，请留意所用的书稿版本、模型、硬件和输入参数。
 
 ## 本地构建
