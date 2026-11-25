@@ -6,7 +6,7 @@
 
 [**Скачать полную книгу в PDF**](https://raw.githubusercontent.com/ilkruglov/ai-infra-book/main/book-ru/dist/AI-Infra-in-Depth-RU.pdf) · [Открыть PDF на GitHub](dist/AI-Infra-in-Depth-RU.pdf)
 
-Предисловие и 12 глав: 969 страниц, 497 рисунков и 131 таблица.
+Предисловие и 12 глав: 970 страниц, 497 рисунков и 131 таблица.
 
 Основной формат для чтения — PDF. Markdown ниже служит также исходником для сборки: часть относительных ссылок на источники и другие главы сохраняет пути оригинала и не открывается непосредственно на GitHub. При сборке PDF такие ссылки преобразуются в ссылки на зафиксированную версию исходного репозитория.
 
@@ -31,6 +31,10 @@
 11. [Планирование ресурсов и среда выполнения](book/chapter11.md)
 12. [Совместная работа устройств, периферии и облака](book/chapter12.md)
 
+Для проверки упражнений к главам 1–3 автор публикует [ответы](https://github.com/bojieli/ai-infra-book/blob/006d75a73f73f59dbb8c53f69cbee9af2ae9f1e6/research/ch01-03-model-led-rewrite-2026-09-10/exercise-answers.md) и [промежуточные значения](https://github.com/bojieli/ai-infra-book/blob/006d75a73f73f59dbb8c53f69cbee9af2ae9f1e6/research/ch01-03-model-led-rewrite-2026-09-10/exercise-values.json). Для главы 4 доступны [расчёт расписания](https://github.com/bojieli/ai-infra-book/tree/006d75a73f73f59dbb8c53f69cbee9af2ae9f1e6/experiments/ch04/04-04) и [практикум по оптимизации матричного умножения на CPU](https://github.com/bojieli/ai-infra-book/tree/006d75a73f73f59dbb8c53f69cbee9af2ae9f1e6/skills/kernel-runtime-analysis/examples).
+
+После главы 12 можно продолжить изучение инференса на телефонах и одноплатных системах по [Introduction to Machine Learning Systems](https://mlsysbook.ai/vol1/). Для микроконтроллеров автор рекомендует [учебник по Arm Cortex-M](https://www.arm.com/resources/education/books/efficient-embedded-systems-nucleo) и [лабораторные TinyML](https://github.com/tinyMLx/courseware).
+
 ## О русском издании
 
 Издание содержит редакционные уточнения; отступления от оригинала явно помечены и сопровождаются обоснованием.
@@ -41,7 +45,7 @@
 
 ## Оригинал и лицензия
 
-Автор оригинала — **Боцзе Ли (Bojie Li)**. [Исходный репозиторий](https://github.com/bojieli/ai-infra-book). Перевод подготовлен по [зафиксированной версии оригинала](https://github.com/bojieli/ai-infra-book/tree/3bdcb4fcab73010eeaccf31cc10a8242a895d82e).
+Автор оригинала — **Боцзе Ли (Bojie Li)**. [Исходный репозиторий](https://github.com/bojieli/ai-infra-book). Перевод подготовлен по [зафиксированной версии оригинала](https://github.com/bojieli/ai-infra-book/tree/006d75a73f73f59dbb8c53f69cbee9af2ae9f1e6).
 
 Книга распространяется по лицензии [Apache License 2.0](LICENSE). Авторские права и сведения о сторонних материалах сохранены в [NOTICE](NOTICE); лицензии используемых шрифтов — в [licenses](licenses/).
 
