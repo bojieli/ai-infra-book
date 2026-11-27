@@ -183,3 +183,13 @@ python3 book/build_epub.py --edition zh       # EPUB 只需 Pandoc 与 Poppler�
 - **在线阅读**：[阅读网站](https://bojieli.github.io/ai-infra-book/)提供章节导航、全文搜索和深色模式，右上角可切换语言。
 - **自动发布**：每次更新 `main` 后自动构建全部格式并发布到 [Releases](https://github.com/bojieli/ai-infra-book/releases)，上方链接始终指向最新版。
 - **翻译版本与译者**：简体中文为原版，作者为 [Bojie Li（李博杰）](https://github.com/bojieli)，正文位于 [`manuscripts/`](manuscripts/README.md)。英文版由社区译者 [@tg1482](https://github.com/tg1482) 翻译，位于 [`book-en/`](book-en/)，包含前言与十二章正文、重绘为英文标注的配图和独立的构建脚本。繁體中文版由社区贡献者 [@edward821220](https://github.com/edward821220) 翻译并整理，位于 [`book-zh-tw/`](book-zh-tw/)，包含前言与十二章正文、繁體配图和独立的构建脚本；两项已知配图例外见[繁體版说明](book-zh-tw/README.md)。俄语 community edition 由 [@ilkruglov](https://github.com/ilkruglov) 组织并完成翻译与校验，位于 [`book-ru/`](book-ru/)，依据固定版本的中文原稿制作，原作者仍为 [Bojie Li](https://github.com/bojieli)。各译本的译者、来源版本和许可证见对应目录说明；译本数字、公式和引用以原版为准。
+
+## 合作推荐
+
+🐼 **合作推荐：买 AI 别花冤枉钱！怕买贵？怕假模型？怕被坑？花钱前先查【模真真】**
+
+- 🏷️ **怕花冤枉钱买贵了？【比价】** 2000+ 模型 · 35 万+ 渠道，官方订阅、按量 API 与套餐换算同台对比，哪家便宜直接排好。
+- 🛡️ **怕买到掺假、降智模型？【验真】** 5000+ 中转站 · 10 万份报告，看真实用户口碑、查模型真假，查清套壳和降智。
+- 🧭 **怕买号被坑？【买号/充值导航】** 1200+ 号商 · 2 万+ 商品（成品号/代充/团队席位），买前看清价格、发货速度与售后质保。
+- 🎁 **想找免费额度？【羊毛】** 每天更新免费额度和羊毛活动，整理公益站合集，免费额度随时领。
+- ⭐ **全部免费 · 模真真自己不卖任何 AI 服务，排名只看数据** 👉 去查一查：[mozhenzhen.com](https://mozhenzhen.com/go/ai-infra-book)
